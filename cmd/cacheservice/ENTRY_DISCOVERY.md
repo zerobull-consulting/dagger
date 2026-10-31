@@ -13,8 +13,8 @@ entries, and how it picks export roots. It is based on the engine at
   notice of one either.
 - Session spans are sent under the **client's** Cloud settings, not the
   engine's. The engine publishes a session's spans only when the CLI that
-  started the session has Cloud telemetry configured (`DAGGER_CLOUD_TOKEN`),
-  and it sends them to the CLI's `DAGGER_CLOUD_URL`. This is why the protocol
+  started the session has Cloud telemetry configured, through
+  `DAGGER_CLOUD_TOKEN` or a `dagger login` credential, and it sends them to the CLI's `DAGGER_CLOUD_URL`. This is why the protocol
   spike (#3) saw no spans: its CLI did not point at the service.
 - With the CLI's `DAGGER_CLOUD_URL` pointed at the service, spans arrive. A
   `withExec` entry learned only from its span was exported, with its layers,
@@ -95,7 +95,10 @@ The engine publishes a session's telemetry to Cloud only when the session's
 main client asks it to (`sessionPublishesToCloud` in
 `engine/server/session_cloud_telemetry.go`). The CLI asks only when it has
 Cloud telemetry configured (`cliCloudTelemetry.configured()` in
-`internal/cmd/dagger/engine.go`). It then hands over:
+`internal/cmd/dagger/engine.go`). That takes a credential from
+`DAGGER_CLOUD_TOKEN` or, when it is unset, from `dagger login` with its
+current org (`GetCloudAuth` in `internal/cloud/auth/auth.go`). It then hands
+over:
 
 - its own `DAGGER_CLOUD_URL` as `ClientMetadata.CloudURL`;
 - its own credential as `ClientMetadata.CloudAuth`.
@@ -108,9 +111,10 @@ store through them (`session_cloud_forwarder.go`). The engine's own
 
 Consequences:
 
-- A CLI with no Cloud token sends no session spans anywhere. The engine logs
+- A CLI with neither `DAGGER_CLOUD_TOKEN` nor a `dagger login` credential
+  sends no session spans anywhere. The engine logs
   nothing about it.
-- A CLI with a token but no `DAGGER_CLOUD_URL` sends spans to the engine's
+- A CLI with a credential but no `DAGGER_CLOUD_URL` sends spans to the engine's
   `DAGGER_CLOUD_URL` if set, else to `https://api.dagger.cloud`.
 - Span requests are authorized with the **user's** token, not the engine's.
   Auth in #10 must accept both kinds, or tell them apart.
@@ -126,6 +130,19 @@ don't put it in the key:
   old one in `wipedCache`; forget every entry under it.
 - **`replacements`** changes when an entry's value is replaced in place. Treat
   a higher count as a new value: export it again.
+- **Fence by generation.** Spans of one session can still be in flight when
+  a newer generation starts reporting, and concurrent sessions' spans arrive
+  in any order. Keep the newest generation seen per cache ID, and ignore
+  observations from an older one. Within a generation, let an observation
+  replace an entry's state only when its `replacements` count is at least
+  the stored one.
+
+Group observations by **session** as well. Every session span's resource
+carries `dagger.io/engine.session`, beside `dagger.io/engine.cache`. Several
+sessions share one engine and can touch the same entry, so candidates and the
+session-end carrier span are tracked per session ID and generation. One
+session's carrier closes only that session's candidates. The persistent entry
+key stays cache ID and result number.
 
 Per entry, keep the latest of: type, deps, parts, retained, retention expiry,
 expiry, replacements, the session that last touched it, and the export state
@@ -133,7 +150,8 @@ expiry, replacements, the session that last touched it, and the export state
 
 ## Choosing export roots
 
-1. **Candidates.** An entry is a candidate when any span in the session showed
+1. **Candidates.** An entry is a candidate for a session when any of that
+   session's spans (by `dagger.io/engine.session`) showed
    `dagger.io/cache.retained = "true"`. Entries without a retention edge are
    released with their session and come back `gone`.
 2. **Skip** candidates already exported with the same `replacements` count,
@@ -166,8 +184,9 @@ expiry, replacements, the session that last touched it, and the export state
 The engine holds their retained entries, but nothing tells the service about
 them. Options:
 
-- **(a) Deployment requirement, no engine change.** Every client sets
-  `DAGGER_CLOUD_TOKEN` and `DAGGER_CLOUD_URL` pointing at the service. Works
+- **(a) Deployment requirement, no engine change.** Every client has Cloud
+  telemetry configured (`DAGGER_CLOUD_TOKEN` or `dagger login`) and sets
+  `DAGGER_CLOUD_URL` pointing at the service. Works
   today; this note's live run used it. Costs: clients lose Dagger Cloud
   traces unless the service forwards them on. The service takes user tokens
   on `/v1/traces`. One client left unconfigured is a silent miss.
@@ -227,8 +246,11 @@ engine code:
   (`internal/cmd/dagger/integration_cloud.go`,
   `internal/cmd/dagger/workspace.go`). `dagger cloud integration` and
   workspace GitHub setup won't work for clients behind the service.
-- **Still a silent miss** for any client without `DAGGER_CLOUD_TOKEN` and
-  this `DAGGER_CLOUD_URL`.
+- **Still a silent miss** for any client without a Cloud credential
+  (`DAGGER_CLOUD_TOKEN` or `dagger login`) and this `DAGGER_CLOUD_URL`.
+- **`dagger login` goes through the service too.** The CLI's auth package
+  uses `DAGGER_CLOUD_URL` as its API base, so logging in and refreshing
+  tokens pass through the proxy.
 
 ### Alternative: the engine's workload export (not tested)
 

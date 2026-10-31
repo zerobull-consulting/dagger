@@ -84,8 +84,9 @@ The debug API has no authentication. It listens on localhost only by default.
    ```
 
    Take entry numbers from the `result` fields of the `cache span` log lines.
-   Cache spans arrive only when the CLI itself has `DAGGER_CLOUD_TOKEN` set
-   and `DAGGER_CLOUD_URL` pointing at the service.
+   Cache spans arrive only when the CLI itself has Cloud telemetry configured,
+   through `DAGGER_CLOUD_TOKEN` or `dagger login`, and has `DAGGER_CLOUD_URL`
+   pointing at the service.
 
 ## Expected behavior, read from the code
 
