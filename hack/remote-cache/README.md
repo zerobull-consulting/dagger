@@ -29,6 +29,7 @@ It needs Docker with Compose v2.
 
 | Setting | Value | Override with |
 | --- | --- | --- |
+| Listen address | `127.0.0.1` (loopback only) | `MINIO_BIND_ADDR` |
 | S3 endpoint | `http://localhost:9000` | `MINIO_API_PORT` |
 | Console | `http://localhost:9001` | `MINIO_CONSOLE_PORT` |
 | Region | `us-east-1` | `MINIO_REGION` |
@@ -37,7 +38,9 @@ It needs Docker with Compose v2.
 | Secret key | `dagger-dev-secret` | `MINIO_ROOT_PASSWORD` |
 | Addressing | path-style (`http://host:9000/<bucket>/<key>`) | none |
 
-The credentials are MinIO's root user. Use them only for local development.
+The credentials are MinIO's root user, and they are committed in this repo.
+That's why MinIO listens on loopback unless you set `MINIO_BIND_ADDR`. Never
+set it to `0.0.0.0` on a machine others can reach.
 
 Set the same overrides for every `dev.sh` command, since `env` and `test`
 print and use them.
@@ -96,36 +99,28 @@ afterwards. The `Remote cache tests` workflow runs them on every pull request.
 The engine reaches only the cache service. MinIO's address reaches it inside
 the presigned URLs the service hands out. **Those URLs are signed for one
 host, and the engine must reach MinIO at exactly that host.** An engine in a
-container can't reach `localhost:9000`, so give the service an endpoint that
-works from inside the engine's container too:
+container can't reach the host's loopback, so either:
 
-- the Docker bridge gateway, usually `http://172.17.0.1:9000`
-  (`docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'`);
-- `http://host.docker.internal:9000`, with the engine started with
-  `--add-host=host.docker.internal:host-gateway`, and that name also resolving
-  where the service runs;
-- or run the engine with `--network host`, and keep `localhost`.
+- publish MinIO on the Docker bridge gateway, which containers on this host
+  can reach and other machines can't:
 
-Both of the first two were checked from a container on 2026-10-31.
+  ```bash
+  MINIO_BIND_ADDR=172.17.0.1 ./hack/remote-cache/dev.sh up
+  ```
 
-Then start the service with the S3 settings and point the engine at the
-service. See [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md)
-for running the service against a dev engine:
+  Find the gateway with
+  `docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'`.
+  `dev.sh env` then prints `http://172.17.0.1:9000` as the endpoint, and
+  `host.docker.internal` (with `--add-host=host.docker.internal:host-gateway`)
+  reaches the same address. Pass the same `MINIO_BIND_ADDR` to every `dev.sh`
+  command;
+- or run the engine with `--network host`, and keep the loopback default.
 
-```bash
-./hack/remote-cache/dev.sh up
-eval "$(./hack/remote-cache/dev.sh env)"
-export CACHESERVICE_S3_ENDPOINT=http://172.17.0.1:9000
-go run ./cmd/cacheservice -v
-```
+Both were checked from a container on 2026-10-31.
 
-and on the engine:
-
-```bash
-_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL=http://<host>:8090
-DAGGER_CLOUD_TOKEN=<any token>
-DAGGER_CLOUD_URL=http://<host>:8090
-```
-
-Until the blob store (#5) lands, the service reads none of the S3 settings,
-and its `PUT /blobs/{digest}` stand-in still stores nothing.
+The service doesn't read any S3 settings yet. The blob store
+([#5](https://github.com/zerobull-consulting/dagger/issues/5)) will read the
+`CACHESERVICE_S3_*` variables that `dev.sh env` prints, and the service's
+`PUT /blobs/{digest}` stand-in stores nothing until then. To run the service
+against a dev engine today, see
+[`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md).

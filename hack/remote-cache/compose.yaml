@@ -18,9 +18,13 @@ services:
       # Presigned URLs carry a region in their signature. Pin it so it matches
       # what the service is configured with.
       MINIO_REGION: ${MINIO_REGION:-us-east-1}
+    # Loopback only by default: the root credentials are committed in this
+    # repo. Set MINIO_BIND_ADDR to the Docker bridge gateway (usually
+    # 172.17.0.1) to let an engine container reach MinIO without exposing it
+    # beyond this host. See README.md.
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${MINIO_BIND_ADDR:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_BIND_ADDR:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio-data:/data
     healthcheck:

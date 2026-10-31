@@ -242,7 +242,9 @@ func TestMinIOPresignedPutSizeBound(t *testing.T) {
 	}
 }
 
-// An expired presigned GET is refused. Renewal (#9) exists for this.
+// An expired presigned GET is refused, so long builds will need fresh URLs:
+// renew -> renewed, still to do in #9. The service answers renew with
+// Unavailable today.
 func TestMinIOPresignedGetExpires(t *testing.T) {
 	e := newMinIOTestEnv(t)
 	ctx := context.Background()
