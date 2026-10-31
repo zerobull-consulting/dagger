@@ -36,15 +36,24 @@ compose() {
 	docker compose -f "$here/compose.yaml" "$@"
 }
 
+# Values are quoted with %q, so the output is safe to eval whatever the
+# settings contain.
 print_env() {
-	cat <<EOF
-export CACHESERVICE_S3_ENDPOINT=http://${host}:${MINIO_API_PORT}
-export CACHESERVICE_S3_REGION=${MINIO_REGION}
-export CACHESERVICE_S3_BUCKET=${MINIO_BUCKET}
-export CACHESERVICE_S3_ACCESS_KEY_ID=${MINIO_ROOT_USER}
-export CACHESERVICE_S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
-export CACHESERVICE_S3_PATH_STYLE=true
-EOF
+	local name
+	for name in ENDPOINT REGION BUCKET ACCESS_KEY_ID SECRET_ACCESS_KEY PATH_STYLE; do
+		printf 'export CACHESERVICE_S3_%s=%q\n' "$name" "$(s3_setting "$name")"
+	done
+}
+
+s3_setting() {
+	case "$1" in
+	ENDPOINT) echo "http://${host}:${MINIO_API_PORT}" ;;
+	REGION) echo "$MINIO_REGION" ;;
+	BUCKET) echo "$MINIO_BUCKET" ;;
+	ACCESS_KEY_ID) echo "$MINIO_ROOT_USER" ;;
+	SECRET_ACCESS_KEY) echo "$MINIO_ROOT_PASSWORD" ;;
+	PATH_STYLE) echo true ;;
+	esac
 }
 
 up() {

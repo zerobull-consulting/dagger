@@ -68,11 +68,15 @@ s3.New(s3.Options{
 
 ## Image
 
-`pgsty/minio:RELEASE.2026-08-04T00-00-00Z`, a community build of MinIO. The
+`pgsty/silo:RELEASE.2026-10-26T00-00-00Z`, the community fork of MinIO that
+pgsty maintains. It used to ship as `pgsty/minio`, which stopped at
+`RELEASE.2026-08-04T00-00-00Z`; new releases ship only as `pgsty/silo`. The
 tag was checked on Docker Hub on 2026-10-31, and it was the newest release
-tag. The image ships `mc`, so the bucket bootstrap uses the same image and
-there is only one tag to pin. To update it, change the `x-minio-image` anchor
-in `compose.yaml` and this section.
+tag. Use the plain tags, not the `-distroless` ones: the plain image ships
+`mc` and `curl`, so the bucket bootstrap and the health check use the same
+image and there is only one tag to pin. Silo still accepts MinIO's `server`
+command and `MINIO_*` settings. To update it, change the `x-minio-image`
+anchor in `compose.yaml` and this section.
 
 ## Tests
 

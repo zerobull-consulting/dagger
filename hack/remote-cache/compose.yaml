@@ -6,7 +6,7 @@
 
 name: dagger-remote-cache
 
-x-minio-image: &minio-image pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+x-minio-image: &minio-image pgsty/silo:RELEASE.2026-10-26T00-00-00Z
 
 services:
   minio:
