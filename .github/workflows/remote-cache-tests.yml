@@ -1,0 +1,36 @@
+name: Remote cache tests
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The remote cache service, the engine's client of it and their wire
+      # protocol: every test in these packages.
+      - name: Service, client and protocol
+        run: go test -race -count=1 -cover ./cmd/cacheservice/... ./engine/remotecache/...
+      # The engine's side of the remote cache: its adapter, configuration and
+      # fixtures, in packages shared with other engine code.
+      - name: Engine integration
+        run: |
+          go test -race -count=1 -run 'RemoteCache|SkippedMessage|ExportLogAttrs' \
+            ./engine/server/ ./cmd/engine/ ./core/schema/
