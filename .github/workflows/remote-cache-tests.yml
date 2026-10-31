@@ -34,3 +34,21 @@ jobs:
         run: |
           go test -race -count=1 -run 'RemoteCache|SkippedMessage|ExportLogAttrs' \
             ./engine/server/ ./cmd/engine/ ./core/schema/
+  minio:
+    name: S3 tests against MinIO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Starts MinIO from hack/remote-cache/compose.yaml and runs the tests
+      # in cmd/cacheservice that need a real S3-compatible store.
+      - name: MinIO tests
+        run: ./hack/remote-cache/dev.sh test
+      - name: Stop MinIO
+        if: always()
+        run: ./hack/remote-cache/dev.sh reset
