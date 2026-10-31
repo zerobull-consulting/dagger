@@ -49,7 +49,8 @@ engine presigned URLs, so the engine never holds S3 credentials.
   a zero `Content-Length` and the URL would take a body of any size. S3 does
   not check the body against the digest.
 - `PresignGet` signs a GET. PUTs expire after 15 minutes and GETs after an hour
-  by default.
+  by default. A URL signed with temporary credentials (STS, an instance role)
+  stops working when they expire, so its `ExpiresAt` is capped at theirs.
 - `UploadURLs` builds an `upload` request's URL map: it checks each blob with
   `Has` (16 at a time) and presigns PUTs only for the missing ones, so a blob
   already stored is not requested again.

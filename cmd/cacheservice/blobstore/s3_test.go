@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/opencontainers/go-digest"
 )
@@ -364,5 +365,59 @@ func TestS3ConfigFromEnvNoCredentials(t *testing.T) {
 	}
 	if cfg.PathStyle {
 		t.Error("PathStyle on by default")
+	}
+}
+
+// A URL signed with temporary credentials stops working when they expire, so
+// its ExpiresAt is no later than theirs.
+func TestPresignExpiryCappedByCredentials(t *testing.T) {
+	credsExpire := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	cfg := testConfig()
+	cfg.Credentials = aws.NewCredentialsCache(aws.CredentialsProviderFunc(
+		func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID: "ASIA", SecretAccessKey: "SECRET", SessionToken: "TOKEN",
+				CanExpire: true, Expires: credsExpire,
+			}, nil
+		}), func(o *aws.CredentialsCacheOptions) { o.ExpiryWindow = 0 })
+	s := newTestStore(t, cfg)
+	ctx := context.Background()
+
+	get, err := s.PresignGet(ctx, testDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !get.ExpiresAt.Equal(credsExpire) {
+		t.Errorf("GET ExpiresAt %v, want the credentials' expiry %v", get.ExpiresAt, credsExpire)
+	}
+	// The PUT's own 15m expiry outlasts the credentials too.
+	put, err := s.PresignPut(ctx, testDigest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !put.ExpiresAt.Equal(credsExpire) {
+		t.Errorf("PUT ExpiresAt %v, want the credentials' expiry %v", put.ExpiresAt, credsExpire)
+	}
+
+	// Credentials outliving the URL leave its own expiry.
+	cfg.PutExpiry = 5 * time.Minute
+	s = newTestStore(t, cfg)
+	before := time.Now()
+	put, err = s.PresignPut(ctx, testDigest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if put.ExpiresAt.Before(before.Add(5*time.Minute)) || put.ExpiresAt.After(time.Now().Add(5*time.Minute)) {
+		t.Errorf("PUT ExpiresAt %v, want 5m after signing", put.ExpiresAt)
+	}
+}
+
+// Only a 404 means missing; other statuses from HEAD are errors.
+func TestHasOnlyNotFoundIsMissing(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusConflict, http.StatusPreconditionFailed} {
+		s := newFakeS3Store(t, &fakeS3{status: status})
+		if ok, err := s.Has(context.Background(), testDigest); err == nil {
+			t.Errorf("HEAD %d: Has = %v, nil; want an error", status, ok)
+		}
 	}
 }

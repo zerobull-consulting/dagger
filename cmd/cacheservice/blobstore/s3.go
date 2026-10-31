@@ -14,7 +14,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/opencontainers/go-digest"
 )
@@ -218,15 +217,9 @@ func (s *S3Store) Has(ctx context.Context, dgst digest.Digest) (bool, error) {
 	return false, fmt.Errorf("head %s: %w", key, err)
 }
 
+// isNotFound reports a 404 and nothing else: a HEAD response has no body, so
+// the status is all S3 says.
 func isNotFound(err error) bool {
-	var notFound *types.NotFound
-	if errors.As(err, &notFound) {
-		return true
-	}
-	var noKey *types.NoSuchKey
-	if errors.As(err, &noKey) {
-		return true
-	}
 	var re *smithyhttp.ResponseError
 	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotFound
 }
@@ -256,7 +249,7 @@ func (s *S3Store) PresignPut(ctx context.Context, dgst digest.Digest, size int64
 	if err != nil {
 		return Address{}, fmt.Errorf("presign PUT %s: %w", key, err)
 	}
-	return Address{URL: req.URL, ExpiresAt: signedAt.Add(s.putExpiry)}, nil
+	return Address{URL: req.URL, ExpiresAt: s.expiresAt(ctx, signedAt, s.putExpiry)}, nil
 }
 
 // PresignGet returns a presigned GET of the blob. It does not check that the
@@ -266,6 +259,7 @@ func (s *S3Store) PresignGet(ctx context.Context, dgst digest.Digest) (Address, 
 	if err != nil {
 		return Address{}, err
 	}
+	// Taken before signing, so the URL works at least until ExpiresAt.
 	signedAt := s.now()
 	req, err := s.presign.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.bucket,
@@ -274,5 +268,18 @@ func (s *S3Store) PresignGet(ctx context.Context, dgst digest.Digest) (Address, 
 	if err != nil {
 		return Address{}, fmt.Errorf("presign GET %s: %w", key, err)
 	}
-	return Address{URL: req.URL, ExpiresAt: signedAt.Add(s.getExpiry)}, nil
+	return Address{URL: req.URL, ExpiresAt: s.expiresAt(ctx, signedAt, s.getExpiry)}, nil
+}
+
+// expiresAt is when a URL signed at signedAt for expiry stops working: at the
+// end of its expiry, or earlier when the credentials that signed it are
+// temporary (STS, an instance role) and expire first.
+func (s *S3Store) expiresAt(ctx context.Context, signedAt time.Time, expiry time.Duration) time.Time {
+	at := signedAt.Add(expiry)
+	// Presigning has just retrieved these, so the provider's cache answers.
+	creds, err := s.client.Options().Credentials.Retrieve(ctx)
+	if err == nil && creds.CanExpire && creds.Expires.Before(at) {
+		return creds.Expires
+	}
+	return at
 }
