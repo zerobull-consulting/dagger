@@ -32,6 +32,32 @@ numbered file in `DIR`.
 
 The debug API has no authentication. It listens on localhost only by default.
 
+## Blob store
+
+[`blobstore`](blobstore) stores layer blobs in S3 for the service
+([#5](https://github.com/zerobull-consulting/dagger/issues/5)). The service
+isn't wired to it yet. Blobs never pass through the service: it hands the
+engine presigned URLs, so the engine never holds S3 credentials.
+
+- Keys are content-addressed: `<prefix>/blobs/<algorithm>/<hex>`, such as
+  `team/blobs/sha256/4f1e...`.
+- `Has` checks a blob with `HeadObject`. A 404 means missing; any other error
+  is an error.
+- `PresignPut` signs a PUT for an exact size: `Content-Length` is a signed
+  header, so S3 refuses a body of any other size. It signs no other headers,
+  matching the engine's upload. It refuses size 0, because SigV4 doesn't sign
+  a zero `Content-Length` and the URL would take a body of any size. S3 does
+  not check the body against the digest.
+- `PresignGet` signs a GET. PUTs expire after 15 minutes and GETs after an hour
+  by default.
+- `UploadURLs` builds an `upload` request's URL map: it checks each blob with
+  `Has` (16 at a time) and presigns PUTs only for the missing ones, so a blob
+  already stored is not requested again.
+
+`S3ConfigFromEnv` reads endpoint, region, bucket, prefix, path-style
+addressing, expiries and static credentials from `CACHESERVICE_S3_*`. Without
+static credentials it uses the AWS SDK's default chain.
+
 ## Running it against a local engine
 
 For a local S3-compatible store (MinIO), see

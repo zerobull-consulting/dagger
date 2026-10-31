@@ -1,8 +1,8 @@
 package main
 
 // Tests against a real S3-compatible store: the MinIO dev environment in
-// hack/remote-cache. They check what the blob store (#5) and the metadata
-// store (#6) will rely on. They skip unless CACHESERVICE_S3_ENDPOINT is set;
+// hack/remote-cache. They check, through the raw SDK, what the blob store
+// (blobstore, #5) and the metadata store (#6) rely on. They skip unless CACHESERVICE_S3_ENDPOINT is set;
 // `hack/remote-cache/dev.sh test` starts MinIO and runs them.
 
 import (
