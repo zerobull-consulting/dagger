@@ -83,8 +83,10 @@ The debug API has no authentication. It listens on localhost only by default.
    curl -s -XPOST 'localhost:8091/debug/engines/1/request?type=export' -d '{"roots":[1,2,3]}'
    ```
 
-   Take entry numbers from the `result` fields of the `cache span` log lines,
-   or from the `engine.share` and `engine.prune` events.
+   Take entry numbers from the `result` fields of the `cache span` log lines.
+   Cache spans arrive only when the CLI itself has Cloud telemetry configured,
+   through `DAGGER_CLOUD_TOKEN` or `dagger login`, and has `DAGGER_CLOUD_URL`
+   pointing at the service.
 
 ## Expected behavior, read from the code
 
@@ -131,7 +133,8 @@ engine's cache from telemetry, posted to `DAGGER_CLOUD_URL`:
   (`engine/telemetryattrs`, scope `dagger.io/engine.cache`):
   - `engine.start`: the cache opened and was restored.
   - `engine.share`: a snapshot-sharing pass completed parts, with each part's
-    entry number, dependencies and replacement count.
+    entry number, dependencies and replacement count. It covers only rows
+    imported from the remote cache, so it says nothing about new entries.
   - `engine.prune`: retention edges were dropped.
   - `engine.stop`: the cache closed.
 
@@ -182,9 +185,10 @@ the service on the same host. The pipelines were small `dagger query` calls:
   `/v1/logs`. No `engine.share` was seen in these runs. Session logs and
   metrics arrived too, and the engine sent `HEAD /v1/traces` to probe the URL.
 - **No spans arrived at `/v1/traces`**, though the engine logged "session
-  telemetry published to Cloud". The cause is not yet known. Until it is,
-  spans can't be relied on to learn entry numbers. This needs a follow-up
-  before designing on top of spans.
+  telemetry published to Cloud". The cause, found later: the engine sends a
+  session's spans to the **CLI's** `DAGGER_CLOUD_URL`, under the CLI's token,
+  not to its own. With the CLI's `DAGGER_CLOUD_URL` pointed at the service,
+  spans arrive. See [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md).
 
 ### What the engine sent only when asked (debug API probes)
 
@@ -232,9 +236,10 @@ the service on the same host. The pipelines were small `dagger query` calls:
 
 ### Takeaways for the storage design
 
-- Learning which entries exist is the open problem. The WebSocket never says
-  so, spans did not arrive, and `engine.share` was not seen. Scanning numbers
-  with `export` works, but it is crude.
+- Learning which entries exist was the open problem. The WebSocket never says
+  so, spans did not arrive, and `engine.share` was not seen. Both are now
+  explained, and the service can learn entries from session spans: see
+  [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md).
 - Blobs are ordinary OCI layer blobs, addressed by digest and PUT whole. That
   maps directly onto S3 objects keyed by digest. Layers repeat across outputs
   (alpine's base layer appeared under two entries), so dedupe by digest.
