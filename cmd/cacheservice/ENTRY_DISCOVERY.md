@@ -150,24 +150,31 @@ replacements, the session that last touched it, and the export state
 (`pending`, `exported` with the bundle key and the parts it covered, `busy`,
 `refused`, `gone`).
 
-**Spans are sparse updates.** A lazy-evaluation span carries the result ID,
-deps and parts, but no type, outcome or retention. An attribute a span
-leaves out keeps its stored value. Spans of the same value arrive in any
-order, so they are merged per field, never replace the whole entry:
+**Two kinds of span.** A **state span** is a call span: it carries
+`dagger.io/cache.outcome` and the entry's whole state at the span's end. On
+a state span, an omitted `retained`, `retention.expires` or `expires` is a
+fact: not retained, or no expiry. A **lazy-evaluation span** carries no
+outcome. It reports only the result ID, deps and parts
+(`engine/telemetryattrs/attrs.go`), so what it leaves out says nothing, and
+the stored value stays. Spans of the same value arrive in any order, so they
+are merged per field, never replace the whole entry:
 
 - **Parts** are a union. A later span can only add parts to a value, as the
   live run shows (`withExec` with 0, then 1, then 3 parts).
 - **Deps** keep the longest list seen for the value. An empty list on a span
   that carries the attribute is a fact, but it never shrinks a known list.
-- **Type**, **retention expiry** and **expiry** take the latest non-empty
-  value.
+- **Type** takes the latest non-empty value.
+- **Retention expiry** and **expiry** come from the state span with the
+  latest end time, including its omissions. Lazy-evaluation spans never
+  change them.
 - **Retained** follows the retention watermark below.
 
 **Order retention by time.** Prunes come through the engine's own exporter
 and spans through the session's, so a span that saw `retained = "true"`
 before a prune can arrive after it. Keep a per-entry retention watermark:
-the `droppedAtUnixNano` of the latest `engine.prune` drop for it. A span
-sets `retained` only if it ended after the watermark. Span end times and
+the `droppedAtUnixNano` of the latest `engine.prune` drop for it. A state
+span sets `retained`, to true or to false, only if it ended after both the
+watermark and the state span stored last. Span end times and
 drop times come from the same engine clock.
 
 ## Choosing export roots
