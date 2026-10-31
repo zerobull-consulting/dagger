@@ -349,15 +349,35 @@ func TestServiceNumbersItsMessages(t *testing.T) {
 	e.hello() // welcome is 1
 	c := waitEngines(t, svc, 1)[0]
 
-	go func() { _, _ = c.request(t.Context(), protocol.TypeMerge, json.RawMessage(`{}`)) }()
+	replies := make(chan protocol.Envelope, 1)
+	errs := make(chan error, 1)
+	go func() {
+		reply, err := c.request(t.Context(), protocol.TypeMerge, json.RawMessage(`{}`))
+		replies <- reply
+		errs <- err
+	}()
 	req := e.next()
 	if req.ID != 2 {
 		t.Fatalf("request numbered %d", req.ID)
 	}
-	env, _ := protocol.NewEnvelope(2, 0, protocol.TypeRenew, protocol.Renew{})
-	e.send(env)
-	if reply := e.next(); reply.ID != 3 {
-		t.Fatalf("reply numbered %d", reply.ID)
+	merged, _ := protocol.NewEnvelope(2, req.ID, protocol.TypeMerged, protocol.Merged{})
+	e.send(merged)
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply := <-replies; reply.Type != protocol.TypeMerged || reply.Re != req.ID {
+			t.Fatalf("request answered with %+v", reply)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("request did not return its reply")
+	}
+
+	renew, _ := protocol.NewEnvelope(3, 0, protocol.TypeRenew, protocol.Renew{})
+	e.send(renew)
+	if reply := e.next(); reply.ID != 3 || reply.Re != 3 {
+		t.Fatalf("reply numbered %d, to %d", reply.ID, reply.Re)
 	}
 }
 
@@ -554,6 +574,9 @@ func TestDebugListsEnginesInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(infos) != 3 {
+		t.Fatalf("%d engines listed", len(infos))
+	}
 	for i, info := range infos {
 		if info.Conn != uint64(i+1) || info.CacheID != "cache-raw" || info.Generation != 9 || info.EngineName != "raw" {
 			t.Fatalf("engine %d: %+v", i, info)
@@ -591,6 +614,9 @@ func TestDebugRelaysEngineError(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK || reply.Type != protocol.TypeError {
 		t.Fatalf("status %d, reply %+v", resp.StatusCode, reply)
+	}
+	if msg := decodeBody[protocol.Error](t, reply).Message; msg != "nope" {
+		t.Fatalf("engine's error relayed as %q", msg)
 	}
 }
 
