@@ -34,6 +34,9 @@ The debug API has no authentication. It listens on localhost only by default.
 
 ## Running it against a local engine
 
+For a local S3-compatible store (MinIO), see
+[`hack/remote-cache`](../../hack/remote-cache/README.md).
+
 1. Start the service:
 
    ```bash
