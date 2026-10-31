@@ -269,3 +269,44 @@ func TestMinIOStoreHasBadCredentials(t *testing.T) {
 		t.Fatalf("Has with bad credentials = %v, nil; want an error", ok)
 	}
 }
+
+// Known gap, pinned on purpose: S3 checks a presigned PUT's size, not its
+// content. A same-size body that doesn't hash to the digest is stored under
+// that digest's key, Has then reports it, and UploadURLs never asks for the
+// right blob again. Downloading engines refuse the blob (containerd checks the
+// digest), so builds stay correct, but the cache entry fails until the object
+// is deleted. When uploads are verified before they reach the digest key,
+// this test should fail: replace it with one that the bad upload is refused.
+func TestMinIOStoreKnownGapMisdeclaredDigest(t *testing.T) {
+	s := newMinIOStore(t, nil)
+	ctx := context.Background()
+	blob, d := randomBlob(t, 4096)
+	wrong := append([]byte{}, blob...)
+	wrong[0] ^= 0xff
+
+	put, err := s.PresignPut(ctx, d, int64(len(blob)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := enginePut(t, put.URL, wrong); status != http.StatusOK {
+		t.Fatalf("PUT of the wrong content: status %d; the store now refuses it, so replace this test", status)
+	}
+	if !mustHas(t, s, d) {
+		t.Fatal("the wrong content isn't reported under the digest; replace this test")
+	}
+	urls, err := UploadURLs(ctx, s, []Blob{{Digest: d, Size: int64(len(blob))}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(urls) != 0 {
+		t.Fatal("UploadURLs asks for the blob again; replace this test")
+	}
+	get, err := s.PresignGet(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, data := httpGet(t, get.URL)
+	if status != http.StatusOK || digest.FromBytes(data) == d {
+		t.Fatalf("GET: status %d, digest matches %v; want the wrong content served", status, digest.FromBytes(data) == d)
+	}
+}

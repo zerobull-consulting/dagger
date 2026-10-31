@@ -46,14 +46,23 @@ engine presigned URLs, so the engine never holds S3 credentials.
 - `PresignPut` signs a PUT for an exact size: `Content-Length` is a signed
   header, so S3 refuses a body of any other size. It signs no other headers,
   matching the engine's upload. It refuses size 0, because SigV4 doesn't sign
-  a zero `Content-Length` and the URL would take a body of any size. S3 does
-  not check the body against the digest.
+  a zero `Content-Length` and the URL would take a body of any size.
 - `PresignGet` signs a GET. PUTs expire after 15 minutes and GETs after an hour
   by default. A URL signed with temporary credentials (STS, an instance role)
   stops working when they expire, so its `ExpiresAt` is capped at theirs.
 - `UploadURLs` builds an `upload` request's URL map: it checks each blob with
   `Has` (16 at a time) and presigns PUTs only for the missing ones, so a blob
   already stored is not requested again.
+
+**Known gap: content isn't verified.** S3 checks a PUT's size, not its
+content. An engine that uploads a same-size body that doesn't hash to the
+digest stores it under that digest. `Has` then reports the blob, and
+`UploadURLs` never asks for the right one again. Downloading engines refuse it
+(containerd checks the digest), so builds stay correct, but that cache entry
+fails until the object is deleted. `TestMinIOStoreKnownGapMisdeclaredDigest`
+pins this behavior. The planned fix needs no engine changes: uploads go to a
+per-session staging prefix, and the service verifies each blob after the
+engine's `uploaded` reply and only then promotes it to its digest key.
 
 `S3ConfigFromEnv` reads endpoint, region, bucket, prefix, path-style
 addressing, expiries and static credentials from `CACHESERVICE_S3_*`. Without

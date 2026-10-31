@@ -110,6 +110,10 @@ through the raw SDK:
   configured expiry.
 - `TestMinIOStoreHasBadCredentials`: `Has` reports bad credentials as an
   error, not as a missing blob.
+- `TestMinIOStoreKnownGapMisdeclaredDigest`: pins a known gap. A same-size
+  body with the wrong content is stored under the digest and never requested
+  again. It should fail once uploads are verified; see
+  [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#blob-store).
 
 Each run writes under its own `test/` prefix in the bucket and deletes it
 afterwards. The `Remote cache tests` workflow runs them on every pull request.
