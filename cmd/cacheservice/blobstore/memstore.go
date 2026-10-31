@@ -15,8 +15,8 @@ import (
 )
 
 // MemStore is a Store in memory, for tests. It is also the http.Handler that
-// serves its presigned addresses: mount it on a server and pass that server's
-// URL to NewMemStore. Like a presigned S3 PUT, a PUT must carry exactly the
+// serves its presigned addresses: create it, mount it on a server, then give
+// it that server's URL with SetBaseURL. Like a presigned S3 PUT, a PUT must carry exactly the
 // size it was signed for; unlike S3, it also checks the body against the
 // digest.
 type MemStore struct {

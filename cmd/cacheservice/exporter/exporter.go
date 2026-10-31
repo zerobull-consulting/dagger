@@ -220,9 +220,12 @@ func (r *Result) fail(roots []uint64, err error) {
 var errTooLarge = errors.New(protocol.TooLargeMessage)
 
 // Export exports req's roots from eng, uploads the blobs the store lacks,
-// and publishes what was stored. It returns an error only when ctx ends or
-// the connection fails; a root that could not be stored is in the result's
-// Failed, with the reason.
+// and publishes what was stored. It returns an error, with the result so
+// far, when the export as a whole fails: ctx ends, the connection fails, the
+// engine answers export or upload with an error reply, or a wait for its
+// answer passes ExportTimeout or UploadTimeout. A root that could not be
+// stored for a reason of its own is in the result's Failed instead, with the
+// reason.
 func (x *Exporter) Export(ctx context.Context, eng Engine, req Request) (Result, error) {
 	roots := slices.Clone(req.Roots)
 	slices.Sort(roots)
@@ -313,9 +316,15 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	survivors := survivingRoots(roots, exported.Skipped)
 
 	blobs, err := neededBlobs(exported.Bundle)
+	if err != nil {
+		err = fmt.Errorf("invalid bundle: %w", err)
+	}
 	var urls map[digest.Digest]string
 	if err == nil {
 		urls, err = blobstore.UploadURLs(ctx, x.cfg.Blobs, blobs)
+		if err != nil {
+			err = fmt.Errorf("blob store: %w", err)
+		}
 	}
 	if err != nil {
 		// Release the chains; the export isn't stored.
@@ -325,7 +334,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		if ctx.Err() != nil {
 			return res, nil, context.Cause(ctx)
 		}
-		res.fail(survivors, fmt.Errorf("blob store: %w", err))
+		res.fail(survivors, err)
 		return res, nil, nil
 	}
 	for _, b := range blobs {

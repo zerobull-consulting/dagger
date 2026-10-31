@@ -40,6 +40,8 @@ type fakeEngine struct {
 	inFlight, peak int
 	// hold blocks each export's reply until closed.
 	hold chan struct{}
+	// mangle, when set, changes each capture before it is sent.
+	mangle func(*fakeengine.Capture)
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -68,6 +70,9 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 		}
 		if capt.Bundle == nil {
 			return protocol.NewEnvelope(1, 1, protocol.TypeExported, protocol.Exported{Skipped: capt.Skipped})
+		}
+		if e.mangle != nil {
+			e.mangle(&capt)
 		}
 		e.mu.Lock()
 		e.nextID++
@@ -440,6 +445,27 @@ func TestExportBlobStoreFailureReleases(t *testing.T) {
 	}
 	uploads := e.eng.uploadMaps()
 	if len(uploads) != 1 || len(uploads[0]) != 0 {
+		t.Fatalf("the export wasn't released: %v", uploads)
+	}
+}
+
+// A bundle listing one layer with two sizes fails as invalid, not as a blob
+// store failure, and its chains are released.
+func TestExportInvalidBundleReleases(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.cache.Add(fakeengine.Entry{Number: 1, Layers: [][]byte{layer("a")}})
+	e.cache.Add(fakeengine.Entry{Number: 2, Layers: [][]byte{layer("a")}})
+	e.eng.mangle = func(c *fakeengine.Capture) {
+		c.Bundle.Outputs[1].Chain.Layers[0].Descriptor.Size++
+	}
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{1, 2}, Outputs: fsOutputs(1, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failed) != 2 || !strings.HasPrefix(res.Failed[0].Error, "invalid bundle:") {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if uploads := e.eng.uploadMaps(); len(uploads) != 1 || len(uploads[0]) != 0 {
 		t.Fatalf("the export wasn't released: %v", uploads)
 	}
 }
