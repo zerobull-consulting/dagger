@@ -93,6 +93,10 @@ type ImportedValue struct {
 
 const valueBundleVersion = 3
 
+// ValueBundleVersion is the only ValueBundle version this engine imports. A
+// store of bundles checks it to refuse ones no engine of this version reads.
+const ValueBundleVersion = valueBundleVersion
+
 // PersistedTransferCodec operates only on encoded copies, without resolving
 // schemas, operations, result references or storage.
 type PersistedTransferCodec interface {

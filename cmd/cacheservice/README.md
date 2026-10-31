@@ -68,6 +68,85 @@ engine's `uploaded` reply and only then promotes it to its digest key.
 addressing, expiries and static credentials from `CACHESERVICE_S3_*`. Without
 static credentials it uses the AWS SDK's default chain.
 
+## Metadata store
+
+[`metastore`](metastore) stores the cache's metadata in the same bucket as the
+blobs, with no separate database
+([#6](https://github.com/zerobull-consulting/dagger/issues/6)). The service
+isn't wired to it yet. Each scope (a team, a tenant) has:
+
+- **bundles**, at `<prefix>/<scope>/bundles/<id>.json`: one per exported
+  `dagql.ValueBundle`. The ID is the SHA-256 of the bundle's JSON, so a bundle
+  is written once (`If-None-Match: *`) and never changes. Storing it again
+  writes nothing. Reading it checks its content against the ID. Only bundles
+  of the version this engine imports (`dagql.ValueBundleVersion`) are stored.
+- **an index**, at `<prefix>/<scope>/index.json`: every stored entry (the
+  bundle and ordinal holding its record, its source engine entry, replacement
+  count, expiry, and the entries it keeps alive: its dependencies and the
+  owners of its pending offers and outputs, as dagql's importer walks them), the retained roots and their expiries, and,
+  per engine `cacheID`, which engine entry numbers map to which service
+  numbers, with the latest generation each was recorded in.
+
+The scope `blobs` is refused, since it would clash with the blob store's keys
+under the same prefix.
+
+**Index updates are atomic.** `UpdateIndex` reads the index and its ETag,
+applies a change, and writes it back with `If-Match` on that ETag, or
+`If-None-Match: *` when there was no index yet. A writer that loses (412, or
+AWS's 409 for a conditional write in flight) waits with jittered exponential
+backoff, reads the new index, and applies its change again. After
+`MaxAttempts` (50 by default) it gives up with `ErrContention`. So concurrent
+writers, in one process or in several replicas, never lose each other's
+updates. All state is in the bucket, so a restarted service loses nothing.
+
+MinIO honors these conditional writes (`TestMinIOConditionalWrites`,
+`TestMinIOMetastoreConditionalWrites`), and so does AWS S3 since 2024.
+`VerifyConditionalWrites` checks a store at startup, with a probe object it
+deletes afterwards. A store that ignored them
+would silently let writers overwrite each other, so a service should refuse
+to start if the check fails. For such a store, the alternative is to keep the
+index in DynamoDB, with bundles still in S3: one item per scope, holding the
+same index JSON and a version attribute, written with `PutItem` and a
+condition expression on that version (`attribute_not_exists(version)` for the
+first write). The read, change and conditional write loop stays the same, so
+only `Objects` would change. An item is limited to 400KB, though, so a large
+scope would need one item per entry instead, written in a transaction with
+the counter item.
+
+**Service numbers are stable.** The service names stored entries with its own
+numbers: the `SenderNumber` of a merge, an offer's `CloudNumber`, and the
+number an engine keeps as its Cloud holding (see
+`dagql/cache_cloud_holding.go`). Engines keep these across their own restarts
+and re-key a holding when a message names another number, so numbers that
+changed on every service restart would make engines re-key everything. So:
+
+- The index's `nextNumber` is the next number to hand out. Numbers start at 1,
+  only go up, and are never reused, even after their entry is dropped.
+- A number is handed out inside an index update. If two writers hand out the
+  same number, only one conditional write wins, and the other retries with
+  the new `nextNumber`.
+- An engine entry already in the index, by `cacheID` and engine number, keeps
+  its service number when it is exported again. Engines keep their `cacheID`
+  and entry numbers across a clean restart (the generation goes up), so this
+  holds across engine restarts too. An unclean restart gets a new `cacheID`,
+  and its entries get new numbers.
+- A record replaces the stored one unless the stored one is newer: from a
+  later generation, or from the same generation with more replacements. So a
+  late export from an older generation never overwrites a newer record.
+- The index is refused unless its mappings and entries agree both ways: each
+  mapping names an entry from that cache and engine number, and each entry is
+  its source's mapping.
+
+`DropExpired` drops expired roots, expired entries and, transitively, the
+entries that depend on them, then every entry no remaining root depends on,
+with their mappings. Bundles stay in the bucket; collecting unreferenced ones
+is left for later.
+
+**Limits.** The whole index is one object, rewritten on every update, so its
+size and the update rate per scope are bounded by how fast one object can be
+read and written. Writers to one scope take turns; writers to different scopes
+don't contend.
+
 ## Running it against a local engine
 
 For a local S3-compatible store (MinIO), see
