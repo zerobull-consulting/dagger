@@ -48,8 +48,8 @@ print and use them.
 `dev.sh env` prints the settings as the `CACHESERVICE_S3_*` variables the
 tests read: `ENDPOINT`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`,
 `SECRET_ACCESS_KEY` and `PATH_STYLE`. The blob store
-([#5](https://github.com/zerobull-consulting/dagger/issues/5)) is expected to
-read the same names.
+(`cmd/cacheservice/blobstore`, `S3ConfigFromEnv`) reads the same names, plus
+`PREFIX`, `PUT_EXPIRY` and `GET_EXPIRY`.
 
 Configure an AWS SDK client for MinIO with a base endpoint, a static
 credential, path-style addressing and checksums only when required. The SDK's
@@ -80,9 +80,11 @@ anchor in `compose.yaml` and this section.
 
 ## Tests
 
-`cmd/cacheservice/minio_test.go` runs against this environment. Each test
-skips unless `CACHESERVICE_S3_ENDPOINT` is set. They check what the storage
-work relies on:
+`dev.sh test` runs every `TestMinIO*` test under `cmd/cacheservice`. Each test
+skips unless `CACHESERVICE_S3_ENDPOINT` is set.
+
+`cmd/cacheservice/minio_test.go` checks what the storage work relies on,
+through the raw SDK:
 
 - `TestMinIOPresignedPutGet`: a blob keyed by its digest goes up through a
   presigned PUT, sent the way the engine sends it (`Content-Length` and no
@@ -94,6 +96,24 @@ work relies on:
 - `TestMinIOConditionalWrites`: MinIO honors `If-None-Match: *` and `If-Match`
   on PUT, which atomic index updates
   ([#6](https://github.com/zerobull-consulting/dagger/issues/6)) need.
+
+`cmd/cacheservice/blobstore/minio_test.go` checks the blob store itself:
+
+- `TestMinIOStorePutGet`: a blob uploaded through the store's presigned PUT
+  comes back through its presigned GET, and `Has` sees it only after the
+  upload.
+- `TestMinIOStoreUploadURLsSkipsExisting`: `UploadURLs` asks only for blobs
+  the bucket doesn't have, so an uploaded blob is not requested again.
+- `TestMinIOStorePutSizeBound`: the store's PUTs refuse bodies of another
+  size.
+- `TestMinIOStoreExpiry`: the store's PUTs and GETs stop working at their
+  configured expiry.
+- `TestMinIOStoreHasBadCredentials`: `Has` reports bad credentials as an
+  error, not as a missing blob.
+- `TestMinIOStoreKnownGapMisdeclaredDigest`: pins a known gap. A same-size
+  body with the wrong content is stored under the digest and never requested
+  again. It should fail once uploads are verified; see
+  [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#blob-store).
 
 Each run writes under its own `test/` prefix in the bucket and deletes it
 afterwards. The `Remote cache tests` workflow runs them on every pull request.
@@ -122,9 +142,8 @@ container can't reach the host's loopback, so either:
 
 Both were checked from a container on 2026-10-31.
 
-The service doesn't read any S3 settings yet. The blob store
-([#5](https://github.com/zerobull-consulting/dagger/issues/5)) will read the
-`CACHESERVICE_S3_*` variables that `dev.sh env` prints, and the service's
-`PUT /blobs/{digest}` stand-in stores nothing until then. To run the service
+The service doesn't use the blob store yet: its `PUT /blobs/{digest}`
+stand-in stores nothing. The blob store (`cmd/cacheservice/blobstore`) reads
+the `CACHESERVICE_S3_*` variables that `dev.sh env` prints. To run the service
 against a dev engine today, see
 [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md).

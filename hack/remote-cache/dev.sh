@@ -6,7 +6,7 @@
 #   dev.sh reset   stop it and delete the data
 #   dev.sh status  show the containers
 #   dev.sh env     print the settings as shell exports
-#   dev.sh test    run the Go test against it (starts it first)
+#   dev.sh test    run the Go tests against it (starts it first)
 #
 # Address, ports, credentials and bucket come from MINIO_BIND_ADDR,
 # MINIO_API_PORT, MINIO_CONSOLE_PORT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
@@ -77,7 +77,7 @@ test)
 	up >/dev/null
 	eval "$(print_env)"
 	cd "$repo"
-	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/
+	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/...
 	;;
 *)
 	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
