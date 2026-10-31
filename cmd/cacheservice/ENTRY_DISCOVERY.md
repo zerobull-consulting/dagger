@@ -155,7 +155,11 @@ expiry, replacements, the session that last touched it, and the export state
    `dagger.io/cache.retained = "true"`. Entries without a retention edge are
    released with their session and come back `gone`.
 2. **Skip** candidates already exported with the same `replacements` count,
-   and those whose `dagger.io/cache.expires` has passed.
+   and those where either expiry has passed: the entry's own
+   (`dagger.io/cache.expires`) or its retention edge's
+   (`dagger.io/cache.retention.expires`). A missing or zero value means no
+   expiry. A lapsed retention edge means the entry is no longer retained,
+   even if an earlier span said it was and no `engine.prune` has arrived.
 3. **When.** Export when the session ends. The carrier span with
    `dagger.io/cache.session.spans` marks the end and says how many cache spans
    to expect. The live run didn't check that this span reaches the service,
