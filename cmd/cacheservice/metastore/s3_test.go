@@ -64,6 +64,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", etag)
+	case http.MethodDelete:
+		_ = f.mem.Delete(r.Context(), key)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 	}
@@ -150,6 +153,9 @@ func TestS3StoreOverTheWire(t *testing.T) {
 
 	if err := s.VerifyConditionalWrites(ctx, "s1"); err != nil {
 		t.Fatal(err)
+	}
+	if keys := f.mem.Keys(); len(keys) != 0 {
+		t.Fatalf("the check left %v behind", keys)
 	}
 	r1, err := s.Record(ctx, "s1", chain(10), "cache-a", 1)
 	if err != nil {

@@ -26,6 +26,8 @@ type Objects interface {
 	// cond doesn't hold, it returns ErrPreconditionFailed and writes
 	// nothing.
 	Put(ctx context.Context, key string, body []byte, cond Condition) (etag string, err error)
+	// Delete removes an object. Deleting a missing object is not an error.
+	Delete(ctx context.Context, key string) error
 }
 
 // Condition is when a Put may write. The zero Condition always writes.
@@ -102,6 +104,15 @@ func (o *S3Objects) Put(ctx context.Context, key string, body []byte, cond Condi
 	return aws.ToString(out.ETag), nil
 }
 
+// Delete removes an object with DeleteObject, which succeeds for a missing
+// key too.
+func (o *S3Objects) Delete(ctx context.Context, key string) error {
+	if _, err := o.Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &o.Bucket, Key: &key}); err != nil {
+		return fmt.Errorf("delete %s: %w", key, err)
+	}
+	return nil
+}
+
 func httpStatus(err error) int {
 	var re *smithyhttp.ResponseError
 	if errors.As(err, &re) {
@@ -157,6 +168,14 @@ func (m *MemObjects) Put(_ context.Context, key string, body []byte, cond Condit
 	etag := strconv.Quote(strconv.FormatUint(m.version, 10))
 	m.objects[key] = memObject{body: bytes.Clone(body), etag: etag}
 	return etag, nil
+}
+
+// Delete removes an object, if it exists.
+func (m *MemObjects) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objects, key)
+	return nil
 }
 
 // Keys returns the stored keys, in no order.

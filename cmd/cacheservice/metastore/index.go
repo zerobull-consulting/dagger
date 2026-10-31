@@ -65,7 +65,9 @@ type Entry struct {
 	// record was read. A record with fewer replacements is older, and
 	// doesn't replace this one.
 	Replacements uint64 `json:"replacements,omitempty"`
-	// Deps are the service numbers of the entry's direct dependencies.
+	// Deps are the service numbers of the entries this one keeps alive: its
+	// direct dependencies, and the owners of its pending offers and of its
+	// outputs, as dagql's importer walks them.
 	Deps []uint64 `json:"deps,omitempty"`
 	// ExpiresAtUnix is when the entry expires (0: never).
 	ExpiresAtUnix int64 `json:"expiresAtUnix,omitempty"`
@@ -181,9 +183,23 @@ func (idx *Index) Validate() error {
 			return errors.New("a cache with no cacheID")
 		}
 		for engineNum, m := range c.Numbers {
-			if _, ok := idx.Entries[m.Number]; !ok {
+			e, ok := idx.Entries[m.Number]
+			if !ok {
 				return fmt.Errorf("cache %q: engine entry %d maps to %d, which is not stored", id, engineNum, m.Number)
 			}
+			if e.Source.CacheID != id || e.Source.Number != engineNum {
+				return fmt.Errorf("cache %q: engine entry %d maps to %d, which came from cache %q entry %d", id, engineNum, m.Number, e.Source.CacheID, e.Source.Number)
+			}
+		}
+	}
+	// And the other way: every entry is its source's mapping.
+	for n, e := range idx.Entries {
+		if e.Source.CacheID == "" || e.Source.Number == 0 {
+			return fmt.Errorf("entry %d: no source", n)
+		}
+		c := idx.Caches[e.Source.CacheID]
+		if c == nil || c.Numbers[e.Source.Number].Number != n {
+			return fmt.Errorf("entry %d: cache %q doesn't map engine entry %d to it", n, e.Source.CacheID, e.Source.Number)
 		}
 	}
 	return nil
@@ -203,6 +219,9 @@ func (idx *Index) allocate() uint64 {
 func ValidateBundle(bundle *dagql.ValueBundle) error {
 	if bundle == nil {
 		return errors.New("nil bundle")
+	}
+	if bundle.Version != dagql.ValueBundleVersion {
+		return fmt.Errorf("unsupported bundle version %d, want %d", bundle.Version, dagql.ValueBundleVersion)
 	}
 	if len(bundle.Roots) == 0 {
 		return errors.New("bundle has no roots")
@@ -226,7 +245,9 @@ func ValidateBundle(bundle *dagql.ValueBundle) error {
 			return fmt.Errorf("values %d and %d have the same sender number %d", prev, v.Ordinal, v.SenderNumber)
 		}
 		senders[v.SenderNumber] = v.Ordinal
-		for _, d := range v.DependencyIDs {
+	}
+	for _, v := range bundle.Values {
+		for _, d := range retentionDeps(bundle, v) {
 			if !in(dagql.TransferOrdinal(d)) {
 				return fmt.Errorf("value %d: dependency %d is not in the bundle", v.Ordinal, d)
 			}
@@ -248,13 +269,30 @@ func ValidateBundle(bundle *dagql.ValueBundle) error {
 	return nil
 }
 
+// retentionDeps returns the ordinals a value keeps alive, as dagql's importer
+// walks them: its dependencies, the owners of its record's pending offers,
+// and the owners of the bundle's outputs for it. Unsorted, with repeats.
+func retentionDeps(bundle *dagql.ValueBundle, v dagql.TransferredValue) []uint64 {
+	deps := slices.Clone(v.DependencyIDs)
+	for _, offer := range v.Record.Envelope.PendingOffers {
+		deps = append(deps, offer.Owner.DependencyIDs...)
+	}
+	for _, o := range bundle.Outputs {
+		if o.Ordinal == v.Ordinal && o.Owner != nil {
+			deps = append(deps, o.Owner.DependencyIDs...)
+		}
+	}
+	return deps
+}
+
 // Record adds a bundle's values to the index, stored in bundle bundleID and
 // exported from engine cache cacheID at generation. It returns each value's
 // service number, by ordinal.
 //
 // A value whose engine entry already maps to a stored entry keeps that
 // service number. Its record replaces the stored one, unless the stored one
-// has more replacements, and so is newer. Any other value gets a new service
+// is newer: from a later generation, or from the same generation with more
+// replacements. Any other value gets a new service
 // number. A root's expiry is the later of the stored one and the bundle's
 // (0, never, is the latest).
 func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (map[dagql.TransferOrdinal]uint64, error) {
@@ -295,11 +333,12 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 			Number:     n,
 			Generation: max(generation, cache.Numbers[v.SenderNumber].Generation),
 		}
-		if old, ok := idx.Entries[n]; ok && old.Replacements > v.SenderReplacements {
+		if old, ok := idx.Entries[n]; ok && newerThan(old, generation, v.SenderReplacements) {
 			continue
 		}
-		deps := make([]uint64, 0, len(v.DependencyIDs))
-		for _, d := range v.DependencyIDs {
+		vdeps := retentionDeps(bundle, v)
+		deps := make([]uint64, 0, len(vdeps))
+		for _, d := range vdeps {
 			deps = append(deps, numbers[dagql.TransferOrdinal(d)])
 		}
 		slices.Sort(deps)
@@ -322,6 +361,17 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 		idx.Roots[n] = Root{ExpiresAtUnix: r.ExpiresAtUnix}
 	}
 	return numbers, nil
+}
+
+// newerThan reports whether a stored entry describes a later state of its
+// engine entry than a record read at generation with replacements: one from
+// a later generation, or from the same one with more replacements. A record
+// from an earlier generation, arriving late, never replaces a later one.
+func newerThan(e *Entry, generation, replacements uint64) bool {
+	if e.Source.Generation != generation {
+		return e.Source.Generation > generation
+	}
+	return e.Replacements > replacements
 }
 
 // laterExpiry reports whether expiry a is at or after b, where 0 is never.

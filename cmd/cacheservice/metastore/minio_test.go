@@ -79,11 +79,25 @@ func deletePrefix(t *testing.T, cfg blobstore.S3Config) {
 	}
 }
 
-// MinIO honors the conditional writes the index relies on.
+// MinIO honors the conditional writes the index relies on, and the check
+// cleans up after itself.
 func TestMinIOMetastoreConditionalWrites(t *testing.T) {
-	s := newMinIOStore(t, minioConfig(t))
-	if err := s.VerifyConditionalWrites(context.Background(), "s1"); err != nil {
+	ctx := context.Background()
+	cfg := minioConfig(t)
+	s := newMinIOStore(t, cfg)
+	if err := s.VerifyConditionalWrites(ctx, "s1"); err != nil {
 		t.Fatal(err)
+	}
+	client, err := blobstore.NewS3Client(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &cfg.Bucket, Prefix: aws.String(cfg.Prefix + "/")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Contents) != 0 {
+		t.Fatalf("the check left %d objects behind", len(out.Contents))
 	}
 }
 

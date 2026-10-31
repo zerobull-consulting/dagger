@@ -78,10 +78,12 @@ isn't wired to it yet. Each scope (a team, a tenant) has:
 - **bundles**, at `<prefix>/<scope>/bundles/<id>.json`: one per exported
   `dagql.ValueBundle`. The ID is the SHA-256 of the bundle's JSON, so a bundle
   is written once (`If-None-Match: *`) and never changes. Storing it again
-  writes nothing.
+  writes nothing. Reading it checks its content against the ID. Only bundles
+  of the version this engine imports (`dagql.ValueBundleVersion`) are stored.
 - **an index**, at `<prefix>/<scope>/index.json`: every stored entry (the
   bundle and ordinal holding its record, its source engine entry, replacement
-  count, dependencies and expiry), the retained roots and their expiries, and,
+  count, expiry, and the entries it keeps alive: its dependencies and the
+  owners of its pending offers and outputs, as dagql's importer walks them), the retained roots and their expiries, and,
   per engine `cacheID`, which engine entry numbers map to which service
   numbers, with the latest generation each was recorded in.
 
@@ -99,7 +101,8 @@ updates. All state is in the bucket, so a restarted service loses nothing.
 
 MinIO honors these conditional writes (`TestMinIOConditionalWrites`,
 `TestMinIOMetastoreConditionalWrites`), and so does AWS S3 since 2024.
-`VerifyConditionalWrites` checks a store at startup. A store that ignored them
+`VerifyConditionalWrites` checks a store at startup, with a probe object it
+deletes afterwards. A store that ignored them
 would silently let writers overwrite each other, so a service should refuse
 to start if the check fails. For such a store, the alternative is to keep the
 index in DynamoDB, with bundles still in S3: one item per scope, holding the
@@ -127,8 +130,12 @@ changed on every service restart would make engines re-key everything. So:
   and entry numbers across a clean restart (the generation goes up), so this
   holds across engine restarts too. An unclean restart gets a new `cacheID`,
   and its entries get new numbers.
-- A record replaces the stored one unless the stored one has more
-  replacements, and so is newer.
+- A record replaces the stored one unless the stored one is newer: from a
+  later generation, or from the same generation with more replacements. So a
+  late export from an older generation never overwrites a newer record.
+- The index is refused unless its mappings and entries agree both ways: each
+  mapping names an entry from that cache and engine number, and each entry is
+  its source's mapping.
 
 `DropExpired` drops expired roots, expired entries and, transitively, the
 entries that depend on them, then every entry no remaining root depends on,

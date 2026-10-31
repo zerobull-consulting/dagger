@@ -46,6 +46,9 @@ const (
 // MaxAttempts times in a row.
 var ErrContention = errors.New("index update lost to concurrent writers too many times")
 
+// ErrCorruptBundle is a stored bundle whose content doesn't hash to its ID.
+var ErrCorruptBundle = errors.New("bundle content doesn't match its ID")
+
 // Config configures a Store.
 type Config struct {
 	// Objects holds the bundles and indexes.
@@ -203,6 +206,9 @@ func (s *Store) GetBundle(ctx context.Context, scope, id string) (*dagql.ValueBu
 	if err != nil {
 		return nil, fmt.Errorf("get bundle: %w", err)
 	}
+	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != id {
+		return nil, fmt.Errorf("get bundle %s: %w", id, ErrCorruptBundle)
+	}
 	var bundle dagql.ValueBundle
 	if err := json.Unmarshal(body, &bundle); err != nil {
 		return nil, fmt.Errorf("decode bundle %s: %w", id, err)
@@ -302,13 +308,19 @@ func backoff(attempt int) time.Duration {
 
 // VerifyConditionalWrites checks that the object store honors the
 // conditional writes UpdateIndex relies on. A store that ignored them would
-// let concurrent writers overwrite each other's index updates. It writes, and
-// leaves behind, <prefix>/<scope>/conditional-write-check/<nonce>.
-func (s *Store) VerifyConditionalWrites(ctx context.Context, scope string) error {
+// let concurrent writers overwrite each other's index updates. It writes
+// <prefix>/<scope>/conditional-write-check/<nonce>, and deletes it again.
+func (s *Store) VerifyConditionalWrites(ctx context.Context, scope string) (err error) {
 	key, err := s.scopeKey(scope, fmt.Sprintf("conditional-write-check/%016x", rand.Uint64()))
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// Also after a failed check, which may have written the probe.
+		if derr := s.objects.Delete(context.WithoutCancel(ctx), key); derr != nil && err == nil {
+			err = fmt.Errorf("conditional write check: delete probe: %w", derr)
+		}
+	}()
 	first, err := s.objects.Put(ctx, key, []byte(`{"check":1}`), Condition{IfNoneMatch: true})
 	if err != nil {
 		return fmt.Errorf("conditional write check: create: %w", err)

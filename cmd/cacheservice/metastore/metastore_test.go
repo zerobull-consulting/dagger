@@ -164,6 +164,15 @@ func TestBundleRoundTrip(t *testing.T) {
 		t.Fatalf("other bundle: %s, %v", other, err)
 	}
 
+	// A bundle whose content doesn't hash to its key is refused.
+	otherKey, _ := s.BundleKey("s1", other)
+	if _, err := mem.Put(ctx, otherKey, []byte(`{"version":3,"roots":[]}`), Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetBundle(ctx, "s1", other); !errors.Is(err, ErrCorruptBundle) {
+		t.Fatalf("corrupt bundle: %v, want ErrCorruptBundle", err)
+	}
+
 	if _, err := s.GetBundle(ctx, "s1", strings.Repeat("0", 64)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing bundle: %v, want ErrNotFound", err)
 	}
@@ -283,6 +292,58 @@ func TestRecordKeepsNewerRecord(t *testing.T) {
 	}
 }
 
+// A record from an earlier generation that arrives late doesn't replace one
+// from a later generation, whatever its replacement count.
+func TestRecordFencesOlderGenerations(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, NewMemObjects())
+	gen2 := testBundle([]val{{sender: 5, replacements: 0, expires: 100}}, root(1, 0))
+	gen1 := testBundle([]val{{sender: 5, replacements: 9, expires: 200}}, root(1, 0))
+	gen3 := testBundle([]val{{sender: 5, replacements: 0, expires: 300}}, root(1, 0))
+
+	r2, err := s.Record(ctx, "s1", gen2, "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := s.Record(ctx, "s1", gen1, "c", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := r1.Index.Entries[1]; e.Bundle != r2.BundleID || e.Source.Generation != 2 || e.ExpiresAtUnix != 100 {
+		t.Fatalf("a late generation 1 record replaced generation 2: %+v", e)
+	}
+	if m := r1.Index.Caches["c"].Numbers[5]; m.Generation != 2 {
+		t.Fatalf("mapping generation went back to %d", m.Generation)
+	}
+	r3, err := s.Record(ctx, "s1", gen3, "c", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := r3.Index.Entries[1]; e.Bundle != r3.BundleID || e.Source.Generation != 3 {
+		t.Fatalf("a generation 3 record didn't replace generation 2: %+v", e)
+	}
+}
+
+// An entry keeps alive the owners of its pending offers and of its outputs,
+// not only its direct dependencies, so DropExpired keeps them too.
+func TestRecordRetainsOfferAndOutputOwners(t *testing.T) {
+	b := testBundle([]val{{sender: 1}, {sender: 2}, {sender: 3}}, root(3, 0))
+	b.Values[2].Record.Envelope.PendingOffers = []dagql.PersistedPartOffer{
+		{Owner: dagql.PersistedOfferOwner{DependencyIDs: []uint64{1}}},
+	}
+	b.Outputs = []dagql.TransferredOutput{{Ordinal: 3, Owner: &dagql.PersistedOfferOwner{DependencyIDs: []uint64{2, 1}}}}
+	idx := NewIndex()
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "c", 1); err != nil {
+		t.Fatal(err)
+	}
+	if deps := idx.Entries[3].Deps; !slices.Equal(deps, []uint64{1, 2}) {
+		t.Fatalf("deps %v, want [1 2]", deps)
+	}
+	if dropped := idx.DropExpired(1000); len(dropped) != 0 {
+		t.Fatalf("dropped %v, owners of a retained root's offers and outputs", dropped)
+	}
+}
+
 func TestRecordRootExpiry(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, NewMemObjects())
@@ -348,6 +409,16 @@ func TestValidateBundle(t *testing.T) {
 		{"self dep", func(b *dagql.ValueBundle) { b.Values[0].DependencyIDs = []uint64{1} }},
 		{"output out of range", func(b *dagql.ValueBundle) {
 			b.Outputs = []dagql.TransferredOutput{{Ordinal: 7}}
+		}},
+		{"unsupported version", func(b *dagql.ValueBundle) { b.Version = 2 }},
+		{"pending offer owner out of range", func(b *dagql.ValueBundle) {
+			b.Values[0].Record.Envelope.PendingOffers = []dagql.PersistedPartOffer{{Owner: dagql.PersistedOfferOwner{DependencyIDs: []uint64{9}}}}
+		}},
+		{"output owner out of range", func(b *dagql.ValueBundle) {
+			b.Outputs = []dagql.TransferredOutput{{Ordinal: 1, Owner: &dagql.PersistedOfferOwner{DependencyIDs: []uint64{9}}}}
+		}},
+		{"output owner is itself", func(b *dagql.ValueBundle) {
+			b.Outputs = []dagql.TransferredOutput{{Ordinal: 2, Owner: &dagql.PersistedOfferOwner{DependencyIDs: []uint64{2}}}}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -611,6 +682,9 @@ func TestReadIndexRefuses(t *testing.T) {
 		{"a dep not stored", `{"version":1,"nextNumber":5,"entries":{"1":{"bundle":"` + strings.Repeat("a", 64) + `","ordinal":1,"deps":[2]}}}`, "dependency 2"},
 		{"a mapping not stored", `{"version":1,"nextNumber":5,"caches":{"c":{"numbers":{"7":{"number":3}}}}}`, "not stored"},
 		{"a null cache", `{"version":1,"nextNumber":5,"caches":{"c":null}}`, "null"},
+		{"a mapping to another source", `{"version":1,"nextNumber":5,"entries":{"1":{"bundle":"` + strings.Repeat("a", 64) + `","ordinal":1,"source":{"cacheID":"a","number":3}}},"caches":{"a":{"numbers":{"3":{"number":1}}},"b":{"numbers":{"7":{"number":1}}}}}`, "came from cache"},
+		{"an entry without its mapping", `{"version":1,"nextNumber":5,"entries":{"1":{"bundle":"` + strings.Repeat("a", 64) + `","ordinal":1,"source":{"cacheID":"a","number":3}}}}`, "doesn't map"},
+		{"an entry without a source", `{"version":1,"nextNumber":5,"entries":{"1":{"bundle":"` + strings.Repeat("a", 64) + `","ordinal":1}}}`, "no source"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mem := NewMemObjects()
@@ -687,13 +761,21 @@ func TestDropExpired(t *testing.T) {
 
 func TestVerifyConditionalWrites(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t, NewMemObjects())
+	mem := NewMemObjects()
+	s := newTestStore(t, mem)
 	if err := s.VerifyConditionalWrites(ctx, "s1"); err != nil {
 		t.Fatal(err)
 	}
-	s = newTestStore(t, ignoresConditions{NewMemObjects()})
+	if keys := mem.Keys(); len(keys) != 0 {
+		t.Fatalf("the check left %v behind", keys)
+	}
+	bad := ignoresConditions{NewMemObjects()}
+	s = newTestStore(t, bad)
 	if err := s.VerifyConditionalWrites(ctx, "s1"); err == nil {
 		t.Fatal("a store that ignores conditions passed")
+	}
+	if keys := bad.Keys(); len(keys) != 0 {
+		t.Fatalf("the failed check left %v behind", keys)
 	}
 }
 
