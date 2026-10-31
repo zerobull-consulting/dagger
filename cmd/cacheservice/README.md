@@ -1,10 +1,11 @@
-# cacheservice: remote cache protocol spike
+# cacheservice: remote cache service
 
-A spike for the S3-compatible remote cache
-([#3](https://github.com/zerobull-consulting/dagger/issues/3), under
-[#1](https://github.com/zerobull-consulting/dagger/issues/1)). It is the
-smallest service an engine talks to. It stores nothing. Its job is to show what
-the engine does on the wire before we design storage.
+The S3-compatible remote cache service
+([#1](https://github.com/zerobull-consulting/dagger/issues/1)). It began as a
+protocol spike ([#3](https://github.com/zerobull-consulting/dagger/issues/3))
+that stored nothing. With `CACHESERVICE_S3_BUCKET` set, it now stores the
+entries engines build in S3: see [Export path](#export-path). Without it, it is
+still the spike, and only logs what the engine does on the wire.
 
 ## What it serves
 
@@ -15,6 +16,8 @@ the engine does on the wire before we design storage.
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
+| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored |
+| `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
 
 On the engine WebSocket, the service:
 
@@ -35,8 +38,8 @@ The debug API has no authentication. It listens on localhost only by default.
 ## Blob store
 
 [`blobstore`](blobstore) stores layer blobs in S3 for the service
-([#5](https://github.com/zerobull-consulting/dagger/issues/5)). The service
-isn't wired to it yet. Blobs never pass through the service: it hands the
+([#5](https://github.com/zerobull-consulting/dagger/issues/5)). The export path
+uses it. Blobs never pass through the service: it hands the
 engine presigned URLs, so the engine never holds S3 credentials.
 
 - Keys are content-addressed: `<prefix>/blobs/<algorithm>/<hex>`, such as
@@ -72,8 +75,8 @@ static credentials it uses the AWS SDK's default chain.
 
 [`metastore`](metastore) stores the cache's metadata in the same bucket as the
 blobs, with no separate database
-([#6](https://github.com/zerobull-consulting/dagger/issues/6)). The service
-isn't wired to it yet. Each scope (a team, a tenant) has:
+([#6](https://github.com/zerobull-consulting/dagger/issues/6)). The export path
+records into it. Each scope (a team, a tenant) has:
 
 - **bundles**, at `<prefix>/<scope>/bundles/<id>.json`: one per exported
   `dagql.ValueBundle`. The ID is the SHA-256 of the bundle's JSON, so a bundle
@@ -146,6 +149,72 @@ is left for later.
 size and the update rate per scope are bounded by how fast one object can be
 read and written. Writers to one scope take turns; writers to different scopes
 don't contend.
+
+## Export path
+
+[`exporter`](exporter) pushes engines' cache entries to S3
+([#7](https://github.com/zerobull-consulting/dagger/issues/7)). It is on when
+`CACHESERVICE_S3_BUCKET` is set; the other `CACHESERVICE_S3_*` settings are as
+for the blob store. At startup the service checks the bucket's conditional
+writes (`VerifyConditionalWrites`) and refuses to start if they fail.
+Exported entries go into one scope, `-scope` (`default`), until auth and
+namespacing ([#10](https://github.com/zerobull-consulting/dagger/issues/10))
+picks one per engine.
+
+**Triggers and roots.** The tracker follows
+[ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md). It learns entries from session
+spans at `/v1/traces`, and prunes and cache wipes from engine events at
+`/v1/logs`. A session's roots are the entries its spans showed retained. Its
+outputs are every part those spans reported. A session is exported:
+
+- when it ends: its carrier span (`dagger.io/cache.session.spans`) arrived,
+  and so did every cache span it counted, or `-export-end-grace` (2s) passed;
+- or, if its end isn't seen, after `-export-quiet` (10s) without a cache span
+  from it;
+- or when asked: `POST /debug/engines/{conn}/export`.
+
+Entries already stored with the same replacement count and parts are left
+out. So are entries whose expiry or retention has lapsed, and entries refused
+for the same value. The export goes to the engine connected with the
+session's cache ID. If none is, the export waits and is tried again.
+
+**One export.**
+
+1. `export` with the roots and outputs. `exported` names skipped roots:
+   `gone` ones are forgotten, `busy` ones are tried again with backoff (2s
+   doubling to 5m), and `refused` ones are not tried again until their value
+   changes.
+2. The layer blobs the bundle's outputs need, each once, less those S3
+   already has (`UploadURLs`), go in `upload` as presigned PUTs. When S3 has
+   them all, the map is empty, and the engine releases the chains.
+3. `uploaded`: if any blob failed, or wasn't answered, nothing is published.
+   The engine released the chains with its answer, so the export is tried
+   again from step 1 after a backoff (1s, doubling). Blobs stored by the
+   earlier try aren't asked for again. After 3 tries the roots count as
+   failed. The tracker tries them again later, up to 5 times per value.
+4. Once every blob is stored, the bundle is published and recorded in the
+   index (`metastore.Record`).
+
+A repeated export of stored entries uploads no blob again, and keeps the
+entries' service numbers. An unchanged bundle is not written again.
+
+**Limits.** The engine works on 4 exports at once and queues the rest, so the
+service sends at most 4 at a time to each engine. The engine uploads 8 blobs at
+once across its exports; the service waits up to an hour for `uploaded`.
+Neither side sends a message over 64 MiB. When the engine answers an export
+with `too large`, or the service's own `export` or `upload` would be over the
+limit, the roots are split in two and each half is exported alone (an
+`upload` too large to send is preceded by an empty one, which releases the
+chains). One root that is too large on its own fails. A batch holds at most
+1,000 roots.
+
+**Known gaps.** Uploaded content isn't verified against its digest
+([#23](https://github.com/zerobull-consulting/dagger/issues/23)). Sessions whose
+clients send no spans to the service are invisible (see
+[ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#gaps-and-options)). The tracker's state
+is in memory, so after a service restart entries are learned again from new
+spans; what is in S3 is not lost, and a re-export uploads nothing already
+stored.
 
 ## Running it against a local engine
 

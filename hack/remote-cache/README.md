@@ -128,6 +128,16 @@ through the raw SDK:
 - `TestMinIOMetastoreRestart`: a new store reads what the old one wrote and
   numbers new entries after the old ones.
 
+`cmd/cacheservice/minio_export_test.go` checks the export path end to end,
+with a fake engine cache served through the engine's own `remotecache.Run`:
+
+- `TestMinIOExportBuild`: after a build's session ends, the engine has
+  uploaded its layers to their keys through presigned PUTs, and its bundle and
+  the index are in the bucket. Exporting it again uploads nothing, stores the
+  same bundle and hands out no new numbers.
+- `TestMinIOExportSharedLayer`: a second build that shares the base layer
+  uploads only its own.
+
 Each run writes under its own `test/` prefix in the bucket and deletes it
 afterwards. The `Remote cache tests` workflow runs them on every pull request.
 

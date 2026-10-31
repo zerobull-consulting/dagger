@@ -35,6 +35,9 @@ type service struct {
 
 	mu    sync.Mutex
 	conns map[uint64]*engineConn
+
+	// export is the export path, nil when it is off.
+	export *exportPath
 }
 
 func newService(logger *slog.Logger, dumpDir string) *service {
@@ -110,6 +113,9 @@ func (s *service) serveEngine(w http.ResponseWriter, r *http.Request) {
 	delete(s.conns, c.id)
 	s.mu.Unlock()
 	c.failPending()
+	if s.export != nil {
+		s.export.exporter.Forget(c)
+	}
 	_ = conn.CloseNow()
 	c.logger.Info("engine disconnected",
 		"after", time.Since(c.connectedAt).Round(time.Millisecond),
@@ -333,6 +339,8 @@ func (s *service) debugHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/engines", s.listEngines)
 	mux.HandleFunc("POST /debug/engines/{conn}/request", s.sendRequest)
+	mux.HandleFunc("POST /debug/engines/{conn}/export", s.serveExport)
+	mux.HandleFunc("GET /debug/engines/{conn}/entries", s.serveEntries)
 	return mux
 }
 
