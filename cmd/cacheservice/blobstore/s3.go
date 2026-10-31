@@ -152,11 +152,34 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		}
 	}
 
+	client, err := NewS3Client(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("s3 blob store: %w", err)
+	}
+	return &S3Store{
+		client:    client,
+		presign:   s3.NewPresignClient(client),
+		bucket:    cfg.Bucket,
+		prefix:    strings.Trim(cfg.Prefix, "/"),
+		putExpiry: cfg.PutExpiry,
+		getExpiry: cfg.GetExpiry,
+		now:       time.Now,
+	}, nil
+}
+
+// NewS3Client returns an S3 client for cfg's endpoint, region, addressing,
+// credentials and HTTP client. It ignores the bucket, prefix and expiries, and
+// makes no requests. The metadata store shares it, so both stores reach S3 the
+// same way.
+func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
+	if cfg.Region == "" {
+		return nil, errors.New("no region")
+	}
 	creds := cfg.Credentials
 	if creds == nil {
 		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.Region))
 		if err != nil {
-			return nil, fmt.Errorf("s3 blob store: load AWS config: %w", err)
+			return nil, fmt.Errorf("load AWS config: %w", err)
 		}
 		creds = awsCfg.Credentials
 	}
@@ -173,16 +196,7 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	if cfg.Endpoint != "" {
 		opts.BaseEndpoint = aws.String(cfg.Endpoint)
 	}
-	client := s3.New(opts)
-	return &S3Store{
-		client:    client,
-		presign:   s3.NewPresignClient(client),
-		bucket:    cfg.Bucket,
-		prefix:    strings.Trim(cfg.Prefix, "/"),
-		putExpiry: cfg.PutExpiry,
-		getExpiry: cfg.GetExpiry,
-		now:       time.Now,
-	}, nil
+	return s3.New(opts), nil
 }
 
 // Key returns the object key of a blob: <prefix>/blobs/<algorithm>/<hex>.

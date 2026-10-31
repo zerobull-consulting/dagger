@@ -115,6 +115,19 @@ through the raw SDK:
   again. It should fail once uploads are verified; see
   [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#blob-store).
 
+`cmd/cacheservice/metastore/minio_test.go` checks the metadata store:
+
+- `TestMinIOMetastoreConditionalWrites`: the store's own startup check,
+  `VerifyConditionalWrites`, passes against MinIO.
+- `TestMinIOMetastoreRecord`: a recorded bundle and the index land at their
+  documented keys and read back; recording the same bundle again hands out no
+  new numbers.
+- `TestMinIOMetastoreConcurrentWriters`: several stores, each with its own S3
+  client, record into one scope at once. No update is lost and no service
+  number is handed out twice.
+- `TestMinIOMetastoreRestart`: a new store reads what the old one wrote and
+  numbers new entries after the old ones.
+
 Each run writes under its own `test/` prefix in the bucket and deletes it
 afterwards. The `Remote cache tests` workflow runs them on every pull request.
 
