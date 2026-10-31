@@ -12,6 +12,9 @@
 //     engine whose DAGGER_CLOUD_URL points here delivers its cache events
 //     (the engine.* log records) here too, and they are logged;
 //
+//   - PUT /blobs/{digest}, a stand-in for presigned upload URLs that checks
+//     each blob against its digest and keeps nothing;
+//
 //   - on a separate, local-only address, a debug API that lists the connected
 //     engines and sends a request to one, to probe what the engine answers:
 //

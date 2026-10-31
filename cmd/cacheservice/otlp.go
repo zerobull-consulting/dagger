@@ -21,6 +21,11 @@ import (
 // post to under DAGGER_CLOUD_URL. The engine's cache events arrive as log
 // records; session spans carry the cache entries their calls touched.
 func (s *service) otlpRoutes(mux *http.ServeMux) {
+	// Before taking over a session's telemetry, the engine probes the Cloud
+	// URL with HEAD /v1/traces; any answer will do.
+	mux.HandleFunc("HEAD /v1/traces", func(w http.ResponseWriter, r *http.Request) {
+		s.logger.Info("otlp probe", "method", r.Method, "path", r.URL.Path, "userAgent", r.UserAgent())
+	})
 	mux.HandleFunc("POST /v1/logs", func(w http.ResponseWriter, r *http.Request) {
 		var req collogspb.ExportLogsServiceRequest
 		if !s.decodeOTLP(w, r, &req) {
@@ -107,6 +112,9 @@ func (s *service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 // decodeOTLP reads an OTLP/HTTP request body, protobuf or JSON, gzipped or
 // not.
 func (s *service) decodeOTLP(w http.ResponseWriter, r *http.Request, msg proto.Message) bool {
+	s.logger.Debug("otlp request", "path", r.URL.Path, "userAgent", r.UserAgent(),
+		"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
+		"contentLength", r.ContentLength)
 	var body io.Reader = r.Body
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		gz, err := gzip.NewReader(r.Body)

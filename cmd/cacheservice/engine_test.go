@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/opencontainers/go-digest"
+
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
@@ -194,5 +196,42 @@ func TestDebugRequest(t *testing.T) {
 	}
 	if reply.Type != protocol.TypeOffered {
 		t.Fatalf("offer answered with %s: %s", reply.Type, body)
+	}
+}
+
+func TestBlobPut(t *testing.T) {
+	svc := newService(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.handler())
+	defer srv.Close()
+
+	put := func(dgst, body string) int {
+		req, err := http.NewRequest(http.MethodPut, srv.URL+"/blobs/"+dgst, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	good := digest.FromString("layer").String()
+	if code := put(good, "layer"); code != http.StatusOK {
+		t.Fatalf("matching blob: status %d", code)
+	}
+	if code := put(good, "other"); code != http.StatusBadRequest {
+		t.Fatalf("mismatched blob: status %d", code)
+	}
+
+	// The engine probes its Cloud URL with HEAD /v1/traces.
+	req, _ := http.NewRequest(http.MethodHead, srv.URL+"/v1/traces", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("probe: status %d", resp.StatusCode)
 	}
 }

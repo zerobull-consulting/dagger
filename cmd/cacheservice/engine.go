@@ -44,6 +44,7 @@ func newService(logger *slog.Logger, dumpDir string) *service {
 func (s *service) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(protocol.EnginePath, s.serveEngine)
+	mux.HandleFunc("PUT /blobs/{digest}", s.serveBlobPut)
 	s.otlpRoutes(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("unhandled request", "method", r.Method, "path", r.URL.Path)
