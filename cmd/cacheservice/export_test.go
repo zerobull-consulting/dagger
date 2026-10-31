@@ -285,6 +285,12 @@ func TestExportAfterSessionEnd(t *testing.T) {
 	if blobs.Puts() != puts {
 		t.Fatalf("repeat export uploaded %d blobs", blobs.Puts()-puts)
 	}
+	// The explicit export is recorded in the tracker.
+	for _, e := range h.svc.export.tracker.Entries(h.cache.ID) {
+		if !e.Stored {
+			t.Fatalf("entry %d not recorded as stored", e.Number)
+		}
+	}
 }
 
 // The explicit hook with no roots exports every tracked entry worth it.

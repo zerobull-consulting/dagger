@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"slices"
 	"sync"
@@ -451,11 +452,6 @@ func (t *Tracker) Done(b Batch, res Result, now time.Time) {
 		if e := c.entries[n]; e != nil {
 			e.stored = b.values[n]
 			e.busy, e.failures, e.failedValue = 0, 0, nil
-			if !e.stored.covers(e) {
-				// Spans that arrived during the export added parts, or
-				// a new value: export it again.
-				e.retryAt = now
-			}
 		}
 		settled[n] = true
 	}
@@ -496,13 +492,50 @@ func (t *Tracker) Done(b Batch, res Result, now time.Time) {
 		settled[f.Number] = true
 	}
 	for n := range b.values {
-		if e := c.entries[n]; e != nil {
-			e.inFlight = false
-		}
 		if !settled[n] {
 			failed(n)
 		}
+		e := c.entries[n]
+		if e == nil {
+			continue
+		}
+		e.inFlight = false
+		// Spans that named the entry during the export were dropped with
+		// their session, since it was in flight; and its value may have
+		// changed since the snapshot exported, been stored or refused. If
+		// it is still worth exporting and nothing is scheduled, export it
+		// again now.
+		if e.retryAt.IsZero() && t.wantedLocked(e, now) {
+			e.retryAt = now
+		}
 	}
+}
+
+// Claim marks the tracked entries among roots in flight, for an export the
+// caller runs itself, and returns the batch to pass to Done. Roots the
+// tracker doesn't know are left out of the batch, and their results are
+// ignored. It fails if any root is already in flight.
+func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	b := Batch{CacheID: cacheID, Request: req, values: map[uint64]*exportedValue{}}
+	c := t.caches[cacheID]
+	if c == nil {
+		return b, nil
+	}
+	for _, n := range req.Roots {
+		if e := c.entries[n]; e != nil && e.inFlight {
+			return Batch{}, fmt.Errorf("root %d is already being exported", n)
+		}
+	}
+	for _, n := range req.Roots {
+		if e := c.entries[n]; e != nil {
+			e.inFlight = true
+			e.retryAt = time.Time{}
+			b.values[n] = e.value()
+		}
+	}
+	return b, nil
 }
 
 func (t *Tracker) backoff(n int) time.Duration {

@@ -282,7 +282,13 @@ func (s *service) serveExport(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Hour)
 	defer cancel()
 	if len(req.Roots) > 0 {
+		b, err := p.tracker.Claim(c.CacheID(), req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		res, err := p.exporter.Export(ctx, c, req)
+		p.tracker.Done(b, res, p.now())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return

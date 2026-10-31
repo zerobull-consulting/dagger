@@ -362,3 +362,60 @@ func TestTrackerPrunedWhileWaitingIsForgotten(t *testing.T) {
 		t.Fatalf("pruned root kept: %+v", e)
 	}
 }
+
+// A root whose value changes while its export is in flight, and which the
+// engine then refuses for the old value, is exported again for the new one.
+func TestTrackerRetriesValueChangedInFlight(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	newer := state(1, 20, fsPart)
+	newer.Replacements = 1
+	tr.Observe(newer, t0)
+	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipRefused}}}, t0)
+	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("new value not retried: %v", got)
+	}
+}
+
+// A root named by a session while in flight, then stored with the value it
+// had, isn't exported again.
+func TestTrackerNoRetryWhenStoredCovers(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Observe(state(1, 20, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 2, t0)
+	tr.Due(t0) // drops the session: its root is in flight
+	tr.Done(b[0], Result{Stored: []uint64{1}}, t0)
+	if got := roots(tr.Due(t0)); len(got) != 0 {
+		t.Fatalf("stored root exported again: %v", got)
+	}
+}
+
+func TestTrackerClaim(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b, err := tr.Claim("c", Request{Roots: []uint64{1, 99}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.values) != 1 {
+		t.Fatalf("claimed %d roots, want the tracked one", len(b.values))
+	}
+	// In flight: neither the scheduler nor another claim takes it.
+	if got := roots(tr.All("c", t0)); len(got) != 0 {
+		t.Fatalf("claimed root handed out: %v", got)
+	}
+	if _, err := tr.Claim("c", Request{Roots: []uint64{1}}); err == nil {
+		t.Fatal("second claim of an in-flight root accepted")
+	}
+	tr.Done(b, Result{Stored: []uint64{1}, Gone: []uint64{99}}, t0)
+	if e := tr.Entries("c"); len(e) != 1 || !e[0].Stored {
+		t.Fatalf("claim's result not recorded: %+v", e)
+	}
+	// An unknown cache: nothing to claim, nothing to record.
+	if b, err := tr.Claim("other", Request{Roots: []uint64{1}}); err != nil || len(b.values) != 0 {
+		t.Fatalf("unknown cache: %+v, %v", b, err)
+	}
+}
