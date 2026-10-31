@@ -181,10 +181,88 @@ them. Options:
   keep what isn't `gone`. Crude: most live entries are core typedefs (about
   4,850 in #3). Only worth it for catching up after the service was down.
 
-Recommendation: build on **(a)** now, since it needs no engine change and
-#7 and #6 can proceed against it. Open a follow-up for **(b)**, the minimal
-engine change, so discovery doesn't depend on client configuration. Keep
-**(c)** for recovery.
+**Decision: go with (a) for now.** It needs no engine change, and #7 and #6
+can proceed against it. To keep clients' Dagger Cloud traces and metrics, the
+service forwards what it receives to the real Cloud URL; see
+[Forwarding to Dagger Cloud](#forwarding-to-dagger-cloud). (b) stays a
+candidate follow-up, (c) is for recovery, and the engine's workload export is
+recorded below as an alternative.
+
+### Forwarding to Dagger Cloud
+
+Under (a), the service is the clients' `DAGGER_CLOUD_URL`. It reads session
+spans to learn entries and passes everything on to the real Cloud URL, so
+clients keep their traces and metrics. Requirements, from the client and
+engine code:
+
+- **Proxy every path, not only `/v1/*`.** The CLI uses `DAGGER_CLOUD_URL` as
+  the base of all Cloud APIs: login and org lookups
+  (`internal/cloud/auth/auth.go`), the GraphQL client
+  (`internal/cloud/client.go`) and trace reads, `GET /v1/traces/{id}`
+  (`internal/cloud/otlp.go`). Tap only `POST /v1/traces` and `POST /v1/logs`.
+  Pass every other request through as is.
+- **Forward synchronously and return Cloud's answer.** The engine's session
+  forwarder advances its cursor only past rows Cloud accepted. It stops on an
+  unusable credential or a permanent refusal (`session_cloud_forwarder.go`).
+  If the service answered 200 itself, rows Cloud refused would be lost
+  silently. Return Cloud's status and body, including partial-success bodies.
+  The engine bounds each request at 10s (`CloudExportTimeout`), so the extra
+  hop must stay well under that.
+- **Keep the headers.** Pass `Authorization` (an engine token as Basic auth,
+  an OIDC token, or an OAuth bearer that the engine refreshes itself),
+  `X-Dagger-Org` and `X-Dagger-Export` (the exporter's sequence) through
+  unchanged.
+- **Tapping must not block forwarding.** Parse a copy of the body after the
+  request has been forwarded. A parse failure is logged, not returned.
+- **Don't forward engine cache events by default.** They arrive under the
+  engine's `DAGGER_CLOUD_TOKEN`, the same token that authenticates the
+  WebSocket. Forwarding them needs a real Cloud engine token. It's also
+  unknown how Cloud treats `engine.*` events from an engine that isn't on its
+  own remote cache. They come from their own logger provider, so a request
+  whose records are all in scope `dagger.io/engine.cache` can be answered
+  locally. Make forwarding them an option.
+- **Known breakage:** with `DAGGER_CLOUD_URL` set to anything other than
+  `api.dagger.cloud`, the CLI sends the GitHub app install and the OAuth
+  redirect to dev targets, including `localhost:3000`
+  (`internal/cmd/dagger/integration_cloud.go`,
+  `internal/cmd/dagger/workspace.go`). `dagger cloud integration` and
+  workspace GitHub setup won't work for clients behind the service.
+- **Still a silent miss** for any client without `DAGGER_CLOUD_TOKEN` and
+  this `DAGGER_CLOUD_URL`.
+
+### Alternative: the engine's workload export (not tested)
+
+The engine has an internal setting, `telemetry.workloadExport`
+(`engine/config/config.go`, hidden from the schema with `jsonschema:"-"`).
+It exports every session's spans from the engine to the standard
+`OTEL_EXPORTER_OTLP_*` endpoint (`engine/telemetry/workload_export.go`).
+Pointed at the service, it would deliver every session's spans under the
+engine's own config. Clients change nothing and Dagger Cloud is untouched, so
+no forwarding is needed.
+
+Limits:
+
+- **Only a fixed list of span fields is kept** (`workloadSpanAttribute` in
+  `engine/telemetry/workload_spans.go`). It includes
+  `dagger.io/cache.result.id` and `dagger.io/cache.outcome`. It drops
+  `retained`, `deps`, `parts`, `type`, `expires` and `replacements`.
+- **The resource has no `dagger.io/engine.cache`.** It has
+  `service.instance.id`, which engine cache events also carry, so the cache ID
+  can be joined from `engine.start`.
+- **It shares the OTLP environment variables** with the engine's resource
+  metrics export.
+- **It is internal and undocumented.** It may change without notice.
+
+How it could work without an engine change: after a session ends, export
+every entry number its spans named. Entries without a retention edge come
+back `gone`, which filters them out. The parts come from the bundle rather
+than the span. With a one-line engine change, adding the
+`dagger.io/cache.*` state fields to the allowlist, it would carry everything
+session spans carry today.
+
+This hasn't been run live. Before choosing it, confirm entry numbers arrive
+at the service, and that export-then-filter-`gone` finds the retained entries
+of a session.
 
 ## Live run
 
