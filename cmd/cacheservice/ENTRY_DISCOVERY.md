@@ -154,9 +154,12 @@ replacements, the session that last touched it, and the export state
 `dagger.io/cache.outcome` and the entry's whole state at the span's end. On
 a state span, an omitted `retained`, `retention.expires` or `expires` is a
 fact: not retained, or no expiry. A **lazy-evaluation span** carries no
-outcome. It reports only the result ID, deps and parts
-(`engine/telemetryattrs/attrs.go`), so what it leaves out says nothing, and
-the stored value stays. Spans of the same value arrive in any order, so they
+outcome. It reports only the result ID, deps, parts, the output content
+digest when there is one, and the replacement count when it isn't 0
+(`endOTelLazyOp` in `dagql/otelprof_lazy.go`). What else it leaves out says
+nothing, and the stored value stays. On both kinds, an omitted
+`dagger.io/cache.replacements` means 0, so the replacement fence above
+applies to every span before any merge. Spans of the same value arrive in any order, so they
 are merged per field, never replace the whole entry:
 
 - **Parts** are a union. A later span can only add parts to a value, as the
