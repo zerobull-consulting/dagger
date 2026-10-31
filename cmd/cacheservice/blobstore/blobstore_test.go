@@ -184,6 +184,43 @@ func TestUploadURLsCanceled(t *testing.T) {
 	}
 }
 
+// fakeStore.Has with a gauge: how many calls run at once, at most.
+type gaugedStore struct {
+	*fakeStore
+	mu        sync.Mutex
+	running   int
+	maxActive int
+}
+
+func (g *gaugedStore) Has(ctx context.Context, d digest.Digest) (bool, error) {
+	g.mu.Lock()
+	g.running++
+	g.maxActive = max(g.maxActive, g.running)
+	g.mu.Unlock()
+	time.Sleep(time.Millisecond)
+	defer func() {
+		g.mu.Lock()
+		g.running--
+		g.mu.Unlock()
+	}()
+	return g.fakeStore.Has(ctx, d)
+}
+
+// Checks run at most maxConcurrentChecks at a time, however many blobs.
+func TestUploadURLsBoundsConcurrency(t *testing.T) {
+	store := &gaugedStore{fakeStore: newFakeStore()}
+	var blobs []Blob
+	for i := range 10 * maxConcurrentChecks {
+		blobs = append(blobs, Blob{Digest: digest.FromString(strings.Repeat("y", i+1)), Size: 1})
+	}
+	if _, err := UploadURLs(context.Background(), store, blobs); err != nil {
+		t.Fatal(err)
+	}
+	if store.maxActive > maxConcurrentChecks {
+		t.Fatalf("%d checks ran at once, want at most %d", store.maxActive, maxConcurrentChecks)
+	}
+}
+
 // More blobs than checks run at once: every one is still checked.
 func TestUploadURLsManyBlobs(t *testing.T) {
 	store := newFakeStore()

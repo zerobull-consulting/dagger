@@ -7,13 +7,13 @@ package blobstore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sync/errgroup"
 )
 
 // Store holds blobs keyed by digest.
@@ -69,58 +69,37 @@ func UploadURLs(ctx context.Context, store Store, blobs []Blob) (map[digest.Dige
 	}
 	sort.Slice(unique, func(i, j int) bool { return unique[i] < unique[j] })
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+	// At most maxConcurrentChecks goroutines exist at once: Go blocks until
+	// one finishes. The first error cancels the rest and is the one returned.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrentChecks)
 	var (
 		mu   sync.Mutex
 		urls = make(map[digest.Digest]string)
-		errs = make([]error, len(unique))
-		wg   sync.WaitGroup
-		sem  = make(chan struct{}, maxConcurrentChecks)
 	)
-	for i, d := range unique {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[i] = fmt.Errorf("blob %s: %w", d, ctx.Err())
-				return
-			}
-			defer func() { <-sem }()
-			url, err := uploadURL(ctx, store, d, sizes[d])
+	for _, d := range unique {
+		if gctx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			url, err := uploadURL(gctx, store, d, sizes[d])
 			if err != nil {
-				errs[i] = fmt.Errorf("blob %s: %w", d, err)
-				cancel()
-				return
+				return fmt.Errorf("blob %s: %w", d, err)
 			}
 			if url != "" {
 				mu.Lock()
 				urls[d] = url
 				mu.Unlock()
 			}
-		}()
+			return nil
+		})
 	}
-	wg.Wait()
-	// Report the errors that caused the failure, not the cancellations they
-	// caused in other checks.
-	var firstErrs []error
-	for _, err := range errs {
-		if err != nil && !errors.Is(err, context.Canceled) {
-			firstErrs = append(firstErrs, err)
-		}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
-	if len(firstErrs) == 0 {
-		for _, err := range errs {
-			if err != nil {
-				firstErrs = append(firstErrs, err)
-			}
-		}
-	}
-	if len(firstErrs) > 0 {
-		return nil, errors.Join(firstErrs...)
+	// Set when the caller's context ended before any check failed.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return urls, nil
 }
