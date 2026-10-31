@@ -18,6 +18,7 @@
 package metastore
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -157,10 +158,12 @@ func BundleID(bundle *dagql.ValueBundle) (string, []byte, error) {
 }
 
 // PutBundle stores a bundle and returns its ID. Storing a bundle that is
-// already stored writes nothing and returns the same ID.
+// already stored writes nothing and returns the same ID. It refuses a bundle
+// ValidateBundle refuses, such as one of another version, and a stored
+// object at the bundle's key whose content doesn't match (ErrCorruptBundle).
 func (s *Store) PutBundle(ctx context.Context, scope string, bundle *dagql.ValueBundle) (string, error) {
-	if bundle == nil {
-		return "", errors.New("put bundle: nil bundle")
+	if err := ValidateBundle(bundle); err != nil {
+		return "", fmt.Errorf("put bundle: %w", err)
 	}
 	id, body, err := BundleID(bundle)
 	if err != nil {
@@ -178,10 +181,13 @@ func (s *Store) PutBundle(ctx context.Context, scope string, bundle *dagql.Value
 		if !errors.Is(err, ErrPreconditionFailed) {
 			return "", fmt.Errorf("put bundle: %w", err)
 		}
-		// The key exists, or a write of it is in flight (S3's 409). Its
-		// content is the same either way; only check that it landed.
-		_, _, err = s.objects.Get(ctx, key)
+		// The key exists, or a write of it is in flight (S3's 409). Check
+		// that what is there is this bundle.
+		stored, _, err := s.objects.Get(ctx, key)
 		if err == nil {
+			if !bytes.Equal(stored, body) {
+				return "", fmt.Errorf("put bundle %s: %w", id, ErrCorruptBundle)
+			}
 			return id, nil
 		}
 		if !errors.Is(err, ErrNotFound) {

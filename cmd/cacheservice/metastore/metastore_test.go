@@ -179,6 +179,17 @@ func TestBundleRoundTrip(t *testing.T) {
 	if _, err := s.PutBundle(ctx, "s1", nil); err == nil {
 		t.Fatal("nil bundle: no error")
 	}
+	old := chain(40)
+	old.Version = 2
+	if _, err := s.PutBundle(ctx, "s1", old); err == nil {
+		t.Fatal("unsupported version: no error")
+	}
+
+	// Putting a bundle over a corrupt object at its key is refused, not
+	// taken as already stored.
+	if _, err := s.PutBundle(ctx, "s1", chain(20)); !errors.Is(err, ErrCorruptBundle) {
+		t.Fatalf("put over a corrupt object: %v, want ErrCorruptBundle", err)
+	}
 }
 
 func TestIndexOfEmptyScope(t *testing.T) {
