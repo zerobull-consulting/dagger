@@ -133,9 +133,10 @@ don't put it in the key:
 - **Fence by generation.** Spans of one session can still be in flight when
   a newer generation starts reporting, and concurrent sessions' spans arrive
   in any order. Keep the newest generation seen per cache ID, and ignore
-  observations from an older one. Within a generation, let an observation
-  replace an entry's state only when its `replacements` count is at least
-  the stored one.
+  observations from an older one. Within a generation, drop an observation
+  whose `replacements` count is lower than the stored one. A higher count
+  starts a new value: reset the entry's parts and deps to that observation's.
+  An equal count is merged as below.
 
 Group observations by **session** as well. Every session span's resource
 carries `dagger.io/engine.session`, beside `dagger.io/engine.cache`. Several
@@ -144,9 +145,30 @@ session-end carrier span are tracked per session ID and generation. One
 session's carrier closes only that session's candidates. The persistent entry
 key stays cache ID and result number.
 
-Per entry, keep the latest of: type, deps, parts, retained, retention expiry,
-expiry, replacements, the session that last touched it, and the export state
-(`pending`, `exported` with the bundle key, `gone`).
+Per entry, keep: type, deps, parts, retained, retention expiry, expiry,
+replacements, the session that last touched it, and the export state
+(`pending`, `exported` with the bundle key and the parts it covered, `busy`,
+`refused`, `gone`).
+
+**Spans are sparse updates.** A lazy-evaluation span carries the result ID,
+deps and parts, but no type, outcome or retention. An attribute a span
+leaves out keeps its stored value. Spans of the same value arrive in any
+order, so they are merged per field, never replace the whole entry:
+
+- **Parts** are a union. A later span can only add parts to a value, as the
+  live run shows (`withExec` with 0, then 1, then 3 parts).
+- **Deps** keep the longest list seen for the value. An empty list on a span
+  that carries the attribute is a fact, but it never shrinks a known list.
+- **Type**, **retention expiry** and **expiry** take the latest non-empty
+  value.
+- **Retained** follows the retention watermark below.
+
+**Order retention by time.** Prunes come through the engine's own exporter
+and spans through the session's, so a span that saw `retained = "true"`
+before a prune can arrive after it. Keep a per-entry retention watermark:
+the `droppedAtUnixNano` of the latest `engine.prune` drop for it. A span
+sets `retained` only if it ended after the watermark. Span end times and
+drop times come from the same engine clock.
 
 ## Choosing export roots
 
@@ -154,8 +176,11 @@ expiry, replacements, the session that last touched it, and the export state
    session's spans (by `dagger.io/engine.session`) showed
    `dagger.io/cache.retained = "true"`. Entries without a retention edge are
    released with their session and come back `gone`.
-2. **Skip** candidates already exported with the same `replacements` count,
-   and those where either expiry has passed: the entry's own
+2. **Skip** candidates already exported with the same `replacements` count
+   and a part set that covers every part now known. An entry whose known
+   parts grew since its export is exported again. Also skip candidates
+   marked `refused` for the same `replacements` count and parts, and those
+   where either expiry has passed: the entry's own
    (`dagger.io/cache.expires`) or its retention edge's
    (`dagger.io/cache.retention.expires`). A missing or zero value means no
    expiry. A lapsed retention edge means the entry is no longer retained,
@@ -175,11 +200,20 @@ expiry, replacements, the session that last touched it, and the export state
    spans. Parts that own no bytes (absent or metadata parts) need no upload.
    Layers dedupe by digest in S3 (#5), so asking for a part already stored
    costs only the `upload` round trip.
-6. **Results.** Mark roots in `skipped` with reason `gone` as gone. Store the
-   bundle (#6), upload the blobs (#7), or send an empty URL map to release
-   the export.
+6. **Results.** Handle each `skipped` root by its reason
+   (`engine/remotecache/protocol/protocol.go`):
+   - `gone`: the engine no longer has it. Mark it gone.
+   - `busy`: it couldn't be captured now. Keep it pending and retry with
+     backoff, in a later `export`.
+   - `refused`: the engine would refuse it again. Mark it refused with its
+     message, and don't retry until its `replacements` count or parts
+     change.
+
+   For the roots that made it into the bundle, store the bundle (#6) and
+   upload the blobs (#7), or send an empty URL map to release the export.
+   Releasing an export never changes a `busy` root's pending state.
 7. **Prunes.** On `engine.prune`, mark each dropped `resultId` as no longer
-   retained. Don't delete what was already stored; retention of stored bundles
+   retained, and raise its retention watermark to the drop time. Don't delete what was already stored; retention of stored bundles
    is #11's job.
 
 ## Gaps and options
@@ -190,8 +224,13 @@ them. Options:
 
 - **(a) Deployment requirement, no engine change.** Every client has Cloud
   telemetry configured (`DAGGER_CLOUD_TOKEN` or `dagger login`) and sets
-  `DAGGER_CLOUD_URL` pointing at the service. Works
-  today; this note's live run used it. Costs: clients lose Dagger Cloud
+  `DAGGER_CLOUD_URL` pointing at the service. The **engine's** own
+  `DAGGER_CLOUD_URL` must point at the service too: engine cache events
+  (`engine.start`, `engine.prune`) go there, not to the clients' URL, and
+  without them the service misses cache wipes and prunes. Even then, the
+  emitter drops events when its queue is full, so wipes and prunes are best
+  effort: an export answer of `gone` remains the final word. Works today;
+  this note's live run used it, with both URLs on the service. Costs: clients lose Dagger Cloud
   traces unless the service forwards them on. The service takes user tokens
   on `/v1/traces`. One client left unconfigured is a silent miss.
 - **(b) Small engine change.** Add an engine event, such as `engine.retain`,
