@@ -291,10 +291,15 @@ func (s *service) serveExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var all exporter.Result
-	for _, b := range p.tracker.All(c.CacheID(), p.now()) {
+	batches := p.tracker.All(c.CacheID(), p.now())
+	for i, b := range batches {
 		res, err := p.exporter.Export(ctx, c, b.Request)
 		p.tracker.Done(b, res, p.now())
 		if err != nil {
+			// Hand the batches not run back to the scheduler.
+			for _, rest := range batches[i+1:] {
+				p.tracker.Requeue(rest, p.now())
+			}
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}

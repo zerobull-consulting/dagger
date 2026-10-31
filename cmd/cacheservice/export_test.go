@@ -429,3 +429,33 @@ func TestParseEngineCache(t *testing.T) {
 		}
 	}
 }
+
+// When one of the hook's batches fails, the batches after it go back to the
+// scheduler instead of staying in flight.
+func TestExportHookRequeuesBatchesNotRun(t *testing.T) {
+	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Tick = time.Hour })
+	// 1 depends on an entry the cache doesn't have, so the first batch's
+	// capture fails.
+	h.cache.Add(fakeengine.Entry{Number: 1, Deps: []uint64{9999}})
+	var spans []*tracepb.Span
+	for n := uint64(1); n <= 1001; n++ {
+		if n > 1 {
+			h.cache.Add(fakeengine.Entry{Number: n, Layers: [][]byte{testLayer(strconv.FormatUint(n, 10))}})
+		}
+		spans = append(spans, cacheSpan(n))
+	}
+	h.postSpans("session-1", spans...)
+
+	if code, _ := h.debugExport(""); code != http.StatusBadGateway {
+		t.Fatalf("status %d", code)
+	}
+	entries := h.svc.export.tracker.Entries(h.cache.ID)
+	last := entries[len(entries)-1]
+	if last.Number != 1001 || last.RetryAt == "" || last.Failures != 0 {
+		t.Fatalf("batch not run wasn't requeued: %+v", last)
+	}
+	// Due again, so a scheduler tick runs it.
+	if b := h.svc.export.tracker.Due(time.Now()); len(b) == 0 {
+		t.Fatal("requeued batch not due")
+	}
+}

@@ -356,12 +356,9 @@ func (t *Tracker) Due(now time.Time) []Batch {
 			for n := range s.candidates {
 				roots[n] = true
 			}
-			if ended {
-				delete(c.sessions, id)
-			} else {
-				s.candidates = map[uint64]bool{}
-				s.lastSpanAt = time.Time{}
-			}
+			// Exported, whether it ended or went quiet. A later span of a
+			// quiet session starts it again.
+			delete(c.sessions, id)
 		}
 		for n, e := range c.entries {
 			if !e.retryAt.IsZero() && !now.Before(e.retryAt) {
@@ -395,7 +392,15 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 	var cur *Batch
 	for _, n := range numbers {
 		e := c.entries[n]
-		if e == nil || !t.wantedLocked(e, now) {
+		if e == nil {
+			continue
+		}
+		if !t.wantedLocked(e, now) {
+			if !e.inFlight {
+				// No longer worth a retry, as once pruned or expired: stop
+				// waiting, so the entry can be forgotten.
+				e.retryAt = time.Time{}
+			}
 			continue
 		}
 		if cur == nil || len(cur.Request.Roots) >= maxBatchRoots {

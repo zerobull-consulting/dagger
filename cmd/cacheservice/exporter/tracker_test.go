@@ -324,3 +324,41 @@ func TestTrackerIgnoresBadParts(t *testing.T) {
 		t.Fatalf("parts %v", e[0].Parts)
 	}
 }
+
+func TestTrackerQuietSessionRemoved(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	if got := roots(tr.Due(t0.Add(10 * time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("quiet session: %v", got)
+	}
+	if n := len(tr.caches["c"].sessions); n != 0 {
+		t.Fatalf("%d sessions kept after export", n)
+	}
+	// A later span starts it again.
+	tr.Observe(state(2, 20, fsPart), t0.Add(11*time.Second))
+	if n := len(tr.caches["c"].sessions); n != 1 {
+		t.Fatalf("%d sessions after a new span", n)
+	}
+}
+
+func TestTrackerPrunedWhileWaitingIsForgotten(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, t0)
+	tr.Pruned("c", 1, []Drop{{Number: 1, DroppedAtUnixNano: 20}})
+
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("pruned root retried: %v", got)
+	}
+	if e := tr.Entries("c"); len(e) != 1 || e[0].RetryAt != "" {
+		t.Fatalf("pruned root still waiting: %+v", e)
+	}
+	// The first pass exports its quiet session, which names it, and the next
+	// forgets it.
+	tr.Due(t0.Add(time.Minute))
+	tr.Due(t0.Add(time.Minute))
+	if e := tr.Entries("c"); len(e) != 0 {
+		t.Fatalf("pruned root kept: %+v", e)
+	}
+}

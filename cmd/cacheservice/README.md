@@ -208,7 +208,13 @@ limit, the roots are split in two and each half is exported alone (an
 chains). One root that is too large on its own fails. A batch holds at most
 1,000 roots.
 
-**Known gaps.** Uploaded content isn't verified against its digest
+**Known gaps.** Nothing is authenticated yet
+([#10](https://github.com/zerobull-consulting/dagger/issues/10)): the
+WebSocket takes any token, and the OTLP receivers take any request. Anyone who
+can reach the service can forge spans, which make it export (or stop
+exporting) a connected engine's entries, or connect as an engine and offer it
+bundles of its own. Run the export path only on a trusted network until then.
+Uploaded content isn't verified against its digest
 ([#23](https://github.com/zerobull-consulting/dagger/issues/23)). Sessions whose
 clients send no spans to the service are invisible (see
 [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#gaps-and-options)). The tracker's state
