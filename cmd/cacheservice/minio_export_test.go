@@ -86,12 +86,13 @@ func TestMinIOExportBuild(t *testing.T) {
 	}
 	exports := h.cache.Exports()
 
-	// A repeated export uploads nothing new, and stores the same bundle.
-	code, res := h.debugExport(`{"roots":[11],"outputs":[{"number":10,"address":{"part":"fs"}},{"number":11,"address":{"part":"fs"}}]}`)
+	// A repeated export of the same roots and outputs uploads nothing new,
+	// and stores the same bundle.
+	code, res := h.debugExport(`{"roots":[10,11],"outputs":[{"number":10,"address":{"part":"fs"}},{"number":11,"address":{"part":"fs"}}]}`)
 	if code != http.StatusOK {
 		t.Fatalf("status %d", code)
 	}
-	if !slices.Equal(res.Stored, []uint64{11}) || len(res.Uploaded) != 0 || len(res.Present) != 2 {
+	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Uploaded) != 0 || len(res.Present) != 2 {
 		t.Fatalf("repeat export: %+v", res)
 	}
 	if !slices.Equal(res.Bundles, []string{entry.Bundle}) {

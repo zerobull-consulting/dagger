@@ -270,13 +270,17 @@ func TestExportAfterSessionEnd(t *testing.T) {
 		t.Fatal("stored entries exported again")
 	}
 
-	// Asked explicitly, the repeat export uploads nothing new.
-	code, res := h.debugExport(`{"roots":[11],"outputs":[{"number":11,"address":{"part":"fs"}},{"number":10,"address":{"part":"fs"}}]}`)
+	// Asked explicitly, the repeat export uploads nothing new, and stores
+	// the same bundle.
+	code, res := h.debugExport(`{"roots":[10,11],"outputs":[{"number":10,"address":{"part":"fs"}},{"number":11,"address":{"part":"fs"}}]}`)
 	if code != http.StatusOK {
 		t.Fatalf("status %d", code)
 	}
-	if !slices.Equal(res.Stored, []uint64{11}) || len(res.Uploaded) != 0 || len(res.Present) != 2 {
+	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Uploaded) != 0 || len(res.Present) != 2 {
 		t.Fatalf("repeat export: %+v", res)
+	}
+	if !slices.Equal(res.Bundles, []string{entry.Bundle}) {
+		t.Fatalf("repeat export stored bundle %v, want %s", res.Bundles, entry.Bundle)
 	}
 	if blobs.Puts() != puts {
 		t.Fatalf("repeat export uploaded %d blobs", blobs.Puts()-puts)
