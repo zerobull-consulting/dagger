@@ -230,15 +230,25 @@ func TestMinIOPresignedPutSizeBound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, err := enginePut(ctx, put.URL, append(blob, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status/100 == 2 {
-		t.Fatalf("PUT of one byte more than signed for succeeded: status %d", status)
-	}
-	if ok, _ := e.exists(ctx, t, key); ok {
-		t.Fatal("the oversized PUT stored an object")
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"one byte longer", append(append([]byte{}, blob...), 0)},
+		{"one byte shorter", blob[:len(blob)-1]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, err := enginePut(ctx, put.URL, tc.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status/100 == 2 {
+				t.Fatalf("PUT of %d bytes, signed for %d, succeeded: status %d", len(tc.body), len(blob), status)
+			}
+			if ok, _ := e.exists(ctx, t, key); ok {
+				t.Fatalf("the PUT of %d bytes stored an object", len(tc.body))
+			}
+		})
 	}
 }
 
