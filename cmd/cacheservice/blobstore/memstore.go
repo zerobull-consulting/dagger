@@ -105,6 +105,13 @@ func (m *MemStore) Get(dgst digest.Digest) ([]byte, bool) {
 	return bytes.Clone(data), ok
 }
 
+// Delete drops a blob, as an expiry or a cleanup would.
+func (m *MemStore) Delete(dgst digest.Digest) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blobs, dgst)
+}
+
 // Len returns how many blobs are stored.
 func (m *MemStore) Len() int {
 	m.mu.Lock()

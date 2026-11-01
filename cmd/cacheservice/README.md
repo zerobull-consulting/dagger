@@ -4,8 +4,9 @@ The S3-compatible remote cache service
 ([#1](https://github.com/zerobull-consulting/dagger/issues/1)). It began as a
 protocol spike ([#3](https://github.com/zerobull-consulting/dagger/issues/3))
 that stored nothing. With `CACHESERVICE_S3_BUCKET` set, it now stores the
-entries engines build in S3: see [Export path](#export-path). Without it, it is
-still the spike, and only logs what the engine does on the wire.
+entries engines build in S3 (see [Export path](#export-path)) and hands them to
+other engines (see [Import path](#import-path)). Without it, it is still the
+spike, and only logs what the engine does on the wire.
 
 ## What it serves
 
@@ -18,6 +19,8 @@ still the spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
 | `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored |
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
+| `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered |
+| `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
 
 On the engine WebSocket, the service:
 
@@ -25,7 +28,8 @@ On the engine WebSocket, the service:
   token and logs only a short SHA-256 fingerprint of it.
 - reads `hello`, replies `welcome`, and records the engine's cache identity.
 - answers WebSocket pings (the library does this; `-v` logs each one).
-- answers `renew` with `{"unavailable": true}`, since nothing is stored.
+- answers `renew` with fresh presigned GETs when the import path is on and
+  every layer is stored, and with `{"unavailable": true}` otherwise.
 - answers any other request from the engine with an `error` reply.
 - logs every envelope in both directions: direction, type, `id`, `re`, message
   size, body size, and a short summary for the known body types.
@@ -228,6 +232,62 @@ clients send no spans to the service are invisible (see
 is in memory, so after a service restart entries are learned again from new
 spans; what is in S3 is not lost, and a re-export uploads nothing already
 stored.
+
+## Import path
+
+[`importer`](importer) makes engines reuse what other engines exported
+([#8](https://github.com/zerobull-consulting/dagger/issues/8)). It is on with
+the export path, reads the same scope, and is turned off with `-import=false`.
+
+**When.** Each welcomed connection gets a sync loop. It syncs on `hello`,
+again whenever another engine's export is stored, and every `-import-poll`
+(30s), which picks up bundles stored by other service replicas. `POST
+/debug/engines/{conn}/import` syncs now.
+
+**One sync.**
+
+1. **Plan.** The index's live roots, grouped by the bundle that holds each
+   one's current record. Roots that have expired, or whose entry has, are
+   left out, and so are an engine's own exports: its cache has them. A bundle
+   already merged into this cache, at this generation, with every root it
+   needs now, is not merged again.
+2. **Merge.** Each bundle is rewritten for the engine: each value's
+   `SenderNumber` becomes its service number, which the engine keeps as its
+   Cloud holding; the roots are the planned ones with the index's expiries;
+   and each output's chain gets a presigned GET per layer, with the scope as
+   its renewal key. Records name each other by ordinal, so values are not
+   dropped or renumbered: a value that only dropped roots needed gets a
+   placeholder number above every stored one, and the engine merges only what
+   the merged roots need. The engine answers `merged`: the entry each record
+   landed on, its replacement count, expiry, dependencies, and complete and
+   offered parts, and which roots it retained or skipped as expired. The
+   importer keeps that, by service number (`GET
+   /debug/engines/{conn}/imports`).
+3. **Offer.** A stored part a merged entry has neither complete nor offered
+   is offered to that entry, by the engine's number, with fresh GETs and the
+   owner's dependencies mapped to the engine's numbers. `accepted` and
+   `alreadyComplete` are recorded. `executionStarted` and `unavailable` are
+   tried again at the next sync, up to 3 times. `invalid` is not tried again.
+   An entry the engine answers `gone` for is forgotten.
+
+A merge refused by the engine is tried again at later syncs, up to 3 times per
+bundle and engine generation. A merge over the 64 MiB message limit is not
+sent. A new engine generation, or an `engine.start` that names a wiped cache,
+starts that cache over; `engine.prune` forgets the dropped entries.
+
+**Renew.** Presigned GETs last `CACHESERVICE_S3_GET_EXPIRY` (1h). When the
+engine reads an offered part after they expired, it sends `renew` with the
+chain's layers; the service checks each is stored and answers with fresh GETs,
+or `unavailable` when one is missing or the renewal key isn't its scope.
+
+**Known gaps.** Bundles are merged whole, so a bundle whose roots were partly
+superseded by a later export still sends the older records of its other
+values; the engine keeps whichever value it merged first, as the same recipe
+is interchangeable. Parts are offered only at an entry's own address, not at
+an output path into it. What the importer knows of each engine is in memory:
+after a service restart, every connected engine is merged everything again,
+which the engine keeps as it is. An engine's own exports are never merged back
+into it, even after it pruned them.
 
 ## Running it against a local engine
 

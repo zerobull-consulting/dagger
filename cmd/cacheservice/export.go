@@ -122,6 +122,9 @@ func (s *service) recordExport(ctx context.Context, eng *engineConn, b exporter.
 		eng.logger.Warn("export failed", "roots", len(b.Request.Roots), "error", err)
 	}
 	p.tracker.Done(b, res, p.now())
+	if len(res.Bundles) > 0 {
+		s.triggerImports(eng.CacheID())
+	}
 }
 
 // connected reports whether c is still a welcomed connection.
@@ -212,7 +215,7 @@ func (s *service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
 // trackEvent feeds the tracker one engine cache event.
 func (s *service) trackEvent(kind, cache, body string) {
 	p := s.export
-	if p == nil {
+	if p == nil && s.imports == nil {
 		return
 	}
 	cacheID, generation, ok := parseEngineCache(cache)
@@ -226,7 +229,12 @@ func (s *service) trackEvent(kind, cache, body string) {
 			s.logger.Warn("undecodable engine event", "kind", kind, "error", err)
 			return
 		}
-		p.tracker.Started(cacheID, generation, ev.WipedCache)
+		if p != nil {
+			p.tracker.Started(cacheID, generation, ev.WipedCache)
+		}
+		if s.imports != nil && ev.WipedCache != "" {
+			s.imports.importer.Forget(ev.WipedCache)
+		}
 	case telemetryattrs.EngineEventPrune:
 		var ev telemetryattrs.EnginePruneEvent
 		if err := json.Unmarshal([]byte(body), &ev); err != nil {
@@ -234,10 +242,17 @@ func (s *service) trackEvent(kind, cache, body string) {
 			return
 		}
 		drops := make([]exporter.Drop, 0, len(ev.Drops))
+		numbers := make([]uint64, 0, len(ev.Drops))
 		for _, d := range ev.Drops {
 			drops = append(drops, exporter.Drop{Number: d.ResultID, DroppedAtUnixNano: d.DroppedAtUnixNano})
+			numbers = append(numbers, d.ResultID)
 		}
-		p.tracker.Pruned(cacheID, generation, drops)
+		if p != nil {
+			p.tracker.Pruned(cacheID, generation, drops)
+		}
+		if s.imports != nil {
+			s.imports.importer.Pruned(cacheID, generation, numbers)
+		}
 	}
 }
 

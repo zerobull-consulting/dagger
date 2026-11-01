@@ -35,6 +35,15 @@ type Entry struct {
 	// Busy and Refused make the engine skip the entry as a root.
 	Busy    bool
 	Refused string
+	// Recipe names what the entry computes, as a recipe digest does: a
+	// merged record lands on the entry of the same recipe. Exported records
+	// carry it as their call's field.
+	Recipe string
+	// CloudNumber is the service's number for the entry, from a merge or an
+	// offer (0: none).
+	CloudNumber uint64
+	// Offer is the fs part offered by the service, not yet pulled.
+	Offer *dagql.PersistedPartOffer
 }
 
 // Cache is a fake engine cache.
@@ -43,6 +52,9 @@ type Cache struct {
 	Generation uint64
 	// MaxRoots, when set, makes an export of more roots fail as too large.
 	MaxRoots int
+	// NoMergeOffers makes merges place no offers, as when the engine's
+	// part is being computed, so only an offer can place them.
+	NoMergeOffers bool
 
 	mu      sync.Mutex
 	entries map[uint64]*Entry
@@ -51,11 +63,28 @@ type Cache struct {
 	inFlight, peak int
 	// hold, when set, blocks each export until it is closed.
 	hold chan struct{}
+	// next is the next number a merge hands out.
+	next uint64
+	// merges counts the merges committed.
+	merges int
+	// offerHook, when set, decides an offer's outcome before the fake does.
+	offerHook func(number uint64, offer protocol.CloudPart) protocol.OfferOutcome
+
+	renewals chan *dagql.RenewalRequest
+	renewed  map[dagql.RenewalRequestID]chan dagql.RenewalReply
+	renewSeq uint64
 }
 
 // New returns an empty cache.
 func New(id string, generation uint64) *Cache {
-	return &Cache{ID: id, Generation: generation, entries: map[uint64]*Entry{}}
+	return &Cache{
+		ID:         id,
+		Generation: generation,
+		entries:    map[uint64]*Entry{},
+		next:       1000,
+		renewals:   make(chan *dagql.RenewalRequest),
+		renewed:    map[dagql.RenewalRequestID]chan dagql.RenewalReply{},
+	}
 }
 
 // Add adds or replaces an entry.
@@ -181,6 +210,9 @@ func (c *Cache) Capture(req protocol.Export) (Capture, error) {
 			SenderReplacements: e.Replacements,
 			Record:             dagql.PersistedRecord{ResultID: n},
 		}
+		if e.Recipe != "" {
+			v.Record.Call = &dagql.ResultCall{Field: e.Recipe}
+		}
 		for _, d := range e.Deps {
 			v.DependencyIDs = append(v.DependencyIDs, uint64(ordinal[d]))
 		}
@@ -265,21 +297,33 @@ func (a Adapter) Export(ctx context.Context, req protocol.Export, consume func(c
 	return consume(ctx, remotecache.Export{Bundle: capt.Bundle, Skipped: capt.Skipped, Blobs: blobSource(capt.Blobs)})
 }
 
-func (Adapter) Merge(context.Context, protocol.Merge) (protocol.Merged, error) {
-	return protocol.Merged{}, errors.New("merge: not supported by the fake")
+func (a Adapter) Merge(_ context.Context, req protocol.Merge) (protocol.Merged, error) {
+	return a.Cache.Merge(req.Bundle)
 }
 
-func (Adapter) OfferParts(context.Context, protocol.Offer) (protocol.Offered, error) {
-	return protocol.Offered{}, errors.New("offer: not supported by the fake")
+func (a Adapter) OfferParts(_ context.Context, req protocol.Offer) (protocol.Offered, error) {
+	return a.Cache.OfferParts(req), nil
 }
 
-func (Adapter) TakeRenewalRequest(ctx context.Context) (*dagql.RenewalRequest, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
+func (a Adapter) TakeRenewalRequest(ctx context.Context) (*dagql.RenewalRequest, error) {
+	select {
+	case req := <-a.Cache.renewals:
+		return req, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
-func (Adapter) ReplyRenewal(dagql.RenewalReply) dagql.RenewalReplyDisposition {
-	return dagql.RenewalReplyDiscarded
+func (a Adapter) ReplyRenewal(reply dagql.RenewalReply) dagql.RenewalReplyDisposition {
+	a.Cache.mu.Lock()
+	ch := a.Cache.renewed[reply.ID]
+	delete(a.Cache.renewed, reply.ID)
+	a.Cache.mu.Unlock()
+	if ch == nil {
+		return dagql.RenewalReplyDiscarded
+	}
+	ch <- reply
+	return dagql.RenewalReplyAccepted
 }
 
 type blobSource map[digest.Digest][]byte
