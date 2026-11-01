@@ -276,3 +276,19 @@ func TestBuildMergeRefuses(t *testing.T) {
 		t.Fatalf("err %v", err)
 	}
 }
+
+// A live root whose dependency has expired is not planned: merging it would
+// hand an engine the expired dependency, as DropExpired would drop the root.
+func TestPlanSkipsRootWithExpiredDependency(t *testing.T) {
+	idx := metastore.NewIndex()
+	id := testBundleID("a")
+	numbers := record(t, idx, id, chainBundle(10, "base", "exec", "test"), "cache-a")
+	// base (1) expires; exec (2) and test (3), the root, depend on it.
+	idx.Entries[numbers[1]].ExpiresAtUnix = 50
+	if got := Plan(idx, "cache-b", 49); len(got) != 1 {
+		t.Fatalf("before expiry: %+v", got)
+	}
+	if got := Plan(idx, "cache-b", 50); len(got) != 0 {
+		t.Fatalf("after the dependency expired: %+v", got)
+	}
+}

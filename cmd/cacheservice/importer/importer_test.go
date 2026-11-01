@@ -610,3 +610,61 @@ func TestOfferPendingStaleGeneration(t *testing.T) {
 		t.Fatalf("newer state changed: %+v", st)
 	}
 }
+
+// A pending offer whose stored entry has expired since it was built is
+// dropped, not offered again.
+func TestSyncDropsExpiredPendingOffer(t *testing.T) {
+	f := newFixture(t)
+	now := time.Unix(1000, 0)
+	f.im.cfg.Now = func() time.Time { return now }
+	b := chainBundle(10, "base")
+	b.Values[0].ExpiresAtUnix = 2000
+	f.store(b, "cache-a")
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(true), onOffer: answerAll(protocol.OfferExecutionStarted)}
+	if _, err := f.im.Sync(context.Background(), eng); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := f.im.State("cache-b"); st.Pending != 1 {
+		t.Fatalf("pending %d", st.Pending)
+	}
+	now = time.Unix(2000, 0)
+	if _, err := f.im.Sync(context.Background(), eng); err != nil {
+		t.Fatal(err)
+	}
+	if _, offers := eng.counts(); offers != 1 {
+		t.Fatalf("expired part offered again: %d offers", offers)
+	}
+	if st, _ := f.im.State("cache-b"); st.Pending != 0 {
+		t.Fatalf("pending %d", st.Pending)
+	}
+}
+
+// A pending offer whose service entry has since landed on another engine
+// entry, or was forgotten, is dropped rather than sent to the old number.
+func TestSyncDropsOfferToMovedEntry(t *testing.T) {
+	for name, move := range map[string]func(v map[uint64]*Value){
+		"moved":     func(v map[uint64]*Value) { v[1].Number = 999 },
+		"forgotten": func(v map[uint64]*Value) { delete(v, 1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.store(chainBundle(10, "base"), "cache-a")
+			eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(true), onOffer: answerAll(protocol.OfferExecutionStarted)}
+			if _, err := f.im.Sync(context.Background(), eng); err != nil {
+				t.Fatal(err)
+			}
+			f.im.mu.Lock()
+			move(f.im.caches["cache-b"].values)
+			f.im.mu.Unlock()
+			if _, err := f.im.Sync(context.Background(), eng); err != nil {
+				t.Fatal(err)
+			}
+			if _, offers := eng.counts(); offers != 1 {
+				t.Fatalf("offer sent to a stale engine number: %d offers", offers)
+			}
+			if st, _ := f.im.State("cache-b"); st.Pending != 0 {
+				t.Fatalf("pending %d", st.Pending)
+			}
+		})
+	}
+}

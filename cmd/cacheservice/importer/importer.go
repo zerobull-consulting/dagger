@@ -632,7 +632,15 @@ func (im *Importer) offerPending(ctx context.Context, eng Engine, st *cacheState
 		im.mu.Unlock()
 		return counts, errStateReset
 	}
-	pending := st.pending
+	// Only offers still worth sending: the stored entry hasn't expired, and
+	// the engine entry it landed on is the one the offer names. An entry
+	// that moved, as when a later merge retired it, or was forgotten, as
+	// after a prune or a gone answer, would only answer gone or unavailable.
+	now := im.cfg.Now().Unix()
+	pending := slices.DeleteFunc(st.pending, func(p pendingOffer) bool {
+		v := st.values[p.part.CloudNumber]
+		return v == nil || v.Number != p.number || expired(p.part.CloudExpiresAtUnix, now)
+	})
 	st.pending = nil
 	im.mu.Unlock()
 	if len(pending) == 0 {

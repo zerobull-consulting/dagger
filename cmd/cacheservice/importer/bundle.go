@@ -34,16 +34,17 @@ func (c Candidate) Key() string { return c.Bundle + "/" + c.Source }
 
 // Plan returns the bundles to merge into the engine cache cacheID, from the
 // scope's index at nowUnix: one per bundle and source cache that hold the
-// current record of at least one live root, with those roots. A root is left out when it or
-// its entry has expired, or when it came from cacheID itself, since that
-// cache already has it. Bundles come in order of their lowest root, so older
+// current record of at least one live root, with those roots. A root is left
+// out when it or its entry has expired, or an entry it depends on has, or
+// when it came from cacheID itself, since that cache already has it. Bundles come in order of their lowest root, so older
 // entries are merged first.
 func Plan(idx *metastore.Index, cacheID string, nowUnix int64) []Candidate {
 	type key struct{ bundle, source string }
 	byBundle := map[key][]uint64{}
+	dead := deadEntries(idx, nowUnix)
 	for n, root := range idx.Roots {
 		e := idx.Entries[n]
-		if e == nil || expired(root.ExpiresAtUnix, nowUnix) || expired(e.ExpiresAtUnix, nowUnix) {
+		if e == nil || expired(root.ExpiresAtUnix, nowUnix) || dead(n) {
 			continue
 		}
 		if e.Source.CacheID == cacheID {
@@ -61,6 +62,42 @@ func Plan(idx *metastore.Index, cacheID string, nowUnix int64) []Candidate {
 		return cmp.Or(cmp.Compare(a.Roots[0], b.Roots[0]), cmp.Compare(a.Bundle, b.Bundle), cmp.Compare(a.Source, b.Source))
 	})
 	return out
+}
+
+// deadEntries returns whether an entry is dead at nowUnix: missing, expired,
+// or depending, transitively, on an entry that is, as metastore's
+// DropExpired judges them. A root over a dead entry is not merged, even
+// before DropExpired has run, so an engine never gets an expired dependency.
+func deadEntries(idx *metastore.Index, nowUnix int64) func(uint64) bool {
+	memo := map[uint64]bool{}
+	visiting := map[uint64]bool{}
+	var dead func(uint64) bool
+	dead = func(n uint64) bool {
+		if d, ok := memo[n]; ok {
+			return d
+		}
+		e := idx.Entries[n]
+		if e == nil || expired(e.ExpiresAtUnix, nowUnix) {
+			memo[n] = true
+			return true
+		}
+		if visiting[n] {
+			// A cycle: decided by the rest of it.
+			return false
+		}
+		visiting[n] = true
+		d := false
+		for _, dep := range e.Deps {
+			if dead(dep) {
+				d = true
+				break
+			}
+		}
+		delete(visiting, n)
+		memo[n] = d
+		return d
+	}
+	return dead
 }
 
 func expired(expiresAtUnix, nowUnix int64) bool {

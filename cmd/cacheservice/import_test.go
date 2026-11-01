@@ -20,6 +20,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -286,4 +287,35 @@ func TestImportOff(t *testing.T) {
 	}
 	svc.triggerImports("")
 	svc.waitImports()
+}
+
+// Roots that have expired in the index are never merged: an engine with an
+// empty cache connects, syncs, and gets nothing.
+func TestImportSkipsExpiredRoots(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	h.buildRecipes()
+	h.exportBuild()
+	past := time.Now().Add(-time.Minute).Unix()
+	if _, err := h.meta.UpdateIndex(context.Background(), testScope, func(idx *metastore.Index) error {
+		for n := range idx.Roots {
+			idx.Roots[n] = metastore.Root{ExpiresAtUnix: past}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := fakeengine.New("cache-b", 1)
+	eng := h.connectEngine(b)
+	code, res := h.debugImport(eng)
+	if code != http.StatusOK || len(res.Merged) != 0 || len(res.Failed) != 0 {
+		t.Fatalf("import: %d %+v", code, res)
+	}
+	if b.Merges() != 0 {
+		t.Fatalf("engine B merged %d times", b.Merges())
+	}
+	for _, recipe := range []string{"from(alpine)", "withExec(make)"} {
+		if _, ok := b.Lookup(recipe); ok {
+			t.Fatalf("%s was imported", recipe)
+		}
+	}
 }

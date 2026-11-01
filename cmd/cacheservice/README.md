@@ -248,8 +248,10 @@ again whenever another engine's export is stored, and every `-import-poll`
 
 1. **Plan.** The index's live roots, grouped by the bundle that holds each
    one's current record and the engine cache that exported it (identical
-   exports from two caches share a bundle, but not sender numbers). Roots that have expired, or whose entry has, are
-   left out, and so are an engine's own exports: its cache has them. A bundle
+   exports from two caches share a bundle, but not sender numbers). Roots
+   that have expired, or whose entry or any entry it depends on has, are
+   left out, as `DropExpired` would drop them, and so are an engine's own
+   exports: its cache has them. A bundle
    already merged into this cache, at this generation, with every root it
    needs now, is not merged again.
 2. **Merge.** Each bundle is rewritten for the engine: each value's
@@ -269,9 +271,11 @@ again whenever another engine's export is stored, and every `-import-poll`
    /debug/engines/{conn}/imports`).
 3. **Offer.** A stored part a merged entry has neither complete nor offered
    is offered to that entry, by the engine's number, with fresh GETs and the
-   owner's dependencies mapped to the engine's numbers. `accepted` and
-   `alreadyComplete` are recorded. `executionStarted` and `unavailable` are
-   tried again at the next sync, up to 3 times. `invalid` is not tried again.
+   owner's dependencies and the value's services mapped to the engine's
+   numbers. `accepted` and `alreadyComplete` are recorded. `executionStarted`
+   and `unavailable` are tried again at the next sync, up to 3 times, unless
+   the stored entry has expired by then, or its engine entry has moved or
+   been forgotten. `invalid` is not tried again.
    An entry the engine answers `gone` for is forgotten. An offer over the
    message limit is split in two until each fits.
 
