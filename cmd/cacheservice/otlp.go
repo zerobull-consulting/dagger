@@ -40,6 +40,7 @@ func (s *service) otlpRoutes(mux *http.ServeMux) {
 			return
 		}
 		s.logSpans(&req)
+		s.trackSpans(&req)
 		writeOTLP(w, r, &coltracepb.ExportTraceServiceResponse{})
 	})
 	mux.HandleFunc("POST /v1/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -76,6 +77,7 @@ func (s *service) logRecords(req *collogspb.ExportLogsServiceRequest) {
 				if s.dumpDir != "" {
 					s.dump(fmt.Sprintf("%06d-event-%s.json", s.dumpSeq.Add(1), kind), []byte(body))
 				}
+				s.trackEvent(kind, cache, body)
 			}
 		}
 	}

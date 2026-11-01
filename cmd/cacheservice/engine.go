@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -35,6 +36,9 @@ type service struct {
 
 	mu    sync.Mutex
 	conns map[uint64]*engineConn
+
+	// export is the export path, nil when it is off.
+	export *exportPath
 }
 
 func newService(logger *slog.Logger, dumpDir string) *service {
@@ -110,6 +114,9 @@ func (s *service) serveEngine(w http.ResponseWriter, r *http.Request) {
 	delete(s.conns, c.id)
 	s.mu.Unlock()
 	c.failPending()
+	if s.export != nil {
+		s.export.exporter.Forget(c)
+	}
 	_ = conn.CloseNow()
 	c.logger.Info("engine disconnected",
 		"after", time.Since(c.connectedAt).Round(time.Millisecond),
@@ -178,6 +185,7 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 		c.mu.Unlock()
 		if waiter == nil {
 			c.logger.Warn("reply to no pending request", "re", env.Re, "type", env.Type)
+			c.releaseLateExport(ctx, env)
 			return
 		}
 		waiter <- env
@@ -190,6 +198,36 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 	default:
 		go func() { _ = c.replyError(ctx, env, fmt.Sprintf("unexpected request %q", env.Type)) }()
 	}
+}
+
+// lateReleaseTimeout bounds the release of an export whose requester gave up.
+const lateReleaseTimeout = time.Minute
+
+// releaseLateExport releases the chains of an export whose reply came after
+// its requester gave up, as when the wait timed out. Otherwise the engine
+// would hold them, and that export's slot, until the connection ends; with
+// all its slots held, it would queue every later export.
+func (c *engineConn) releaseLateExport(ctx context.Context, env protocol.Envelope) {
+	if env.Type != protocol.TypeExported {
+		return
+	}
+	var exported protocol.Exported
+	if err := env.Decode(&exported); err != nil || exported.ExportID == "" {
+		return
+	}
+	body, err := json.Marshal(protocol.Upload{ExportID: exported.ExportID, URLs: map[digest.Digest]string{}})
+	if err != nil {
+		return
+	}
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, lateReleaseTimeout)
+		defer cancel()
+		if _, err := c.request(rctx, protocol.TypeUpload, body); err != nil {
+			c.logger.Warn("release of a late export failed", "exportID", exported.ExportID, "error", err)
+			return
+		}
+		c.logger.Info("released a late export", "exportID", exported.ExportID)
+	}()
 }
 
 // request sends a service request to the engine and waits for its reply.
@@ -333,6 +371,8 @@ func (s *service) debugHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/engines", s.listEngines)
 	mux.HandleFunc("POST /debug/engines/{conn}/request", s.sendRequest)
+	mux.HandleFunc("POST /debug/engines/{conn}/export", s.serveExport)
+	mux.HandleFunc("GET /debug/engines/{conn}/entries", s.serveEntries)
 	return mux
 }
 
