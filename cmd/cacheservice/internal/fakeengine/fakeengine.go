@@ -87,6 +87,13 @@ func (c *Cache) Peak() int {
 	return c.peak
 }
 
+// InFlight returns how many exports have their chains held now.
+func (c *Cache) InFlight() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inFlight
+}
+
 // Hold makes exports wait, holding their chains, until the returned function
 // is called.
 func (c *Cache) Hold() (release func()) {

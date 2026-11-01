@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -184,6 +185,7 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 		c.mu.Unlock()
 		if waiter == nil {
 			c.logger.Warn("reply to no pending request", "re", env.Re, "type", env.Type)
+			c.releaseLateExport(ctx, env)
 			return
 		}
 		waiter <- env
@@ -196,6 +198,36 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 	default:
 		go func() { _ = c.replyError(ctx, env, fmt.Sprintf("unexpected request %q", env.Type)) }()
 	}
+}
+
+// lateReleaseTimeout bounds the release of an export whose requester gave up.
+const lateReleaseTimeout = time.Minute
+
+// releaseLateExport releases the chains of an export whose reply came after
+// its requester gave up, as when the wait timed out. Otherwise the engine
+// would hold them, and that export's slot, until the connection ends; with
+// all its slots held, it would queue every later export.
+func (c *engineConn) releaseLateExport(ctx context.Context, env protocol.Envelope) {
+	if env.Type != protocol.TypeExported {
+		return
+	}
+	var exported protocol.Exported
+	if err := env.Decode(&exported); err != nil || exported.ExportID == "" {
+		return
+	}
+	body, err := json.Marshal(protocol.Upload{ExportID: exported.ExportID, URLs: map[digest.Digest]string{}})
+	if err != nil {
+		return
+	}
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, lateReleaseTimeout)
+		defer cancel()
+		if _, err := c.request(rctx, protocol.TypeUpload, body); err != nil {
+			c.logger.Warn("release of a late export failed", "exportID", exported.ExportID, "error", err)
+			return
+		}
+		c.logger.Info("released a late export", "exportID", exported.ExportID)
+	}()
 }
 
 // request sends a service request to the engine and waits for its reply.

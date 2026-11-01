@@ -465,3 +465,26 @@ func TestExportHookRequeuesBatchesNotRun(t *testing.T) {
 		t.Fatal("requeued batch not due")
 	}
 }
+
+// An export whose reply comes after the service gave up waiting is released,
+// so the engine doesn't hold its chains and slot until it disconnects.
+func TestExportLateReplyReleased(t *testing.T) {
+	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Exporter.ExportTimeout = 100 * time.Millisecond })
+	h.build()
+	release := h.cache.Hold()
+	code, _ := h.debugExport(`{"roots":[11],"outputs":[{"number":11,"address":{"part":"fs"}}]}`)
+	if code != http.StatusBadGateway {
+		t.Fatalf("status %d, want the export to time out", code)
+	}
+	if h.cache.InFlight() != 1 {
+		t.Fatalf("%d exports held", h.cache.InFlight())
+	}
+	release() // the engine answers, late
+	deadline := time.Now().Add(10 * time.Second)
+	for h.cache.InFlight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("late export never released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
