@@ -541,27 +541,51 @@ func (im *Importer) applyMerged(eng Engine, st *cacheState, c Candidate, mb Merg
 		if !ok || target == nil || target.has(o.Address) {
 			continue
 		}
+		// The offer names rows by the engine's numbers, where the bundle
+		// named them by ordinal: its owner's dependencies and its value's
+		// services. One that landed on no entry leaves the part unoffered.
+		engineNumber := func(ordinal uint64) (uint64, bool) {
+			mv := byOrdinal[dagql.TransferOrdinal(ordinal)]
+			if mv == nil {
+				return 0, false
+			}
+			return mv.Number, true
+		}
 		var owner dagql.PersistedOfferOwner
+		missing := false
 		if o.Owner != nil {
-			missing := false
 			for _, d := range o.Owner.DependencyIDs {
-				mv := byOrdinal[dagql.TransferOrdinal(d)]
-				if mv == nil {
+				n, ok := engineNumber(d)
+				if !ok {
 					missing = true
 					break
 				}
-				owner.DependencyIDs = append(owner.DependencyIDs, mv.Number)
+				owner.DependencyIDs = append(owner.DependencyIDs, n)
 			}
+		}
+		value := *o.Value
+		value.Services = slices.Clone(o.Value.Services)
+		for i := range value.Services {
 			if missing {
-				continue
+				break
 			}
+			n, ok := engineNumber(value.Services[i].ServiceResultID)
+			if !ok {
+				missing = true
+				break
+			}
+			value.Services[i].ServiceResultID = n
+			value.Services[i].Aliases = slices.Clone(value.Services[i].Aliases)
+		}
+		if missing {
+			continue
 		}
 		offers = append(offers, pendingOffer{
 			number: target.Number,
 			part: protocol.CloudPart{
 				Offer: dagql.PersistedPartOffer{
 					Address: o.Address,
-					Value:   *o.Value,
+					Value:   value,
 					Chain:   *o.Chain,
 					Owner:   owner,
 				},

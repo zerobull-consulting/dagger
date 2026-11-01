@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -544,5 +545,39 @@ func TestSyncStaleGeneration(t *testing.T) {
 	st, ok := f.im.State("cache-b")
 	if !ok || st.Generation != 2 || len(st.Merged) != 1 || len(st.Values) != 1 {
 		t.Fatalf("state %+v", st)
+	}
+}
+
+// An explicit offer names its owner's dependencies and its value's services
+// by the engine's numbers, not the bundle's ordinals.
+func TestSyncOfferMapsServices(t *testing.T) {
+	f := newFixture(t)
+	b := chainBundle(10, "svc", "exec")
+	out := &b.Outputs[1]
+	out.Owner = &dagql.PersistedOfferOwner{DependencyIDs: []uint64{1}}
+	out.Value.Services = []dagql.TransferredServiceBinding{{ServiceResultID: 1, Hostname: "db"}}
+	f.store(b, "cache-a")
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(true), onOffer: answerAll(protocol.OfferAccepted)}
+	if _, err := f.im.Sync(context.Background(), eng); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, item := range eng.offers[0].Items {
+		if item.Number != 102 {
+			continue
+		}
+		found = true
+		p := item.Offers[0].Offer
+		// landAll puts ordinal 1 on engine number 101.
+		if !slices.Equal(p.Owner.DependencyIDs, []uint64{101}) || p.Value.Services[0].ServiceResultID != 101 {
+			t.Fatalf("offer %+v", p)
+		}
+	}
+	if !found {
+		t.Fatalf("no offer to exec: %+v", eng.offers[0].Items)
+	}
+	// The stored bundle keeps its ordinals.
+	if b.Outputs[1].Value.Services[0].ServiceResultID != 1 {
+		t.Fatal("stored bundle changed")
 	}
 }
