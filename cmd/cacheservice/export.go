@@ -105,9 +105,15 @@ func (s *service) runBatch(ctx context.Context, b exporter.Batch) {
 		return
 	}
 	res, err := p.exporter.Export(ctx, eng, b.Request)
+	s.recordExport(ctx, eng, b, res, err)
+}
+
+// recordExport records an export's result in the tracker. An export cut
+// short because its engine went away, or ctx ended, is not a failure of its
+// roots: they wait for the engine and are tried again.
+func (s *service) recordExport(ctx context.Context, eng *engineConn, b exporter.Batch, res exporter.Result, err error) {
+	p := s.export
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
-		// The engine went away, or the service is stopping: not a failure
-		// of these roots.
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
 		p.tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
 		return
@@ -302,7 +308,7 @@ func (s *service) serveExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		res, err := p.exporter.Export(ctx, c, req)
-		p.tracker.Done(b, res, p.now())
+		s.recordExport(ctx, c, b, res, err)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -314,7 +320,7 @@ func (s *service) serveExport(w http.ResponseWriter, r *http.Request) {
 	batches := p.tracker.All(c.CacheID(), p.now())
 	for i, b := range batches {
 		res, err := p.exporter.Export(ctx, c, b.Request)
-		p.tracker.Done(b, res, p.now())
+		s.recordExport(ctx, c, b, res, err)
 		if err != nil {
 			// Hand the batches not run back to the scheduler.
 			for _, rest := range batches[i+1:] {

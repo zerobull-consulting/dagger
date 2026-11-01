@@ -488,3 +488,36 @@ func TestExportLateReplyReleased(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// An explicit export cut short (here, by its HTTP request ending) is not a
+// failure of its roots: they wait to be tried again.
+func TestExportHookInterruptedNotFailed(t *testing.T) {
+	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Tick = time.Hour })
+	h.build()
+	h.postSpans("session-1", cacheSpan(11, "10"))
+	release := h.cache.Hold()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	url := h.debug.URL + "/debug/engines/" + strconv.FormatUint(h.engine.id, 10) + "/export"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(`{"roots":[11]}`))
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("the request wasn't cut short")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e := h.svc.export.tracker.Entries(h.cache.ID)
+		if len(e) == 1 && e[0].RetryAt != "" {
+			if e[0].Failures != 0 {
+				t.Fatalf("interrupted export counted as a failure: %+v", e[0])
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("interrupted export not recorded: %+v", e)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
