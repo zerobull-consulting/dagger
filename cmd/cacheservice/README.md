@@ -208,6 +208,13 @@ limit, the roots are split in two and each half is exported alone (an
 chains). One root that is too large on its own fails. A batch holds at most
 1,000 roots.
 
+Presigned PUTs last `CACHESERVICE_S3_PUT_EXPIRY` (15m). In an export with so
+many blobs that the engine, uploading 8 at a time, starts some after that,
+those uploads fail and the export is tried again with fresh URLs for the
+blobs still missing. For exports that large, raise the expiry. An export cut
+short because its engine disconnected, or the service stopped, isn't counted
+as a failure: its roots wait for the engine and are tried again.
+
 **Known gaps.** Nothing is authenticated yet
 ([#10](https://github.com/zerobull-consulting/dagger/issues/10)): the
 WebSocket takes any token, and the OTLP receivers take any request. Anyone who

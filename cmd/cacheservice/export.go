@@ -105,10 +105,24 @@ func (s *service) runBatch(ctx context.Context, b exporter.Batch) {
 		return
 	}
 	res, err := p.exporter.Export(ctx, eng, b.Request)
+	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
+		// The engine went away, or the service is stopping: not a failure
+		// of these roots.
+		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
+		p.tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
+		return
+	}
 	if err != nil {
 		eng.logger.Warn("export failed", "roots", len(b.Request.Roots), "error", err)
 	}
 	p.tracker.Done(b, res, p.now())
+}
+
+// connected reports whether c is still a welcomed connection.
+func (s *service) connected(c *engineConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns[c.id] == c
 }
 
 // engineFor returns the latest welcomed connection of an engine cache.

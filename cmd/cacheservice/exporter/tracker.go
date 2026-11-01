@@ -441,33 +441,55 @@ func (t *Tracker) wantedLocked(e *trackedEntry, now time.Time) bool {
 // settle, as when the batch failed as a whole (the engine disconnected),
 // count as failed, and are tried again later.
 func (t *Tracker) Done(b Batch, res Result, now time.Time) {
+	t.done(b, res, now, time.Time{})
+}
+
+// Interrupted records what an export of a batch did before something other
+// than the export failed it, such as its engine disconnecting or the
+// service stopping. Unlike Done, the roots the result doesn't settle don't
+// count as failed: they are due again at retryAt.
+func (t *Tracker) Interrupted(b Batch, res Result, now, retryAt time.Time) {
+	t.done(b, res, now, retryAt)
+}
+
+func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	c := t.caches[b.CacheID]
 	if c == nil {
 		return
 	}
+	// Results apply only to the batch's own roots: a result can name a root
+	// the tracker didn't claim, whose state the batch says nothing about.
+	entry := func(n uint64) *trackedEntry {
+		if _, ok := b.values[n]; !ok {
+			return nil
+		}
+		return c.entries[n]
+	}
 	settled := map[uint64]bool{}
 	for _, n := range res.Stored {
-		if e := c.entries[n]; e != nil {
+		if e := entry(n); e != nil {
 			e.stored = b.values[n]
 			e.busy, e.failures, e.failedValue = 0, 0, nil
 		}
 		settled[n] = true
 	}
 	for _, n := range res.Gone {
-		delete(c.entries, n)
+		if entry(n) != nil {
+			delete(c.entries, n)
+		}
 		settled[n] = true
 	}
 	for _, s := range res.Refused {
-		if e := c.entries[s.Number]; e != nil {
+		if e := entry(s.Number); e != nil {
 			e.refused = b.values[s.Number]
 			e.refusedMessage = s.Message
 		}
 		settled[s.Number] = true
 	}
 	for _, s := range res.Busy {
-		if e := c.entries[s.Number]; e != nil {
+		if e := entry(s.Number); e != nil {
 			e.retryAt = now.Add(t.backoff(e.busy))
 			e.busy++
 		}
@@ -493,7 +515,13 @@ func (t *Tracker) Done(b Batch, res Result, now time.Time) {
 	}
 	for n := range b.values {
 		if !settled[n] {
-			failed(n)
+			if !interruptedRetry.IsZero() {
+				if e := c.entries[n]; e != nil {
+					e.retryAt = interruptedRetry
+				}
+			} else {
+				failed(n)
+			}
 		}
 		e := c.entries[n]
 		if e == nil {

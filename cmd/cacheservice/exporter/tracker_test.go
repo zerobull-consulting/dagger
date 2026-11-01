@@ -419,3 +419,22 @@ func TestTrackerClaim(t *testing.T) {
 		t.Fatalf("unknown cache: %+v, %v", b, err)
 	}
 }
+
+// An interrupted export settles what it did, and puts the rest back without
+// counting a failure.
+func TestTrackerInterrupted(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Observe(state(2, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	for range 10 {
+		tr.Interrupted(b[0], Result{Stored: []uint64{1}}, t0, t0.Add(time.Second))
+		b = tr.Due(t0.Add(time.Second))
+		if got := roots(b); !slices.Equal(got, []uint64{2}) {
+			t.Fatalf("interrupted root: %v", got)
+		}
+	}
+	if e := tr.Entries("c"); !e[0].Stored || e[1].Failures != 0 {
+		t.Fatalf("entries %+v", e)
+	}
+}
