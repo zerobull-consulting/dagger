@@ -24,7 +24,10 @@ type importPath struct {
 
 	mu       sync.Mutex
 	triggers map[*engineConn]chan struct{}
-	wg       sync.WaitGroup
+	// closed is set when the service waits for the loops: no loop starts
+	// after it, so no wg.Add races wg.Wait.
+	closed bool
+	wg     sync.WaitGroup
 }
 
 // importConfig configures the import path.
@@ -59,11 +62,15 @@ func (s *service) startImports(connCtx context.Context, c *engineConn) {
 	trigger := make(chan struct{}, 1)
 	trigger <- struct{}{}
 	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return
+	}
 	p.triggers[c] = trigger
+	p.wg.Add(1)
 	p.mu.Unlock()
 	ctx, cancel := context.WithCancel(connCtx)
 	stop := context.AfterFunc(p.ctx, cancel)
-	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		defer cancel()
@@ -136,8 +143,11 @@ func (s *service) renew(ctx context.Context, req protocol.Renew) protocol.Renewe
 // waitImports waits for the sync loops, after the context that runs them has
 // ended.
 func (s *service) waitImports() {
-	if s.imports != nil {
-		s.imports.wg.Wait()
+	if p := s.imports; p != nil {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+		p.wg.Wait()
 	}
 }
 
