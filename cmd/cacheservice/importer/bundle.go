@@ -15,21 +15,32 @@ import (
 	"github.com/dagger/dagger/dagql"
 )
 
-// Candidate is a stored bundle to merge into an engine cache, and the service
-// numbers of the roots to merge it with.
+// Candidate is a stored bundle to merge into an engine cache, the engine
+// cache that exported the roots, and the service numbers of the roots to
+// merge it with.
+//
+// Bundle IDs are content hashes, so two engine caches that export identical
+// bundles share one: the roots of each are a candidate of their own, since
+// the bundle's sender numbers are each cache's own.
 type Candidate struct {
 	Bundle string   `json:"bundle"`
+	Source string   `json:"source"`
 	Roots  []uint64 `json:"roots"`
 }
 
+// Key names the candidate's bundle and source, for what the importer keeps
+// per merge.
+func (c Candidate) Key() string { return c.Bundle + "/" + c.Source }
+
 // Plan returns the bundles to merge into the engine cache cacheID, from the
-// scope's index at nowUnix: one per bundle that holds the current record of
-// at least one live root, with those roots. A root is left out when it or
+// scope's index at nowUnix: one per bundle and source cache that hold the
+// current record of at least one live root, with those roots. A root is left out when it or
 // its entry has expired, or when it came from cacheID itself, since that
 // cache already has it. Bundles come in order of their lowest root, so older
 // entries are merged first.
 func Plan(idx *metastore.Index, cacheID string, nowUnix int64) []Candidate {
-	byBundle := map[string][]uint64{}
+	type key struct{ bundle, source string }
+	byBundle := map[key][]uint64{}
 	for n, root := range idx.Roots {
 		e := idx.Entries[n]
 		if e == nil || expired(root.ExpiresAtUnix, nowUnix) || expired(e.ExpiresAtUnix, nowUnix) {
@@ -38,15 +49,16 @@ func Plan(idx *metastore.Index, cacheID string, nowUnix int64) []Candidate {
 		if e.Source.CacheID == cacheID {
 			continue
 		}
-		byBundle[e.Bundle] = append(byBundle[e.Bundle], n)
+		k := key{e.Bundle, e.Source.CacheID}
+		byBundle[k] = append(byBundle[k], n)
 	}
 	out := make([]Candidate, 0, len(byBundle))
-	for id, roots := range byBundle {
+	for k, roots := range byBundle {
 		slices.Sort(roots)
-		out = append(out, Candidate{Bundle: id, Roots: roots})
+		out = append(out, Candidate{Bundle: k.bundle, Source: k.source, Roots: roots})
 	}
 	slices.SortFunc(out, func(a, b Candidate) int {
-		return cmp.Or(cmp.Compare(a.Roots[0], b.Roots[0]), cmp.Compare(a.Bundle, b.Bundle))
+		return cmp.Or(cmp.Compare(a.Roots[0], b.Roots[0]), cmp.Compare(a.Bundle, b.Bundle), cmp.Compare(a.Source, b.Source))
 	})
 	return out
 }
@@ -80,23 +92,33 @@ type MergeBundle struct {
 	// Numbers are the values' service numbers, by ordinal. A value no
 	// merged root needs, whose entry the index no longer has, is absent.
 	Numbers map[dagql.TransferOrdinal]uint64
+	// Merged are the ordinals of the merged roots. The bundle's other roots
+	// are sent expired.
+	Merged map[dagql.TransferOrdinal]bool
 }
+
+// expiredRoot is the expiry a root not being merged is sent with: long past,
+// so the engine validates the bundle with it and merges only what the
+// merged roots need.
+const expiredRoot = 1
 
 // BuildMerge rewrites stored bundle bundleID for a merge of the given roots,
 // by service number, as the index idx describes them:
 //
 //   - each value's SenderNumber becomes its service number, which the engine
 //     keeps as its Cloud holding's number;
-//   - the roots are the given ones, each with the index's expiry for it;
+//   - the given roots are merged, each with the index's expiry for it;
 //   - each output's chain gets a download address per layer from sign, and
 //     renewalKey, which the engine names when it asks for fresh addresses.
 //
 // Records name each other by ordinal, so values are neither dropped nor
-// renumbered. A value that only roots left out need, and whose entry the
-// index has since dropped, has no service number: it gets a placeholder at
-// or above the index's next number, which no stored entry has, and the
-// engine merges only what the given roots need. A value a given root needs
-// must still be stored.
+// renumbered. The engine refuses a bundle with a value outside its roots'
+// closure, so the stored bundle's other roots are sent too, expired
+// (expiredRoot): the engine validates the bundle with them, then skips them
+// with whatever only they need. A value that only those need, and whose
+// entry the index has since dropped, has no service number: it gets a
+// placeholder at or above the index's next number, which no stored entry
+// has, and is never merged. A value a given root needs must still be stored.
 //
 // The stored bundle is not changed.
 func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stored *dagql.ValueBundle, roots []uint64, sign Signer, renewalKey string) (MergeBundle, error) {
@@ -154,9 +176,26 @@ func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stor
 		}
 	}
 
+	merged := make(map[dagql.TransferOrdinal]bool, len(rootOrdinals))
+	for _, r := range rootOrdinals {
+		merged[r.Ordinal] = true
+	}
+	allRoots := slices.Clone(rootOrdinals)
+	for _, r := range stored.Roots {
+		if !merged[r.Ordinal] {
+			allRoots = append(allRoots, dagql.TransferredRoot{Ordinal: r.Ordinal, ExpiresAtUnix: expiredRoot})
+			merged[r.Ordinal] = false
+		}
+	}
+	for o, m := range merged {
+		if !m {
+			delete(merged, o)
+		}
+	}
+	slices.SortFunc(allRoots, func(a, b dagql.TransferredRoot) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
 	out := dagql.ValueBundle{
 		Version: stored.Version,
-		Roots:   rootOrdinals,
+		Roots:   allRoots,
 		Values:  make([]dagql.TransferredValue, len(stored.Values)),
 	}
 	placeholder := idx.NextNumber
@@ -195,7 +234,7 @@ func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stor
 		}
 		out.Outputs = append(out.Outputs, o)
 	}
-	return MergeBundle{Bundle: out, Numbers: numbers}, nil
+	return MergeBundle{Bundle: out, Numbers: numbers, Merged: merged}, nil
 }
 
 // closure returns the ordinals the roots keep alive, as dagql's merge walks

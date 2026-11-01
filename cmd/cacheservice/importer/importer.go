@@ -148,9 +148,9 @@ type cacheState struct {
 
 	// The fields below are guarded by Importer.mu.
 	generation uint64
-	// merged are the bundles merged, by ID.
+	// merged are the bundles merged, by Candidate.Key.
 	merged map[string]*MergedBundle
-	// failures counts failed merges, by bundle ID.
+	// failures counts failed merges, by Candidate.Key.
 	failures map[string]int
 	// values are what the engine kept, by service number.
 	values map[uint64]*Value
@@ -163,6 +163,8 @@ type cacheState struct {
 // MergedBundle is one merge the engine committed.
 type MergedBundle struct {
 	Bundle string `json:"bundle"`
+	// Source is the engine cache that exported the merged roots.
+	Source string `json:"source"`
 	// Roots are the merged roots, by service number.
 	Roots []uint64 `json:"roots"`
 	// Retained are the roots the engine retains, by service number, with
@@ -328,10 +330,10 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		im.mu.Lock()
 		if im.stateLocked(cacheID, generation) != st {
 			im.mu.Unlock()
-			return res, errors.New("engine cache state reset during sync")
+			return res, errStateReset
 		}
-		done := st.merged[c.Bundle]
-		failures := st.failures[c.Bundle]
+		done := st.merged[c.Key()]
+		failures := st.failures[c.Key()]
 		im.mu.Unlock()
 		if done != nil && subset(c.Roots, done.Roots) {
 			continue
@@ -339,19 +341,19 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		if failures >= im.cfg.MergeAttempts {
 			continue
 		}
-		merged, offers, err := im.merge(ctx, eng, idx, c)
+		merged, offers, err := im.merge(ctx, eng, st, idx, c)
 		if err != nil {
 			if ctx.Err() != nil {
 				return res, context.Cause(ctx)
 			}
 			var connErr *connectionError
-			if errors.As(err, &connErr) {
+			if errors.As(err, &connErr) || errors.Is(err, errStateReset) {
 				return res, err
 			}
 			im.log.Warn("import: merge failed", "cacheID", cacheID, "bundle", c.Bundle, "roots", len(c.Roots), "error", err)
 			res.Failed = append(res.Failed, FailedBundle{Bundle: c.Bundle, Error: err.Error()})
 			im.mu.Lock()
-			st.failures[c.Bundle]++
+			st.failures[c.Key()]++
 			im.mu.Unlock()
 			continue
 		}
@@ -377,6 +379,16 @@ func subset(a, b []uint64) bool {
 		}
 	}
 	return true
+}
+
+// errStateReset is a sync whose engine cache state was reset or replaced
+// while it ran, as when the cache was wiped or a newer generation connected:
+// what it learned is discarded.
+var errStateReset = errors.New("engine cache state reset during sync")
+
+// current reports whether st is still the state of eng's cache. Requires mu.
+func (im *Importer) currentLocked(eng Engine, st *cacheState) bool {
+	return im.caches[eng.CacheID()] == st && st.generation == eng.Generation()
 }
 
 // connectionError is a request that failed for the connection, not the
@@ -410,7 +422,7 @@ func (im *Importer) bundle(ctx context.Context, id string) (*dagql.ValueBundle, 
 
 // merge merges one bundle, records what the engine kept, and returns the
 // offers of the stored parts its entries lack.
-func (im *Importer) merge(ctx context.Context, eng Engine, idx *metastore.Index, c Candidate) (MergedBundle, []pendingOffer, error) {
+func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *metastore.Index, c Candidate) (MergedBundle, []pendingOffer, error) {
 	stored, err := im.bundle(ctx, c.Bundle)
 	if err != nil {
 		return MergedBundle{}, nil, fmt.Errorf("read bundle: %w", err)
@@ -442,12 +454,14 @@ func (im *Importer) merge(ctx context.Context, eng Engine, idx *metastore.Index,
 	if err := env.Decode(&reply); err != nil {
 		return MergedBundle{}, nil, err
 	}
-	return im.applyMerged(eng, c, mb, reply)
+	return im.applyMerged(eng, st, c, mb, reply)
 }
 
-// applyMerged records a merged reply, and returns the offers of the parts the
-// merged entries lack.
-func (im *Importer) applyMerged(eng Engine, c Candidate, mb MergeBundle, reply protocol.Merged) (MergedBundle, []pendingOffer, error) {
+// applyMerged records a merged reply in st, and returns the offers of the
+// parts the merged entries lack. A reply that arrives after st was reset or
+// replaced is discarded with errStateReset, so it can't repopulate the state
+// of a wiped cache or of another generation.
+func (im *Importer) applyMerged(eng Engine, st *cacheState, c Candidate, mb MergeBundle, reply protocol.Merged) (MergedBundle, []pendingOffer, error) {
 	byOrdinal := make(map[dagql.TransferOrdinal]*protocol.MergedValue, len(reply.Values))
 	for i := range reply.Values {
 		v := &reply.Values[i]
@@ -459,12 +473,14 @@ func (im *Importer) applyMerged(eng Engine, c Candidate, mb MergeBundle, reply p
 		}
 		byOrdinal[v.Ordinal] = v
 	}
+	// Only the merged roots: the bundle's other roots are sent expired.
 	rootNumber := map[dagql.TransferOrdinal]uint64{}
-	for _, r := range mb.Bundle.Roots {
-		rootNumber[r.Ordinal] = mb.Numbers[r.Ordinal]
+	for o := range mb.Merged {
+		rootNumber[o] = mb.Numbers[o]
 	}
 	out := MergedBundle{
 		Bundle:     c.Bundle,
+		Source:     c.Source,
 		Roots:      slices.Clone(c.Roots),
 		Retained:   map[uint64]int64{},
 		Values:     len(reply.Values),
@@ -546,9 +562,12 @@ func (im *Importer) applyMerged(eng Engine, c Candidate, mb MergeBundle, reply p
 	}
 
 	im.mu.Lock()
-	st := im.stateLocked(eng.CacheID(), eng.Generation())
-	st.merged[c.Bundle] = &out
-	delete(st.failures, c.Bundle)
+	if !im.currentLocked(eng, st) {
+		im.mu.Unlock()
+		return MergedBundle{}, nil, errStateReset
+	}
+	st.merged[c.Key()] = &out
+	delete(st.failures, c.Key())
 	for n, v := range values {
 		st.values[n] = v
 	}
@@ -573,7 +592,7 @@ func (im *Importer) offerPending(ctx context.Context, eng Engine, st *cacheState
 	}
 	requeue := func(ps []pendingOffer) {
 		im.mu.Lock()
-		if im.caches[eng.CacheID()] == st && st.generation == eng.Generation() {
+		if im.currentLocked(eng, st) {
 			st.pending = append(st.pending, ps...)
 		}
 		im.mu.Unlock()
@@ -594,6 +613,15 @@ func (im *Importer) offerPending(ctx context.Context, eng Engine, st *cacheState
 		chain.Addresses = addrs
 	}
 
+	return im.sendOffers(ctx, eng, st, pending, requeue)
+}
+
+// sendOffers sends pending offers in one offer request, one item per engine
+// entry, and records their outcomes. A request over the message limit is
+// split in two, by items, or by parts when it has one item; a single part
+// too large to send is dropped.
+func (im *Importer) sendOffers(ctx context.Context, eng Engine, st *cacheState, pending []pendingOffer, requeue func([]pendingOffer)) (OfferCounts, error) {
+	var counts OfferCounts
 	var order []uint64
 	items := map[uint64][]int{}
 	for i, p := range pending {
@@ -612,7 +640,38 @@ func (im *Importer) offerPending(ctx context.Context, eng Engine, st *cacheState
 	}
 	body, err := im.encode(req)
 	if err != nil {
-		im.log.Warn("import: offer too large; dropped", "items", len(req.Items), "error", err)
+		if len(pending) == 1 {
+			im.log.Warn("import: offer of one part too large; dropped", "number", pending[0].number, "error", err)
+			return counts, nil
+		}
+		// Split by items, keeping each item whole, or, with one item,
+		// by parts.
+		var first, rest []pendingOffer
+		if len(order) > 1 {
+			half := map[uint64]bool{}
+			for _, n := range order[:len(order)/2] {
+				half[n] = true
+			}
+			for _, p := range pending {
+				if half[p.number] {
+					first = append(first, p)
+				} else {
+					rest = append(rest, p)
+				}
+			}
+		} else {
+			first, rest = pending[:len(pending)/2], pending[len(pending)/2:]
+		}
+		for i, part := range [][]pendingOffer{first, rest} {
+			c, err := im.sendOffers(ctx, eng, st, part, requeue)
+			counts.add(c)
+			if err != nil {
+				if i == 0 {
+					requeue(rest)
+				}
+				return counts, err
+			}
+		}
 		return counts, nil
 	}
 	rctx, cancel := context.WithTimeout(ctx, im.cfg.RequestTimeout)
@@ -644,7 +703,7 @@ func (im *Importer) offerPending(ctx context.Context, eng Engine, st *cacheState
 
 	var retry []pendingOffer
 	im.mu.Lock()
-	live := im.caches[eng.CacheID()] == st && st.generation == eng.Generation()
+	live := im.currentLocked(eng, st)
 	for i, answer := range offered.Items {
 		n := req.Items[i].Number
 		sent := items[n]
@@ -761,13 +820,14 @@ func (im *Importer) Renew(ctx context.Context, req protocol.Renew) protocol.Rene
 
 // State is what the importer knows of one engine cache.
 type State struct {
-	CacheID    string           `json:"cacheID"`
-	Generation uint64           `json:"generation"`
-	Merged     []MergedBundle   `json:"merged"`
-	Failures   map[string]int   `json:"failures,omitempty"`
-	Values     map[uint64]Value `json:"values"`
-	Pending    int              `json:"pending"`
-	Offers     OfferCounts      `json:"offers"`
+	CacheID    string         `json:"cacheID"`
+	Generation uint64         `json:"generation"`
+	Merged     []MergedBundle `json:"merged"`
+	// Failures counts failed merges, by bundle ID and source cache.
+	Failures map[string]int   `json:"failures,omitempty"`
+	Values   map[uint64]Value `json:"values"`
+	Pending  int              `json:"pending"`
+	Offers   OfferCounts      `json:"offers"`
 }
 
 // State returns what the importer knows of cacheID, and false when it knows
@@ -789,11 +849,22 @@ func (im *Importer) State(cacheID string) (State, bool) {
 		Offers:     st.offers,
 	}
 	for _, m := range st.merged {
-		out.Merged = append(out.Merged, *m)
+		cp := *m
+		cp.Roots = slices.Clone(m.Roots)
+		cp.Retained = maps.Clone(m.Retained)
+		cp.Expired = slices.Clone(m.Expired)
+		out.Merged = append(out.Merged, cp)
 	}
-	slices.SortFunc(out.Merged, func(a, b MergedBundle) int { return cmp.Compare(a.Bundle, b.Bundle) })
+	slices.SortFunc(out.Merged, func(a, b MergedBundle) int {
+		return cmp.Or(cmp.Compare(a.Bundle, b.Bundle), cmp.Compare(a.Source, b.Source))
+	})
+	// Copies: offers append to the live slices.
 	for n, v := range st.values {
-		out.Values[n] = *v
+		cp := *v
+		cp.Deps = slices.Clone(v.Deps)
+		cp.Complete = slices.Clone(v.Complete)
+		cp.Offered = slices.Clone(v.Offered)
+		out.Values[n] = cp
 	}
 	return out, true
 }

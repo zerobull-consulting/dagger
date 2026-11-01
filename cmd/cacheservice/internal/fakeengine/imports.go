@@ -100,6 +100,32 @@ func (c *Cache) Merge(b dagql.ValueBundle) (protocol.Merged, error) {
 		senders[v.SenderNumber] = true
 		values[v.Ordinal] = v
 	}
+	// As the engine does, refuse values outside the roots' closure,
+	// expired roots included.
+	reached := map[dagql.TransferOrdinal]bool{}
+	var reach func(dagql.TransferOrdinal)
+	reach = func(o dagql.TransferOrdinal) {
+		if reached[o] || values[o] == nil {
+			return
+		}
+		reached[o] = true
+		for _, d := range values[o].DependencyIDs {
+			reach(dagql.TransferOrdinal(d))
+		}
+	}
+	for _, r := range b.Roots {
+		reach(r.Ordinal)
+	}
+	for _, o := range b.Outputs {
+		if o.Owner != nil && reached[o.Ordinal] {
+			for _, d := range o.Owner.DependencyIDs {
+				reach(dagql.TransferOrdinal(d))
+			}
+		}
+	}
+	if len(reached) != len(values) {
+		return protocol.Merged{}, errors.New("bundle contains rows outside its root closure")
+	}
 	outputs := map[dagql.TransferOrdinal]*dagql.TransferredOutput{}
 	for i := range b.Outputs {
 		o := &b.Outputs[i]

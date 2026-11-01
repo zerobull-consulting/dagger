@@ -75,6 +75,11 @@ func (e *scriptedEngine) counts() (merges, offers int) {
 // with its fs part offered, or, withholding, neither offered nor complete.
 func landAll(withhold bool) func(protocol.Merge) (any, protocol.Type) {
 	return func(m protocol.Merge) (any, protocol.Type) {
+		// As the engine does: every value must be in the roots' closure,
+		// expired roots included.
+		if got := closure(&m.Bundle, m.Bundle.Roots); len(got) != len(m.Bundle.Values) {
+			return protocol.Error{Message: "bundle contains rows outside its root closure"}, protocol.TypeError
+		}
 		merged := protocol.Merged{Generation: 1, EngineTime: time.Now().UnixNano()}
 		for _, v := range m.Bundle.Values {
 			mv := protocol.MergedValue{Ordinal: v.Ordinal, Number: 100 + uint64(v.Ordinal), Deps: []uint64{}, Complete: []dagql.PersistedPartAddress{}, Offered: []dagql.PersistedPartAddress{}}
@@ -333,7 +338,7 @@ func TestSyncMergeFailures(t *testing.T) {
 		t.Fatalf("%d merges, want %d", merges, DefaultMergeAttempts)
 	}
 	st, _ := f.im.State("cache-b")
-	if st.Failures[rec.BundleID] != DefaultMergeAttempts {
+	if st.Failures[rec.BundleID+"/cache-a"] != DefaultMergeAttempts {
 		t.Fatalf("failures %+v", st.Failures)
 	}
 }
@@ -429,5 +434,94 @@ func TestNewRefuses(t *testing.T) {
 	meta, _ := metastore.New(metastore.Config{Objects: metastore.NewMemObjects()})
 	if _, err := New(Config{Blobs: blobstore.NewMemStore(""), Meta: meta, Scope: "blobs"}); err == nil {
 		t.Fatal("bad scope accepted")
+	}
+}
+
+// A bundle with a dropped root still merges: the engine sees every value in
+// its roots' closure, and only the live root is reported.
+func TestSyncPartlyDroppedBundle(t *testing.T) {
+	f := newFixture(t)
+	b := chainBundle(10, "base", "exec")
+	b.Values = append(b.Values, dagql.TransferredValue{
+		Ordinal: 3, SenderNumber: 50,
+		Record: dagql.PersistedRecord{ResultID: 3, Call: &dagql.ResultCall{Field: "lone"}},
+	})
+	b.Roots = append(b.Roots, dagql.TransferredRoot{Ordinal: 3, ExpiresAtUnix: 10})
+	rec := f.store(b, "cache-a")
+	if _, err := f.meta.DropExpired(context.Background(), scope, 20); err != nil {
+		t.Fatal(err)
+	}
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(false)}
+	res, err := f.im.Sync(context.Background(), eng)
+	if err != nil || len(res.Merged) != 1 || len(res.Failed) != 0 {
+		t.Fatalf("%+v, %v", res, err)
+	}
+	m := res.Merged[0]
+	if len(m.Retained) != 1 || len(m.Expired) != 0 {
+		t.Fatalf("merged %+v", m)
+	}
+	if _, ok := m.Retained[rec.Numbers[2]]; !ok {
+		t.Fatalf("retained %+v", m.Retained)
+	}
+}
+
+// A merged reply that arrives after the cache was wiped is discarded.
+func TestSyncDiscardsReplyAfterReset(t *testing.T) {
+	f := newFixture(t)
+	f.store(chainBundle(10, "base"), "cache-a")
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1}
+	eng.onMerge = func(m protocol.Merge) (any, protocol.Type) {
+		f.im.Forget("cache-b")
+		return landAll(false)(m)
+	}
+	res, err := f.im.Sync(context.Background(), eng)
+	if !errors.Is(err, errStateReset) || len(res.Merged) != 0 {
+		t.Fatalf("%+v, %v", res, err)
+	}
+	if st, ok := f.im.State("cache-b"); ok {
+		t.Fatalf("state repopulated: %+v", st)
+	}
+}
+
+// Offers over the message limit are split, not dropped.
+func TestSyncSplitsLargeOffers(t *testing.T) {
+	f := newFixture(t)
+	f.store(chainBundle(10, "a", "b", "c", "d"), "cache-a")
+	var sizes []int
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: func(m protocol.Merge) (any, protocol.Type) {
+		// After the merge, room for some offers but not all four parts.
+		f.im.cfg.MaxMessageBytes = 2200
+		return landAll(true)(m)
+	}, onOffer: func(o protocol.Offer) (any, protocol.Type) {
+		data, _ := json.Marshal(o)
+		sizes = append(sizes, len(data))
+		return answerAll(protocol.OfferAccepted)(o)
+	}}
+	res, err := f.im.Sync(context.Background(), eng)
+	if err != nil || len(res.Merged) != 1 {
+		t.Fatalf("%+v, %v", res, err)
+	}
+	_, offers := eng.counts()
+	if offers < 2 || res.Offers.Accepted != 4 {
+		t.Fatalf("%d offers (%v bytes), %+v", offers, sizes, res.Offers)
+	}
+}
+
+// State returns copies: changing them changes nothing the importer keeps.
+func TestStateCopies(t *testing.T) {
+	f := newFixture(t)
+	f.store(chainBundle(10, "base"), "cache-a")
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(false)}
+	if _, err := f.im.Sync(context.Background(), eng); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := f.im.State("cache-b")
+	st.Values[1].Offered[0] = dagql.PersistedPartAddress{Part: "changed"}
+	for n := range st.Merged[0].Retained {
+		st.Merged[0].Retained[n] = 99
+	}
+	again, _ := f.im.State("cache-b")
+	if again.Values[1].Offered[0].Part != "fs" || again.Merged[0].Retained[1] == 99 {
+		t.Fatalf("state aliased: %+v", again)
 	}
 }

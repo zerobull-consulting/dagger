@@ -84,7 +84,7 @@ func TestPlan(t *testing.T) {
 	record(t, idx, b1, chainBundle(30, "mine"), "cache-b")
 
 	got := Plan(idx, "cache-b", 100)
-	want := []Candidate{{Bundle: a1, Roots: []uint64{2}}, {Bundle: a2, Roots: []uint64{3}}}
+	want := []Candidate{{Bundle: a1, Source: "cache-a", Roots: []uint64{2}}, {Bundle: a2, Source: "cache-a", Roots: []uint64{3}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan for cache-b: %+v, want %+v", got, want)
 	}
@@ -114,9 +114,39 @@ func TestPlanFollowsCurrentRecord(t *testing.T) {
 	got := Plan(idx, "cache-b", 0)
 	// Both of the second bundle's roots-so-far: exec stays a root, and
 	// test is one too; both records are now in the second bundle.
-	want := []Candidate{{Bundle: second, Roots: []uint64{2, 3}}}
+	want := []Candidate{{Bundle: second, Source: "cache-a", Roots: []uint64{2, 3}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan: %+v, want %+v", got, want)
+	}
+}
+
+// Identical exports from two caches share a bundle ID: each cache's roots are
+// a candidate of their own, and each merges with its own numbers.
+func TestPlanSharedBundle(t *testing.T) {
+	idx := metastore.NewIndex()
+	id := testBundleID("same")
+	stored := chainBundle(10, "base")
+	na := record(t, idx, id, stored, "cache-a")
+	nb := record(t, idx, id, stored, "cache-b")
+	got := Plan(idx, "cache-c", 0)
+	want := []Candidate{
+		{Bundle: id, Source: "cache-a", Roots: []uint64{na[1]}},
+		{Bundle: id, Source: "cache-b", Roots: []uint64{nb[1]}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("plan: %+v, want %+v", got, want)
+	}
+	if got[0].Key() == got[1].Key() {
+		t.Fatal("candidates share a key")
+	}
+	for _, c := range got {
+		mb, err := BuildMerge(context.Background(), idx, c.Bundle, stored, c.Roots, testSigner, "team")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mb.Bundle.Values[0].SenderNumber != c.Roots[0] {
+			t.Fatalf("%s: sender %d, want %d", c.Source, mb.Bundle.Values[0].SenderNumber, c.Roots[0])
+		}
 	}
 }
 
@@ -147,8 +177,8 @@ func TestBuildMerge(t *testing.T) {
 		}
 	}
 	// The index's roots and expiries.
-	if !reflect.DeepEqual(b.Roots, []dagql.TransferredRoot{{Ordinal: 2, ExpiresAtUnix: 12345}}) {
-		t.Fatalf("roots %+v", b.Roots)
+	if !reflect.DeepEqual(b.Roots, []dagql.TransferredRoot{{Ordinal: 2, ExpiresAtUnix: 12345}}) || !reflect.DeepEqual(mb.Merged, map[dagql.TransferOrdinal]bool{2: true}) {
+		t.Fatalf("roots %+v, merged %v", b.Roots, mb.Merged)
 	}
 	// An address per layer, and the renewal key.
 	for _, o := range b.Outputs {
@@ -186,6 +216,15 @@ func TestBuildMergeDroppedValues(t *testing.T) {
 	mb, err := BuildMerge(context.Background(), idx, id, stored, []uint64{numbers[2]}, testSigner, "team")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The dropped root is still sent, expired, so every value is in the
+	// roots' closure, as the engine requires; only exec is merged.
+	wantRoots := []dagql.TransferredRoot{{Ordinal: 2}, {Ordinal: 3, ExpiresAtUnix: expiredRoot}}
+	if !reflect.DeepEqual(mb.Bundle.Roots, wantRoots) || !reflect.DeepEqual(mb.Merged, map[dagql.TransferOrdinal]bool{2: true}) {
+		t.Fatalf("roots %+v, merged %v", mb.Bundle.Roots, mb.Merged)
+	}
+	if got := closure(&mb.Bundle, mb.Bundle.Roots); len(got) != len(mb.Bundle.Values) {
+		t.Fatalf("closure %v of %d values", got, len(mb.Bundle.Values))
 	}
 	if got := mb.Bundle.Values[2].SenderNumber; got < idx.NextNumber {
 		t.Fatalf("placeholder %d is below the next number %d", got, idx.NextNumber)

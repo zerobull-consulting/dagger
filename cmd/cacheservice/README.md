@@ -247,7 +247,8 @@ again whenever another engine's export is stored, and every `-import-poll`
 **One sync.**
 
 1. **Plan.** The index's live roots, grouped by the bundle that holds each
-   one's current record. Roots that have expired, or whose entry has, are
+   one's current record and the engine cache that exported it (identical
+   exports from two caches share a bundle, but not sender numbers). Roots that have expired, or whose entry has, are
    left out, and so are an engine's own exports: its cache has them. A bundle
    already merged into this cache, at this generation, with every root it
    needs now, is not merged again.
@@ -256,9 +257,12 @@ again whenever another engine's export is stored, and every `-import-poll`
    Cloud holding; the roots are the planned ones with the index's expiries;
    and each output's chain gets a presigned GET per layer, with the scope as
    its renewal key. Records name each other by ordinal, so values are not
-   dropped or renumbered: a value that only dropped roots needed gets a
-   placeholder number above every stored one, and the engine merges only what
-   the merged roots need. The engine answers `merged`: the entry each record
+   dropped or renumbered, and the engine refuses a bundle with a value
+   outside its roots' closure. So the bundle's other roots are sent too,
+   already expired: the engine validates the bundle with them, then skips
+   them and whatever only they need. A value only those need, whose entry the
+   index has dropped, gets a placeholder number above every stored one, and
+   is never merged. The engine answers `merged`: the entry each record
    landed on, its replacement count, expiry, dependencies, and complete and
    offered parts, and which roots it retained or skipped as expired. The
    importer keeps that, by service number (`GET
@@ -268,12 +272,14 @@ again whenever another engine's export is stored, and every `-import-poll`
    owner's dependencies mapped to the engine's numbers. `accepted` and
    `alreadyComplete` are recorded. `executionStarted` and `unavailable` are
    tried again at the next sync, up to 3 times. `invalid` is not tried again.
-   An entry the engine answers `gone` for is forgotten.
+   An entry the engine answers `gone` for is forgotten. An offer over the
+   message limit is split in two until each fits.
 
 A merge refused by the engine is tried again at later syncs, up to 3 times per
 bundle and engine generation. A merge over the 64 MiB message limit is not
 sent. A new engine generation, or an `engine.start` that names a wiped cache,
-starts that cache over; `engine.prune` forgets the dropped entries.
+starts that cache over; `engine.prune` forgets the dropped entries. A merged
+reply that arrives after its cache's state was reset is discarded.
 
 **Renew.** Presigned GETs last `CACHESERVICE_S3_GET_EXPIRY` (1h). When the
 engine reads an offered part after they expired, it sends `renew` with the
@@ -287,7 +293,9 @@ is interchangeable. Parts are offered only at an entry's own address, not at
 an output path into it. What the importer knows of each engine is in memory:
 after a service restart, every connected engine is merged everything again,
 which the engine keeps as it is. An engine's own exports are never merged back
-into it, even after it pruned them.
+into it, even after it pruned them. Entries an engine prunes, or answers
+`gone` for, are not merged into it again until it restarts: merging them back
+on the next poll would undo its garbage collection, which prunes them again.
 
 ## Running it against a local engine
 
