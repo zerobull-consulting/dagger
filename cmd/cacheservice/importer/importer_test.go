@@ -525,3 +525,24 @@ func TestStateCopies(t *testing.T) {
 		t.Fatalf("state aliased: %+v", again)
 	}
 }
+
+// A sync of an older generation leaves the newer generation's state alone.
+func TestSyncStaleGeneration(t *testing.T) {
+	f := newFixture(t)
+	f.store(chainBundle(10, "base"), "cache-a")
+	newer := &scriptedEngine{cacheID: "cache-b", generation: 2, onMerge: landAll(false)}
+	if _, err := f.im.Sync(context.Background(), newer); err != nil {
+		t.Fatal(err)
+	}
+	older := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(false)}
+	if _, err := f.im.Sync(context.Background(), older); !errors.Is(err, errStateReset) {
+		t.Fatalf("stale sync: %v", err)
+	}
+	if merges, _ := older.counts(); merges != 0 {
+		t.Fatalf("stale sync merged %d times", merges)
+	}
+	st, ok := f.im.State("cache-b")
+	if !ok || st.Generation != 2 || len(st.Merged) != 1 || len(st.Values) != 1 {
+		t.Fatalf("state %+v", st)
+	}
+}

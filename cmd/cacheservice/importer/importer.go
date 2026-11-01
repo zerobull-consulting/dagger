@@ -260,13 +260,21 @@ type FailedBundle struct {
 	Error  string `json:"error"`
 }
 
-// state returns the state of eng's cache, reset when its generation
-// changed. Requires mu.
+// stateLocked returns the state of a cache at generation, reset when the
+// cache has restarted into it, or nil when generation is older than the
+// state's: a stale connection must not reset a newer generation's state.
+// Requires mu. To check a state is still current without changing it, use
+// currentLocked.
 func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	st := im.caches[cacheID]
 	if st == nil {
 		st = &cacheState{}
 		im.caches[cacheID] = st
+	}
+	if st.merged != nil && st.generation > generation {
+		// A connection of an older generation: its cache restarted since,
+		// and the newer generation's state stays.
+		return nil
 	}
 	if st.generation != generation || st.merged == nil {
 		st.generation = generation
@@ -319,6 +327,9 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	im.mu.Lock()
 	st := im.stateLocked(cacheID, generation)
 	im.mu.Unlock()
+	if st == nil {
+		return res, errStateReset
+	}
 	st.sync.Lock()
 	defer st.sync.Unlock()
 
@@ -328,7 +339,7 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	}
 	for _, c := range Plan(idx, cacheID, im.cfg.Now().Unix()) {
 		im.mu.Lock()
-		if im.stateLocked(cacheID, generation) != st {
+		if !im.currentLocked(eng, st) {
 			im.mu.Unlock()
 			return res, errStateReset
 		}
