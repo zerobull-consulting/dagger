@@ -581,3 +581,32 @@ func TestSyncOfferMapsServices(t *testing.T) {
 		t.Fatal("stored bundle changed")
 	}
 }
+
+// A stale connection's sync never takes or sends the newer generation's
+// pending offers, wherever it notices the restart.
+func TestOfferPendingStaleGeneration(t *testing.T) {
+	f := newFixture(t)
+	f.store(chainBundle(10, "base"), "cache-a")
+	newer := &scriptedEngine{cacheID: "cache-b", generation: 2, onMerge: landAll(true), onOffer: answerAll(protocol.OfferExecutionStarted)}
+	if _, err := f.im.Sync(context.Background(), newer); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := f.im.State("cache-b")
+	if st.Pending != 1 {
+		t.Fatalf("pending %d", st.Pending)
+	}
+	f.im.mu.Lock()
+	live := f.im.caches["cache-b"]
+	f.im.mu.Unlock()
+
+	older := &scriptedEngine{cacheID: "cache-b", generation: 1, onOffer: answerAll(protocol.OfferAccepted)}
+	if _, err := f.im.offerPending(context.Background(), older, live); !errors.Is(err, errStateReset) {
+		t.Fatalf("stale offer: %v", err)
+	}
+	if _, offers := older.counts(); offers != 0 {
+		t.Fatalf("stale connection sent %d offers", offers)
+	}
+	if st, _ := f.im.State("cache-b"); st.Pending != 1 || st.Generation != 2 {
+		t.Fatalf("newer state changed: %+v", st)
+	}
+}

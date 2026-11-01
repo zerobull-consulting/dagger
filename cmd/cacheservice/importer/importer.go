@@ -332,6 +332,13 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	}
 	st.sync.Lock()
 	defer st.sync.Unlock()
+	// The state may have moved on while this sync waited for the lock.
+	im.mu.Lock()
+	current := im.currentLocked(eng, st)
+	im.mu.Unlock()
+	if !current {
+		return res, errStateReset
+	}
 
 	idx, err := im.cfg.Meta.Index(ctx, im.cfg.Scope)
 	if err != nil {
@@ -619,6 +626,12 @@ func (im *Importer) applyMerged(eng Engine, st *cacheState, c Candidate, mb Merg
 func (im *Importer) offerPending(ctx context.Context, eng Engine, st *cacheState) (OfferCounts, error) {
 	var counts OfferCounts
 	im.mu.Lock()
+	if !im.currentLocked(eng, st) {
+		// The state belongs to another generation now, or was wiped: its
+		// pending offers, if any, are for another connection's entries.
+		im.mu.Unlock()
+		return counts, errStateReset
+	}
 	pending := st.pending
 	st.pending = nil
 	im.mu.Unlock()
