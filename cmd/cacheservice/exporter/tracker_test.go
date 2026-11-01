@@ -257,7 +257,8 @@ func TestTrackerFailuresBackOffThenStop(t *testing.T) {
 	if got := roots(tr.All("c", now)); len(got) != 0 {
 		t.Fatalf("still trying after MaxFailures: %v", got)
 	}
-	// Roots a result doesn't settle, as after a disconnect, count as failed.
+	// Roots a result doesn't settle, as after an error reply or a timeout,
+	// count as failed.
 	tr.Observe(state(2, 10, fsPart), t0)
 	b := tr.All("c", now)
 	tr.Done(b[0], Result{}, now)

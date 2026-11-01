@@ -438,8 +438,10 @@ func (t *Tracker) wantedLocked(e *trackedEntry, now time.Time) bool {
 }
 
 // Done records what an export of a batch did. Roots the result doesn't
-// settle, as when the batch failed as a whole (the engine disconnected),
-// count as failed, and are tried again later.
+// settle, as when the export failed as a whole (an error reply from the
+// engine, or a timeout), count as failed, and are tried again later with
+// backoff. An export cut short by its engine disconnecting, or the service
+// stopping, goes to Interrupted instead, which counts no failure.
 func (t *Tracker) Done(b Batch, res Result, now time.Time) {
 	t.done(b, res, now, time.Time{})
 }
