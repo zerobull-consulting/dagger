@@ -300,6 +300,10 @@ func intAttr(kvs []*commonpb.KeyValue, key string) int64 {
 // with no roots, every tracked entry of the engine worth exporting, and
 // answers with what was stored.
 func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
+	if s.export == nil {
+		writeDebugError(w, ErrExportOff)
+		return
+	}
 	conn, ok := debugConnID(w, r)
 	if !ok {
 		return
@@ -320,6 +324,10 @@ func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) serveEntries(w http.ResponseWriter, r *http.Request) {
+	if s.export == nil {
+		writeDebugError(w, ErrExportOff)
+		return
+	}
 	conn, ok := debugConnID(w, r)
 	if !ok {
 		return

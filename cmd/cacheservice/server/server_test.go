@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -71,5 +73,29 @@ func TestAccessorErrors(t *testing.T) {
 	}
 	if st, err := h.svc.Imports(h.engine.id); err != nil || st.CacheID != h.cache.ID {
 		t.Errorf("Imports: %+v, %v", st, err)
+	}
+}
+
+// With a path off, its debug routes answer 409 before looking at the
+// connection, as they did before they wrapped the accessors.
+func TestDebugPathOffBeforeConn(t *testing.T) {
+	debug := httptest.NewServer(New(slog.New(slog.DiscardHandler), "").DebugHandler())
+	defer debug.Close()
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/debug/engines/abc/entries"},
+		{http.MethodPost, "/debug/engines/abc/export"},
+		{http.MethodGet, "/debug/engines/abc/imports"},
+		{http.MethodPost, "/debug/engines/abc/import"},
+		{http.MethodGet, "/debug/engines/1/entries"},
+	} {
+		req, _ := http.NewRequest(tc.method, debug.URL+tc.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("%s %s: status %d, want 409", tc.method, tc.path, resp.StatusCode)
+		}
 	}
 }

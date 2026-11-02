@@ -84,12 +84,22 @@ test)
 e2e)
 	# Extra arguments go to go test, such as -run 'TestRealEngines/^renew$'.
 	# E2E_SCENARIOS picks the scenarios after the first, which always runs.
+	scenarios="${E2E_SCENARIOS:-}"
+	for sc in $scenarios; do
+		case "$sc" in
+		reexport | renew | prune | superseded) ;;
+		*)
+			echo "dev.sh e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: reexport renew prune superseded)" >&2
+			exit 2
+			;;
+		esac
+	done
+	run=TestRealEngines
+	if [[ -n "${scenarios// /}" ]]; then
+		run="TestRealEngines/^($(tr -s ' ' '|' <<<"$scenarios" | sed 's/^|//; s/|$//'))\$"
+	fi
 	up >/dev/null
 	eval "$(print_env)"
-	run=TestRealEngines
-	if [[ -n "${E2E_SCENARIOS:-}" ]]; then
-		run="TestRealEngines/^($(tr -s ' ' '|' <<<"${E2E_SCENARIOS}" | sed 's/^|//; s/|$//'))\$"
-	fi
 	cd "$repo"
 	CACHESERVICE_E2E=1 go test -count=1 -v -timeout 60m -run "$run" ./cmd/cacheservice/e2e/ "${@:2}"
 	;;

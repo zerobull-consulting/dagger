@@ -196,6 +196,10 @@ func (s *Service) waitImports() {
 // serveImport is the explicit import hook: POST /debug/engines/{conn}/import
 // syncs the engine now, and answers with what was merged and offered.
 func (s *Service) serveImport(w http.ResponseWriter, r *http.Request) {
+	if s.imports == nil {
+		writeDebugError(w, ErrImportOff)
+		return
+	}
 	conn, ok := debugConnID(w, r)
 	if !ok {
 		return
@@ -213,6 +217,10 @@ func (s *Service) serveImport(w http.ResponseWriter, r *http.Request) {
 // serveImports shows what the import path knows of an engine's cache: the
 // bundles merged into it, and the entries they landed on.
 func (s *Service) serveImports(w http.ResponseWriter, r *http.Request) {
+	if s.imports == nil {
+		writeDebugError(w, ErrImportOff)
+		return
+	}
 	conn, ok := debugConnID(w, r)
 	if !ok {
 		return

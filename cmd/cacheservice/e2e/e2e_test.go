@@ -218,7 +218,9 @@ func (s *state) hit() bool {
 	cacheB := s.b.CacheID()
 
 	res, timeA := s.a.Query("run-a", pipeline)
-	s.stampA = Field(res, stampPath)
+	// Trimmed, as the outputs compared with it are: the file ends with a
+	// newline, which the shell version's $(...) dropped.
+	s.stampA = strings.TrimSpace(Field(res, stampPath))
 	s.sumsA = stampSums(s.stampA)
 	t.Logf("A took %s. Stamp:\n%s", timeA.Round(10*time.Millisecond), s.stampA)
 
@@ -243,7 +245,7 @@ func (s *state) hit() bool {
 
 	logMark, s3Mark := s.main.Logs.Mark(), env.Proxy.Mark()
 	res, timeB := s.b.Query("run-b", pipeline)
-	stampB := Field(res, stampPath)
+	stampB := strings.TrimSpace(Field(res, stampPath))
 	t.Logf("B took %s. Stamp:\n%s", timeB.Round(10*time.Millisecond), stampB)
 	// The pipeline has two withExec calls; their spans may come in several
 	// batches.
@@ -254,7 +256,7 @@ func (s *state) hit() bool {
 	})
 
 	res, timeVerify := s.b.Query("verify-b", verifyQuery())
-	verified := Field(res, verifyPath)
+	verified := strings.TrimSpace(Field(res, verifyPath))
 	t.Logf("B's verify took %s. Output:\n%s", timeVerify.Round(10*time.Millisecond), verified)
 	gets := env.Proxy.Blobs(s3Mark, http.MethodGet)
 
@@ -453,7 +455,7 @@ func (s *state) renew(t *testing.T) {
 	// C reads the layers, after the GETs expired.
 	logMark, s3Mark := s.replica.Logs.Mark(), env.Proxy.Mark()
 	res, timeC := c.Query("renew-verify-c", verifyQuery())
-	outC := Field(res, verifyPath)
+	outC := strings.TrimSpace(Field(res, verifyPath))
 	t.Logf("C took %s, %s after the merge. Output:\n%s", timeC.Round(10*time.Millisecond), time.Since(mergedAt).Round(time.Second), outC)
 	renews := envelopes(s.replica, logMark, c.Conn, protocol.TypeRenew)
 	reneweds := envelopes(s.replica, logMark, c.Conn, protocol.TypeRenewed)
@@ -497,7 +499,7 @@ func (s *state) renew(t *testing.T) {
 	env.DeleteBlob(top)
 	logMark = s.replica.Logs.Mark()
 	res, timeD := d.Query("renew-verify-d", verifyQuery())
-	outD := Field(res, verifyPath)
+	outD := strings.TrimSpace(Field(res, verifyPath))
 	t.Logf("D took %s. Output:\n%s", timeD.Round(10*time.Millisecond), outD)
 	unavailable := false
 	for _, r := range envelopes(s.replica, logMark, d.Conn, protocol.TypeRenewed) {
