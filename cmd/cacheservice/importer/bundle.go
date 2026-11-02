@@ -199,7 +199,9 @@ func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stor
 
 	numbers := make(map[dagql.TransferOrdinal]uint64, len(stored.Values))
 	for _, v := range stored.Values {
-		m, ok := mapping.Numbers[v.SenderNumber]
+		// A value the source cache had imported names the stored entry it
+		// came from.
+		m, ok := mapping.Lookup(v.SenderNumber)
 		if !ok {
 			continue
 		}

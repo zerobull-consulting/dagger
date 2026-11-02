@@ -41,6 +41,17 @@ const IndexVersion = 1
 // So a mapping is keyed by cacheID and engine number, and remembers the
 // latest generation it was recorded in. Exporting the same engine entry
 // again updates its service entry, instead of storing a second one.
+//
+// # Imported entries
+//
+// An engine that had a stored entry merged into it holds the value on an
+// entry of its own. Its Imported mappings name those entries: engine number
+// to the service number of the stored entry the value came from. The
+// importer records them after each merge. A later export of such an entry,
+// as a root or in another root's closure, reuses the stored entry instead of
+// storing the same value again under a new number. An import doesn't change
+// the stored entry's source: only a record that adds parts to it does (see
+// Record).
 type Index struct {
 	Version    int    `json:"version"`
 	NextNumber uint64 `json:"nextNumber"`
@@ -71,6 +82,10 @@ type Entry struct {
 	Deps []uint64 `json:"deps,omitempty"`
 	// ExpiresAtUnix is when the entry expires (0: never).
 	ExpiresAtUnix int64 `json:"expiresAtUnix,omitempty"`
+	// Parts are the parts the record's bundle holds outputs of, by
+	// PartKey, sorted. A record of an imported value replaces this one
+	// only if it holds more.
+	Parts []string `json:"parts,omitempty"`
 }
 
 // Source is an engine entry: its cache, the cache's generation when the
@@ -90,8 +105,36 @@ type Root struct {
 type EngineCache struct {
 	// Generation is the latest generation the cache was recorded in.
 	Generation uint64 `json:"generation"`
-	// Numbers are the service numbers, by engine entry number.
+	// Numbers are the service numbers of the entries the cache exported,
+	// by engine entry number: each is the source of its entry.
 	Numbers map[uint64]Mapping `json:"numbers"`
+	// Imported are the service numbers of the stored entries merged into
+	// the cache, by the engine entry each landed on. Their source is
+	// another cache. A stored entry is imported on at most one engine
+	// entry per cache, and an engine entry is either exported or imported.
+	Imported map[uint64]Mapping `json:"imported,omitempty"`
+}
+
+// Lookup returns the service number an engine entry maps to, exported or
+// imported.
+func (c *EngineCache) Lookup(engineNum uint64) (Mapping, bool) {
+	if c == nil {
+		return Mapping{}, false
+	}
+	if m, ok := c.Numbers[engineNum]; ok {
+		return m, true
+	}
+	m, ok := c.Imported[engineNum]
+	return m, ok
+}
+
+// PartKey names a part address, for comparing parts: its JSON.
+func PartKey(a dagql.PersistedPartAddress) string {
+	data, err := json.Marshal(a)
+	if err != nil {
+		return fmt.Sprintf("%+v", a)
+	}
+	return string(data)
 }
 
 // Mapping is the service number of one engine entry, and the latest
@@ -190,6 +233,25 @@ func (idx *Index) Validate() error {
 			if e.Source.CacheID != id || e.Source.Number != engineNum {
 				return fmt.Errorf("cache %q: engine entry %d maps to %d, which came from cache %q entry %d", id, engineNum, m.Number, e.Source.CacheID, e.Source.Number)
 			}
+		}
+		// Imported: a stored entry from another cache, at most once, on
+		// an engine entry the cache didn't export.
+		targets := make(map[uint64]uint64, len(c.Imported))
+		for engineNum, m := range c.Imported {
+			e, ok := idx.Entries[m.Number]
+			if !ok {
+				return fmt.Errorf("cache %q: imported engine entry %d maps to %d, which is not stored", id, engineNum, m.Number)
+			}
+			if e.Source.CacheID == id {
+				return fmt.Errorf("cache %q: imported engine entry %d maps to %d, which the cache exported itself", id, engineNum, m.Number)
+			}
+			if _, ok := c.Numbers[engineNum]; ok {
+				return fmt.Errorf("cache %q: engine entry %d is both exported and imported", id, engineNum)
+			}
+			if prev, ok := targets[m.Number]; ok {
+				return fmt.Errorf("cache %q: engine entries %d and %d both import %d", id, min(prev, engineNum), max(prev, engineNum), m.Number)
+			}
+			targets[m.Number] = engineNum
 		}
 	}
 	// And the other way: every entry is its source's mapping.
@@ -292,9 +354,14 @@ func retentionDeps(bundle *dagql.ValueBundle, v dagql.TransferredValue) []uint64
 // A value whose engine entry already maps to a stored entry keeps that
 // service number. Its record replaces the stored one, unless the stored one
 // is newer: from a later generation, or from the same generation with more
-// replacements. Any other value gets a new service
-// number. A root's expiry is the later of the stored one and the bundle's
-// (0, never, is the latest).
+// replacements. A value whose engine entry is imported (see RecordImports)
+// takes the imported entry's number, so the same value isn't stored twice.
+// Its record replaces the stored one only if the bundle holds every part the
+// stored record does, and more; the entry's source then becomes this cache,
+// and the old source's mapping becomes an import. Generations and
+// replacement counts of two caches don't compare, so nothing else decides
+// between them. Any other value gets a new service number. A root's expiry
+// is the later of the stored one and the bundle's (0, never, is the latest).
 func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (map[dagql.TransferOrdinal]uint64, error) {
 	if !bundleIDPattern.MatchString(bundleID) {
 		return nil, fmt.Errorf("invalid bundle ID %q", bundleID)
@@ -317,24 +384,55 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 	slices.SortFunc(values, func(a, b dagql.TransferredValue) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
 
 	numbers := make(map[dagql.TransferOrdinal]uint64, len(values))
+	imported := map[dagql.TransferOrdinal]bool{}
 	for _, v := range values {
-		m, ok := cache.Numbers[v.SenderNumber]
-		if ok {
+		if m, ok := cache.Numbers[v.SenderNumber]; ok {
 			if _, stored := idx.Entries[m.Number]; stored {
 				numbers[v.Ordinal] = m.Number
 				continue
 			}
 		}
+		if m, ok := cache.Imported[v.SenderNumber]; ok {
+			if _, stored := idx.Entries[m.Number]; stored {
+				numbers[v.Ordinal] = m.Number
+				imported[v.Ordinal] = true
+				continue
+			}
+		}
 		numbers[v.Ordinal] = idx.allocate()
 	}
+	parts := bundleParts(bundle)
 	for _, v := range values {
 		n := numbers[v.Ordinal]
-		cache.Numbers[v.SenderNumber] = Mapping{
-			Number:     n,
-			Generation: max(generation, cache.Numbers[v.SenderNumber].Generation),
-		}
-		if old, ok := idx.Entries[n]; ok && newerThan(old, generation, v.SenderReplacements) {
-			continue
+		if imported[v.Ordinal] {
+			m := cache.Imported[v.SenderNumber]
+			m.Generation = max(m.Generation, generation)
+			cache.Imported[v.SenderNumber] = m
+			old := idx.Entries[n]
+			if !morePartsThan(parts[v.Ordinal], old.Parts) {
+				continue
+			}
+			// This record holds more: it becomes the entry's, and this
+			// cache its source.
+			if src := idx.Caches[old.Source.CacheID]; src != nil {
+				if sm, ok := src.Numbers[old.Source.Number]; ok && sm.Number == n {
+					delete(src.Numbers, old.Source.Number)
+					if src.Imported == nil {
+						src.Imported = map[uint64]Mapping{}
+					}
+					src.Imported[old.Source.Number] = sm
+				}
+			}
+			delete(cache.Imported, v.SenderNumber)
+			cache.Numbers[v.SenderNumber] = m
+		} else {
+			cache.Numbers[v.SenderNumber] = Mapping{
+				Number:     n,
+				Generation: max(generation, cache.Numbers[v.SenderNumber].Generation),
+			}
+			if old, ok := idx.Entries[n]; ok && newerThan(old, generation, v.SenderReplacements) {
+				continue
+			}
 		}
 		vdeps := retentionDeps(bundle, v)
 		deps := make([]uint64, 0, len(vdeps))
@@ -350,6 +448,7 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 			Replacements:  v.SenderReplacements,
 			Deps:          deps,
 			ExpiresAtUnix: v.ExpiresAtUnix,
+			Parts:         parts[v.Ordinal],
 		}
 	}
 	for _, r := range bundle.Roots {
@@ -361,6 +460,98 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 		idx.Roots[n] = Root{ExpiresAtUnix: r.ExpiresAtUnix}
 	}
 	return numbers, nil
+}
+
+// bundleParts returns the parts each value has outputs of in a bundle, by
+// ordinal, as sorted PartKeys.
+func bundleParts(bundle *dagql.ValueBundle) map[dagql.TransferOrdinal][]string {
+	out := map[dagql.TransferOrdinal][]string{}
+	for _, o := range bundle.Outputs {
+		out[o.Ordinal] = append(out[o.Ordinal], PartKey(o.Address))
+	}
+	for o, keys := range out {
+		slices.Sort(keys)
+		out[o] = slices.Compact(keys)
+	}
+	return out
+}
+
+// morePartsThan reports whether parts holds every one of old, and more.
+func morePartsThan(parts, old []string) bool {
+	if len(parts) <= len(old) {
+		return false
+	}
+	for _, k := range old {
+		if _, found := slices.BinarySearch(parts, k); !found {
+			return false
+		}
+	}
+	return true
+}
+
+// Import is one stored entry merged into an engine cache: the service
+// number of the stored entry, and the engine entry it landed on.
+type Import struct {
+	Number uint64 `json:"number"`
+	Engine uint64 `json:"engine"`
+}
+
+// RecordImports records that stored entries were merged into the engine
+// cache cacheID at generation, and landed on the given engine entries, and
+// returns how many it recorded. It skips an import of an entry no longer
+// stored, of an entry the cache exported itself, and onto an engine entry
+// the cache exported: that entry is the cache's own, and keeps its own
+// service number. A stored entry imported onto another engine entry than
+// before, as when the engine replaced the one it landed on, moves there.
+func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Import) int {
+	if cacheID == "" {
+		return 0
+	}
+	cache := idx.Caches[cacheID]
+	recorded := 0
+	for _, im := range imports {
+		e, ok := idx.Entries[im.Number]
+		if !ok || im.Engine == 0 || e.Source.CacheID == cacheID {
+			continue
+		}
+		if cache == nil {
+			cache = &EngineCache{Numbers: map[uint64]Mapping{}}
+			idx.Caches[cacheID] = cache
+		}
+		if _, own := cache.Numbers[im.Engine]; own {
+			continue
+		}
+		if cache.Imported == nil {
+			cache.Imported = map[uint64]Mapping{}
+		}
+		for engineNum, m := range cache.Imported {
+			if m.Number == im.Number && engineNum != im.Engine {
+				delete(cache.Imported, engineNum)
+			}
+		}
+		gen := generation
+		if m, ok := cache.Imported[im.Engine]; ok && m.Number == im.Number {
+			gen = max(gen, m.Generation)
+		}
+		cache.Imported[im.Engine] = Mapping{Number: im.Number, Generation: gen}
+		cache.Generation = max(cache.Generation, generation)
+		recorded++
+	}
+	return recorded
+}
+
+// ForgetImports drops the imported mappings of an engine cache, as when the
+// cache was wiped: its engine entries are gone. The entries it exported
+// stay, since other engines may still import them.
+func (idx *Index) ForgetImports(cacheID string) {
+	c := idx.Caches[cacheID]
+	if c == nil {
+		return
+	}
+	c.Imported = nil
+	if len(c.Numbers) == 0 {
+		delete(idx.Caches, cacheID)
+	}
 }
 
 // newerThan reports whether a stored entry describes a later state of its
@@ -393,7 +584,8 @@ func expired(expiresAtUnix, nowUnix int64) bool {
 // DropExpired drops what has expired at nowUnix and returns the dropped
 // entries' service numbers, in order. It drops expired roots; then expired
 // entries and, transitively, every entry that depends on one; then every
-// entry no remaining root depends on. Mappings to dropped entries go too.
+// entry no remaining root depends on. Mappings to dropped entries, exported
+// or imported, go too.
 // Their numbers are not handed out again.
 //
 // Bundles stay in the store, even when no entry refers to them any more.
@@ -464,6 +656,11 @@ func (idx *Index) DropExpired(nowUnix int64) []uint64 {
 				delete(c.Numbers, engineNum)
 			}
 		}
+		for engineNum, m := range c.Imported {
+			if _, ok := idx.Entries[m.Number]; !ok {
+				delete(c.Imported, engineNum)
+			}
+		}
 	}
 	return dropped
 }
@@ -514,4 +711,35 @@ func (s *Store) DropExpired(ctx context.Context, scope string, nowUnix int64) ([
 		return nil
 	})
 	return dropped, err
+}
+
+// RecordImports records stored entries merged into an engine cache, as
+// Index.RecordImports does, in one atomic index update, and returns how many
+// it recorded.
+func (s *Store) RecordImports(ctx context.Context, scope, cacheID string, generation uint64, imports []Import) (int, error) {
+	if cacheID == "" {
+		return 0, errors.New("record imports: no cacheID")
+	}
+	if len(imports) == 0 {
+		return 0, nil
+	}
+	var n int
+	_, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
+		n = idx.RecordImports(cacheID, generation, imports)
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("record imports into %q: %w", cacheID, err)
+	}
+	return n, nil
+}
+
+// ForgetImports drops an engine cache's imported mappings from the scope's
+// index, as Index.ForgetImports does, in one atomic index update.
+func (s *Store) ForgetImports(ctx context.Context, scope, cacheID string) error {
+	_, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
+		idx.ForgetImports(cacheID)
+		return nil
+	})
+	return err
 }

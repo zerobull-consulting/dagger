@@ -147,9 +147,15 @@ func carrierSpan(cacheSpans int) *tracepb.Span {
 // postSpans posts a session's spans as the engine forwards them.
 func (h *exportHarness) postSpans(session string, spans ...*tracepb.Span) {
 	h.t.Helper()
+	h.postSpansOf(h.cache, session, spans...)
+}
+
+// postSpansOf posts a session's spans of another engine's cache.
+func (h *exportHarness) postSpansOf(cache *fakeengine.Cache, session string, spans ...*tracepb.Span) {
+	h.t.Helper()
 	req := &coltracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
 		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
-			kv(telemetryattrs.EngineCacheAttr, h.cache.ID+"/"+strconv.FormatUint(h.cache.Generation, 10)),
+			kv(telemetryattrs.EngineCacheAttr, cache.ID+"/"+strconv.FormatUint(cache.Generation, 10)),
 			kv(telemetryattrs.EngineSessionAttr, session),
 		}},
 		ScopeSpans: []*tracepb.ScopeSpans{{Spans: spans}},
@@ -209,7 +215,13 @@ func (h *exportHarness) waitIndex(numbers ...uint64) *metastore.Index {
 // debugExport calls the explicit export hook.
 func (h *exportHarness) debugExport(body string) (int, exporter.Result) {
 	h.t.Helper()
-	url := h.debug.URL + "/debug/engines/" + strconv.FormatUint(h.engine.id, 10) + "/export"
+	return h.debugExportOf(h.engine, body)
+}
+
+// debugExportOf calls the explicit export hook of another connection.
+func (h *exportHarness) debugExportOf(c *engineConn, body string) (int, exporter.Result) {
+	h.t.Helper()
+	url := h.debug.URL + "/debug/engines/" + strconv.FormatUint(c.id, 10) + "/export"
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		h.t.Fatal(err)

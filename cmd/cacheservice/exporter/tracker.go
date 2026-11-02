@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -54,8 +55,9 @@ type TrackerConfig struct {
 //     carrier span, once all its cache spans arrived, or EndGrace after it),
 //     or after QuietPeriod without a cache span from it.
 //   - An entry already stored with the same replacement count and parts is
-//     not exported again. Nor is one refused for the same value, or one
-//     whose expiry or retention has lapsed.
+//     not exported again. Nor is one imported from the store with them
+//     (Imported), one refused for the same value, or one whose expiry or
+//     retention has lapsed.
 //   - Busy roots, and roots whose export failed, are exported again later,
 //     with backoff.
 //
@@ -71,6 +73,10 @@ type trackedCache struct {
 	generation uint64
 	entries    map[uint64]*trackedEntry
 	sessions   map[string]*trackedSession
+	// imports are the values merged into the cache from the store, by
+	// engine number: what the merge left on each entry. Kept apart from
+	// entries, which are forgotten when their spans stop.
+	imports map[uint64]*exportedValue
 }
 
 type trackedSession struct {
@@ -190,7 +196,7 @@ type Observation struct {
 func (t *Tracker) cache(cacheID string, generation uint64) *trackedCache {
 	c := t.caches[cacheID]
 	if c == nil {
-		c = &trackedCache{generation: generation, entries: map[uint64]*trackedEntry{}, sessions: map[string]*trackedSession{}}
+		c = &trackedCache{generation: generation, entries: map[uint64]*trackedEntry{}, sessions: map[string]*trackedSession{}, imports: map[uint64]*exportedValue{}}
 		t.caches[cacheID] = c
 	}
 	if generation < c.generation {
@@ -249,14 +255,12 @@ func (t *Tracker) Observe(o Observation, now time.Time) {
 		e.deps = slices.Clone(o.Deps)
 	}
 	for _, p := range o.Parts {
-		if _, ok := e.parts[p]; ok {
-			continue
-		}
 		var addr dagql.PersistedPartAddress
 		if err := json.Unmarshal([]byte(p), &addr); err != nil || addr.Part == "" {
 			continue
 		}
-		e.parts[p] = addr
+		// Keyed as the store keys parts, so imports compare.
+		e.parts[metastore.PartKey(addr)] = addr
 	}
 	if o.State && o.EndUnixNano >= e.stateEndNano {
 		e.stateEndNano = o.EndUnixNano
@@ -301,6 +305,7 @@ func (t *Tracker) Pruned(cacheID string, generation uint64, drops []Drop) {
 		return
 	}
 	for _, d := range drops {
+		delete(c.imports, d.Number)
 		e := c.entries[d.Number]
 		if e == nil {
 			continue
@@ -322,6 +327,41 @@ func (t *Tracker) Started(cacheID string, generation uint64, wipedCache string) 
 	t.cache(cacheID, generation)
 	if wipedCache != "" && wipedCache != cacheID {
 		delete(t.caches, wipedCache)
+	}
+}
+
+// ImportedValue is a stored value merged into an engine cache: the engine
+// entry it landed on, at what replacement count, with which parts complete
+// or offered.
+type ImportedValue struct {
+	Number       uint64
+	Replacements uint64
+	Parts        []dagql.PersistedPartAddress
+}
+
+// Imported records values merged into an engine cache from the store. While
+// an entry has the replacement count and no part beyond what its merge left,
+// it is the stored value, and is not exported: an import isn't the engine's
+// own entry. One that changed is exported, and the index (metastore's
+// Record) keeps the stored entry's number for it.
+func (t *Tracker) Imported(cacheID string, generation uint64, values []ImportedValue) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c := t.cache(cacheID, generation)
+	if c == nil {
+		return
+	}
+	for _, v := range values {
+		if v.Number == 0 {
+			continue
+		}
+		ev := &exportedValue{replacements: v.Replacements}
+		for _, p := range v.Parts {
+			ev.parts = append(ev.parts, metastore.PartKey(p))
+		}
+		slices.Sort(ev.parts)
+		ev.parts = slices.Compact(ev.parts)
+		c.imports[v.Number] = ev
 	}
 }
 
@@ -396,7 +436,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 		if e == nil {
 			continue
 		}
-		if !t.wantedLocked(e, now) {
+		if !t.wantedLocked(c, n, e, now) {
 			if !e.inFlight {
 				// No longer worth a retry, as once pruned or expired: stop
 				// waiting, so the entry can be forgotten.
@@ -419,8 +459,8 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 	return batches
 }
 
-// wantedLocked reports whether an entry should be exported now.
-func (t *Tracker) wantedLocked(e *trackedEntry, now time.Time) bool {
+// wantedLocked reports whether entry n should be exported now.
+func (t *Tracker) wantedLocked(c *trackedCache, n uint64, e *trackedEntry, now time.Time) bool {
 	if e.inFlight || !e.retained {
 		return false
 	}
@@ -428,7 +468,7 @@ func (t *Tracker) wantedLocked(e *trackedEntry, now time.Time) bool {
 	if (e.expires != 0 && e.expires <= unix) || (e.retentionExpires != 0 && e.retentionExpires <= unix) {
 		return false
 	}
-	if e.stored.covers(e) || e.refused.covers(e) {
+	if e.stored.covers(e) || e.refused.covers(e) || c.imports[n].covers(e) {
 		return false
 	}
 	if e.failedValue.covers(e) && e.failures >= t.cfg.MaxFailures {
@@ -535,7 +575,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		// changed since the snapshot exported, been stored or refused. If
 		// it is still worth exporting and nothing is scheduled, export it
 		// again now.
-		if e.retryAt.IsZero() && t.wantedLocked(e, now) {
+		if e.retryAt.IsZero() && t.wantedLocked(c, n, e, now) {
 			e.retryAt = now
 		}
 	}
@@ -611,7 +651,7 @@ func (t *Tracker) Entries(cacheID string) []EntryState {
 			Deps:         e.deps,
 			Parts:        slices.Sorted(maps.Keys(e.parts)),
 			Retained:     e.retained,
-			Stored:       e.stored.covers(e),
+			Stored:       e.stored.covers(e) || c.imports[n].covers(e),
 			Failures:     e.failures,
 		}
 		if e.refused.covers(e) {
