@@ -6,6 +6,11 @@ name: Remote cache tests
       - reopened
       - synchronize
       - ready_for_review
+  # Runs on the base branch save Go caches that every PR into it can restore
+  # (a PR's own caches are visible only to that PR).
+  push:
+    branches:
+      - feature/remote-cache
   workflow_dispatch: {}
 permissions:
   contents: read
@@ -21,9 +26,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Go
+        id: setup-go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # setup-go's own cache uses one key for every job, so only the first
+          # job to finish saves it; each job caches its own build below.
+          cache: false
+      # Module and build caches, per job (the unit job builds with -race, so
+      # its build cache differs). The key is new on every commit, so each run
+      # saves what it built; restore-keys take the newest earlier cache.
+      - name: Go cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
       # The remote cache service, the engine's client of it and their wire
       # protocol: every test in these packages.
       - name: Service, client and protocol
@@ -42,9 +64,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Go
+        id: setup-go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # setup-go's own cache uses one key for every job, so only the first
+          # job to finish saves it; each job caches its own build below.
+          cache: false
+      # Module and build caches, per job (the unit job builds with -race, so
+      # its build cache differs). The key is new on every commit, so each run
+      # saves what it built; restore-keys take the newest earlier cache.
+      - name: Go cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-minio-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-minio-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-minio-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
       # Starts MinIO from hack/remote-cache/compose.yaml and runs the tests
       # in cmd/cacheservice that need a real S3-compatible store.
       - name: MinIO tests
