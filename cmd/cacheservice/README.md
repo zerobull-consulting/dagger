@@ -315,12 +315,38 @@ limit, the roots are split in two and each half is exported alone (an
 chains). One root that is too large on its own fails. A batch holds at most
 1,000 roots.
 
+The import path can't split a stored bundle (records name each other by
+ordinal), and adds a presigned GET, about 1 KB, per layer of each output's
+chain when it merges one. So the exporter stores a bundle only if its merge
+would fit in a message too: `importer.MergeSize` bounds it from the bundle's
+size, a GET's size (measured by signing one) and what a merge rewrites. An
+export whose bundle would be over is split like one too large for a message,
+before any blob is uploaded, and a root whose bundle alone would be over fails
+as `too large to import`
+([#12](https://github.com/zerobull-consulting/dagger/issues/12); see
+[Resilience](#resilience)).
+
 Presigned PUTs last `CACHESERVICE_S3_PUT_EXPIRY` (15m). In an export with so
 many blobs that the engine, uploading 8 at a time, starts some after that,
 those uploads fail and the export is tried again with fresh URLs for the
 blobs still missing. For exports that large, raise the expiry. An export cut
 short because its engine disconnected, or the service stopped, isn't counted
-as a failure: its roots wait for the engine and are tried again.
+as a failure: its roots wait for the engine (`NoEngineWait`, 10s) and are
+tried again on its next connection, from `export`: the engine released the
+chains when the connection ended. A clean engine restart keeps the cache ID
+and entry numbers, so this holds across one too, on the new generation.
+
+**S3 errors.** The service's own requests (`HeadObject` for which blobs to
+ask for, bundle and index writes) go through the AWS SDK's standard retryer,
+which retries throttling (503 `SlowDown`) and 5xx answers with backoff. The
+engine doesn't retry a failed blob PUT itself; it reports it in `uploaded`,
+and the export is tried again as above. Nothing is published until every blob
+is stored, and the index is written last, so a failure at any step leaves no
+index entry naming a missing bundle, and no stored bundle naming a missing
+blob; at worst, blobs or a bundle nothing names yet, which the next export
+reuses. An export that fails as a whole (S3 down) counts a failure of its
+roots, which are tried again with backoff (2s doubling), up to 5 times per
+value.
 
 **Known gaps.** Nothing is authenticated yet
 ([#10](https://github.com/zerobull-consulting/dagger/issues/10)): the
@@ -334,7 +360,10 @@ clients send no spans to the service are invisible (see
 [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#gaps-and-options)). The tracker's state
 is in memory, so after a service restart entries are learned again from new
 spans; what is in S3 is not lost, and a re-export uploads nothing already
-stored.
+stored. An export pending or in flight when the service stops is lost until a
+later session names its entries
+([#45](https://github.com/zerobull-consulting/dagger/issues/45), pinned by
+`TestKnownGapServiceRestartForgetsPendingExport`).
 
 ## Import path
 
@@ -392,7 +421,9 @@ again whenever another engine's export is stored, and every `-import-poll`
 
 A merge refused by the engine is tried again at later syncs, up to 3 times per
 bundle and engine generation. A merge over the 64 MiB message limit is not
-sent. A new engine generation, or an `engine.start` that names a wiped cache,
+sent; the export path no longer stores a bundle whose merge would be (see
+[Export path](#export-path)), but one stored before that, or by a service
+with a higher limit, is never imported. A new engine generation, or an `engine.start` that names a wiped cache,
 starts that cache over (a wiped cache's imports leave the index too);
 `engine.prune` forgets the dropped entries, but keeps their imports in the
 index. A merged
@@ -414,8 +445,23 @@ is interchangeable. The real-engine run's `superseded` scenario checks which rec
 empty engine ends with ([The scenarios](#the-scenarios)). Parts are offered only at an entry's own address, not at
 an output path into it. What the importer knows of each engine is in memory:
 after a service restart, every connected engine is merged everything again,
-which the engine keeps as it is. An engine's own exports are never merged back
-into it, even after it pruned them. Entries an engine prunes, or answers
+once, including entries it had pruned. This is accepted rather than fixed
+with a per-cache marker in the store
+([#12](https://github.com/zerobull-consulting/dagger/issues/12)): it happens
+once per restart, not per poll; a merge carries records and GETs, not layers;
+an engine whose GC pruned the entries prunes them again if they stay unused;
+and a marker would add a store write to every prune event. Pinned by
+`TestServiceRestartMergesPrunedEntriesAgainOnce`; the real-engine
+`service-restart` scenario measures it ([Resilience](#resilience)). A bundle that holds an engine's imports names them
+by the engine numbers they landed on, resolved through the cache's current
+imported mapping; once those imports move (the engine pruned them, restarted
+and had them merged again) or are dropped (a wipe), the bundle can't be
+merged into any engine again
+([#47](https://github.com/zerobull-consulting/dagger/issues/47), pinned by
+`TestKnownGapBundleOfMovedImportsUnmergeable`; found by the real-engine run,
+where C's verify export fails to merge after the `prune` scenario). An
+engine's own exports are never merged back into it, even after it pruned
+them. Entries an engine prunes, or answers
 `gone` for, are not merged into it again until it restarts: merging them back
 on the next poll would undo its garbage collection, which prunes them again.
 
@@ -533,7 +579,9 @@ builds a pipeline and the service exports it to MinIO; engine B, with an
 empty cache, runs the same pipeline and gets cache hits whose layers come
 from MinIO. Then it runs the [scenarios](#the-scenarios) that check what a
 first hit doesn't: a repeated export, renewal after the GETs expired, a
-pruned import, and a replaced value. One command builds and starts
+pruned import, and a replaced value; and the [resilience](#resilience)
+scenarios, which drop a connection, restart an engine and the service, and
+make S3 fail, each mid-export. One command builds and starts
 everything from empty and checks the outcome. It is a Go test,
 [`e2e`](e2e/), that runs the service in-process, and CI runs it on every
 pull request. See
@@ -731,6 +779,63 @@ Two more things about the module path:
   its body's `withExec` was the hit, on the imported entry.
 - The module's own loading (sources, type definitions) is exported too: the
   first call's bundle held 50 values.
+
+### Resilience
+
+[#12](https://github.com/zerobull-consulting/dagger/issues/12)'s cases, and
+which layer proves each. Real engines prove what depends on the engine's own
+behavior (chains released when a connection ends, reconnect backoff, entry
+numbers across a restart, retries of real S3 clients); fake engines, behind
+the engine's own `remotecache.Run`, prove what needs exact control (sizes,
+timeouts, a restart with state to compare) or would cost minutes.
+
+| Case | Layer | Tests | Why there |
+| --- | --- | --- | --- |
+| Connection lost mid-upload | both | e2e `disconnect`; `TestConnectionLostMidUpload`, `TestExportHookInterruptedNotFailed`, engine's `TestExportReleasedWhenTheConnectionDrops` | The real engine shows the release and the reconnect; the fake one checks the chains are released before the retry. |
+| Engine restart, new generation | real engines (export side) | e2e `engine-restart`; import side: `TestSyncStaleGeneration`, `TestOfferPendingStaleGeneration`, `TestTrackerGenerationFence`, `TestRecordFencesOlderGenerations` | Whether entry numbers survive a restart is the engine's: only a real one shows the cut export runs again under the same numbers. |
+| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestKnownGapServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap exactly. |
+| S3 throttling, 5xx, outage | real engines | e2e `s3-faults`; `TestExportRetriesFailedUploads`, `TestExportGivesUpOnFailingUploads`, `TestExportBlobStoreFailureReleases`, `TestUpdateIndexRetriesOnAFreshIndex` | Who retries what is split between the engine's PUTs and the service's AWS SDK client, which only the real pair shows. |
+| Oversized messages | fake engine, and MinIO | `TestImportBundleNearMergeLimit` (and `TestMinIO…`), `TestExportSplitsBundleTooLargeToImport`, `TestExportOneRootBundleTooLargeToImport`, `TestMergeSizeBoundsBuildMerge`; splitting: `TestExportSplitsTooLarge`, `TestSyncTooLarge`, `TestSyncSplitsLargeOffers` | A real bundle near 64 MiB would take minutes to build and move; the limit is a setting, lowered in tests. |
+| Slow or stalled uploads | fake engine and unit tests | engine's `TestStalledUploadFails`, `TestStalledHTTP2UploadFails`, `TestSlowUploadIsNotCutOff`, `TestStalledUploadFreesItsSlot`; `TestExportUploadTimeout` | The engine gives up after a minute without progress, with timeouts the unit tests shorten; a real-engine version would add that minute to every run, so there is none. |
+
+**What was fixed.** The merge-size gap of #12's second comment: a stored
+bundle could fit in a message while its merge, with a presigned GET per layer
+(535 bytes each from MinIO, about 1 KB from S3 with longer keys, more with a
+session token), did not, and the importer never sent it. The exporter now
+checks each bundle's merge size before it uploads anything, and splits (see
+[Export path](#export-path)). `TestImportBundleNearMergeLimit` fails without
+the fix. `Service.CloseEngine` is new, to drop one connection.
+
+**Accepted.** After a service restart, every connected engine is merged every
+live bundle again, once, pruned entries included: see
+[Import path](#import-path). The real run measured it: 8 bundles, 61 values,
+merged into B within 187ms of its `hello`.
+
+**Known gaps.** An export pending or in flight when the service stops is lost
+until a later session names its entries
+([#45](https://github.com/zerobull-consulting/dagger/issues/45)). And the
+first run of `service-restart` found that a bundle holding imports can no
+longer be merged once its cache's imports moved
+([#47](https://github.com/zerobull-consulting/dagger/issues/47), see
+[Import path](#import-path)): C's verify export from `renew`, after `prune`
+restarted C. The old service had merged it into B before; the new one can't.
+The scenario expects only the bundles still mergeable, and logs the other as
+`GAP`.
+
+From a run on 2026-11-02, in the same setup as above, each scenario's cost
+on top of the run (42s together; the whole run took 1m58s with the binaries
+built):
+
+| Scenario | Took | What it showed |
+| --- | --- | --- |
+| `disconnect` | 4.6s | A reconnected 1.5s after the drop, with the same cache and generation. The export on the dropped connection was logged interrupted; nothing was published while it was cut (the index and 8 bundles unchanged); 2s later (`NoEngineWait` in the harness) it ran again on the new connection, uploaded the layers that had been in flight, and was stored. B then got the exec as a hit. |
+| `engine-restart` | 13.5s | `docker restart` took 10.9s; A came back with the same cache ID and generation 2. The cut export ran again on generation 2 under the same entry numbers, and its 3 entries were recorded as generation 2's. |
+| `s3-faults` | 11.9s | 2 blob PUTs answered 503 `SlowDown` (both in the export's first try), retried by a new export after 1s; 1 bundle PUT answered 500 and 2 index PUTs 503, each retried by the SDK; stored, with no failed export. With S3 down, the export failed once (S3 refused 14 requests, the SDK's retries included), nothing was published, and it was stored on the tracker's next try once S3 was back. |
+| `service-restart` | 11.6s | Down 2s; A and B were back 3.5s after the stop. The redo above, of the 8 of B's 11 bundles still live and mergeable (2 had expired; 1 is #47's); nothing of A's own merged into A. The export cut by the restart was not retried (`GAP`, #45); A's next session of the pipeline was exported and stored with its layers. |
+
+Every scenario ended with S3 consistent (the index's entries all in stored
+bundles; the stored bundles' layers all stored, except the one `renew`
+deleted on purpose) and B getting the scenario's pipeline as a cache hit.
 
 ## Expected behavior, read from the code
 
