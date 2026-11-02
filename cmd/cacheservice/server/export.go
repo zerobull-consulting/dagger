@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -61,6 +62,9 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	// Checked now, so a bad config fails here rather than on a connection.
 	if _, err := exporter.New(cfg.Exporter); err != nil {
 		return err
+	}
+	if _, err := namespaceBlobs(cfg.Exporter.Blobs, cfg.Exporter.Scope); err != nil {
+		return fmt.Errorf("exporter: %w", err)
 	}
 	if err := s.setDefaultNamespace(cfg.Exporter.Scope); err != nil {
 		return err
@@ -271,6 +275,11 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body string) {
 	p := s.export
 	if p == nil && s.imports == nil {
+		return
+	}
+	// Only the kinds acted on below go further: kind comes from the
+	// request, and names a metric label when the event is dropped.
+	if kind != telemetryattrs.EngineEventStart && kind != telemetryattrs.EngineEventPrune {
 		return
 	}
 	cacheID, generation, ok := parseEngineCache(cache)

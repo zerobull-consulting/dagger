@@ -901,6 +901,7 @@ func TestParseTokens(t *testing.T) {
 		"tok-a ..\n",                   // not a namespace
 		"tok-a blobs\n",                // reserved
 		"tok-a team-a\ntok-a team-b\n", // twice
+		"tok:a team-a\n",               // HTTP Basic ends the username at ':'
 	} {
 		_, err := ParseTokens([]byte(bad))
 		if err == nil {
@@ -937,4 +938,46 @@ func TestRejectionLog(t *testing.T) {
 	if n != rejectionWarnings {
 		t.Fatalf("%d of many tokens' refusals logged at warning level, want %d", n, rejectionWarnings)
 	}
+}
+
+// Event kinds the service doesn't act on are ignored before the owner check,
+// so a token can't make up kinds that name metric series: only engine.start
+// and engine.prune are ever counted as ignored.
+func TestUnknownEventKindsNotCounted(t *testing.T) {
+	h := newAuthHarness(t)
+	a := fakeengine.New("cache-a", 1)
+	h.connect(a, "tok-a")
+	for i := range 20 {
+		if code := h.postEvent("tok-a2", cacheAttr(a), "made-up-"+strconv.Itoa(i), pruneOf(10)); code != http.StatusOK {
+			t.Fatalf("status %d", code)
+		}
+	}
+	if n := h.rec.recordsAt("engine event ignored: it came with a token other than the engine's", slog.LevelWarn); n != 0 {
+		t.Fatalf("%d made-up events logged as ignored", n)
+	}
+	resp := httptest.NewRecorder()
+	h.svc.MetricsHandler().ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if body := resp.Body.String(); strings.Contains(body, "made-up") {
+		t.Fatal("a made-up event kind names a metric series")
+	}
+}
+
+// hiddenStore is a blob store that can't keep namespaces apart.
+type hiddenStore struct{ blobstore.Store }
+
+// The export and import paths refuse a blob store that can't keep
+// namespaces apart: sharing one would let a namespace renew, be offered,
+// or skip uploading another's blobs.
+func TestEnableRefusesStoreWithoutNamespaces(t *testing.T) {
+	blobs, meta := newMemStores(t)
+	store := hiddenStore{blobs}
+	ctx := t.Context()
+	svc := New(slog.New(slog.DiscardHandler), "")
+	if err := svc.EnableExport(ctx, ExportConfig{Exporter: exporter.Config{Blobs: store, Meta: meta, Scope: testScope}}); err == nil {
+		t.Fatal("the export path took a store without namespaces")
+	}
+	if err := svc.EnableImport(ctx, ImportConfig{Importer: importer.Config{Blobs: store, Meta: meta, Scope: testScope}}); err == nil {
+		t.Fatal("the import path took a store without namespaces")
+	}
+	svc.Wait()
 }

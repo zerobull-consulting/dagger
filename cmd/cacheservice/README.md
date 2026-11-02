@@ -580,7 +580,8 @@ b72d41c09e...   team-a
 5e01aa83f4...   team-b
 ```
 
-A token may not contain white space and may appear once. A namespace is what
+A token may not contain white space or `:` (HTTP Basic ends the username at
+the first colon), and may appear once. A namespace is what
 a scope may be: 1-128 letters, digits, `.`, `_` or `-`, starting with a letter
 or digit, and not `blobs`. Many tokens may share a namespace. Generate tokens
 long and random (`openssl rand -hex 32`), and keep the file readable by the
@@ -652,7 +653,8 @@ stays, for its other tokens, and for the token if it comes back.
 Each namespace's blobs are stored under its own prefix,
 `<prefix>/<namespace>/blobs/<algorithm>/<hex>`, even when two namespaces
 store the same layer. The service checks, presigns PUTs and GETs for, and
-renews only the connection's namespace's keys, so one namespace can never get
+renews only the connection's namespace's keys (`EnableExport` and
+`EnableImport` refuse a blob store that can't keep namespaces apart), so one namespace can never get
 a GET for another's blob, nor have its uploads skipped because another
 namespace has the blob (`TestNamespacesKeepExportsApart`,
 `TestRenewAcrossNamespacesRefused`, `TestMinIONamespaceKeys`).

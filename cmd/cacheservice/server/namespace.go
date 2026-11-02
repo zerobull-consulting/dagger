@@ -137,13 +137,19 @@ func (s *Service) newNamespace(name string) (*namespace, error) {
 	return n, nil
 }
 
+// errNotNamespaced is the error of a blob store that can't keep namespaces
+// apart: sharing one would let a namespace renew, be offered or skip the
+// upload of another's blobs.
+var errNotNamespaced = errors.New("the blob store doesn't keep namespaces apart (blobstore.Namespacer)")
+
 // namespaceBlobs is the store of a namespace's blobs: the namespace's view of
-// a store that keeps namespaces apart, or else the store itself, shared.
+// the store.
 func namespaceBlobs(store blobstore.Store, name string) (blobstore.Store, error) {
-	if ns, ok := store.(blobstore.Namespacer); ok {
-		return ns.Namespace(name)
+	ns, ok := store.(blobstore.Namespacer)
+	if !ok {
+		return nil, errNotNamespaced
 	}
-	return store, nil
+	return ns.Namespace(name)
 }
 
 // namespacesNow returns the namespaces created so far, by name.

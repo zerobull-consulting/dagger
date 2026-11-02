@@ -32,7 +32,8 @@ type Tokens interface {
 //	3f9c0e...   team-a
 //	b72d41...   team-b
 //
-// A token may not contain white space and may appear once; a namespace is
+// A token may not contain white space or ':' (HTTP Basic ends the username
+// at the first colon), and may appear once; a namespace is
 // what metastore.ValidateScope accepts. Many tokens may share a namespace.
 //
 // TokenFile keeps only the tokens' SHA-256 hashes, and compares them in
@@ -70,6 +71,11 @@ func ParseTokens(data []byte) (*TokenFile, error) {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
 			return nil, fmt.Errorf("tokens file: line %d: want a token and a namespace, separated by white space", n)
+		}
+		if strings.Contains(fields[0], ":") {
+			// HTTP Basic splits the username from the password at the
+			// first colon, so such a token could never authenticate.
+			return nil, fmt.Errorf("tokens file: line %d: a token may not contain ':'", n)
 		}
 		ns := fields[1]
 		if err := metastore.ValidateScope(ns); err != nil {

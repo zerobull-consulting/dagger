@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -62,6 +63,9 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	// Checked now, so a bad config fails here rather than on a connection.
 	if _, err := importer.New(cfg.Importer); err != nil {
 		return err
+	}
+	if _, err := namespaceBlobs(cfg.Importer.Blobs, cfg.Importer.Scope); err != nil {
+		return fmt.Errorf("importer: %w", err)
 	}
 	if err := s.setDefaultNamespace(cfg.Importer.Scope); err != nil {
 		return err
