@@ -130,7 +130,8 @@ build() {
 
 start_minio() {
 	log "Starting MinIO on ${gateway}, from empty"
-	dev reset >/dev/null 2>&1 || true
+	# The run is only from empty if this deletes the old data.
+	dev reset >/dev/null || die "could not delete MinIO's data, so the run would not start from empty"
 	dev up >/dev/null 2>&1 || dev up
 	eval "$(dev env)"
 }
@@ -321,7 +322,8 @@ else
 	ok=0
 fi
 echo "B's spans:   Container.withExec ${execs_hit_b} hit, ${execs_run_b} executed"
-((execs_run_b == 0)) || ok=0
+# The pipeline has two withExec calls: both must be hits.
+((execs_run_b == 0 && execs_hit_b == 2)) || ok=0
 if [[ "$sums_a" == "$sums_b" ]]; then
 	echo "layers:      the layer files on B are A's (checksums match A's stamps)"
 else
