@@ -44,6 +44,11 @@ type ServiceOptions struct {
 	// Addr is the address to listen on (host:port); empty picks a free
 	// port on the bridge gateway.
 	Addr string
+	// TokensFile, when set, authenticates engines with it (server's
+	// UseTokensFile); ReloadTokens reads it again, as SIGHUP does for the
+	// command. Without it, the service takes any token, in the run's
+	// scope.
+	TokensFile string
 }
 
 // noEngineWait is how long an export waits for its engine to reconnect:
@@ -83,8 +88,14 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
 	}
-	// On the bridge gateway only: it takes any token and any OTLP request,
-	// so it isn't exposed beyond this host.
+	if opts.TokensFile != "" {
+		if err := svc.UseTokensFile(opts.TokensFile); err != nil {
+			cancel()
+			t.Fatalf("service %s: %v", name, err)
+		}
+	}
+	// On the bridge gateway only: without tokens it takes any token and
+	// any OTLP request, so it isn't exposed beyond this host.
 	addr := opts.Addr
 	if addr == "" {
 		addr = net.JoinHostPort(e.Gateway, "0")

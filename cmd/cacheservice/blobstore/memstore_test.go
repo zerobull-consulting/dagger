@@ -84,3 +84,60 @@ func TestMemStore(t *testing.T) {
 		t.Fatal("bad digest accepted")
 	}
 }
+
+// A namespace's view keeps its blobs apart: a blob PUT through one view is
+// stored, counted and served in that namespace only, and its addresses name
+// the namespace.
+func TestMemStoreNamespaces(t *testing.T) {
+	m := NewMemStore("")
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	m.SetBaseURL(srv.URL)
+	ctx := context.Background()
+	a, err := m.In("team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := m.Namespace("team-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := []byte("layer bytes")
+	d := digest.FromBytes(blob)
+	put, err := a.PresignPut(ctx, d, int64(len(blob)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := memPut(t, put.URL, blob, int64(len(blob))); code != http.StatusOK {
+		t.Fatalf("put: %d", code)
+	}
+	if ok, _ := a.Has(ctx, d); !ok || a.Len() != 1 {
+		t.Fatal("not stored in team-a")
+	}
+	for name, s := range map[string]Store{"team-b": b, "the store": m} {
+		if ok, _ := s.Has(ctx, d); ok {
+			t.Fatalf("stored in %s too", name)
+		}
+	}
+	if m.Len() != 0 {
+		t.Fatal("counted at the top")
+	}
+	getB, _ := b.PresignGet(ctx, d)
+	resp, err := http.Get(getB.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("team-b's GET of team-a's blob: %d", resp.StatusCode)
+	}
+	getA, _ := a.PresignGet(ctx, d)
+	if want := srv.URL + "/mem/team-a/" + d.String(); getA.URL != want {
+		t.Fatalf("address %s, want %s", getA.URL, want)
+	}
+	for _, bad := range []string{"", "a/b", "..", "."} {
+		if _, err := m.Namespace(bad); err == nil {
+			t.Errorf("namespace %q accepted", bad)
+		}
+	}
+}

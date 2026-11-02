@@ -152,7 +152,7 @@ func waitTracked(t *testing.T, h *exportHarness, cacheID string, numbers ...uint
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		seen := 0
-		for _, e := range h.svc.export.tracker.Entries(cacheID) {
+		for _, e := range h.ns().tracker.Entries(cacheID) {
 			if slices.Contains(numbers, e.Number) && e.Retained && e.Stored {
 				seen++
 			}
@@ -162,7 +162,7 @@ func waitTracked(t *testing.T, h *exportHarness, cacheID string, numbers ...uint
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %v tracked as stored: %+v", numbers, h.svc.export.tracker.Entries(cacheID))
+	t.Fatalf("timed out waiting for %v tracked as stored: %+v", numbers, h.ns().tracker.Entries(cacheID))
 }
 
 // waitMerged waits until the importer has committed a merge into c, and
@@ -197,7 +197,7 @@ func TestWipedCacheImportsDropped(t *testing.T) {
 	if len(idx.Entries) != 2 {
 		t.Fatalf("entries %d: the wipe dropped A's entries", len(idx.Entries))
 	}
-	if _, ok := h.svc.imports.importer.State(b.ID); ok {
+	if _, ok := h.ns().importer.State(b.ID); ok {
 		t.Fatal("the importer still knows the wiped cache")
 	}
 }

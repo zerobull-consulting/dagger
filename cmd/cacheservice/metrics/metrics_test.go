@@ -27,7 +27,7 @@ func TestNilRecordsNothing(t *testing.T) {
 	m.BundleWrite("s", metrics.BundleWritten, 1)
 	m.BundleRead("s", 1)
 	m.ImportBundleCache(true)
-	m.ImportSync(false, time.Millisecond)
+	m.ImportSync("team", false, time.Millisecond)
 	m.ExportBatch(metrics.ExportBatch{Outcome: metrics.OutcomeOK})
 	if m.Collectors() != nil {
 		t.Fatal("nil metrics has collectors")
@@ -130,8 +130,8 @@ func TestBundlesAndImports(t *testing.T) {
 	m.ImportBundleCache(true)
 	m.ImportBundleCache(false)
 	m.ImportBundleCache(false)
-	m.ImportSync(false, time.Millisecond)
-	m.ImportSync(true, time.Millisecond)
+	m.ImportSync("team", false, time.Millisecond)
+	m.ImportSync("team", true, time.Millisecond)
 	for _, c := range []struct {
 		name   string
 		labels map[string]string
@@ -143,8 +143,8 @@ func TestBundlesAndImports(t *testing.T) {
 		{"cacheservice_bundle_read_bytes_total", map[string]string{"scope": "team"}, 4096},
 		{"cacheservice_import_bundle_cache_total", map[string]string{"result": "hit"}, 1},
 		{"cacheservice_import_bundle_cache_total", map[string]string{"result": "miss"}, 2},
-		{"cacheservice_import_syncs_total", map[string]string{"outcome": metrics.OutcomeOK}, 1},
-		{"cacheservice_import_syncs_total", map[string]string{"outcome": metrics.OutcomeError}, 1},
+		{"cacheservice_import_syncs_total", map[string]string{"scope": "team", "outcome": metrics.OutcomeOK}, 1},
+		{"cacheservice_import_syncs_total", map[string]string{"scope": "team", "outcome": metrics.OutcomeError}, 1},
 	} {
 		if got := metricstest.Value(t, reg, c.name, c.labels); got != c.want {
 			t.Errorf("%s%v = %v, want %v", c.name, c.labels, got, c.want)
@@ -158,17 +158,17 @@ func TestBundlesAndImports(t *testing.T) {
 func TestExportBatch(t *testing.T) {
 	m, reg := newTest(t)
 	m.ExportBatch(metrics.ExportBatch{
-		Outcome: metrics.OutcomeOK, Duration: time.Second, Roots: 5,
+		Scope: "team", Outcome: metrics.OutcomeOK, Duration: time.Second, Roots: 5,
 		Stored: 3, Gone: 1, Refused: 1, Uploaded: 2, Present: 4, Bundles: 1,
 	})
-	m.ExportBatch(metrics.ExportBatch{Outcome: metrics.ExportInterrupted, Roots: 2})
+	m.ExportBatch(metrics.ExportBatch{Scope: "team", Outcome: metrics.ExportInterrupted, Roots: 2})
 	for _, c := range []struct {
 		name   string
 		labels map[string]string
 		want   float64
 	}{
-		{"cacheservice_export_batches_total", map[string]string{"outcome": metrics.OutcomeOK}, 1},
-		{"cacheservice_export_batches_total", map[string]string{"outcome": metrics.ExportInterrupted}, 1},
+		{"cacheservice_export_batches_total", map[string]string{"scope": "team", "outcome": metrics.OutcomeOK}, 1},
+		{"cacheservice_export_batches_total", map[string]string{"scope": "team", "outcome": metrics.ExportInterrupted}, 1},
 		{"cacheservice_export_roots_total", map[string]string{"result": "stored"}, 3},
 		{"cacheservice_export_roots_total", map[string]string{"result": "gone"}, 1},
 		{"cacheservice_export_roots_total", map[string]string{"result": "refused"}, 1},

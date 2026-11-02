@@ -86,6 +86,8 @@ func TestRealEngines(t *testing.T) {
 	env.Run("renew", st.renew)
 	env.Run("prune", st.prune)
 	env.Run("superseded", st.superseded)
+	// Auth and namespaces (#10): its own service, with tokens, and engines.
+	env.Run("namespaces", st.namespaces)
 	// The resilience scenarios (#12), last: they break things on purpose,
 	// and service-restart replaces the main service.
 	env.Run("disconnect", st.disconnect)

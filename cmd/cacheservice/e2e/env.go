@@ -368,9 +368,21 @@ func (e *Env) listKeys(prefix string) []string {
 	return keys
 }
 
-// BlobKey is the object key of a layer blob.
+// BlobKey is the object key of a layer blob of the run's scope, the
+// namespace of a service without tokens.
 func (e *Env) BlobKey(d digest.Digest) string {
-	return e.S3Config.Prefix + "/blobs/" + d.Algorithm().String() + "/" + d.Encoded()
+	return e.BlobKeyIn(e.Scope, d)
+}
+
+// BlobKeyIn is the object key of a layer blob of a namespace.
+func (e *Env) BlobKeyIn(ns string, d digest.Digest) string {
+	return e.S3Config.Prefix + "/" + ns + "/blobs/" + d.Algorithm().String() + "/" + d.Encoded()
+}
+
+// HasKey reports whether an object is stored.
+func (e *Env) HasKey(key string) bool {
+	e.T.Helper()
+	return len(e.listKeys(key)) > 0
 }
 
 // DeleteBlob deletes a layer blob from MinIO, and checks it is gone.
@@ -422,7 +434,7 @@ func (e *Env) CheckConsistent(t *testing.T, when string) {
 	slices.Sort(missingBundles)
 	slices.Sort(missingResolutions)
 	blobs := map[string]bool{}
-	for _, key := range e.listKeys(e.S3Config.Prefix + "/blobs/") {
+	for _, key := range e.listKeys(e.S3Config.Prefix + "/" + e.Scope + "/blobs/") {
 		blobs[key] = true
 	}
 	named := map[digest.Digest]bool{}

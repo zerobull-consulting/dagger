@@ -86,6 +86,9 @@ type Metrics struct {
 	exportRoots         *prometheus.CounterVec
 	exportBlobs         *prometheus.CounterVec
 	exportBundles       prometheus.Counter
+	authRejected        *prometheus.CounterVec
+	tokensRevoked       *prometheus.CounterVec
+	eventsIgnored       *prometheus.CounterVec
 	collectors          []prometheus.Collector
 }
 
@@ -189,8 +192,8 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"result"}),
 		importSyncs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "import_syncs_total",
-			Help: "Import syncs of one engine, by outcome: ok or error.",
-		}, []string{"outcome"}),
+			Help: "Import syncs of one engine, by scope (the engine's namespace) and outcome: ok or error.",
+		}, []string{"scope", "outcome"}),
 		importSyncDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: ns, Name: "import_sync_duration_seconds",
 			Help:    "Time per import sync of one engine.",
@@ -198,8 +201,8 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		exportBatches: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_batches_total",
-			Help: "Export batches run on an engine, by outcome: ok, error, or interrupted (the engine went away, or the service stopped).",
-		}, []string{"outcome"}),
+			Help: "Export batches run on an engine, by scope (the engine's namespace) and outcome: ok, error, or interrupted (the engine went away, or the service stopped).",
+		}, []string{"scope", "outcome"}),
 		exportBatchDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: ns, Name: "export_batch_duration_seconds",
 			Help:    "Time per export batch, from export to the index update.",
@@ -222,6 +225,18 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "export_bundles_total",
 			Help: "Bundles exports published.",
 		}),
+		authRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "auth_rejected_total",
+			Help: "Requests refused for a missing or unknown token, by endpoint: engine (the WebSocket) or otlp.",
+		}, []string{"endpoint"}),
+		tokensRevoked: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "connections_revoked_total",
+			Help: "Engine connections closed because their token was removed from its namespace, by scope.",
+		}, []string{"scope"}),
+		eventsIgnored: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "engine_events_ignored_total",
+			Help: "Engine events dropped because they came with a token other than the engine's, by scope and kind.",
+		}, []string{"scope", "kind"}),
 	}
 	m.collectors = []prometheus.Collector{
 		m.indexReads, m.indexReadBytes, m.indexReadDuration,
@@ -233,6 +248,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.importBundleCache, m.importResCache, m.importSyncs, m.importSyncDuration,
 		m.exportBatches, m.exportBatchDuration, m.exportBatchRoots,
 		m.exportRoots, m.exportBlobs, m.exportBundles,
+		m.authRejected, m.tokensRevoked, m.eventsIgnored,
 	}
 	if reg != nil {
 		reg.MustRegister(m.collectors...)
@@ -382,8 +398,8 @@ func (m *Metrics) ImportBundleCache(hit bool) {
 	m.importBundleCache.WithLabelValues(result).Inc()
 }
 
-// ImportSync records one engine's import sync.
-func (m *Metrics) ImportSync(failed bool, d time.Duration) {
+// ImportSync records one engine's import sync, in the engine's scope.
+func (m *Metrics) ImportSync(scope string, failed bool, d time.Duration) {
 	if m == nil {
 		return
 	}
@@ -391,12 +407,14 @@ func (m *Metrics) ImportSync(failed bool, d time.Duration) {
 	if failed {
 		outcome = OutcomeError
 	}
-	m.importSyncs.WithLabelValues(outcome).Inc()
+	m.importSyncs.WithLabelValues(scope, outcome).Inc()
 	m.importSyncDuration.Observe(d.Seconds())
 }
 
 // ExportBatch is what one export batch did, for ExportBatch.
 type ExportBatch struct {
+	// Scope is the namespace of the batch's engine.
+	Scope string
 	// Outcome is OutcomeOK, OutcomeError or ExportInterrupted.
 	Outcome  string
 	Duration time.Duration
@@ -416,7 +434,7 @@ func (m *Metrics) ExportBatch(b ExportBatch) {
 	if m == nil {
 		return
 	}
-	m.exportBatches.WithLabelValues(b.Outcome).Inc()
+	m.exportBatches.WithLabelValues(b.Scope, b.Outcome).Inc()
 	m.exportBatchDuration.Observe(b.Duration.Seconds())
 	m.exportBatchRoots.Observe(float64(b.Roots))
 	for result, n := range map[string]int{
@@ -433,4 +451,29 @@ func (m *Metrics) ExportBatch(b ExportBatch) {
 		m.exportBlobs.WithLabelValues("present").Add(float64(b.Present))
 	}
 	m.exportBundles.Add(float64(b.Bundles))
+}
+
+// AuthRejected records a request refused for a missing or unknown token.
+func (m *Metrics) AuthRejected(endpoint string) {
+	if m == nil {
+		return
+	}
+	m.authRejected.WithLabelValues(endpoint).Inc()
+}
+
+// TokenRevoked records a connection closed because its token was removed.
+func (m *Metrics) TokenRevoked(scope string) {
+	if m == nil {
+		return
+	}
+	m.tokensRevoked.WithLabelValues(scope).Inc()
+}
+
+// IgnoredEvent records an engine event dropped because it came with a token
+// other than the engine's.
+func (m *Metrics) IgnoredEvent(scope, kind string) {
+	if m == nil {
+		return
+	}
+	m.eventsIgnored.WithLabelValues(scope, kind).Inc()
 }

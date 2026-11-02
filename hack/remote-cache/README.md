@@ -214,7 +214,9 @@ cache volume. It:
    (`server.Service`) is configured with the proxy as its S3 endpoint, so
    the presigned URLs it hands out point at the proxy, and every request an
    engine makes to the store is recorded, with its time and status. MinIO
-   itself can stay on loopback;
+   itself can stay on loopback. The main service has no tokens file: it is
+   unauthenticated, so only the bridge reaches it, and every engine is in the
+   run's scope (`e2e`), whose blobs are at `e2e/<run>/e2e/blobs/`;
 3. starts engines A and B in containers, each with
    `_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL`, `DAGGER_CLOUD_TOKEN` and
    `DAGGER_CLOUD_URL` pointing at the service;
@@ -255,6 +257,7 @@ the main service's exports by polling the index.
 | `reexport` | [#30](https://github.com/zerobull-consulting/dagger/issues/30) | Exports A's stored entries again with `Service.Export`, with every root and part the tracker knows of. Then runs a second pipeline on A over the same `alpine` (one exec writing 2MB). | The repeat stores every root, uploads no blob, finds every blob present, leaves the index as it was (numbers and bundles) and writes no bundle object. The second pipeline uploads only its own layers: `alpine`'s is in its bundle, and not among the blob PUTs. |
 | `renew` | [#31](https://github.com/zerobull-consulting/dagger/issues/31) | Starts the replica, with GETs that last `E2E_GET_EXPIRY` seconds and an import poll of `E2E_IMPORT_POLL` seconds, and engines C and D on it, empty. Once both have A's entries merged, waits for the GETs to expire, and runs the verify exec on C. Then deletes the last exec's layer from MinIO, and runs it on D. | C sends `renew`, the replica answers with fresh GETs, the store serves C every layer of A's chain, with no blob GET before the renew and none refused, and C's files are A's. D's `renew` of the chain with the deleted layer answers `unavailable`; D's query still succeeds, with exec1's files A's and exec2's new (it ran again). |
 | `prune` | [#32](https://github.com/zerobull-consulting/dagger/issues/32) | Prunes C's cache with `{ engine { localCache { prune } } }` (with no arguments, it drops every releasable entry), waits 5 import polls, syncs C 3 times by hand (`Service.Import`), then restarts C on the same volume. Starts the replica and C if `renew` didn't run. | The prune reaches the replica (`engine.prune`) and the importer forgets the pruned values; nothing is merged or offered to C over the polls and syncs; after the restart (a new generation), the replica merges the entries into C again. [#47](https://github.com/zerobull-consulting/dagger/issues/47): C's bundles that hold entries it imported (its `renew` verify exec) still build a merge once those imports moved to C's new entries, though resolving them through C's current mappings would fail; and no merge so far failed with "is no longer stored". |
+| `namespaces` | [#10](https://github.com/zerobull-consulting/dagger/issues/10) | Starts its own service, with a tokens file (`ServiceOptions.TokensFile`) of two tokens in namespaces `team-a` and `team-b`, and engines NA and NB on them, empty (`StartEnginesWithTokens`; each runs its CLI with its engine's token, since session spans come under the CLI's). Runs a pipeline of its own on NA (one exec writing 1MB, with a nonce), then on NB once NA's entries are stored. Starts engine NC on NA's token, waits for NA's entries to be merged into it, and runs the pipeline on NC. Then removes team B's token from the file and reloads it (`Service.ReloadTokens`, as on `SIGHUP`). | Each engine is in its token's namespace. Nothing is merged into NB, whose exec runs itself (no hit, its own stamp); neither namespace's index maps the other's engine; NA's exec layer is stored under `team-a/blobs/` only, and `alpine`'s layer under both namespaces' prefixes. NC gets only NA's bundles, and hits NA's exec with NA's stamp. After the reload, NB's connection is closed (logged revoked), NB's engine logs the close with status 4001, its reconnection is refused (401), the service lists NA and NC only, and it logged nothing at error level. |
 | `superseded` | [#32](https://github.com/zerobull-consulting/dagger/issues/32), [#27](https://github.com/zerobull-consulting/dagger/issues/27) | Writes a Dang module (`ttlmod` in the run's directory) whose function `stamp2` has a cache TTL of `E2E_TTL` seconds, runs it on A, waits for it to expire, and runs it again. Then starts engine F, empty, waits until both bundles are merged into it, and reads the value on it. | A replaced the value in place, the index kept its service number and moved it to a newer bundle, and F's call resolved to the imported entry (its `withExec` hit; a function with a TTL is evaluated on every call). It reports which record F got by the layer it read: the newer one passes; the older one is logged as `GAP` (#27), without failing; neither fails. F, the first engine started after `prune` moved C's imports, gets C's bundles holding them merged, with their roots and the imported entries (#47). |
 
 The resilience scenarios ([#12](https://github.com/zerobull-consulting/dagger/issues/12))
@@ -283,13 +286,14 @@ progress, and oversized bundles).
 Each check is logged as `ok` or `FAIL`; a failed check fails its scenario
 without stopping it. Run some scenarios only with
 `E2E_SCENARIOS="renew prune" ./hack/remote-cache/dev.sh e2e` (the names:
-`reexport`, `renew`, `prune`, `superseded`, `disconnect`, `engine-restart`,
-`s3-faults`, `service-restart`), or pass `go
+`reexport`, `renew`, `prune`, `superseded`, `namespaces`, `disconnect`,
+`engine-restart`, `s3-faults`, `service-restart`), or pass `go
 test` flags after `e2e`, such as `-run 'TestRealEngines/^renew$'`. The first
 part always runs.
 
 Each run's files are in `E2E_DIR/runs/<run>/`: each service's log
-(`main.log`, `replica.log`), each CLI call's output and log, the index and
+(`main.log`, `replica.log`, `namespaces.log`), the `namespaces` scenario's
+tokens file (`tokens`), each CLI call's output and log, the index and
 importer state at each step, and, when the run failed, each engine's log.
 When the test ends it removes the engines, their volumes and the run's
 objects in the bucket; with `E2E_KEEP=1` it leaves them, and `dev.sh
