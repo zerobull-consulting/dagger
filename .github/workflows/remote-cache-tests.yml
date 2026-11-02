@@ -6,7 +6,7 @@ name: Remote cache tests
       - reopened
       - synchronize
       - ready_for_review
-  # Runs on the base branch save Go caches every PR into it can restore
+  # Runs on the base branch save Go caches that every PR into it can restore
   # (a PR's own caches are visible only to that PR).
   push:
     branches:
