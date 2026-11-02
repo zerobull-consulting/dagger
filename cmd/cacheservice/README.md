@@ -1041,6 +1041,20 @@ Two more things about the module path:
 - The module's own loading (sources, type definitions) is exported too: the
   first call's bundle held 50 values.
 
+**`namespaces`
+([#10](https://github.com/zerobull-consulting/dagger/issues/10)).** Its own
+service, with a tokens file, and engines NA and NB on tokens of `team-a` and
+`team-b`. NA's pipeline (alpine, one exec) was stored in team A's index; a
+sync of NB right after merged nothing, and NB ran the exec itself (0 hits, its
+own stamp). Neither index mapped the other team's engine; NA's exec layer was
+under `team-a/blobs/` only, and alpine's layer under both namespaces. NC, on
+NA's token, had NA's bundle merged and hit NA's exec with NA's stamp. After
+team B's token was removed and the file reloaded, NB's engine logged
+`received close frame: status = StatusCode(4001) and reason = "token
+revoked"`, its reconnection was refused with 401, and the service logged
+nothing at error level. It adds about 12s to the run (the whole run took
+2m06s with the binaries built).
+
 ### Resilience
 
 [#12](https://github.com/zerobull-consulting/dagger/issues/12)'s cases, and
