@@ -139,9 +139,6 @@ start_minio() {
 
 start_service() {
 	log "Starting cacheservice on ${gateway}:${CACHESERVICE_PORT}"
-	if curl -fsS -o /dev/null "$debug_url/debug/engines" 2>/dev/null; then
-		die "a cacheservice already answers on ${debug_url}: stop it first (dev.sh e2e-down, with the E2E_DIR it was started with)"
-	fi
 	"$E2E_DIR/bin/cacheservice" -v \
 		-listen "${gateway}:${CACHESERVICE_PORT}" \
 		-debug-listen "127.0.0.1:${CACHESERVICE_DEBUG_PORT}" \
@@ -254,6 +251,16 @@ run) ;;
 *) die "usage: e2e.sh [run|down]" ;;
 esac
 
+# Before anything is deleted: a service answering that this E2E_DIR didn't
+# start belongs to another run, and stopping its engines or resetting MinIO
+# would wipe that run's caches and data.
+own_service=0
+if [[ -f "$E2E_DIR/cacheservice.pid" ]] && kill -0 "$(cat "$E2E_DIR/cacheservice.pid")" 2>/dev/null; then
+	own_service=1
+fi
+if ((!own_service)) && curl -fsS -o /dev/null "$debug_url/debug/engines" 2>/dev/null; then
+	die "a cacheservice already answers on ${debug_url}: stop it first (dev.sh e2e-down, with the E2E_DIR it was started with)"
+fi
 stop_all
 rm -rf "$E2E_DIR/"{run-,verify-,minio-,imports-,entries-,index}* "$E2E_DIR/cacheservice.log"
 build
@@ -278,6 +285,14 @@ index_json >"$E2E_DIR/index-after-a.json"
 jq -e '(.entries // {}) | length > 0' "$E2E_DIR/index-after-a.json" >/dev/null ||
 	die "the index in MinIO has no entries: $E2E_DIR/index-after-a.json"
 curl -fsS "$debug_url/debug/engines/$conn_a/entries" >"$E2E_DIR/entries-a.json"
+# The layers B must read from MinIO: the longest fs chain in A's bundles,
+# the last exec's container (alpine's layer and both execs').
+for bundle in $(jq -r '[.entries[].bundle] | unique[]' "$E2E_DIR/index-after-a.json"); do
+	mc_minio "mc cat local/${CACHESERVICE_S3_BUCKET}/${CACHESERVICE_S3_PREFIX:+${CACHESERVICE_S3_PREFIX}/}${E2E_SCOPE}/bundles/${bundle}.json"
+done | jq -rs '[.[].outputs[]? | select(.address.part == "fs")
+	| [.. | objects | select(has("digest") and has("mediaType")) | .digest]]
+	| max_by(length) // [] | .[]' >"$E2E_DIR/layers-a.txt"
+[[ -s "$E2E_DIR/layers-a.txt" ]] || die "A's bundles name no fs layers: $E2E_DIR/index-after-a.json"
 echo "index: $(jq '.entries | length' "$E2E_DIR/index-after-a.json") entries, $(jq '.roots | length' "$E2E_DIR/index-after-a.json") roots" >&2
 
 log "Waiting for the service to merge them into B"
@@ -309,6 +324,12 @@ curl -fsS "$debug_url/debug/engines/$conn_b/imports" >"$E2E_DIR/imports-b.json"
 index_json >"$E2E_DIR/index-final.json"
 grep 'GetObject' "$E2E_DIR/minio-trace-b.log" | grep '/blobs/' >"$E2E_DIR/minio-blob-gets-b.log" || true
 blob_gets="$(grep -c . "$E2E_DIR/minio-blob-gets-b.log" || true)"
+# Every layer of A's chain must be among them, not just some.
+missing_layers=()
+while read -r digest; do
+	grep -qF "/blobs/${digest/://}" "$E2E_DIR/minio-blob-gets-b.log" || missing_layers+=("$digest")
+done <"$E2E_DIR/layers-a.txt"
+expected_layers="$(grep -c . "$E2E_DIR/layers-a.txt")"
 
 # The layer files B read must be A's: their checksums are in A's stamps.
 sums_a="$(awk '{print $3}' <<<"$stamp_a")"
@@ -331,11 +352,11 @@ else
 	echo "WRONG LAYERS: the layer files on B are not A's"
 	ok=0
 fi
-if ((blob_gets > 0)); then
-	echo "from S3:     B's engine read ${blob_gets} layer blob(s) from MinIO:"
+if ((blob_gets > 0 && ${#missing_layers[@]} == 0)); then
+	echo "from S3:     B's engine read all ${expected_layers} layers of A's chain from MinIO (${blob_gets} blob GETs):"
 	sed -E 's/^.*(GetObject [^ ]*\/blobs\/[a-z0-9]+\/[0-9a-f]{12})[^ ]*.*$/               \1.../' "$E2E_DIR/minio-blob-gets-b.log"
 else
-	echo "NOT FROM S3: MinIO saw no blob GETs while B ran"
+	echo "NOT FROM S3: MinIO didn't serve B these layers of A's chain: ${missing_layers[*]:-all of them}"
 	ok=0
 fi
 echo "timings:     A ${time_a}s (empty cache, builds)"
