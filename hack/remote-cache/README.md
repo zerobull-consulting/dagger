@@ -22,8 +22,8 @@ the settings. Data persists in the `dagger-remote-cache_minio-data` volume.
 | `dev.sh status` | Show the containers. |
 | `dev.sh env` | Print the settings as `export` lines: `eval "$(./hack/remote-cache/dev.sh env)"`. |
 | `dev.sh test` | Start MinIO and run the Go tests against it. |
-| `dev.sh e2e` | Run the remote cache with two real engines, from empty. **Deletes MinIO's data first.** See [Real engines](#real-engines-devsh-e2e). |
-| `dev.sh e2e-down` | Stop the service and engines `dev.sh e2e` left running. |
+| `dev.sh e2e` | Run the remote cache with real engines, from empty, and its scenarios. **Deletes MinIO's data first.** See [Real engines](#real-engines-devsh-e2e). |
+| `dev.sh e2e-down` | Stop the services and engines `dev.sh e2e` left running. |
 
 It needs Docker with Compose v2.
 
@@ -178,8 +178,9 @@ prints. To run it against a dev engine by hand, see
 ./hack/remote-cache/dev.sh e2e
 ```
 
-One command runs the remote cache end to end with two engines built from this
-repo ([#29](https://github.com/zerobull-consulting/dagger/issues/29)). It
+One command runs the remote cache end to end with engines built from this
+repo ([#29](https://github.com/zerobull-consulting/dagger/issues/29)), then
+the [scenarios](#scenarios) that check the paths beyond a first cache hit. It
 starts from nothing: it **deletes MinIO's data** (`dev.sh reset`), and gives
 engines A and B new, empty cache volumes. Then it:
 
@@ -218,9 +219,37 @@ and no merge into A carries A's own entries back
 What a run showed is in
 [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#real-engine-run).
 
+### Scenarios
+
+After that first scenario, on the same MinIO, service and engines, it runs
+the scenarios in `E2E_SCENARIOS`, in this order (all of them by default). A
+scenario that needs other service settings runs against a **replica**: a
+second `cacheservice` on the same bucket and scope, on port 8092 (debug API
+on `127.0.0.1:8093`, log in `replica.log`), as another replica of the service
+would be. It learns of the main service's exports by polling the index, so
+nothing needs restarting, and the one-command run stays one command.
+
+| Scenario | Issue | What it does | Passes when |
+| --- | --- | --- | --- |
+| `reexport` | [#30](https://github.com/zerobull-consulting/dagger/issues/30) | Exports A's stored entries again with `POST /debug/engines/{conn}/export`, with every root and part the tracker knows of. Then runs a second pipeline on A over the same `alpine` (one exec writing 2MB). | The repeat stores every root, uploads no blob, finds every blob present, leaves the index as it was (numbers and bundles) and writes no bundle object. The second pipeline uploads only its own layers: `alpine`'s is in its bundle, and not among MinIO's PUTs. |
+| `renew` | [#31](https://github.com/zerobull-consulting/dagger/issues/31) | Starts the replica, with GETs that last `E2E_GET_EXPIRY` seconds and an import poll of `E2E_IMPORT_POLL` seconds, and engines C and D on it, empty. Once both have A's entries merged, waits for the GETs to expire, and runs the verify exec on C. Then deletes the last exec's layer from MinIO, and runs it on D. | C sends `renew`, the replica answers with fresh GETs, MinIO serves C every layer of A's chain, and C's files are A's. D's `renew` of the chain with the deleted layer answers `unavailable`; D's query still succeeds, with exec1's files A's and exec2's new (it ran again). |
+| `prune` | [#32](https://github.com/zerobull-consulting/dagger/issues/32) | Prunes C's cache with `{ engine { localCache { prune } } }` (with no arguments, it drops every releasable entry), waits 5 import polls, syncs C 3 times by hand (`POST /debug/engines/{conn}/import`), then restarts C on the same volume. Starts the replica and C if `renew` didn't run. | The prune reaches the replica (`engine.prune`) and the importer forgets the pruned values; nothing is merged or offered to C over the polls and syncs; after the restart (a new generation), the replica merges the entries into C again. |
+| `superseded` | [#32](https://github.com/zerobull-consulting/dagger/issues/32), [#27](https://github.com/zerobull-consulting/dagger/issues/27) | Writes a Dang module (`E2E_DIR/ttlmod`) whose function `stamp2` has a cache TTL of `E2E_TTL` seconds, runs it on A, waits for it to expire, and runs it again. Then starts engine F, empty, and reads the value on it, tracing MinIO. | A replaced the value in place, the index kept its service number and moved it to a newer bundle, and F's call resolved to the imported entry (its `withExec` hit; a function with a TTL is evaluated on every call). It reports which record F got by the layer it read: the newer one passes; the older one is printed as `GAP` (#27), without failing; neither fails. |
+
+Each scenario prints its checks as it ends (`ok`, `FAIL`), and the run exits
+non-zero if any failed. `E2E_SCENARIOS=renew ./hack/remote-cache/dev.sh e2e`
+runs the first scenario and `renew` only. The evidence is in `E2E_DIR`, by
+scenario prefix: `reexport-*` (the request, its result, the index and bundle
+listing before and after, MinIO's trace of the second pipeline), `renew-*`
+(the importer's state, the renew envelopes from `replica.log`, each engine's
+MinIO trace and blob GETs), `prune-*` (the importer's state before, after the
+prune, after the polls and after the restart, the prune event, the hand
+syncs) and `superseded-*` (each export's index and bundle, F's imports, its
+span and MinIO trace).
+
 Everything stays up afterwards for poking at (`curl
 localhost:8091/debug/engines`, the MinIO console); `dev.sh e2e-down` stops
-the engines and the service, and `dev.sh down` stops MinIO. Logs, query
+the engines, the service and the replica, and `dev.sh down` stops MinIO. Logs, query
 results, the index before and after, the importer's state and MinIO's trace
 are in `E2E_DIR`.
 
@@ -232,6 +261,11 @@ are in `E2E_DIR`.
 | `E2E_CA_FILE` | unset | A CA bundle to add to the engine image, for hosts behind a TLS-intercepting proxy |
 | `E2E_TIMEOUT` | `180` | Seconds to wait for the export, and for the merge |
 | `CACHESERVICE_PORT`, `CACHESERVICE_DEBUG_PORT` | `8090`, `8091` | The service's ports |
+| `REPLICA_PORT`, `REPLICA_DEBUG_PORT` | `8092`, `8093` | The replica's ports |
+| `E2E_SCENARIOS` | `reexport renew prune superseded` | The scenarios to run after the first, which always runs |
+| `E2E_GET_EXPIRY` | `30` | Seconds the replica's presigned GETs last (`renew`) |
+| `E2E_IMPORT_POLL` | `2` | Seconds between the replica's import polls (`prune`) |
+| `E2E_TTL` | `30` | The cache TTL of the `superseded` scenario's function, in seconds |
 
 Notes:
 

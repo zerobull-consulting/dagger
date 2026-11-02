@@ -260,7 +260,23 @@ session's cache ID. If none is, the export waits and is tried again.
    index (`metastore.Record`).
 
 A repeated export of stored entries uploads no blob again, and keeps the
-entries' service numbers. An unchanged bundle is not written again.
+entries' service numbers. An unchanged bundle is not written again. Before a
+bundle is stored, the service drops what belongs to one export rather than to
+the values (`stripVolatile` in `exporter`): every chain's download addresses,
+and the engine-internal `buildkit/createdat` layer annotation. An engine that
+had entries merged into it exports their unpulled parts as pending offers in
+its records, with the presigned GETs it was given: stored, they would reach
+every engine the bundle is merged into, as GETs that work until they expire
+and are never renewed. The offers stay, with their layers and renewal key, so
+a receiver renews them through its own session. The engine annotates a layer
+with its creation time only once its snapshot's metadata has one, so the
+first export of an exec's layers lacks the annotation and later exports have
+it, which made a repeated export a new bundle. Both were seen on the
+real-engine run ([Real-engine run](#real-engine-run)).
+
+A blob deleted from the bucket is uploaded again by the next export that
+needs it from an engine that has it: `UploadURLs` asks for every blob the
+store lacks.
 
 **Limits.** The engine works on 4 exports at once and queues the rest, so the
 service sends at most 4 at a time to each engine. The engine uploads 8 blobs at
@@ -359,11 +375,16 @@ reply that arrives after its cache's state was reset is discarded.
 engine reads an offered part after they expired, it sends `renew` with the
 chain's layers; the service checks each is stored and answers with fresh GETs,
 or `unavailable` when one is missing or the renewal key isn't its scope.
+The engine checks an address's expiry itself, and renews without trying an
+expired GET; it renews a whole chain at once, and only once per read. When
+renewal answers `unavailable`, the read fails and the engine computes the part
+again, as for a cache miss (seen on the real-engine run).
 
 **Known gaps.** Bundles are merged whole, so a bundle whose roots were partly
 superseded by a later export still sends the older records of its other
 values; the engine keeps whichever value it merged first, as the same recipe
-is interchangeable. Parts are offered only at an entry's own address, not at
+is interchangeable. The real-engine run's `superseded` scenario checks which record an
+empty engine ends with ([The scenarios](#the-scenarios)). Parts are offered only at an entry's own address, not at
 an output path into it. What the importer knows of each engine is in memory:
 after a service restart, every connected engine is merged everything again,
 which the engine keeps as it is. An engine's own exports are never merged back
@@ -433,13 +454,15 @@ For a local S3-compatible store (MinIO), see
 
 ## Real-engine run
 
-`./hack/remote-cache/dev.sh e2e` runs both paths with two real engines built
+`./hack/remote-cache/dev.sh e2e` runs both paths with real engines built
 from this repo
 ([#29](https://github.com/zerobull-consulting/dagger/issues/29)): engine A
 builds a pipeline and the service exports it to MinIO; engine B, with an
 empty cache, runs the same pipeline and gets cache hits whose layers come
-from MinIO. One command builds and starts everything from empty and checks
-the outcome. See
+from MinIO. Then it runs the [scenarios](#the-scenarios) that check what a
+first hit doesn't: a repeated export, renewal after the GETs expired, a
+pruned import, and a replaced value. One command builds and starts
+everything from empty and checks the outcome. See
 [`hack/remote-cache/README.md`](../../hack/remote-cache/README.md#real-engines-devsh-e2e)
 for what it does and its settings.
 
@@ -480,9 +503,9 @@ the two pipeline runs.
   layer blobs (alpine's and both execs') from MinIO through the merged
   presigned GETs, as ranged `GetObject`s (206), and the data files it read had
   A's checksums. B never pulled `alpine` from a registry.
-- **No offers, no renew.** Every part was already in the merge, so the
-  service sent no `offer`. The GETs had not expired, so B sent no `renew`
-  ([#31](https://github.com/zerobull-consulting/dagger/issues/31) covers it).
+- **No offers.** Every part was already in the merge, so the service sent
+  no `offer`. B read within the GETs' hour, so it sent no `renew`; the
+  [`renew` scenario](#the-scenarios) lets them expire.
 - Nothing in the service broke, and it logged no warning.
 
 ### What the fake engine did not show
@@ -507,11 +530,9 @@ the two pipeline runs.
   resolved to A's numbers as B's imports), and ended with 7 entries: A's 6
   and the verify exec's container, which depends on A's last exec by its
   original number.
-- **The expired-roots path did not run.** Each merged bundle's roots were
-  all planned, so none was sent already expired (`ExpiresAtUnix: 1`), and
-  `planValueMergeLocked` skipping them is still seen only in the code. It
-  needs a bundle with a superseded or expired root
-  ([#32](https://github.com/zerobull-consulting/dagger/issues/32)).
+- **The expired-roots path did not run in the first scenario.** Each merged
+  bundle's roots were all planned, so none was sent already expired
+  (`ExpiresAtUnix: 1`). The `superseded` scenario runs it: see below.
 - **An unsampled `TRACEPARENT` hides every entry.** This container exports
   `TRACEPARENT=00-…-00` to every process. The CLI continued that unsampled
   trace, so neither it nor the engine recorded any span: the engine logged
@@ -521,6 +542,121 @@ the two pipeline runs.
   nothing. `dev.sh e2e` unsets `TRACEPARENT` for the CLI. A client in CI that
   inherits one has the same silent miss as a client with no Cloud
   credential (see [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#gaps-and-options)).
+
+### The scenarios
+
+From a run on 2026-11-02, in the same setup, after the first scenario
+([`hack/remote-cache/README.md`](../../hack/remote-cache/README.md#scenarios)
+has what each does and checks). `renew` and `prune` run against a replica:
+a second service on the same bucket and scope, with GETs that last 30s and an
+import poll of 2s, which learns of the main service's exports from the index.
+
+**`reexport`
+([#30](https://github.com/zerobull-consulting/dagger/issues/30)).** A's 4
+stored roots, exported again with every part (`POST
+/debug/engines/{conn}/export`), were stored in 0.03s: no blob uploaded, all 4
+present, the index unchanged (the same 7 entries and bundles, next number 8),
+and no bundle object written. A second pipeline on A over the same `alpine`
+uploaded its own 2 blobs (MinIO saw 2 PUTs); `alpine`'s layer was present, in
+its bundle, and not uploaded again.
+
+The first real run of this found a bug (fixed): the repeat stored a **new
+bundle**, which moved A's entries to it in the index and was merged again
+into B. The engine had added a `buildkit/createdat` annotation to the exec
+layers' descriptors, which their first export lacked: a layer the engine has
+just compressed for an export has no creation time in its snapshot's metadata
+yet. The service now drops the annotation before it stores a bundle (see
+[Export path](#export-path)), with regression tests against MemStore and
+MinIO (`TestRepeatedExportCreatedAtAnnotationSameBundle`,
+`TestMinIOExportBuild`); the fake engine annotates re-exported layers as the
+engine does.
+
+**`renew` ([#31](https://github.com/zerobull-consulting/dagger/issues/31)).**
+The replica merged A's entries into C and D, both empty. 36s after the merge,
+with the GETs 30s old, C ran the verify exec: it sent one `renew` with the
+whole chain (3 layers, alpine's and both execs'), the replica checked each
+blob (3 `HeadObject`s) and answered with 3 fresh GETs 12ms later, and MinIO
+served the 3 ranged GETs (206) 1ms after that. MinIO saw no GET before the
+renew, and no 403: the engine checks an address's expiry itself, and renews
+an expired one without trying it. C's files had A's checksums, and its query
+took 1.19s, against 0.61s for B's verify exec with live GETs.
+
+Then exec2's layer was deleted from MinIO (once C's verify exec was stored:
+see below) and D ran the verify exec. D read alpine's and exec1's layers
+(206), got a 404 for exec2's, and sent `renew` for the chain; the replica
+logged `renew of a missing layer` and answered `unavailable`. D then ran
+exec2 again, as for a cache miss: the query succeeded in 1.18s, exec1's
+files were A's, and exec2's had a new stamp and checksum. D's GETs had not
+expired: the replica had merged C's verify export into D after the expiry,
+with fresh GETs for the same layers. So the 404, not the expiry, made it
+renew.
+
+Two things it found:
+
+- **Stored bundles carried presigned GETs (fixed).** An engine that had
+  entries merged into it holds their parts as offers until it pulls them, and
+  exports them, addresses included, in its records' pending offers. B's and
+  C's verify exports were stored that way, with the GETs the services had
+  handed them, and merged into later engines. On the first run of this
+  scenario, D read exec1's layers with the hour-long GETs the main service
+  had given B, without renewing them, though its own had expired. The service now
+  drops every chain's addresses before storing a bundle, and keeps the offers
+  and their renewal key (`TestStoredBundlesHoldNoAddresses`, and its MinIO
+  variant).
+- **The store repairs a deleted blob.** Deleted before C's verify exec was
+  exported, exec2's layer came back: the export's `UploadURLs` found it
+  missing, and C, which had it on disk, uploaded it again. The scenario now
+  deletes it after C's export is stored. This is the export path working as
+  designed, and it means a blob lost from the bucket is restored by the next
+  export of an engine that has it.
+
+**`prune` ([#32](https://github.com/zerobull-consulting/dagger/issues/32)).**
+Engine C pruned its cache with `{ engine { localCache { prune } } }` (no
+arguments: every releasable entry; the harness's engines have GC off). Its
+disk usage went from 32MB to 0, its `engine.prune` event named 9 entries, and
+the replica's importer kept 3 of the 11 values it had merged into C. Over 5
+import polls (2s each) and 3 syncs by hand, nothing was merged or offered to
+C, and the importer's state for C didn't change. After `docker restart`
+(generation 2), the replica merged the 4 bundles into C again, 11 values.
+
+**`superseded`
+([#32](https://github.com/zerobull-consulting/dagger/issues/32),
+[#27](https://github.com/zerobull-consulting/dagger/issues/27)).** A Dang
+module function with `@cache(ttl: "30s")` returns
+`container.from(alpine).withExec(...)` writing a random stamp. On A, its first
+value was exported as service number 60; once it expired, the same call
+replaced the value in place (same engine entry, 1 replacement, a new layer),
+and the export kept number 60 and moved it to a newer bundle. The older
+bundle still held the first record, among 5 other roots of the module's own
+entries. Engine F, empty, then had the scope's 6 bundles merged, in order of their
+lowest root: first the newer one (roots 2 and 60), last the older one (5
+planned roots; the importer sent its root for the first record already
+expired, and the engine merged 47 of its 50 values, skipping the superseded
+root and what only it needed). F's call resolved to
+the imported entry, and read the **newer** record's layer from MinIO, not the
+first's.
+
+So F ended with the newer record. Two things kept #27's outcome from
+showing here. The newer bundle's lowest root is `alpine`'s
+`Container.from` (2), which it shares, so it was merged first. And the first
+record had expired, so even merged first it would not have been kept. The
+engine replaces an expired value in place only when no other entry depends
+on it (`replaceResultValueInPlaceLocked`); otherwise it computes it into a
+new entry, with a new service number, and nothing is superseded. A
+superseded record in another root's closure therefore needs that root to be
+gone from A but live in the index, as after a prune, and the scenario doesn't
+build that. In the index, an entry's expiry doesn't carry to the
+entries that depend on it: a `File.contents` over an expired container stays
+a root with no expiry, and the plan leaves it out only because a dependency
+expired.
+
+Two more things about the module path:
+
+- A function with an explicit cache TTL is evaluated again on every call
+  (`core/sdk/dang/v2/entrypoint.go`), so on F its call span says `executed`;
+  its body's `withExec` was the hit, on the imported entry.
+- The module's own loading (sources, type definitions) is exported too: the
+  first call's bundle held 50 values.
 
 ## Expected behavior, read from the code
 
