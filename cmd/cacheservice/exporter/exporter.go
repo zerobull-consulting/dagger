@@ -26,6 +26,13 @@
 // would be larger is answered with protocol.TooLargeMessage, and an upload
 // whose request would be. Either way, the roots are split in two and each
 // half is exported on its own.
+//
+// The import path sends a stored bundle whole, with a presigned GET added
+// per layer of each output's chain, and can't split it: records name each
+// other by ordinal. So a bundle is stored only if its merge would fit in a
+// message too (importer.MergeSize, against Config.MaxMergeBytes); an export
+// whose bundle wouldn't is split the same way, and a root whose bundle alone
+// wouldn't fails.
 package exporter
 
 import (
@@ -41,6 +48,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache"
@@ -90,6 +98,10 @@ type Config struct {
 	// MaxMessageBytes is the largest request the exporter sends. Zero means
 	// protocol.MaxMessageBytes. Tests lower it.
 	MaxMessageBytes int
+	// MaxMergeBytes is the largest merge request the import path sends: its
+	// own MaxMessageBytes. A bundle whose merge would be larger is not
+	// stored (see importer.MergeSize). Zero means protocol.MaxMessageBytes.
+	MaxMergeBytes int
 }
 
 // Exporter exports entries from engines to the store.
@@ -102,6 +114,9 @@ type Exporter struct {
 	mu sync.Mutex
 	// slots bound the exports in flight per engine.
 	slots map[Engine]chan struct{}
+	// addressBytes is the size of a presigned GET from the blob store, as
+	// a merge carries it; 0 until measured.
+	addressBytes int
 }
 
 // New returns an Exporter for cfg.
@@ -126,6 +141,9 @@ func New(cfg Config) (*Exporter, error) {
 	}
 	if cfg.MaxMessageBytes <= 0 {
 		cfg.MaxMessageBytes = protocol.MaxMessageBytes
+	}
+	if cfg.MaxMergeBytes <= 0 {
+		cfg.MaxMergeBytes = protocol.MaxMessageBytes
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -219,6 +237,47 @@ func (r *Result) fail(roots []uint64, err error) {
 // limit.
 var errTooLarge = errors.New(protocol.TooLargeMessage)
 
+// bundleTooLargeError is an exported bundle whose merge would be over the
+// import path's message limit. It is an errTooLarge: the roots are split.
+type bundleTooLargeError struct{ size, limit int }
+
+func (e *bundleTooLargeError) Error() string {
+	return fmt.Sprintf("bundle too large to import: its merge would be up to %d bytes, over the %d byte message limit", e.size, e.limit)
+}
+
+func (e *bundleTooLargeError) Is(target error) bool { return target == errTooLarge }
+
+// checkMergeSize returns a bundleTooLargeError when the merge the import
+// path would make of bundle, as stored, could be over MaxMergeBytes.
+func (x *Exporter) checkMergeSize(ctx context.Context, bundle *dagql.ValueBundle) error {
+	data, err := json.Marshal(bundle)
+	if err != nil {
+		return err
+	}
+	size := importer.MergeSize(bundle, len(data), x.addressSize(ctx), x.cfg.Scope)
+	if size > x.cfg.MaxMergeBytes {
+		return &bundleTooLargeError{size: size, limit: x.cfg.MaxMergeBytes}
+	}
+	return nil
+}
+
+// addressSize is the size of one presigned GET from the blob store, as a
+// merge carries it, measured once.
+func (x *Exporter) addressSize(ctx context.Context) int {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.addressBytes == 0 {
+		n, err := importer.AddressBytes(ctx, importer.StoreSigner(x.cfg.Blobs))
+		if err != nil {
+			// Measured again next time.
+			x.log.Warn("export: can't sign a GET to size merges; assuming the default", "error", err)
+			return importer.DefaultAddressBytes
+		}
+		x.addressBytes = n
+	}
+	return x.addressBytes
+}
+
 // Export exports req's roots from eng, uploads the blobs the store lacks,
 // and publishes what was stored. It returns an error, with the result so
 // far, when the export as a whole fails: ctx ends, the connection fails, the
@@ -243,6 +302,12 @@ func (x *Exporter) export(ctx context.Context, eng Engine, roots []uint64, outpu
 		return res, err
 	}
 	if len(roots) == 1 {
+		var big *bundleTooLargeError
+		if errors.As(err, &big) {
+			x.log.Warn("export: one root's bundle is too large to import", "root", roots[0], "mergeBytes", big.size, "limit", big.limit)
+			res.fail(roots, big)
+			return res, nil
+		}
 		x.log.Warn("export: one root is too large for a message", "root", roots[0])
 		res.fail(roots, fmt.Errorf("export of this root alone is over the %d byte message limit", x.cfg.MaxMessageBytes))
 		return res, nil
@@ -315,6 +380,16 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	survivors := survivingRoots(roots, exported.Skipped)
 
+	stripVolatile(exported.Bundle)
+	if err := x.checkMergeSize(ctx, exported.Bundle); err != nil {
+		// Not stored: release the chains, and let the caller split the
+		// roots.
+		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
+			return res, nil, rerr
+		}
+		return Result{}, nil, err
+	}
+
 	blobs, err := neededBlobs(exported.Bundle)
 	if err != nil {
 		err = fmt.Errorf("invalid bundle: %w", err)
@@ -375,7 +450,6 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		return res, survivors, nil
 	}
 
-	stripVolatile(exported.Bundle)
 	rec, err := x.cfg.Meta.Record(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation())
 	if err != nil {
 		if ctx.Err() != nil {

@@ -126,6 +126,33 @@ func (en *Engine) Restart() {
 	en.waitConn(en.Conn)
 }
 
+// RestartAsync starts restarting the engine's container, and returns a
+// function that waits for the restart and the engine's new connection.
+func (en *Engine) RestartAsync() (wait func()) {
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := en.env.ctx()
+		defer cancel()
+		_, err := Docker(ctx, "restart", en.Container)
+		done <- err
+	}()
+	return func() {
+		en.env.T.Helper()
+		if err := <-done; err != nil {
+			en.env.T.Fatalf("restart engine %s: %v", en.Name, err)
+		}
+		en.waitConn(en.Conn)
+	}
+}
+
+// Attach points the engine at svc, a restarted service on its address, and
+// waits for its connection there.
+func (en *Engine) Attach(svc *Service) {
+	en.env.T.Helper()
+	en.Service = svc
+	en.waitConn(0)
+}
+
 func (en *Engine) remove() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

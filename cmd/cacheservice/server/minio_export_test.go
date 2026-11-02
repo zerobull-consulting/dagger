@@ -24,6 +24,14 @@ import (
 // prefix.
 func newMinIOExportHarness(t *testing.T) (*exportHarness, *minioTestEnv) {
 	t.Helper()
+	blobs, meta, env := newMinIOStores(t)
+	return newExportHarness(t, blobs, meta, nil), env
+}
+
+// newMinIOStores are the blob and metadata stores on MinIO, under the test's
+// own prefix.
+func newMinIOStores(t *testing.T) (blobstore.Store, *metastore.Store, *minioTestEnv) {
+	t.Helper()
 	env := newMinIOTestEnv(t)
 	cfg, err := blobstore.S3ConfigFromEnv()
 	if err != nil {
@@ -49,7 +57,7 @@ func newMinIOExportHarness(t *testing.T) (*exportHarness, *minioTestEnv) {
 	if err := meta.VerifyConditionalWrites(ctx, testScope); err != nil {
 		t.Fatal(err)
 	}
-	return newExportHarness(t, blobs, meta, nil), env
+	return blobs, meta, env
 }
 
 // After a build on engine A, its layers and bundle exist in S3. A repeated
