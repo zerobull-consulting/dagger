@@ -432,8 +432,8 @@ the two pipeline runs.
   an engine's entries are imports (`GET /debug/engines/{conn}/imports`), but
   the exporter doesn't consult it, and the index can map an engine entry
   only to an entry that engine exported. A fix means letting the index map an
-  importing engine's entries to the stored entries they came from. It is left
-  for a follow-up.
+  importing engine's entries to the stored entries they came from
+  ([#35](https://github.com/zerobull-consulting/dagger/issues/35)).
 - **The expired-roots path did not run.** Each merged bundle's roots were
   all planned, so none was sent already expired (`ExpiresAtUnix: 1`), and
   `planValueMergeLocked` skipping them is still seen only in the code. It
