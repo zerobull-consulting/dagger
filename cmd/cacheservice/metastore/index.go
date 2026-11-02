@@ -13,7 +13,17 @@ import (
 
 // IndexVersion is the index format this package writes. It refuses to read a
 // later one, rather than drop fields it doesn't know.
-const IndexVersion = 1
+//
+// Version 2 added Entry.Resolution (#47). A version 1 index reads as one
+// whose records name no resolution, and is written back as version 2. A
+// service that reads only version 1 refuses a version 2 index, rather than
+// rewrite it without the resolutions: so during a rolling upgrade the older
+// replicas stop updating the scope instead of erasing what the newer ones
+// recorded.
+const IndexVersion = 2
+
+// oldestIndexVersion is the oldest index format this package reads.
+const oldestIndexVersion = 1
 
 // Index is everything a scope stores, apart from the bundles' contents.
 //
@@ -86,6 +96,13 @@ type Entry struct {
 	// PartKey, sorted. A record of an imported value replaces this one
 	// only if it holds more.
 	Parts []string `json:"parts,omitempty"`
+	// Resolution is the ID of the stored Resolution of the export that
+	// wrote this record: the service number of each of the bundle's values
+	// when it was recorded, which a merge of the bundle sends. Empty for a
+	// record stored before resolutions were: the bundle is then resolved
+	// through the source cache's current mappings (see BuildMerge in
+	// package importer).
+	Resolution string `json:"resolution,omitempty"`
 }
 
 // Source is an engine entry: its cache, the cache's generation when the
@@ -160,9 +177,11 @@ func decodeIndex(body []byte) (*Index, error) {
 	if err := json.Unmarshal(body, &idx); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	if idx.Version != IndexVersion {
-		return nil, fmt.Errorf("index version %d, this service reads %d", idx.Version, IndexVersion)
+	if idx.Version < oldestIndexVersion || idx.Version > IndexVersion {
+		return nil, fmt.Errorf("index version %d, this service reads %d to %d", idx.Version, oldestIndexVersion, IndexVersion)
 	}
+	// Version 1 has no resolutions; its records read as naming none.
+	idx.Version = IndexVersion
 	if idx.Entries == nil {
 		idx.Entries = map[uint64]*Entry{}
 	}
@@ -209,6 +228,9 @@ func (idx *Index) Validate() error {
 		}
 		if e.Ordinal == 0 {
 			return fmt.Errorf("entry %d: no ordinal", n)
+		}
+		if e.Resolution != "" && !bundleIDPattern.MatchString(e.Resolution) {
+			return fmt.Errorf("entry %d: invalid resolution ID %q", n, e.Resolution)
 		}
 		for _, d := range e.Deps {
 			if _, ok := idx.Entries[d]; !ok {
@@ -362,15 +384,26 @@ func retentionDeps(bundle *dagql.ValueBundle, v dagql.TransferredValue) []uint64
 // replacement counts of two caches don't compare, so nothing else decides
 // between them. Any other value gets a new service number. A root's expiry
 // is the later of the stored one and the bundle's (0, never, is the latest).
+//
+// Each record it writes names the bundle's resolution: the service numbers
+// it returns. RecordResolved returns that resolution too; Store.Record
+// stores it before the index that names it.
 func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (map[dagql.TransferOrdinal]uint64, error) {
+	numbers, _, err := idx.RecordResolved(bundleID, bundle, cacheID, generation)
+	return numbers, err
+}
+
+// RecordResolved is Record, and also returns the bundle's resolution, which
+// the records it wrote name by its ID.
+func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (map[dagql.TransferOrdinal]uint64, *Resolution, error) {
 	if !bundleIDPattern.MatchString(bundleID) {
-		return nil, fmt.Errorf("invalid bundle ID %q", bundleID)
+		return nil, nil, fmt.Errorf("invalid bundle ID %q", bundleID)
 	}
 	if cacheID == "" {
-		return nil, errors.New("no cacheID")
+		return nil, nil, errors.New("no cacheID")
 	}
 	if err := ValidateBundle(bundle); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cache := idx.Caches[cacheID]
 	if cache == nil {
@@ -400,6 +433,14 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 			}
 		}
 		numbers[v.Ordinal] = idx.allocate()
+	}
+	res, err := NewResolution(bundleID, cacheID, numbers)
+	if err != nil {
+		return nil, nil, err
+	}
+	resID, _, err := ResolutionID(res)
+	if err != nil {
+		return nil, nil, err
 	}
 	parts := bundleParts(bundle)
 	for _, v := range values {
@@ -449,6 +490,7 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 			Deps:          deps,
 			ExpiresAtUnix: v.ExpiresAtUnix,
 			Parts:         parts[v.Ordinal],
+			Resolution:    resID,
 		}
 	}
 	for _, r := range bundle.Roots {
@@ -459,7 +501,7 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 		}
 		idx.Roots[n] = Root{ExpiresAtUnix: r.ExpiresAtUnix}
 	}
-	return numbers, nil
+	return numbers, res, nil
 }
 
 // bundleParts returns the parts each value has outputs of in a bundle, by
@@ -682,6 +724,9 @@ func (idx *Index) DropExpired(nowUnix int64) []uint64 {
 type Recorded struct {
 	// BundleID is the bundle's ID.
 	BundleID string
+	// ResolutionID is the ID of the bundle's stored resolution, which the
+	// records it wrote name.
+	ResolutionID string
 	// Numbers are the values' service numbers, by ordinal.
 	Numbers map[dagql.TransferOrdinal]uint64
 	// Index is the index as written.
@@ -689,8 +734,23 @@ type Recorded struct {
 }
 
 // Record stores an exported bundle and adds its values to the scope's index,
-// as Index.Record does, in one atomic index update. The bundle is stored
-// first, so the index never names a bundle that isn't there.
+// as Index.Record does, in one atomic index update.
+//
+// Writes go in an order where every partial state is harmless, so a reader
+// never sees the index name an object that isn't stored:
+//
+//  1. The bundle.
+//  2. Its resolution (see Resolution), once the update has resolved the
+//     values against the index it read, and before it writes the index.
+//     If the conditional index write then loses, the update resolves again
+//     against the newer index, and stores that resolution, if it differs,
+//     before trying again.
+//  3. The index.
+//
+// A service that stops after 1 or 2 leaves a bundle or resolution no index
+// names: nothing reads it, and the export is not recorded (as before
+// resolutions, an export the service didn't record is exported again by a
+// later session). A resolution of a losing attempt is left the same way.
 func (s *Store) Record(ctx context.Context, scope string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (Recorded, error) {
 	if err := ValidateBundle(bundle); err != nil {
 		return Recorded{}, fmt.Errorf("record bundle: %w", err)
@@ -702,16 +762,35 @@ func (s *Store) Record(ctx context.Context, scope string, bundle *dagql.ValueBun
 	if err != nil {
 		return Recorded{}, err
 	}
-	var numbers map[dagql.TransferOrdinal]uint64
-	idx, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
+	var (
+		numbers map[dagql.TransferOrdinal]uint64
+		res     *Resolution
+		resID   string
+		stored  = map[string]bool{}
+	)
+	idx, err := s.updateIndex(ctx, scope, func(idx *Index) error {
 		var err error
-		numbers, err = idx.Record(id, bundle, cacheID, generation)
+		numbers, res, err = idx.RecordResolved(id, bundle, cacheID, generation)
 		return err
+	}, func(*Index) error {
+		rid, _, err := ResolutionID(res)
+		if err != nil {
+			return err
+		}
+		resID = rid
+		if stored[rid] {
+			return nil
+		}
+		if _, err := s.PutResolution(ctx, scope, res); err != nil {
+			return err
+		}
+		stored[rid] = true
+		return nil
 	})
 	if err != nil {
 		return Recorded{}, fmt.Errorf("record bundle %s: %w", id, err)
 	}
-	return Recorded{BundleID: id, Numbers: numbers, Index: idx}, nil
+	return Recorded{BundleID: id, ResolutionID: resID, Numbers: numbers, Index: idx}, nil
 }
 
 // DropExpired drops what has expired at nowUnix from the scope's index, as

@@ -71,3 +71,14 @@ func TestMinIOImportBundleNearMergeLimit(t *testing.T) {
 		})
 	}
 }
+
+// #47 against MinIO: a bundle holding B's imports merges into a fresh engine
+// after they move, or are wiped.
+func TestMinIOBundleOfMovedImportsMerges(t *testing.T) {
+	for _, how := range []string{"moved", "wiped"} {
+		t.Run(how, func(t *testing.T) {
+			h, _ := newMinIOExportHarness(t)
+			testBundleOfMovedImports(t, h, how)
+		})
+	}
+}
