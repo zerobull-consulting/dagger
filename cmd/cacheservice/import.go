@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -40,10 +42,23 @@ type importConfig struct {
 // without a trigger.
 const DefaultImportPoll = 30 * time.Second
 
-// enableImport turns on the import path until ctx ends.
+// enableImport turns on the import path until ctx ends. Turn on the export
+// path first: the import path tells its tracker what each merge left in an
+// engine cache, so an unchanged import isn't exported back.
 func (s *service) enableImport(ctx context.Context, cfg importConfig) error {
 	if cfg.Importer.Logger == nil {
 		cfg.Importer.Logger = s.logger.With("component", "import")
+	}
+	if cfg.Importer.Imported == nil && s.export != nil {
+		tracker := s.export.tracker
+		cfg.Importer.Imported = func(cacheID string, generation uint64, values map[uint64]importer.Value) {
+			out := make([]exporter.ImportedValue, 0, len(values))
+			for _, v := range values {
+				parts := slices.Concat(v.Complete, v.Offered)
+				out = append(out, exporter.ImportedValue{Number: v.Number, Replacements: v.Replacements, Parts: parts})
+			}
+			tracker.Imported(cacheID, generation, out)
+		}
 	}
 	im, err := importer.New(cfg.Importer)
 	if err != nil {
@@ -129,6 +144,33 @@ func (s *service) triggerImports(except string) {
 		default:
 		}
 	}
+}
+
+// forgetWiped forgets a wiped engine cache: what the importer knows of it,
+// now, and its imports in the index, in the background, so the telemetry
+// request that reported the wipe doesn't wait on the store. A merge whose
+// imports land after the index write finds the cache forgotten, and drops
+// them again. A write cut short by the service stopping leaves the dead
+// cache's imports in the index; its ID never connects again, so nothing
+// uses them, and they go when their entries are dropped.
+func (s *service) forgetWiped(cacheID string) {
+	p := s.imports
+	p.importer.Forget(cacheID)
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return
+	}
+	p.wg.Add(1)
+	p.mu.Unlock()
+	go func() {
+		defer p.wg.Done()
+		ctx, cancel := context.WithTimeout(p.ctx, time.Minute)
+		defer cancel()
+		if err := p.importer.ForgetImports(ctx, cacheID); err != nil {
+			s.logger.Warn("forgetting a wiped cache's imports failed", "cacheID", cacheID, "error", err)
+		}
+	}()
 }
 
 // renew answers an engine's renew: fresh download addresses when the import
