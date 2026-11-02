@@ -164,7 +164,10 @@ func TestImportFreshEngine(t *testing.T) {
 	checkPull(t, b, "withExec(make)", layers)
 	checkPull(t, b, "from(alpine)", layers[:1])
 
-	// What the service knows B kept.
+	// What the service knows B kept. The importer commits the merge, then
+	// records its imports, after B already shows the offers: wait for the
+	// index to hold B's two imports before reading its state.
+	waitImports(t, h.meta, "cache-b", 2)
 	st := h.debugImports(eng)
 	if st.CacheID != "cache-b" || len(st.Merged) != 1 || len(st.Values) != 2 {
 		t.Fatalf("imports %+v", st)
