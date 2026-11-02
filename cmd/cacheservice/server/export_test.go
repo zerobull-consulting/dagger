@@ -93,16 +93,55 @@ func newExportHarnessWith(t *testing.T, blobs blobstore.Store, meta *metastore.S
 		srv.Close()
 		debug.Close()
 	})
-	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: blobs, meta: meta, ctx: ctx}
+	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: scoped(t, blobs), meta: meta, ctx: ctx}
 	h.engine = waitEngines(t, svc, 1)[0]
 	return h
 }
 
-// newMemExportHarness uses in-memory stores.
+// ns is the harness's namespace: testScope, every engine's when the service
+// has no tokens.
+func (h *exportHarness) ns() *namespace {
+	h.t.Helper()
+	return mustNamespace(h.t, h.svc, testScope)
+}
+
+// mustNamespace returns a service's namespace, created if need be.
+func mustNamespace(t *testing.T, svc *Service, name string) *namespace {
+	t.Helper()
+	ns, err := svc.namespace(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ns
+}
+
+// newMemExportHarness uses in-memory stores. It returns the blob store's view
+// of testScope, where the harness's engines' blobs are.
 func newMemExportHarness(t *testing.T, modify func(*ExportConfig)) (*exportHarness, *blobstore.MemStore) {
 	t.Helper()
 	blobs, meta := newMemStores(t)
-	return newExportHarness(t, blobs, meta, modify), blobs
+	return newExportHarness(t, blobs, meta, modify), memIn(t, blobs, testScope)
+}
+
+// memIn is a MemStore's view of a namespace.
+func memIn(t *testing.T, blobs *blobstore.MemStore, ns string) *blobstore.MemStore {
+	t.Helper()
+	view, err := blobs.In(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view
+}
+
+// scoped is a blob store's view of testScope, where the service keeps the
+// blobs of engines with no tokens in tests.
+func scoped(t *testing.T, store blobstore.Store) blobstore.Store {
+	t.Helper()
+	view, err := namespaceBlobs(store, testScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view
 }
 
 // newMemStores are in-memory blob and metadata stores, the blob store
@@ -324,7 +363,7 @@ func TestExportAfterSessionEnd(t *testing.T) {
 		t.Fatalf("repeat export uploaded %d blobs", blobs.Puts()-puts)
 	}
 	// The explicit export is recorded in the tracker.
-	for _, e := range h.svc.export.tracker.Entries(h.cache.ID) {
+	for _, e := range h.ns().tracker.Entries(h.cache.ID) {
 		if !e.Stored {
 			t.Fatalf("entry %d not recorded as stored", e.Number)
 		}
@@ -372,7 +411,7 @@ func TestExportRetriesBusy(t *testing.T) {
 	h.postSpans("session-1", cacheSpan(11, "10"), carrierSpan(1))
 
 	deadline := time.Now().Add(5 * time.Second)
-	for h.svc.export.tracker.Entries(h.cache.ID)[0].RetryAt == "" {
+	for h.ns().tracker.Entries(h.cache.ID)[0].RetryAt == "" {
 		if time.Now().After(deadline) {
 			t.Fatal("busy root not scheduled for a retry")
 		}
@@ -388,12 +427,12 @@ func TestExportEngineEvents(t *testing.T) {
 	h.build()
 	h.postSpans("session-1", cacheSpan(11, "10"))
 	h.postEvent(telemetryattrs.EngineEventPrune, `{"drops":[{"resultId":11,"droppedAtUnixNano":`+strconv.FormatInt(time.Now().Add(time.Hour).UnixNano(), 10)+`}]}`)
-	if e := h.svc.export.tracker.Entries(h.cache.ID); len(e) != 1 || e[0].Retained {
+	if e := h.ns().tracker.Entries(h.cache.ID); len(e) != 1 || e[0].Retained {
 		t.Fatalf("entries after prune: %+v", e)
 	}
 	h.postEvent(telemetryattrs.EngineEventStart, `{"wipedCache":"cache-a"}`)
 	// The start is of the same cache ID, so nothing is wiped.
-	if e := h.svc.export.tracker.Entries(h.cache.ID); len(e) != 1 {
+	if e := h.ns().tracker.Entries(h.cache.ID); len(e) != 1 {
 		t.Fatalf("entries after start: %+v", e)
 	}
 	// Undecodable events are ignored.
@@ -407,7 +446,7 @@ func TestExportWaitsForEngine(t *testing.T) {
 	other := &exportHarness{t: t, srv: h.srv, cache: fakeengine.New("cache-b", 1)}
 	other.postSpans("session-1", cacheSpan(5), carrierSpan(1))
 	time.Sleep(100 * time.Millisecond)
-	e := h.svc.export.tracker.Entries("cache-b")
+	e := h.ns().tracker.Entries("cache-b")
 	if len(e) != 1 || e[0].Stored || e[0].Failures != 0 {
 		t.Fatalf("entries %+v", e)
 	}
@@ -493,13 +532,13 @@ func TestExportHookRequeuesBatchesNotRun(t *testing.T) {
 	if code, _ := h.debugExport(""); code != http.StatusBadGateway {
 		t.Fatalf("status %d", code)
 	}
-	entries := h.svc.export.tracker.Entries(h.cache.ID)
+	entries := h.ns().tracker.Entries(h.cache.ID)
 	last := entries[len(entries)-1]
 	if last.Number != 1001 || last.RetryAt == "" || last.Failures != 0 {
 		t.Fatalf("batch not run wasn't requeued: %+v", last)
 	}
 	// Due again, so a scheduler tick runs it.
-	if b := h.svc.export.tracker.Due(time.Now()); len(b) == 0 {
+	if b := h.ns().tracker.Due(time.Now()); len(b) == 0 {
 		t.Fatal("requeued batch not due")
 	}
 }
@@ -546,7 +585,7 @@ func TestExportHookInterruptedNotFailed(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		e := h.svc.export.tracker.Entries(h.cache.ID)
+		e := h.ns().tracker.Entries(h.cache.ID)
 		if len(e) == 1 && e[0].RetryAt != "" {
 			if e[0].Failures != 0 {
 				t.Fatalf("interrupted export counted as a failure: %+v", e[0])

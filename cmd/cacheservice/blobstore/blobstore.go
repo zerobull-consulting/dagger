@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,26 @@ type Store interface {
 	PresignPut(ctx context.Context, dgst digest.Digest, size int64) (Address, error)
 	// PresignGet returns an address that serves the blob to a plain GET.
 	PresignGet(ctx context.Context, dgst digest.Digest) (Address, error)
+}
+
+// Namespacer is a Store that can keep each namespace's blobs apart. The
+// service stores every namespace's blobs under its own keys (see the README,
+// "Auth and namespaces"), so a blob uploaded by one namespace is never served
+// to, or counted as stored for, another.
+type Namespacer interface {
+	// Namespace returns the store of one namespace's blobs. It makes no
+	// requests.
+	Namespace(ns string) (Store, error)
+}
+
+// ValidateNamespace reports whether ns can name a namespace's keys: one key
+// segment. The service checks namespaces against metastore.ValidateScope,
+// which is stricter.
+func ValidateNamespace(ns string) error {
+	if ns == "" || ns == "." || ns == ".." || strings.ContainsAny(ns, "/\\") {
+		return fmt.Errorf("invalid blob namespace %q", ns)
+	}
+	return nil
 }
 
 // Address is a presigned URL and the time it stops working.

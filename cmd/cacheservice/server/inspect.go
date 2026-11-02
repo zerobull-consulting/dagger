@@ -40,6 +40,7 @@ func (s *Service) Engines() []EngineInfo {
 			Conn:          c.id,
 			Remote:        c.remote,
 			Token:         c.token,
+			Namespace:     c.ns.name,
 			ConnectedAt:   c.connectedAt,
 			CacheID:       c.hello.CacheID,
 			Generation:    c.hello.Generation,
@@ -72,7 +73,7 @@ func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries := p.tracker.Entries(c.CacheID())
+	entries := c.ns.tracker.Entries(c.CacheID())
 	if entries == nil {
 		entries = []exporter.EntryState{}
 	}
@@ -92,20 +93,20 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 		return exporter.Result{}, err
 	}
 	if len(req.Roots) > 0 {
-		b, err := p.tracker.Claim(c.CacheID(), req)
+		b, err := c.ns.tracker.Claim(c.CacheID(), req)
 		if err != nil {
 			return exporter.Result{}, &ExportConflictError{err}
 		}
 		return s.exportBatch(ctx, c, b)
 	}
 	var all exporter.Result
-	batches := p.tracker.All(c.CacheID(), p.now())
+	batches := c.ns.tracker.All(c.CacheID(), p.now())
 	for i, b := range batches {
 		res, err := s.exportBatch(ctx, c, b)
 		if err != nil {
 			// Hand the batches not run back to the scheduler.
 			for _, rest := range batches[i+1:] {
-				p.tracker.Requeue(rest, p.now())
+				c.ns.tracker.Requeue(rest, p.now())
 			}
 			return all, err
 		}
@@ -123,7 +124,7 @@ func (s *Service) Imports(conn uint64) (importer.State, error) {
 	if err != nil {
 		return importer.State{}, err
 	}
-	st, ok := s.imports.importer.State(c.CacheID())
+	st, ok := c.ns.importer.State(c.CacheID())
 	if !ok {
 		st = importer.State{CacheID: c.CacheID(), Generation: c.Generation(), Merged: []importer.MergedBundle{}, Values: map[uint64]importer.Value{}}
 	}

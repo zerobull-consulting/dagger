@@ -18,11 +18,16 @@ What it does, its scenarios and its settings are in
 | Cache service (`Service`, `StartService`) | In the test process, on the Docker bridge gateway | `server.Service`'s Go API: `Engines`, `Entries`, `Imports`, `Export`, `Import`. A recording `slog` handler (`LogRecorder`) keeps what it logs: cache spans, envelopes, engine events, exports and merges. |
 | S3 proxy (`S3Proxy`) | In the test process, on the gateway | The services' S3 endpoint, so presigned URLs point at it too. It records every request (method, key, time, status) instead of tracing MinIO, and injects faults (`Fault`): S3 errors or stalls for the requests they match. |
 | MinIO | `hack/remote-cache/compose.yaml`, on loopback | Through the proxy for the services and engines; directly (`Env.S3`, `Env.Meta`) to read the index and bundles and delete blobs, so the test's own reads aren't recorded as the engines'. |
-| Engines (`Engine`, `StartEngines`) | Docker containers from an image built for the run | The `docker` CLI: start, restart, remove. |
-| Client (`Engine.CLI`, `Engine.Query`) | The `dagger` CLI built for the run | With a clean environment. The CLI's Cloud settings come from the environment, which is process-wide, so it runs as its own process rather than as the engine client in this one. |
+| Engines (`Engine`, `StartEngines`, `StartEnginesWithTokens`) | Docker containers from an image built for the run | The `docker` CLI: start, restart, remove, logs (`Engine.Logs`). Each authenticates with `Engine.Token`: its host name, or the token it was started with. |
+| Client (`Engine.CLI`, `Engine.Query`) | The `dagger` CLI built for the run | With a clean environment. The CLI's Cloud settings come from the environment, which is process-wide, so it runs as its own process rather than as the engine client in this one. Its token is `e2e-cli`, or its engine's when the engine was started with a token: session spans reach the service under the CLI's token, which must be in the engine's namespace. |
 
 Each run has its own bucket prefix, scope, engine names and volumes, so runs
-don't need MinIO reset and don't see each other's entries.
+don't need MinIO reset and don't see each other's entries. Services are
+unauthenticated, with every engine in the run's scope, unless started with
+`ServiceOptions.TokensFile`; `Service.ReloadTokens` then reads the file again,
+as `SIGHUP` does for the command. `Env.BlobKey` is a blob's key in the run's
+scope, and `Env.BlobKeyIn`, `Env.IndexOf` and `Env.ChainLayersIn` read another
+namespace's.
 
 ## Adding a scenario
 
@@ -42,4 +47,6 @@ answered are recorded with its name). After breaking something,
 names a missing bundle, and no stored bundle a missing layer.
 
 The resilience scenarios (#12) are in `resilience_test.go`; they run last,
-since `service-restart` replaces the main service.
+since `service-restart` replaces the main service. `namespaces` (#10), in
+`namespaces_test.go`, runs its own service with a tokens file, and its own
+engines.

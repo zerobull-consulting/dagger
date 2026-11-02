@@ -161,6 +161,49 @@ func TestMinIOStorePutGet(t *testing.T) {
 	}
 }
 
+// A blob PUT through one namespace's store is at <prefix>/<ns>/blobs/..., is
+// stored for that namespace only, and another namespace's GET of its digest
+// finds nothing: UploadURLs asks the other namespace for its own copy.
+func TestMinIOStoreNamespaces(t *testing.T) {
+	s := newMinIOStore(t, nil)
+	ctx := context.Background()
+	nsA, err := s.Namespace("team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nsB, err := s.Namespace("team-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := nsA.(*S3Store), nsB.(*S3Store)
+	blob, d := randomBlob(t, 4096)
+	put, err := a.PresignPut(ctx, d, int64(len(blob)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := enginePut(t, put.URL, blob); status != http.StatusOK {
+		t.Fatalf("presigned PUT: status %d", status)
+	}
+	key, _ := a.Key(d)
+	if want := s.prefix + "/team-a/blobs/sha256/" + d.Encoded(); key != want {
+		t.Fatalf("key %s, want %s", key, want)
+	}
+	if !mustHas(t, a, d) || mustHas(t, b, d) || mustHas(t, s, d) {
+		t.Fatalf("stored in team-a %v, team-b %v, at the top %v", mustHas(t, a, d), mustHas(t, b, d), mustHas(t, s, d))
+	}
+	get, err := b.PresignGet(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := httpGet(t, get.URL); status != http.StatusNotFound {
+		t.Fatalf("team-b's GET: status %d", status)
+	}
+	urls, err := UploadURLs(ctx, b, []Blob{{Digest: d, Size: int64(len(blob))}})
+	if err != nil || len(urls) != 1 {
+		t.Fatalf("team-b's upload URLs %v, %v", urls, err)
+	}
+}
+
 // An existing blob is not requested again: once uploaded, UploadURLs leaves
 // it out of the next upload request.
 func TestMinIOStoreUploadURLsSkipsExisting(t *testing.T) {

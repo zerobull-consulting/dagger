@@ -2,12 +2,11 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-	"slices"
 	"sync"
 	"time"
 
-	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
@@ -19,7 +18,9 @@ import (
 // stored, and every poll interval, which picks up bundles stored by other
 // service replicas.
 type importPath struct {
-	importer *importer.Importer
+	// cfg configures each namespace's importer; cfg.Scope is replaced by
+	// the namespace.
+	cfg importer.Config
 	// poll is how often each engine is synced without a trigger (0: never).
 	poll time.Duration
 	// ctx ends every sync loop when the service stops.
@@ -44,22 +45,14 @@ type ImportConfig struct {
 const DefaultImportPoll = 30 * time.Second
 
 // EnableImport turns on the import path until ctx ends. Turn on the export
-// path first: the import path tells its tracker what each merge left in an
-// engine cache, so an unchanged import isn't exported back.
+// path first: the import path tells each namespace's tracker what each merge
+// left in an engine cache, so an unchanged import isn't exported back. Each
+// namespace gets an importer of cfg.Importer, with the namespace as its scope
+// and its own view of the blob store; cfg.Importer.Scope is the namespace of
+// a service without tokens. Call it before the service serves engines.
 func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	if cfg.Importer.Logger == nil {
 		cfg.Importer.Logger = s.logger.With("component", "import")
-	}
-	if cfg.Importer.Imported == nil && s.export != nil {
-		tracker := s.export.tracker
-		cfg.Importer.Imported = func(cacheID string, generation uint64, values map[uint64]importer.Value) {
-			out := make([]exporter.ImportedValue, 0, len(values))
-			for _, v := range values {
-				parts := slices.Concat(v.Complete, v.Offered)
-				out = append(out, exporter.ImportedValue{Number: v.Number, Replacements: v.Replacements, Parts: parts})
-			}
-			tracker.Imported(cacheID, generation, out)
-		}
 	}
 	if cfg.Importer.Meta != nil && cfg.Importer.Meta.Metrics() == nil {
 		cfg.Importer.Meta = cfg.Importer.Meta.WithMetrics(s.metrics)
@@ -67,11 +60,17 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	if cfg.Importer.Metrics == nil {
 		cfg.Importer.Metrics = s.metrics
 	}
-	im, err := importer.New(cfg.Importer)
-	if err != nil {
+	// Checked now, so a bad config fails here rather than on a connection.
+	if _, err := importer.New(cfg.Importer); err != nil {
 		return err
 	}
-	s.imports = &importPath{importer: im, poll: cfg.Poll, ctx: ctx, triggers: map[*engineConn]chan struct{}{}}
+	if _, err := namespaceBlobs(cfg.Importer.Blobs, cfg.Importer.Scope); err != nil {
+		return fmt.Errorf("importer: %w", err)
+	}
+	if err := s.setDefaultNamespace(cfg.Importer.Scope); err != nil {
+		return err
+	}
+	s.imports = &importPath{cfg: cfg.Importer, poll: cfg.Poll, ctx: ctx, triggers: map[*engineConn]chan struct{}{}}
 	return nil
 }
 
@@ -122,6 +121,9 @@ func (s *Service) startImports(connCtx context.Context, c *engineConn) {
 
 // syncImports syncs one engine and logs what it did.
 func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Result {
+	if c.revoked.Load() {
+		return importer.Result{}
+	}
 	res, err := s.syncMeasured(ctx, c)
 	if err != nil && ctx.Err() == nil && s.connected(c) {
 		c.logger.Warn("import sync failed", "error", err)
@@ -138,14 +140,15 @@ func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Resul
 // API asked for it.
 func (s *Service) syncMeasured(ctx context.Context, c *engineConn) (importer.Result, error) {
 	start := time.Now()
-	res, err := s.imports.importer.Sync(metrics.WithCaller(ctx, metrics.CallerImport), c)
-	s.metrics.ImportSync(err != nil, time.Since(start))
+	res, err := c.ns.importer.Sync(metrics.WithCaller(ctx, metrics.CallerImport), c)
+	s.metrics.ImportSync(c.ns.name, err != nil, time.Since(start))
 	return res, err
 }
 
-// triggerImports syncs every connected engine but those of cache except,
-// which just exported what there is to import.
-func (s *Service) triggerImports(except string) {
+// triggerImports syncs every connected engine of a namespace but those of
+// cache except, which just exported what there is to import. Engines of
+// other namespaces can't import it.
+func (s *Service) triggerImports(ns *namespace, except string) {
 	p := s.imports
 	if p == nil {
 		return
@@ -153,7 +156,7 @@ func (s *Service) triggerImports(except string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for c, trigger := range p.triggers {
-		if c.CacheID() == except {
+		if c.ns != ns || c.CacheID() == except || c.revoked.Load() {
 			continue
 		}
 		select {
@@ -170,9 +173,9 @@ func (s *Service) triggerImports(except string) {
 // them again. A write cut short by the service stopping leaves the dead
 // cache's imports in the index; its ID never connects again, so nothing
 // uses them, and they go when their entries are dropped.
-func (s *Service) forgetWiped(cacheID string) {
+func (s *Service) forgetWiped(ns *namespace, cacheID string) {
 	p := s.imports
-	p.importer.Forget(cacheID)
+	ns.importer.Forget(cacheID)
 	p.mu.Lock()
 	if p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()
@@ -184,19 +187,29 @@ func (s *Service) forgetWiped(cacheID string) {
 		defer p.wg.Done()
 		ctx, cancel := context.WithTimeout(p.ctx, time.Minute)
 		defer cancel()
-		if err := p.importer.ForgetImports(ctx, cacheID); err != nil {
-			s.logger.Warn("forgetting a wiped cache's imports failed", "cacheID", cacheID, "error", err)
+		if err := ns.importer.ForgetImports(ctx, cacheID); err != nil {
+			s.logger.Warn("forgetting a wiped cache's imports failed", "namespace", ns.name, "cacheID", cacheID, "error", err)
 		}
 	}()
 }
 
 // renew answers an engine's renew: fresh download addresses when the import
-// path is on and every layer is stored, unavailable otherwise.
-func (s *Service) renew(ctx context.Context, req protocol.Renew) protocol.Renewed {
-	if s.imports == nil {
+// path is on and every layer is stored in the connection's namespace,
+// unavailable otherwise. The renewal key must be the namespace (the importer
+// sends it as every offered chain's), and each layer must be stored under
+// the namespace's own blob keys, so a connection can't renew another
+// namespace's blobs, whatever digests it names.
+//
+// Renewals are not limited to the digests offered to the connection: an
+// engine renews the parts of entries merged before a reconnect, or before
+// the service restarted, which this process never offered it. Within its
+// namespace, a token could have those blobs merged into its engine anyway.
+// TestRenewNotLimitedToOfferedDigests pins it.
+func (s *Service) renew(ctx context.Context, c *engineConn, req protocol.Renew) protocol.Renewed {
+	if s.imports == nil || c.revoked.Load() {
 		return protocol.Renewed{Unavailable: true}
 	}
-	return s.imports.importer.Renew(ctx, req)
+	return c.ns.importer.Renew(ctx, req)
 }
 
 // waitImports waits for the sync loops, after the context that runs them has
