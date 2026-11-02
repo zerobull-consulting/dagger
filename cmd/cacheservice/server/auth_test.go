@@ -1231,3 +1231,57 @@ func TestOwnerReleasedOnDisconnect(t *testing.T) {
 		t.Fatal("another token speaks for a cache that just disconnected")
 	}
 }
+
+// Revocation racing registration: a connection whose token a reload removes
+// while it says hello is either refused at hello or revoked by the reload;
+// once both are done, it is never listed, and its import loop is gone.
+func TestRevocationRacingRegistration(t *testing.T) {
+	h := newAuthHarness(t)
+	without, err := ParseTokens([]byte("tok-a team-a\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	with, err := ParseTokens([]byte(testTokens))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		h.svc.SetTokens(with)
+		raw, code := dialAs(t, h.srv, "tok-b")
+		if code != http.StatusSwitchingProtocols {
+			t.Fatalf("round %d: upgrade %d", i, code)
+		}
+		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-race-" + strconv.Itoa(i), Generation: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.svc.SetTokens(without)
+		}()
+		raw.send(env)
+		<-done
+		// Read until the service closes the connection: a welcome may
+		// come first, when the reload ran after register.
+		if got := raw.closed(); got != protocol.CloseTokenRevoked {
+			t.Fatalf("round %d: closed with %d, want %d", i, got, protocol.CloseTokenRevoked)
+		}
+		for _, info := range h.svc.Engines() {
+			if info.Token == tokenFingerprint("tok-b") {
+				t.Fatalf("round %d: a revoked token's connection is listed: %+v", i, info)
+			}
+		}
+		waitUntil(t, 5*time.Second, "no import loop of tok-b", func() bool {
+			p := h.svc.imports
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			for c := range p.triggers {
+				if c.secret == "tok-b" {
+					return false
+				}
+			}
+			return true
+		})
+	}
+}
