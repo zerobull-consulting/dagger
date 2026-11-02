@@ -36,6 +36,10 @@
 //     GET  /debug/engines/{conn}/entries               (what the export path tracks)
 //     POST /debug/engines/{conn}/import                (merge and offer now)
 //     GET  /debug/engines/{conn}/imports               (what the import path merged)
+//     GET  /metrics                                    (Prometheus metrics)
+//
+//   - with -metrics-listen set, /metrics alone on that address, for a
+//     scraper that shouldn't reach the debug API.
 //
 // Point an engine at it with:
 //
@@ -62,18 +66,20 @@ import (
 
 func main() {
 	var (
-		listen      string
-		debugListen string
-		dumpDir     string
-		verbose     bool
-		scope       string
-		quiet       time.Duration
-		endGrace    time.Duration
-		imports     bool
-		importPoll  time.Duration
+		listen        string
+		debugListen   string
+		metricsListen string
+		dumpDir       string
+		verbose       bool
+		scope         string
+		quiet         time.Duration
+		endGrace      time.Duration
+		imports       bool
+		importPoll    time.Duration
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
 	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the unauthenticated debug API (empty: off)")
+	flag.StringVar(&metricsListen, "metrics-listen", "", "address serving only the Prometheus metrics at /metrics (empty: off; the debug API serves them too)")
 	flag.StringVar(&dumpDir, "dump-dir", "", "write every envelope and engine event body to this directory")
 	flag.BoolVar(&verbose, "v", false, "log pings and every cache span")
 	flag.StringVar(&scope, "scope", "default", "the scope exported entries are recorded in")
@@ -121,6 +127,11 @@ func main() {
 	servers := []*http.Server{{Addr: listen, Handler: svc.Handler()}}
 	if debugListen != "" {
 		servers = append(servers, &http.Server{Addr: debugListen, Handler: svc.DebugHandler()})
+	}
+	if metricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", svc.MetricsHandler())
+		servers = append(servers, &http.Server{Addr: metricsListen, Handler: mux})
 	}
 	errs := make(chan error, len(servers))
 	for _, srv := range servers {

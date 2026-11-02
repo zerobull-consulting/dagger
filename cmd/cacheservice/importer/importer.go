@@ -44,6 +44,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -103,6 +104,9 @@ type Config struct {
 	// values. The export path uses it to know an unchanged
 	// import is already stored.
 	Imported func(cacheID string, generation uint64, values map[uint64]Value)
+	// Metrics records whether the bundles a merge needs were in memory.
+	// Nil records nothing.
+	Metrics *metrics.Metrics
 }
 
 // Importer merges stored bundles into engines, and offers them stored parts.
@@ -538,6 +542,7 @@ func (im *Importer) bundle(ctx context.Context, id string) (*dagql.ValueBundle, 
 	im.mu.Lock()
 	b := im.bundles[id]
 	im.mu.Unlock()
+	im.cfg.Metrics.ImportBundleCache(b != nil)
 	if b != nil {
 		return b, nil
 	}

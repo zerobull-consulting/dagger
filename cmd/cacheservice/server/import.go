@@ -9,6 +9,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -59,6 +60,12 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 			}
 			tracker.Imported(cacheID, generation, out)
 		}
+	}
+	if cfg.Importer.Meta != nil && cfg.Importer.Meta.Metrics() == nil {
+		cfg.Importer.Meta = cfg.Importer.Meta.WithMetrics(s.metrics)
+	}
+	if cfg.Importer.Metrics == nil {
+		cfg.Importer.Metrics = s.metrics
 	}
 	im, err := importer.New(cfg.Importer)
 	if err != nil {
@@ -115,7 +122,7 @@ func (s *Service) startImports(connCtx context.Context, c *engineConn) {
 
 // syncImports syncs one engine and logs what it did.
 func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Result {
-	res, err := s.imports.importer.Sync(ctx, c)
+	res, err := s.syncMeasured(ctx, c)
 	if err != nil && ctx.Err() == nil && s.connected(c) {
 		c.logger.Warn("import sync failed", "error", err)
 	}
@@ -124,6 +131,16 @@ func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Resul
 			"accepted", res.Offers.Accepted, "alreadyComplete", res.Offers.AlreadyComplete)
 	}
 	return res
+}
+
+// syncMeasured syncs one engine, measures the sync, and labels its index
+// reads and updates as the import path's, whether a sync loop or the debug
+// API asked for it.
+func (s *Service) syncMeasured(ctx context.Context, c *engineConn) (importer.Result, error) {
+	start := time.Now()
+	res, err := s.imports.importer.Sync(metrics.WithCaller(ctx, metrics.CallerImport), c)
+	s.metrics.ImportSync(err != nil, time.Since(start))
+	return res, err
 }
 
 // triggerImports syncs every connected engine but those of cache except,
