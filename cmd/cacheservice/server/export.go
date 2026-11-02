@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -33,17 +33,17 @@ type exportPath struct {
 	wg sync.WaitGroup
 }
 
-// exportConfig configures the export path.
-type exportConfig struct {
+// ExportConfig configures the export path.
+type ExportConfig struct {
 	Exporter     exporter.Config
 	Tracker      exporter.TrackerConfig
 	Tick         time.Duration
 	NoEngineWait time.Duration
 }
 
-// enableExport turns on the export path, and runs its scheduler until ctx
+// EnableExport turns on the export path, and runs its scheduler until ctx
 // ends. Without it, the service exports nothing on its own.
-func (s *service) enableExport(ctx context.Context, cfg exportConfig) error {
+func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	if cfg.Exporter.Logger == nil {
 		cfg.Exporter.Logger = s.logger.With("component", "export")
 	}
@@ -75,7 +75,7 @@ func (s *service) enableExport(ctx context.Context, cfg exportConfig) error {
 
 // scheduleExports runs the exports that come due until ctx ends, then waits
 // for those in flight.
-func (s *service) scheduleExports(ctx context.Context) {
+func (s *Service) scheduleExports(ctx context.Context) {
 	p := s.export
 	t := time.NewTicker(p.tick)
 	defer t.Stop()
@@ -96,7 +96,7 @@ func (s *service) scheduleExports(ctx context.Context) {
 }
 
 // runBatch exports one batch on the engine connected with its cache.
-func (s *service) runBatch(ctx context.Context, b exporter.Batch) {
+func (s *Service) runBatch(ctx context.Context, b exporter.Batch) {
 	p := s.export
 	eng := s.engineFor(b.CacheID)
 	if eng == nil {
@@ -111,7 +111,7 @@ func (s *service) runBatch(ctx context.Context, b exporter.Batch) {
 // recordExport records an export's result in the tracker. An export cut
 // short because its engine went away, or ctx ended, is not a failure of its
 // roots: they wait for the engine and are tried again.
-func (s *service) recordExport(ctx context.Context, eng *engineConn, b exporter.Batch, res exporter.Result, err error) {
+func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.Batch, res exporter.Result, err error) {
 	p := s.export
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
@@ -128,14 +128,14 @@ func (s *service) recordExport(ctx context.Context, eng *engineConn, b exporter.
 }
 
 // connected reports whether c is still a welcomed connection.
-func (s *service) connected(c *engineConn) bool {
+func (s *Service) connected(c *engineConn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conns[c.id] == c
 }
 
 // engineFor returns the latest welcomed connection of an engine cache.
-func (s *service) engineFor(cacheID string) *engineConn {
+func (s *Service) engineFor(cacheID string) *engineConn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var latest *engineConn
@@ -158,7 +158,7 @@ func (c *engineConn) Request(ctx context.Context, typ protocol.Type, body json.R
 }
 
 // trackSpans feeds the tracker the cache spans of a trace request.
-func (s *service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
+func (s *Service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
 	p := s.export
 	if p == nil {
 		return
@@ -213,7 +213,7 @@ func (s *service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
 }
 
 // trackEvent feeds the tracker one engine cache event.
-func (s *service) trackEvent(kind, cache, body string) {
+func (s *Service) trackEvent(kind, cache, body string) {
 	p := s.export
 	if p == nil && s.imports == nil {
 		return
@@ -299,7 +299,7 @@ func intAttr(kvs []*commonpb.KeyValue, key string) int64 {
 // /debug/engines/{conn}/export exports the posted roots and outputs, or,
 // with no roots, every tracked entry of the engine worth exporting, and
 // answers with what was stored.
-func (s *service) serveExport(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
 	p := s.export
 	if p == nil {
 		http.Error(w, "the export path is off: no store is configured", http.StatusConflict)
@@ -350,7 +350,7 @@ func (s *service) serveExport(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveEntries lists what the tracker knows of an engine's cache.
-func (s *service) serveEntries(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveEntries(w http.ResponseWriter, r *http.Request) {
 	p := s.export
 	if p == nil {
 		http.Error(w, "the export path is off: no store is configured", http.StatusConflict)
@@ -367,7 +367,7 @@ func (s *service) serveEntries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, entries)
 }
 
-func (s *service) debugConn(w http.ResponseWriter, r *http.Request) *engineConn {
+func (s *Service) debugConn(w http.ResponseWriter, r *http.Request) *engineConn {
 	id, err := strconv.ParseUint(r.PathValue("conn"), 10, 64)
 	if err != nil {
 		http.Error(w, "bad conn", http.StatusBadRequest)
@@ -385,7 +385,7 @@ func (s *service) debugConn(w http.ResponseWriter, r *http.Request) *engineConn 
 
 // waitExports waits for the exports in flight, after the context that runs
 // them has ended.
-func (s *service) waitExports() {
+func (s *Service) waitExports() {
 	if s.export != nil {
 		s.export.wg.Wait()
 	}

@@ -1,4 +1,4 @@
-package main
+package server
 
 // The import path against MinIO (#8): engine A's build is exported to S3,
 // and engine B, with an empty cache, has it merged and pulls its layers

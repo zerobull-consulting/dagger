@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -32,8 +32,8 @@ type importPath struct {
 	wg     sync.WaitGroup
 }
 
-// importConfig configures the import path.
-type importConfig struct {
+// ImportConfig configures the import path.
+type ImportConfig struct {
 	Importer importer.Config
 	Poll     time.Duration
 }
@@ -42,10 +42,10 @@ type importConfig struct {
 // without a trigger.
 const DefaultImportPoll = 30 * time.Second
 
-// enableImport turns on the import path until ctx ends. Turn on the export
+// EnableImport turns on the import path until ctx ends. Turn on the export
 // path first: the import path tells its tracker what each merge left in an
 // engine cache, so an unchanged import isn't exported back.
-func (s *service) enableImport(ctx context.Context, cfg importConfig) error {
+func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	if cfg.Importer.Logger == nil {
 		cfg.Importer.Logger = s.logger.With("component", "import")
 	}
@@ -69,7 +69,7 @@ func (s *service) enableImport(ctx context.Context, cfg importConfig) error {
 }
 
 // startImports runs c's sync loop until connCtx or the service ends.
-func (s *service) startImports(connCtx context.Context, c *engineConn) {
+func (s *Service) startImports(connCtx context.Context, c *engineConn) {
 	p := s.imports
 	if p == nil {
 		return
@@ -114,7 +114,7 @@ func (s *service) startImports(connCtx context.Context, c *engineConn) {
 }
 
 // syncImports syncs one engine and logs what it did.
-func (s *service) syncImports(ctx context.Context, c *engineConn) importer.Result {
+func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Result {
 	res, err := s.imports.importer.Sync(ctx, c)
 	if err != nil && ctx.Err() == nil && s.connected(c) {
 		c.logger.Warn("import sync failed", "error", err)
@@ -128,7 +128,7 @@ func (s *service) syncImports(ctx context.Context, c *engineConn) importer.Resul
 
 // triggerImports syncs every connected engine but those of cache except,
 // which just exported what there is to import.
-func (s *service) triggerImports(except string) {
+func (s *Service) triggerImports(except string) {
 	p := s.imports
 	if p == nil {
 		return
@@ -153,7 +153,7 @@ func (s *service) triggerImports(except string) {
 // them again. A write cut short by the service stopping leaves the dead
 // cache's imports in the index; its ID never connects again, so nothing
 // uses them, and they go when their entries are dropped.
-func (s *service) forgetWiped(cacheID string) {
+func (s *Service) forgetWiped(cacheID string) {
 	p := s.imports
 	p.importer.Forget(cacheID)
 	p.mu.Lock()
@@ -175,7 +175,7 @@ func (s *service) forgetWiped(cacheID string) {
 
 // renew answers an engine's renew: fresh download addresses when the import
 // path is on and every layer is stored, unavailable otherwise.
-func (s *service) renew(ctx context.Context, req protocol.Renew) protocol.Renewed {
+func (s *Service) renew(ctx context.Context, req protocol.Renew) protocol.Renewed {
 	if s.imports == nil {
 		return protocol.Renewed{Unavailable: true}
 	}
@@ -184,7 +184,7 @@ func (s *service) renew(ctx context.Context, req protocol.Renew) protocol.Renewe
 
 // waitImports waits for the sync loops, after the context that runs them has
 // ended.
-func (s *service) waitImports() {
+func (s *Service) waitImports() {
 	if p := s.imports; p != nil {
 		p.mu.Lock()
 		p.closed = true
@@ -195,7 +195,7 @@ func (s *service) waitImports() {
 
 // serveImport is the explicit import hook: POST /debug/engines/{conn}/import
 // syncs the engine now, and answers with what was merged and offered.
-func (s *service) serveImport(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveImport(w http.ResponseWriter, r *http.Request) {
 	if s.imports == nil {
 		http.Error(w, "the import path is off: no store is configured", http.StatusConflict)
 		return
@@ -216,7 +216,7 @@ func (s *service) serveImport(w http.ResponseWriter, r *http.Request) {
 
 // serveImports shows what the import path knows of an engine's cache: the
 // bundles merged into it, and the entries they landed on.
-func (s *service) serveImports(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveImports(w http.ResponseWriter, r *http.Request) {
 	if s.imports == nil {
 		http.Error(w, "the import path is off: no store is configured", http.StatusConflict)
 		return

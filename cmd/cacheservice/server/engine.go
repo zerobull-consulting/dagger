@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -26,8 +26,8 @@ import (
 // helloTimeout bounds the wait for an engine's hello after the upgrade.
 const helloTimeout = 30 * time.Second
 
-// service holds the connected engines.
-type service struct {
+// Service holds the connected engines.
+type Service struct {
 	logger  *slog.Logger
 	dumpDir string
 
@@ -43,11 +43,16 @@ type service struct {
 	imports *importPath
 }
 
-func newService(logger *slog.Logger, dumpDir string) *service {
-	return &service{logger: logger, dumpDir: dumpDir, conns: map[uint64]*engineConn{}}
+// New returns a service with no engines, and with the export and import
+// paths off. dumpDir, when set, receives every envelope and engine event
+// body; it must exist.
+func New(logger *slog.Logger, dumpDir string) *Service {
+	return &Service{logger: logger, dumpDir: dumpDir, conns: map[uint64]*engineConn{}}
 }
 
-func (s *service) handler() http.Handler {
+// Handler serves engines: the WebSocket at protocol.EnginePath, the OTLP
+// receivers and the blob PUT stand-in.
+func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(protocol.EnginePath, s.serveEngine)
 	mux.HandleFunc("PUT /blobs/{digest}", s.serveBlobPut)
@@ -68,7 +73,7 @@ type engineConn struct {
 	connectedAt time.Time
 	conn        *websocket.Conn
 	logger      *slog.Logger
-	svc         *service
+	svc         *Service
 
 	lastID atomic.Uint64
 	hello  protocol.Hello
@@ -78,7 +83,7 @@ type engineConn struct {
 	pending map[uint64]chan protocol.Envelope
 }
 
-func (s *service) serveEngine(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
 	token, _, ok := r.BasicAuth()
 	if !ok || token == "" {
 		s.logger.Warn("engine rejected: no token", "remote", r.RemoteAddr)
@@ -362,14 +367,14 @@ func summarize(env protocol.Envelope) []any {
 	return nil
 }
 
-func (s *service) dump(name string, data []byte) {
+func (s *Service) dump(name string, data []byte) {
 	if err := os.WriteFile(filepath.Join(s.dumpDir, name), data, 0o644); err != nil {
 		s.logger.Warn("dump failed", "file", name, "error", err)
 	}
 }
 
-// closeAll closes every engine connection, as the service going away.
-func (s *service) closeAll() {
+// CloseEngines closes every engine connection, as the service going away.
+func (s *Service) CloseEngines() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, c := range s.conns {
@@ -383,8 +388,8 @@ func tokenFingerprint(token string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-// debugHandler serves the debug API, which is not authenticated.
-func (s *service) debugHandler() http.Handler {
+// DebugHandler serves the debug API, which is not authenticated.
+func (s *Service) DebugHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/engines", s.listEngines)
 	mux.HandleFunc("POST /debug/engines/{conn}/request", s.sendRequest)
@@ -406,7 +411,7 @@ type engineInfo struct {
 	EngineName    string    `json:"engineName"`
 }
 
-func (s *service) listEngines(w http.ResponseWriter, _ *http.Request) {
+func (s *Service) listEngines(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	infos := make([]engineInfo, 0, len(s.conns))
 	for _, c := range s.conns {
@@ -428,7 +433,7 @@ func (s *service) listEngines(w http.ResponseWriter, _ *http.Request) {
 
 // sendRequest sends the posted body as a request of the given type to one
 // engine, and answers with the engine's reply envelope.
-func (s *service) sendRequest(w http.ResponseWriter, r *http.Request) {
+func (s *Service) sendRequest(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseUint(r.PathValue("conn"), 10, 64)
 	if err != nil {
 		http.Error(w, "bad conn", http.StatusBadRequest)

@@ -39,6 +39,31 @@ numbered file in `DIR`.
 
 The debug API has no authentication. It listens on localhost only by default.
 
+## Code layout
+
+The service lives in package [`server`](server/), so it can run outside this
+command: `cmd/cacheservice` (`main.go`) only parses flags, reads the
+`CACHESERVICE_S3_*` settings and listens. To run the service in-process, as
+tests do:
+
+```go
+svc := server.New(logger, "")
+// Optional: store exports in S3 and merge them into engines.
+if err := svc.EnableS3(ctx, s3cfg, server.S3Options{Scope: "default"}); err != nil {
+	return err
+}
+engines := httptest.NewServer(svc.Handler())     // the -listen address
+debug := httptest.NewServer(svc.DebugHandler())  // the -debug-listen address
+// To stop: cancel ctx, then
+svc.CloseEngines()
+svc.Wait()
+```
+
+`EnableExport` and `EnableImport` take stores directly, such as the in-memory
+ones the unit tests use. The stores and the export and import logic are in
+[`blobstore`](blobstore/), [`metastore`](metastore/),
+[`exporter`](exporter/) and [`importer`](importer/).
+
 ## Blob store
 
 [`blobstore`](blobstore) stores layer blobs in S3 for the service
