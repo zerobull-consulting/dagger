@@ -6,8 +6,8 @@ name: Remote cache tests
       - reopened
       - synchronize
       - ready_for_review
-  # Runs on the base branch save Go caches that every PR into it can restore
-  # (a PR's own caches are visible only to that PR).
+  # Only runs on the base branch save Go caches (see "Save Go cache"); every
+  # PR into it restores them.
   push:
     branches:
       - feature/remote-cache
@@ -34,10 +34,12 @@ jobs:
           # job to finish saves it; each job caches its own build below.
           cache: false
       # Module and build caches, per job (the unit job builds with -race, so
-      # its build cache differs). The key is new on every commit, so each run
-      # saves what it built; restore-keys take the newest earlier cache.
-      - name: Go cache
-        uses: actions/cache@v4
+      # its build cache differs). Every run restores the newest cache saved
+      # by a push to feature/remote-cache; only those pushes save one (see
+      # "Save Go cache"), so PRs don't fill the cache with their own copies.
+      - name: Restore Go cache
+        id: go-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/go/pkg/mod
@@ -56,6 +58,14 @@ jobs:
         run: |
           go test -race -count=1 -run 'RemoteCache|SkippedMessage|ExportLogAttrs' \
             ./engine/server/ ./cmd/engine/ ./core/schema/
+      - name: Save Go cache
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
   minio:
     name: S3 tests against MinIO
     runs-on: ubuntu-24.04
@@ -72,10 +82,12 @@ jobs:
           # job to finish saves it; each job caches its own build below.
           cache: false
       # Module and build caches, per job (the unit job builds with -race, so
-      # its build cache differs). The key is new on every commit, so each run
-      # saves what it built; restore-keys take the newest earlier cache.
-      - name: Go cache
-        uses: actions/cache@v4
+      # its build cache differs). Every run restores the newest cache saved
+      # by a push to feature/remote-cache; only those pushes save one (see
+      # "Save Go cache"), so PRs don't fill the cache with their own copies.
+      - name: Restore Go cache
+        id: go-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/go/pkg/mod
@@ -91,3 +103,11 @@ jobs:
       - name: Stop MinIO
         if: always()
         run: ./hack/remote-cache/dev.sh reset
+      - name: Save Go cache
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
