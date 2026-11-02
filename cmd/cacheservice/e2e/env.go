@@ -411,6 +411,10 @@ func (e *Env) CheckConsistent(t *testing.T, when string) {
 		if !stored[entry.Bundle] {
 			missingBundles = append(missingBundles, fmt.Sprintf("entry %d's bundle %s", n, Short(entry.Bundle)))
 		}
+		// Strict on purpose: every run starts on an empty prefix, so each
+		// entry was recorded by this service, which always names a stored
+		// resolution. Records from before resolutions (Entry.Resolution
+		// empty), which the importer still merges, can't occur here.
 		if entry.Resolution == "" || !resolutions[entry.Resolution] {
 			missingResolutions = append(missingResolutions, fmt.Sprintf("entry %d's resolution %q", n, Short(entry.Resolution)))
 		}

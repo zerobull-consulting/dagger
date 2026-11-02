@@ -64,7 +64,7 @@ func NewResolution(bundleID, cacheID string, numbers map[dagql.TransferOrdinal]u
 		Numbers: make([]uint64, len(numbers)),
 	}
 	for o, n := range numbers {
-		if o == 0 || int(o) > len(numbers) {
+		if o == 0 || uint64(o) > uint64(len(numbers)) {
 			return nil, fmt.Errorf("resolution: ordinal %d out of range [1, %d]", o, len(numbers))
 		}
 		r.Numbers[o-1] = n
@@ -77,7 +77,7 @@ func NewResolution(bundleID, cacheID string, numbers map[dagql.TransferOrdinal]u
 
 // Number returns the service number of the value at ordinal o.
 func (r *Resolution) Number(o dagql.TransferOrdinal) (uint64, bool) {
-	if r == nil || o == 0 || int(o) > len(r.Numbers) {
+	if r == nil || o == 0 || uint64(o) > uint64(len(r.Numbers)) {
 		return 0, false
 	}
 	return r.Numbers[o-1], true
@@ -145,6 +145,9 @@ func (s *Store) ResolutionKey(scope, id string) (string, error) {
 // already stored writes nothing and returns the same ID; a stored object at
 // its key whose content doesn't match is ErrCorruptBundle.
 func (s *Store) PutResolution(ctx context.Context, scope string, r *Resolution) (string, error) {
+	if r == nil {
+		return "", errors.New("put resolution: nil resolution")
+	}
 	if err := r.validate(); err != nil {
 		return "", fmt.Errorf("put resolution: %w", err)
 	}

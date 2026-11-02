@@ -348,6 +348,14 @@ func TestResolutionRefuses(t *testing.T) {
 	if _, err := NewResolution(id, "", map[dagql.TransferOrdinal]uint64{1: 1}); err == nil {
 		t.Error("no cacheID: no error")
 	}
+	// An ordinal past int's range is out of range, not a panic.
+	huge := dagql.TransferOrdinal(1 << 63)
+	if _, err := NewResolution(id, "c", map[dagql.TransferOrdinal]uint64{huge: 1}); err == nil {
+		t.Error("huge ordinal: no error")
+	}
+	if n, ok := (&Resolution{Numbers: []uint64{7}}).Number(huge); ok || n != 0 {
+		t.Errorf("huge ordinal: %d, %v", n, ok)
+	}
 
 	objects := NewMemObjects()
 	s := newTestStore(t, objects)
@@ -360,6 +368,9 @@ func TestResolutionRefuses(t *testing.T) {
 	}
 	if err := res.Check(strings.Repeat("b", 64), "c", testBundle([]val{{sender: 1}, {sender: 2}}, root(1, 0))); err == nil {
 		t.Error("check against another bundle: no error")
+	}
+	if _, err := s.PutResolution(ctx, "s1", nil); err == nil {
+		t.Error("nil resolution: no error")
 	}
 	rid, err := s.PutResolution(ctx, "s1", res)
 	if err != nil {
