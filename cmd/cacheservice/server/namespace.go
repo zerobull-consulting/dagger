@@ -56,6 +56,13 @@ func (n *namespace) own(cacheID string, key tokenKey) {
 	n.owners[cacheID] = key
 }
 
+// disown forgets the owner of a wiped cache, whose ID never connects again.
+func (n *namespace) disown(cacheID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.owners, cacheID)
+}
+
 // ownerAccepts reports whether an engine event about cacheID may come from
 // token key: when no connection of the namespace has said hello as cacheID
 // (an engine's start event may arrive before its hello), or when the latest

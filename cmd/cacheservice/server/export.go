@@ -294,6 +294,9 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 			s.ignoredEvent(ns, kind+" (wiped cache)", wiped)
 			wiped = ""
 		}
+		if wiped != "" && wiped != cacheID {
+			ns.disown(wiped)
+		}
 		if p != nil {
 			ns.tracker.Started(cacheID, generation, wiped)
 		}
