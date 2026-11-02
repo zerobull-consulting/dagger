@@ -7,6 +7,8 @@
 #   dev.sh status  show the containers
 #   dev.sh env     print the settings as shell exports
 #   dev.sh test    run the Go tests against it (starts it first)
+#   dev.sh e2e     run the remote cache with two real engines (e2e.sh)
+#   dev.sh e2e-down  stop what dev.sh e2e left running
 #
 # Address, ports, credentials and bucket come from MINIO_BIND_ADDR,
 # MINIO_API_PORT, MINIO_CONSOLE_PORT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
@@ -79,8 +81,10 @@ test)
 	cd "$repo"
 	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/...
 	;;
+e2e) exec "$here/e2e.sh" run ;;
+e2e-down) exec "$here/e2e.sh" down ;;
 *)
-	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac
