@@ -24,10 +24,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Go
         id: setup-go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           # setup-go's own cache uses one key for every job, so only the first
@@ -39,7 +39,7 @@ jobs:
       # "Save Go cache"), so PRs don't fill the cache with their own copies.
       - name: Restore Go cache
         id: go-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -60,7 +60,7 @@ jobs:
             ./engine/server/ ./cmd/engine/ ./core/schema/
       - name: Save Go cache
         if: github.event_name == 'push' && !cancelled()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -72,10 +72,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Go
         id: setup-go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           # setup-go's own cache uses one key for every job, so only the first
@@ -87,7 +87,7 @@ jobs:
       # "Save Go cache"), so PRs don't fill the cache with their own copies.
       - name: Restore Go cache
         id: go-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -105,7 +105,7 @@ jobs:
         run: ./hack/remote-cache/dev.sh reset
       - name: Save Go cache
         if: github.event_name == 'push' && !cancelled()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -117,10 +117,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Go
         id: setup-go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           # setup-go's own cache uses one key for every job, so only the first
@@ -131,7 +131,7 @@ jobs:
       # feature/remote-cache; only those pushes save one.
       - name: Restore Go cache
         id: go-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -161,7 +161,7 @@ jobs:
         run: ./hack/remote-cache/dev.sh reset
       - name: Save Go cache
         if: github.event_name == 'push' && !cancelled()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             ~/go/pkg/mod
