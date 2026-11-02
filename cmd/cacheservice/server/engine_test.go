@@ -170,7 +170,7 @@ func TestDebugRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var infos []engineInfo
+	var infos []EngineInfo
 	err = json.NewDecoder(resp.Body).Decode(&infos)
 	resp.Body.Close()
 	if err != nil {
