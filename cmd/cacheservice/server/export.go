@@ -300,13 +300,8 @@ func intAttr(kvs []*commonpb.KeyValue, key string) int64 {
 // with no roots, every tracked entry of the engine worth exporting, and
 // answers with what was stored.
 func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
-	p := s.export
-	if p == nil {
-		http.Error(w, "the export path is off: no store is configured", http.StatusConflict)
-		return
-	}
-	c := s.debugConn(w, r)
-	if c == nil {
+	conn, ok := debugConnID(w, r)
+	if !ok {
 		return
 	}
 	var req exporter.Request
@@ -316,71 +311,25 @@ func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Hour)
 	defer cancel()
-	if len(req.Roots) > 0 {
-		b, err := p.tracker.Claim(c.CacheID(), req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
-		res, err := p.exporter.Export(ctx, c, req)
-		s.recordExport(ctx, c, b, res, err)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		writeJSON(w, res)
+	res, err := s.Export(ctx, conn, req)
+	if err != nil {
+		writeDebugError(w, err)
 		return
 	}
-	var all exporter.Result
-	batches := p.tracker.All(c.CacheID(), p.now())
-	for i, b := range batches {
-		res, err := p.exporter.Export(ctx, c, b.Request)
-		s.recordExport(ctx, c, b, res, err)
-		if err != nil {
-			// Hand the batches not run back to the scheduler.
-			for _, rest := range batches[i+1:] {
-				p.tracker.Requeue(rest, p.now())
-			}
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		all.Merge(res)
-	}
-	writeJSON(w, all)
+	writeJSON(w, res)
 }
 
-// serveEntries lists what the tracker knows of an engine's cache.
 func (s *Service) serveEntries(w http.ResponseWriter, r *http.Request) {
-	p := s.export
-	if p == nil {
-		http.Error(w, "the export path is off: no store is configured", http.StatusConflict)
+	conn, ok := debugConnID(w, r)
+	if !ok {
 		return
 	}
-	c := s.debugConn(w, r)
-	if c == nil {
+	entries, err := s.Entries(conn)
+	if err != nil {
+		writeDebugError(w, err)
 		return
-	}
-	entries := p.tracker.Entries(c.CacheID())
-	if entries == nil {
-		entries = []exporter.EntryState{}
 	}
 	writeJSON(w, entries)
-}
-
-func (s *Service) debugConn(w http.ResponseWriter, r *http.Request) *engineConn {
-	id, err := strconv.ParseUint(r.PathValue("conn"), 10, 64)
-	if err != nil {
-		http.Error(w, "bad conn", http.StatusBadRequest)
-		return nil
-	}
-	s.mu.Lock()
-	c := s.conns[id]
-	s.mu.Unlock()
-	if c == nil {
-		http.Error(w, "no such engine", http.StatusNotFound)
-		return nil
-	}
-	return c
 }
 
 // waitExports waits for the exports in flight, after the context that runs

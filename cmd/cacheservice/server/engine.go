@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -400,7 +399,8 @@ func (s *Service) DebugHandler() http.Handler {
 	return mux
 }
 
-type engineInfo struct {
+// EngineInfo is a welcomed engine connection, as Engines lists it.
+type EngineInfo struct {
 	Conn          uint64    `json:"conn"`
 	Remote        string    `json:"remote"`
 	Token         string    `json:"token"`
@@ -412,23 +412,7 @@ type engineInfo struct {
 }
 
 func (s *Service) listEngines(w http.ResponseWriter, _ *http.Request) {
-	s.mu.Lock()
-	infos := make([]engineInfo, 0, len(s.conns))
-	for _, c := range s.conns {
-		infos = append(infos, engineInfo{
-			Conn:          c.id,
-			Remote:        c.remote,
-			Token:         c.token,
-			ConnectedAt:   c.connectedAt,
-			CacheID:       c.hello.CacheID,
-			Generation:    c.hello.Generation,
-			EngineVersion: c.hello.EngineVersion,
-			EngineName:    c.hello.EngineName,
-		})
-	}
-	s.mu.Unlock()
-	sort.Slice(infos, func(i, j int) bool { return infos[i].Conn < infos[j].Conn })
-	writeJSON(w, infos)
+	writeJSON(w, s.Engines())
 }
 
 // sendRequest sends the posted body as a request of the given type to one
