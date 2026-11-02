@@ -161,6 +161,7 @@ func (s *Service) register(c *engineConn) bool {
 		s.mu.Unlock()
 		if ok {
 			c.ns.own(c.hello.CacheID, c.key)
+			c.owned.Store(true)
 		}
 		return ok
 	}

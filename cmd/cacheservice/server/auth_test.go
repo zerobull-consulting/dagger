@@ -1155,3 +1155,79 @@ func TestDefaultNamespaceWithoutStore(t *testing.T) {
 		t.Fatal("a bad scope was taken")
 	}
 }
+
+// A namespace keeps the owners of its live connections, and of caches whose
+// connections ended within ownerIdleTTL (an engine that reconnects, or whose
+// telemetry arrives late, is still spoken for only by its token); older idle
+// owners go, and at most maxIdleOwners idle ones stay, the longest idle going
+// first. So a token that says hello with ever new cache IDs leaves bounded
+// state.
+func TestOwnersBounded(t *testing.T) {
+	prevTTL, prevMax := ownerIdleTTL, maxIdleOwners
+	ownerIdleTTL, maxIdleOwners = time.Hour, 3
+	t.Cleanup(func() { ownerIdleTTL, maxIdleOwners = prevTTL, prevMax })
+	clock := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	n := &namespace{name: "team-a", owners: map[string]*owner{}, now: func() time.Time { return clock }}
+	a, b := keyOf("tok-a"), keyOf("tok-b")
+
+	n.own("live", a) // stays connected throughout
+	n.own("gone", a)
+	n.release("gone")
+	clock = clock.Add(30 * time.Minute)
+	if n.ownerAccepts("gone", b) || !n.ownerAccepts("gone", a) {
+		t.Fatal("an owner idle for 30 minutes no longer speaks for its cache")
+	}
+	clock = clock.Add(31 * time.Minute)
+	n.own("other", a) // sweeps
+	if _, ok := n.owners["gone"]; ok {
+		t.Fatal("an owner idle for over an hour was kept")
+	}
+
+	// Many short connections with new cache IDs: at most 3 idle owners
+	// stay, the newest, besides the live ones.
+	for i := range 50 {
+		clock = clock.Add(time.Second)
+		id := "churn-" + strconv.Itoa(i)
+		n.own(id, b)
+		n.release(id)
+	}
+	idle := 0
+	for id, o := range n.owners {
+		if o.live == 0 {
+			idle++
+			if id != "churn-49" && id != "churn-48" && id != "churn-47" && id != "churn-46" {
+				t.Errorf("kept idle owner %s", id)
+			}
+		}
+	}
+	if idle > 4 {
+		t.Fatalf("%d idle owners kept", idle)
+	}
+	if !n.ownerAccepts("live", a) || n.ownerAccepts("live", b) || n.owners["other"] == nil {
+		t.Fatal("a live owner was dropped")
+	}
+}
+
+// A real connection's end releases its ownership, and its token still
+// speaks for the cache after it disconnects (within ownerIdleTTL).
+func TestOwnerReleasedOnDisconnect(t *testing.T) {
+	h := newAuthHarness(t)
+	raw, _ := dialAs(t, h.srv, "tok-a")
+	raw.helloAs("cache-r")
+	ns := h.ns("team-a")
+	ns.mu.Lock()
+	live := ns.owners["cache-r"].live
+	ns.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("live %d", live)
+	}
+	_ = raw.conn.CloseNow()
+	waitUntil(t, 5*time.Second, "the owner to be released", func() bool {
+		ns.mu.Lock()
+		defer ns.mu.Unlock()
+		return ns.owners["cache-r"].live == 0
+	})
+	if ns.ownerAccepts("cache-r", keyOf("tok-a2")) {
+		t.Fatal("another token speaks for a cache that just disconnected")
+	}
+}

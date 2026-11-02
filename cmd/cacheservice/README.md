@@ -610,7 +610,10 @@ sends two kinds, under different tokens:
   `engine.start` can arrive before its `hello`). An `engine.start` that
   reports wiping a cache whose connection had another token is taken without
   the wipe. The others are dropped, logged (`engine event ignored`) and
-  counted (`engine_events_ignored_total`).
+  counted (`engine_events_ignored_total`). A cache's owner is kept while it
+  is connected and for an hour after, and at most 4096 owners of
+  disconnected caches are kept per namespace, so cache IDs that never come
+  back don't pile up.
 - **Session spans** (`/v1/traces`) come under the token of the client that
   ran the session: the CLI forwards them, or the engine publishes them for it
   with the client's credential (`engine/server/session_cloud_telemetry.go`).

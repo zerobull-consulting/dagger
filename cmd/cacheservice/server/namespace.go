@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
@@ -40,20 +41,84 @@ type namespace struct {
 	// token of its latest welcomed connection. Engine events (engine.start,
 	// engine.prune) about a cache are taken only from that token: another
 	// token of the namespace, such as a client's or another engine's, can't
-	// steer what the service knows of it. See ownerAccepts.
-	owners map[string]tokenKey
+	// steer what the service knows of it. See ownerAccepts. An owner
+	// with no live connection is kept for ownerIdleTTL, so it still
+	// speaks for its cache across a reconnect, and at most
+	// maxIdleOwners of them are kept (see own).
+	owners map[string]*owner
+	// now is the clock; tests replace it.
+	now func() time.Time
 }
+
+// owner is the token of an engine cache's latest welcomed connection.
+type owner struct {
+	key tokenKey
+	// live counts the cache's welcomed connections still open, and
+	// idleSince is when the last of them ended.
+	live      int
+	idleSince time.Time
+}
+
+// The bounds of a namespace's owners of disconnected caches: a token can
+// say hello with any number of cache IDs, and each would otherwise stay
+// forever.
+var (
+	ownerIdleTTL  = time.Hour
+	maxIdleOwners = 4096
+)
 
 // tokenKey identifies a token without holding it: its SHA-256.
 type tokenKey [sha256.Size]byte
 
 func keyOf(token string) tokenKey { return sha256.Sum256([]byte(token)) }
 
-// own records that a connection with token key said hello as cacheID.
+// own records that a connection with token key said hello as cacheID; the
+// connection's end calls release. It also drops the owners idle for longer
+// than ownerIdleTTL, then, beyond maxIdleOwners idle ones, the longest idle.
+// A cache whose owner was dropped is as one no connection has named: its
+// events are taken from any token of the namespace, until it connects again.
 func (n *namespace) own(cacheID string, key tokenKey) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.owners[cacheID] = key
+	now := n.now()
+	var idle []string
+	for id, o := range n.owners {
+		if o.live > 0 {
+			continue
+		}
+		if now.Sub(o.idleSince) > ownerIdleTTL {
+			delete(n.owners, id)
+			continue
+		}
+		idle = append(idle, id)
+	}
+	if extra := len(idle) - maxIdleOwners; extra >= 0 {
+		sort.Slice(idle, func(i, j int) bool { return n.owners[idle[i]].idleSince.Before(n.owners[idle[j]].idleSince) })
+		for _, id := range idle[:extra+1] {
+			if id != cacheID {
+				delete(n.owners, id)
+			}
+		}
+	}
+	o := n.owners[cacheID]
+	if o == nil {
+		o = &owner{}
+		n.owners[cacheID] = o
+	}
+	o.key = key
+	o.live++
+}
+
+// release records that a connection own counted has ended.
+func (n *namespace) release(cacheID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if o := n.owners[cacheID]; o != nil && o.live > 0 {
+		o.live--
+		if o.live == 0 {
+			o.idleSince = n.now()
+		}
+	}
 }
 
 // disown forgets the owner of a wiped cache, whose ID never connects again.
@@ -70,8 +135,8 @@ func (n *namespace) disown(cacheID string) {
 func (n *namespace) ownerAccepts(cacheID string, key tokenKey) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	owner, ok := n.owners[cacheID]
-	return !ok || owner == key
+	o, ok := n.owners[cacheID]
+	return !ok || o.key == key
 }
 
 // namespace returns a namespace's state, created with the paths enabled now.
@@ -91,7 +156,7 @@ func (s *Service) namespace(name string) (*namespace, error) {
 
 // newNamespace builds a namespace's paths from the enabled paths' configs.
 func (s *Service) newNamespace(name string) (*namespace, error) {
-	n := &namespace{name: name, owners: map[string]tokenKey{}}
+	n := &namespace{name: name, owners: map[string]*owner{}, now: time.Now}
 	if s.export == nil && s.imports == nil {
 		return n, nil
 	}

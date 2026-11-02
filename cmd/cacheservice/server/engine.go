@@ -127,7 +127,10 @@ type engineConn struct {
 	ns *namespace
 	// revoked is set once the token no longer maps to ns: the connection
 	// gets nothing more of the namespace while its close handshake runs.
-	revoked     atomic.Bool
+	revoked atomic.Bool
+	// owned is set once register counted the connection as its cache's
+	// owner; its end releases it.
+	owned       atomic.Bool
 	remote      string
 	connectedAt time.Time
 	conn        *websocket.Conn
@@ -191,6 +194,9 @@ func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	c.failPending()
+	if c.owned.Load() {
+		c.ns.release(c.hello.CacheID)
+	}
 	if c.ns.exporter != nil {
 		c.ns.exporter.Forget(c)
 	}
