@@ -1096,3 +1096,62 @@ func TestTokenReloadsSerialized(t *testing.T) {
 		t.Fatalf("tok-b refused after the second set: %d", code)
 	}
 }
+
+// Dump file names carry what engines send (an event's kind, an envelope's
+// type), so they can't name a path: an event kind of "../" segments is
+// dumped inside the dump directory, and nothing is written outside it.
+func TestDumpNamesStayInDumpDir(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "dump")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, srv := newTestService(t, dir)
+	kind := "../../escaped"
+	req := &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+			Body:       strValue(`{"forged":true}`),
+			Attributes: []*commonpb.KeyValue{kv(telemetryattrs.EngineEventAttr, kind), kv(telemetryattrs.EngineCacheAttr, "c/1")},
+		}}}},
+	}}}
+	if code := otlpPostAs(t, srv.URL+"/v1/logs", "any", req); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "dump" {
+		t.Fatalf("written outside the dump directory: %v", entries)
+	}
+	dumped, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dumped) != 1 || dumped[0].Name() != "000001-event-.._.._escaped.json" {
+		t.Fatalf("dumped %v", dumped)
+	}
+	if got := dumpName("a/b\\c d\x00é"); got != "a_b_c_d___" {
+		t.Fatalf("dumpName: %q", got)
+	}
+}
+
+// Without a store, the default namespace is still the one the command's
+// -scope names (SetDefaultNamespace).
+func TestDefaultNamespaceWithoutStore(t *testing.T) {
+	svc, _, srv := newTestService(t, "")
+	if err := svc.SetDefaultNamespace("team"); err != nil {
+		t.Fatal(err)
+	}
+	raw, code := dialAs(t, srv, "anything")
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade: %d", code)
+	}
+	raw.helloAs("cache-x")
+	if infos := svc.Engines(); len(infos) != 1 || infos[0].Namespace != "team" {
+		t.Fatalf("engines %+v", infos)
+	}
+	if err := svc.SetDefaultNamespace("bad/scope"); err == nil {
+		t.Fatal("a bad scope was taken")
+	}
+}

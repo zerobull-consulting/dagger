@@ -164,6 +164,14 @@ func (s *Service) namespacesNow() []*namespace {
 	return out
 }
 
+// SetDefaultNamespace sets the namespace of every engine when there are no
+// tokens, such as the command's -scope. EnableExport and EnableImport set it
+// to their scope, and must name the same one. Call it before engines
+// connect.
+func (s *Service) SetDefaultNamespace(scope string) error {
+	return s.setDefaultNamespace(scope)
+}
+
 // setDefaultNamespace takes a path's scope as the namespace of a service
 // without tokens. Both paths must name the same one.
 func (s *Service) setDefaultNamespace(scope string) error {

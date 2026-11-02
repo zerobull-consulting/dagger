@@ -130,6 +130,11 @@ func main() {
 	defer stop()
 
 	svc := server.New(logger, dumpDir)
+	// The namespace of every engine without tokens, with a store or not.
+	if err := svc.SetDefaultNamespace(scope); err != nil {
+		logger.Error("scope", "error", err)
+		os.Exit(2)
+	}
 	if tokensFile != "" {
 		if err := svc.UseTokensFile(tokensFile); err != nil {
 			logger.Error("tokens", "error", err)

@@ -447,10 +447,32 @@ func summarize(env protocol.Envelope) []any {
 	return nil
 }
 
+// dump writes one file to the dump directory. Names carry what engines send
+// (an envelope's type, an event's kind), so dumpName keeps them one plain
+// file name inside the directory.
 func (s *Service) dump(name string, data []byte) {
+	name = dumpName(name)
 	if err := os.WriteFile(filepath.Join(s.dumpDir, name), data, 0o644); err != nil {
 		s.logger.Warn("dump failed", "file", name, "error", err)
 	}
+}
+
+// dumpName replaces every character of name but letters, digits, '.', '_'
+// and '-' with '_': no separator is left, so the name can't leave the dump
+// directory. It is cut to 200 bytes, within any file system's limit.
+func dumpName(name string) string {
+	b := []byte(name)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			b[i] = '_'
+		}
+	}
+	if len(b) > 200 {
+		b = b[:200]
+	}
+	return string(b)
 }
 
 // CloseEngines closes every engine connection, as the service going away.
