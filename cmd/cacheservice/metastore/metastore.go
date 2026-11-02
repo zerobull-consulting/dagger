@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"
 )
 
@@ -60,6 +61,9 @@ type Config struct {
 	// MaxAttempts bounds the writes UpdateIndex tries. Zero means
 	// DefaultMaxAttempts.
 	MaxAttempts int
+	// Metrics records index and bundle reads and writes. Nil records
+	// nothing.
+	Metrics *metrics.Metrics
 }
 
 // Store keeps bundles and indexes in Objects. It holds no state of its own,
@@ -68,6 +72,7 @@ type Store struct {
 	objects     Objects
 	prefix      string
 	maxAttempts int
+	metrics     *metrics.Metrics
 	// sleep waits between attempts; tests replace it.
 	sleep func(context.Context, time.Duration) error
 }
@@ -87,8 +92,19 @@ func New(cfg Config) (*Store, error) {
 		objects:     cfg.Objects,
 		prefix:      strings.Trim(cfg.Prefix, "/"),
 		maxAttempts: cfg.MaxAttempts,
+		metrics:     cfg.Metrics,
 		sleep:       sleepCtx,
 	}, nil
+}
+
+// Metrics returns what the Store records into, or nil.
+func (s *Store) Metrics() *metrics.Metrics { return s.metrics }
+
+// WithMetrics returns a Store on the same objects that records into m.
+func (s *Store) WithMetrics(m *metrics.Metrics) *Store {
+	c := *s
+	c.metrics = m
+	return &c
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -176,6 +192,7 @@ func (s *Store) PutBundle(ctx context.Context, scope string, bundle *dagql.Value
 	for attempt := 1; ; attempt++ {
 		_, err = s.objects.Put(ctx, key, body, Condition{IfNoneMatch: true})
 		if err == nil {
+			s.metrics.BundleWrite(scope, metrics.BundleWritten, len(body))
 			return id, nil
 		}
 		if !errors.Is(err, ErrPreconditionFailed) {
@@ -188,6 +205,7 @@ func (s *Store) PutBundle(ctx context.Context, scope string, bundle *dagql.Value
 			if !bytes.Equal(stored, body) {
 				return "", fmt.Errorf("put bundle %s: %w", id, ErrCorruptBundle)
 			}
+			s.metrics.BundleWrite(scope, metrics.BundleExisting, len(body))
 			return id, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -212,6 +230,7 @@ func (s *Store) GetBundle(ctx context.Context, scope, id string) (*dagql.ValueBu
 	if err != nil {
 		return nil, fmt.Errorf("get bundle: %w", err)
 	}
+	s.metrics.BundleRead(scope, len(body))
 	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != id {
 		return nil, fmt.Errorf("get bundle %s: %w", id, ErrCorruptBundle)
 	}
@@ -236,9 +255,12 @@ func (s *Store) readIndex(ctx context.Context, scope string) (*Index, string, er
 	if err != nil {
 		return nil, "", err
 	}
+	start := time.Now()
 	body, etag, err := s.objects.Get(ctx, key)
 	if errors.Is(err, ErrNotFound) {
-		return NewIndex(), "", nil
+		idx := NewIndex()
+		s.metrics.IndexRead(ctx, scope, time.Since(start), shapeOf(idx, 0))
+		return idx, "", nil
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("read index: %w", err)
@@ -247,6 +269,7 @@ func (s *Store) readIndex(ctx context.Context, scope string) (*Index, string, er
 	if err != nil {
 		return nil, "", fmt.Errorf("read index %s: %w", key, err)
 	}
+	s.metrics.IndexRead(ctx, scope, time.Since(start), shapeOf(idx, len(body)))
 	if etag == "" {
 		return nil, "", fmt.Errorf("read index %s: the store returned no ETag, so it can't be updated safely", key)
 	}
@@ -267,15 +290,24 @@ func (s *Store) UpdateIndex(ctx context.Context, scope string, change func(*Inde
 	if err != nil {
 		return nil, err
 	}
+	start := time.Now()
+	attempts := 0
+	outcome := metrics.OutcomeError
+	defer func() {
+		s.metrics.IndexUpdate(ctx, scope, outcome, attempts, time.Since(start))
+	}()
 	for attempt := 1; ; attempt++ {
+		attempts = attempt
 		idx, etag, err := s.readIndex(ctx, scope)
 		if err != nil {
 			return nil, err
 		}
 		if err := change(idx); err != nil {
+			outcome = metrics.OutcomeAborted
 			return nil, err
 		}
 		if err := idx.Validate(); err != nil {
+			outcome = metrics.OutcomeAborted
 			return nil, fmt.Errorf("update index %s: the change left it invalid: %w", key, err)
 		}
 		body, err := json.Marshal(idx)
@@ -288,18 +320,27 @@ func (s *Store) UpdateIndex(ctx context.Context, scope string, change func(*Inde
 		}
 		_, err = s.objects.Put(ctx, key, body, cond)
 		if err == nil {
+			s.metrics.IndexWrite(ctx, scope, true, shapeOf(idx, len(body)))
+			outcome = metrics.OutcomeOK
 			return idx, nil
 		}
 		if !errors.Is(err, ErrPreconditionFailed) {
 			return nil, fmt.Errorf("update index: %w", err)
 		}
+		s.metrics.IndexWrite(ctx, scope, false, shapeOf(idx, len(body)))
 		if attempt >= s.maxAttempts {
+			outcome = metrics.OutcomeContention
 			return nil, fmt.Errorf("update index %s after %d attempts: %w", key, attempt, ErrContention)
 		}
 		if err := s.sleep(ctx, backoff(attempt)); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// shapeOf is what idx holds, encoded in n bytes, for the size gauges.
+func shapeOf(idx *Index, n int) metrics.IndexShape {
+	return metrics.IndexShape{Bytes: n, Entries: len(idx.Entries), Roots: len(idx.Roots), Caches: len(idx.Caches)}
 }
 
 // backoff is the wait after a lost attempt: a random duration up to

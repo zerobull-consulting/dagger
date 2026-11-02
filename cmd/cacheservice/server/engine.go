@@ -18,7 +18,11 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/opencontainers/go-digest"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -40,13 +44,35 @@ type Service struct {
 	export *exportPath
 	// imports is the import path, nil when it is off.
 	imports *importPath
+
+	// registry holds metrics, which records the storage costs.
+	registry *prometheus.Registry
+	metrics  *metrics.Metrics
 }
 
 // New returns a service with no engines, and with the export and import
 // paths off. dumpDir, when set, receives every envelope and engine event
 // body; it must exist.
 func New(logger *slog.Logger, dumpDir string) *Service {
-	return &Service{logger: logger, dumpDir: dumpDir, conns: map[uint64]*engineConn{}}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	return &Service{
+		logger:   logger,
+		dumpDir:  dumpDir,
+		conns:    map[uint64]*engineConn{},
+		registry: reg,
+		metrics:  metrics.New(reg),
+	}
+}
+
+// Metrics returns what the service records its storage costs into. The
+// export and import paths record into it, through their metadata store,
+// unless their config names a store with metrics of its own.
+func (s *Service) Metrics() *metrics.Metrics { return s.metrics }
+
+// MetricsHandler serves the service's metrics in the Prometheus format.
+func (s *Service) MetricsHandler() http.Handler {
+	return promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{Registry: s.registry})
 }
 
 // Handler serves engines: the WebSocket at protocol.EnginePath, the OTLP
@@ -396,6 +422,7 @@ func (s *Service) DebugHandler() http.Handler {
 	mux.HandleFunc("GET /debug/engines/{conn}/entries", s.serveEntries)
 	mux.HandleFunc("POST /debug/engines/{conn}/import", s.serveImport)
 	mux.HandleFunc("GET /debug/engines/{conn}/imports", s.serveImports)
+	mux.Handle("GET /metrics", s.MetricsHandler())
 	return mux
 }
 

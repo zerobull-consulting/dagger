@@ -21,6 +21,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
+| `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, for a scraper that shouldn't reach the debug API |
 
 On the engine WebSocket, the service:
 
@@ -62,7 +63,8 @@ svc.Wait()
 `EnableExport` and `EnableImport` take stores directly, such as the in-memory
 ones the unit tests use. The stores and the export and import logic are in
 [`blobstore`](blobstore/), [`metastore`](metastore/),
-[`exporter`](exporter/) and [`importer`](importer/).
+[`exporter`](exporter/) and [`importer`](importer/). What the service
+measures is in [`metrics`](metrics/).
 
 ## Blob store
 
@@ -416,6 +418,49 @@ which the engine keeps as it is. An engine's own exports are never merged back
 into it, even after it pruned them. Entries an engine prunes, or answers
 `gone` for, are not merged into it again until it restarts: merging them back
 on the next poll would undo its garbage collection, which prunes them again.
+
+## Metrics
+
+[`metrics`](metrics/) measures the storage costs that decide when the index
+needs another layout
+([#46](https://github.com/zerobull-consulting/dagger/issues/46)). The
+service serves them in the Prometheus format at `GET /metrics`, on the debug
+address and, with `-metrics-listen`, alone on another. The export and import
+paths record into them through their metadata store. All are prefixed
+`cacheservice_`.
+
+| Metric | Labels | What it shows |
+| --- | --- | --- |
+| `index_size_bytes`, `index_entries`, `index_roots`, `index_caches` | `scope` | The index's size and contents, as last read or written |
+| `index_reads_total`, `index_read_bytes_total`, `index_read_duration_seconds` | `scope`, `caller` | Whole-index reads, including each attempt of an update |
+| `index_updates_total` | `scope`, `caller`, `outcome` | Index updates: `ok`, `contention` (gave up with `ErrContention`), `aborted` (the change refused) or `error` |
+| `index_update_attempts`, `index_update_duration_seconds` | `scope`, `caller` | Attempts and time per update, across backoffs |
+| `index_conflicts_total`, `index_write_bytes_total` | `scope`, `caller` | Conditional writes lost to another writer, and bytes written, lost writes included |
+| `bundle_writes_total` | `scope`, `outcome` | Bundles stored: `written`, or `existing` (already stored) |
+| `bundle_write_size_bytes` | `scope` | Size of each bundle stored |
+| `bundle_reads_total`, `bundle_read_bytes_total` | `scope` | Bundles read from the store |
+| `import_bundle_cache_total` | `result` | Bundles a merge needed: `hit` (in memory) or `miss` |
+| `import_syncs_total`, `import_sync_duration_seconds` | `outcome` | Import syncs of one engine |
+| `export_batches_total` | `outcome` | Export batches: `ok`, `error` or `interrupted` |
+| `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
+| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
+| `export_blobs_total` | `result` | Layer blobs: `uploaded`, or `present` (the store had them) |
+| `export_bundles_total` | | Bundles published |
+
+`caller` is `export` or `import` for the path that read or updated the index,
+and `other` for the rest (a wiped cache's imports leaving the index, the
+debug API's reads). The Go runtime and process collectors are served too.
+
+What to watch:
+
+- **Contention:** `index_conflicts_total` against `index_updates_total`, and
+  the `index_update_attempts` distribution. Any `contention` outcome means an
+  update was given up.
+- **Index cost:** `index_size_bytes` against `index_update_duration_seconds`
+  and `index_read_duration_seconds`. Every update rewrites the whole index.
+- **Bytes per import sync:** `rate(index_read_bytes_total{caller="import"})`
+  over `rate(import_syncs_total)`.
+- **Bundle cache:** `import_bundle_cache_total{result="hit"}` against `miss`.
 
 ## Running it against a local engine
 
