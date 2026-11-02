@@ -186,12 +186,17 @@ stored entry landed on as the cache's import (`Index.RecordImports`):
   that engine built the value itself. The tracker
   likewise doesn't export an unchanged import for a later expiry, as it
   doesn't for a stored entry (`TestTrackerImportedIgnoresExpiry`).
-- **Known gap:** a record of an imported value that holds a part the stored
-  record lacks, but lacks one the stored record holds, is not recorded
+- **Known gap
+  ([#37](https://github.com/zerobull-consulting/dagger/issues/37)):** a
+  record of an imported value that holds a part the stored record lacks, but
+  lacks one the stored record holds, is not recorded
   (`TestRecordKnownGapImportWithOtherParts`). Replacing the stored record
   would lose its part, and an entry names one record, so two bundles' parts
-  can't be combined. The new part stays in that engine and doesn't reach
-  others. Recording it would need entries that name a record per part.
+  can't be combined. The export still reports the root as stored, so the
+  tracker doesn't try it again while the value is unchanged
+  (`TestExportKnownGapImportWithOtherParts`). The new part stays in that
+  engine and doesn't reach others. Recording it would need entries that name
+  a record per part.
 - Indexes written before imports have entries with no parts. A record of an
   imported value with any part replaces such an entry once.
 

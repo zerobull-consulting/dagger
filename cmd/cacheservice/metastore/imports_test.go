@@ -240,9 +240,9 @@ func TestStoreRecordImports(t *testing.T) {
 	}
 }
 
-// Known gap: an importing cache's record of an imported value that holds a
-// part the stored record lacks, but lacks one the stored record holds, is
-// not recorded. The stored record stays, so its parts aren't lost (an entry
+// Known gap (#37): an importing cache's record of an imported value that
+// holds a part the stored record lacks, but lacks one the stored record
+// holds, is not recorded. The stored record stays, so its parts aren't lost (an entry
 // names one record, and records of two bundles can't be merged), and the new
 // part never reaches the index. The engine still has it; only other engines
 // don't get it. See "Imported entries" in README.md.
@@ -320,4 +320,40 @@ func cloneIndex(t *testing.T, idx *Index) *Index {
 		t.Fatal(err)
 	}
 	return cp
+}
+
+// RecordImports returns only the imports the index holds after the call:
+// one that a later import in the same call replaced isn't reported as
+// recorded, so the importer doesn't tell the export path a value is the
+// import of an engine entry that maps to another one.
+func TestRecordImportsReportsOnlyWhatItKept(t *testing.T) {
+	idx := NewIndex()
+	b := testBundle([]val{{sender: 10}, {sender: 11}}, root(1, 0), root(2, 0))
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1); err != nil {
+		t.Fatal(err)
+	}
+	got := idx.RecordImports("cache-b", 1, []Import{
+		{Number: 1, Engine: 100}, // replaced: 2 lands on 100 too
+		{Number: 2, Engine: 100},
+		{Number: 1, Engine: 101}, // 1 moves on, from 100 (already replaced) to 101
+		{Number: 2, Engine: 102}, // and 2 moves on to 102, leaving 100
+	})
+	want := []Import{{Number: 1, Engine: 101}, {Number: 2, Engine: 102}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
+	}
+	if fmt.Sprint(idx.Caches["cache-b"].Imported) != fmt.Sprint(map[uint64]Mapping{101: {Number: 1, Generation: 1}, 102: {Number: 2, Generation: 1}}) {
+		t.Fatalf("imports %v", idx.Caches["cache-b"].Imported)
+	}
+	if err := idx.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// The same engine entry twice in one call: only the last stays.
+	got = idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 200}, {Number: 2, Engine: 200}})
+	if !slices.Equal(got, []Import{{Number: 2, Engine: 200}}) {
+		t.Fatalf("recorded %v", got)
+	}
+	if err := idx.Validate(); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -498,7 +498,9 @@ type Import struct {
 
 // RecordImports records that stored entries were merged into the engine
 // cache cacheID at generation, and landed on the given engine entries, and
-// returns the imports it recorded. It skips an import of an entry no longer
+// returns the imports it recorded that the index still holds when it
+// returns, in order: a later import in the same call may replace an earlier
+// one. It skips an import of an entry no longer
 // stored, of an entry the cache exported itself, and onto an engine entry
 // the cache exported: that entry is the cache's own, and keeps its own
 // service number. A stored entry imported onto another engine entry than
@@ -537,7 +539,18 @@ func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Imp
 		cache.Generation = max(cache.Generation, generation)
 		recorded = append(recorded, im)
 	}
-	return recorded
+	// Only what the index holds now: a later import in the same call can
+	// replace an earlier one, onto the same engine entry or by moving the
+	// stored entry elsewhere.
+	kept := recorded[:0]
+	seen := map[Import]bool{}
+	for _, im := range recorded {
+		if m, ok := cache.Imported[im.Engine]; ok && m.Number == im.Number && !seen[im] {
+			seen[im] = true
+			kept = append(kept, im)
+		}
+	}
+	return kept
 }
 
 // ForgetImports drops the imported mappings of an engine cache, as when the
