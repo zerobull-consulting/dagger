@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -40,10 +42,23 @@ type importConfig struct {
 // without a trigger.
 const DefaultImportPoll = 30 * time.Second
 
-// enableImport turns on the import path until ctx ends.
+// enableImport turns on the import path until ctx ends. Turn on the export
+// path first: the import path tells its tracker what each merge left in an
+// engine cache, so an unchanged import isn't exported back.
 func (s *service) enableImport(ctx context.Context, cfg importConfig) error {
 	if cfg.Importer.Logger == nil {
 		cfg.Importer.Logger = s.logger.With("component", "import")
+	}
+	if cfg.Importer.Imported == nil && s.export != nil {
+		tracker := s.export.tracker
+		cfg.Importer.Imported = func(cacheID string, generation uint64, values map[uint64]importer.Value) {
+			out := make([]exporter.ImportedValue, 0, len(values))
+			for _, v := range values {
+				parts := slices.Concat(v.Complete, v.Offered)
+				out = append(out, exporter.ImportedValue{Number: v.Number, Replacements: v.Replacements, Parts: parts})
+			}
+			tracker.Imported(cacheID, generation, out)
+		}
 	}
 	im, err := importer.New(cfg.Importer)
 	if err != nil {

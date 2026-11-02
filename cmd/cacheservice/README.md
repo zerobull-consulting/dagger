@@ -90,9 +90,12 @@ records into it. Each scope (a team, a tenant) has:
 - **an index**, at `<prefix>/<scope>/index.json`: every stored entry (the
   bundle and ordinal holding its record, its source engine entry, replacement
   count, expiry, and the entries it keeps alive: its dependencies and the
-  owners of its pending offers and outputs, as dagql's importer walks them), the retained roots and their expiries, and,
-  per engine `cacheID`, which engine entry numbers map to which service
-  numbers, with the latest generation each was recorded in.
+  owners of its pending offers and outputs, as dagql's importer walks them,
+  and the parts its bundle holds outputs of), the retained roots and their
+  expiries, and, per engine `cacheID`, which engine entry numbers map to
+  which service numbers, with the latest generation each was recorded in:
+  the entries the cache exported (`numbers`), and the stored entries merged
+  into it (`imported`, see [Imported entries](#imported-entries)).
 
 The scope `blobs` is refused, since it would clash with the blob store's keys
 under the same prefix.
@@ -141,12 +144,42 @@ changed on every service restart would make engines re-key everything. So:
   later generation, or from the same generation with more replacements. So a
   late export from an older generation never overwrites a newer record.
 - The index is refused unless its mappings and entries agree both ways: each
-  mapping names an entry from that cache and engine number, and each entry is
-  its source's mapping.
+  exported mapping names an entry from that cache and engine number, and
+  each entry is its source's mapping. Each imported mapping names a stored
+  entry from another cache, on an engine entry the cache didn't export, and
+  a stored entry is imported at most once per cache.
+
+**Imported entries.** An engine that had a stored entry merged into it holds
+the value on an entry of its own, and its sessions name that entry when they
+hit it. So, after each merge, the importer records the engine entry each
+stored entry landed on as the cache's import (`Index.RecordImports`):
+
+- `Record` gives a value whose engine entry is imported the imported entry's
+  service number, whether it is a root or in another root's closure. The
+  same value is never stored twice under two numbers, and a new entry over
+  imported ones depends on their original numbers.
+- An import doesn't change the stored entry's source. A record from the
+  importing cache replaces the stored one only if its bundle holds outputs of
+  every part the stored record does, and more. The entry then keeps its
+  number, its source becomes the importing cache, and the old source's
+  mapping becomes an import. Generations and replacement counts of two
+  caches don't compare, so nothing else decides between their records.
+- An import that isn't recorded: of an entry no longer stored, of an entry
+  the cache exported itself, or onto an engine entry the cache exported,
+  which keeps its own number. A stored entry imported onto another engine
+  entry than before moves there.
+- A wiped cache (`engine.start` naming it) loses its imports; its exported
+  entries stay. `engine.prune` does not drop imports: a prune drops
+  retention edges, and an entry another one depends on lives on, so a later
+  export may still name it in a closure. Dropping its import then would
+  store it again under a new number, or leave that bundle unmergeable. Engine
+  numbers are never reused within a cache, so a stale import names nothing.
+- Indexes written before imports have entries with no parts. A record of an
+  imported value with any part replaces such an entry once.
 
 `DropExpired` drops expired roots, expired entries and, transitively, the
 entries that depend on them, then every entry no remaining root depends on,
-with their mappings. Bundles stay in the bucket; collecting unreferenced ones
+with their mappings, exported and imported. Bundles stay in the bucket; collecting unreferenced ones
 is left for later.
 
 **Limits.** The whole index is one object, rewritten on every update, so its
@@ -178,8 +211,12 @@ outputs are every part those spans reported. A session is exported:
 - or when asked: `POST /debug/engines/{conn}/export`.
 
 Entries already stored with the same replacement count and parts are left
-out. So are entries whose expiry or retention has lapsed, and entries refused
-for the same value. The export goes to the engine connected with the
+out, and so are entries merged into the engine by the import path that still
+have the replacement count and no part beyond what the merge left: they are
+the stored values. So are entries whose expiry or retention has lapsed, and
+entries refused for the same value. An import that changed is exported, and
+`Record` keeps the stored entry's number for it (see
+[Imported entries](#imported-entries)). The export goes to the engine connected with the
 session's cache ID. If none is, the export waits and is tried again.
 
 **One export.**
@@ -268,7 +305,9 @@ again whenever another engine's export is stored, and every `-import-poll`
    landed on, its replacement count, expiry, dependencies, and complete and
    offered parts, and which roots it retained or skipped as expired. The
    importer keeps that, by service number (`GET
-   /debug/engines/{conn}/imports`).
+   /debug/engines/{conn}/imports`), records each landed entry in the index as
+   the cache's import, and tells the export path's tracker. If the index
+   can't be updated, the merge counts as failed and is sent again later.
 3. **Offer.** A stored part a merged entry has neither complete nor offered
    is offered to that entry, by the engine's number, with fresh GETs and the
    owner's dependencies and the value's services mapped to the engine's
@@ -282,7 +321,9 @@ again whenever another engine's export is stored, and every `-import-poll`
 A merge refused by the engine is tried again at later syncs, up to 3 times per
 bundle and engine generation. A merge over the 64 MiB message limit is not
 sent. A new engine generation, or an `engine.start` that names a wiped cache,
-starts that cache over; `engine.prune` forgets the dropped entries. A merged
+starts that cache over (a wiped cache's imports leave the index too);
+`engine.prune` forgets the dropped entries, but keeps their imports in the
+index. A merged
 reply that arrives after its cache's state was reset is discarded.
 
 **Renew.** Presigned GETs last `CACHESERVICE_S3_GET_EXPIRY` (1h). When the
@@ -417,23 +458,26 @@ the two pipeline runs.
 
 ### What the fake engine did not show
 
-- **B re-exports what it imported.** B's session spans name the entries it
-  hit, which are the imported rows, and they are retained. So the service
-  exports them again, from B: a new bundle with no blobs to upload, whose
-  values are recorded as new entries under B's cache ID, with new service
-  numbers. That bundle is then merged back into A, which already has every
-  value (the engine keeps what it has, as the same recipe is
-  interchangeable). The extra exec's bundle carries the imported values in
-  its closure too, and records them again. After the run, the index held 13
+- **B re-exported what it imported (fixed).** B's session spans name the
+  entries it hit, which are the imported rows, and they are retained. So the
+  service exported them again, from B: a new bundle with no blobs to upload,
+  whose values were recorded as new entries under B's cache ID, with new
+  service numbers. That bundle was then merged back into A, which already had
+  every value. The extra exec's bundle carried the imported values in its
+  closure too, and recorded them again. After the run, the index held 13
   entries: A's 6, and 7 under B, of which only 2 (the new exec and its
-  output) were new. Nothing is wrong in what engines get, but the index and
-  the bundles grow by a copy of every imported value per importing engine,
-  and the copies have their own service numbers. The importer knows which of
-  an engine's entries are imports (`GET /debug/engines/{conn}/imports`), but
-  the exporter doesn't consult it, and the index can map an engine entry
-  only to an entry that engine exported. A fix means letting the index map an
-  importing engine's entries to the stored entries they came from
-  ([#35](https://github.com/zerobull-consulting/dagger/issues/35)).
+  output) were new. Since
+  [#35](https://github.com/zerobull-consulting/dagger/issues/35), the index
+  records what each merge left in an engine as its imports (see
+  [Imported entries](#imported-entries)): the tracker doesn't export an
+  unchanged import, and a bundle that names one, as a root or in its closure,
+  reuses the stored entry. `dev.sh e2e` now checks that the index ends with
+  A's entries and only the verify exec's new ones, each once, and that
+  nothing of A's is merged back into A. A run on 2026-11-02 with the fix
+  stored two exports, A's build and B's verify exec (5 values, of which 4
+  resolved to A's numbers as B's imports), and ended with 7 entries: A's 6
+  and the verify exec's container, which depends on A's last exec by its
+  original number.
 - **The expired-roots path did not run.** Each merged bundle's roots were
   all planned, so none was sent already expired (`ExpiresAtUnix: 1`), and
   `planValueMergeLocked` skipping them is still seen only in the code. It

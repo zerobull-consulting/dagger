@@ -46,3 +46,10 @@ func TestMinIOImportRenew(t *testing.T) {
 	}
 	checkPull(t, b, "withExec(make)", layers)
 }
+
+// #35 against MinIO: an importing engine doesn't export its imports back as
+// new entries.
+func TestMinIOImportsNotReexported(t *testing.T) {
+	h, _ := newMinIOExportHarness(t)
+	testImportsNotReexported(t, h)
+}

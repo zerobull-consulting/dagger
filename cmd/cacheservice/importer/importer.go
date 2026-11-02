@@ -14,6 +14,9 @@
 //     at what replacement count and expiry, with its complete and offered
 //     parts, and which roots it retained or skipped as expired. The importer
 //     keeps that, by service number, to know what the engine kept.
+//     The engine entries the values landed on are recorded in the index as
+//     the cache's imports (metastore.Index.RecordImports), so a later export
+//     of them reuses the stored entries instead of storing them again.
 //  3. Offer: a stored part the merged entry has neither complete nor offered
 //     is offered to that entry, by the engine's number. accepted and
 //     alreadyComplete are recorded; executionStarted and unavailable are
@@ -91,6 +94,11 @@ type Config struct {
 	MaxMessageBytes int
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
+	// Imported, when set, is called after each committed merge with what
+	// it left in the engine cache: the engine entry each stored entry
+	// landed on, by service number. The export path uses it to know an
+	// unchanged import is already stored.
+	Imported func(cacheID string, generation uint64, values map[uint64]Value)
 }
 
 // Importer merges stored bundles into engines, and offers them stored parts.
@@ -189,6 +197,14 @@ type Value struct {
 	// Complete and Offered are the entry's parts, by address key.
 	Complete []dagql.PersistedPartAddress `json:"complete,omitempty"`
 	Offered  []dagql.PersistedPartAddress `json:"offered,omitempty"`
+}
+
+func (v *Value) clone() Value {
+	cp := *v
+	cp.Deps = slices.Clone(v.Deps)
+	cp.Complete = slices.Clone(v.Complete)
+	cp.Offered = slices.Clone(v.Offered)
+	return cp
 }
 
 func (v *Value) has(a dagql.PersistedPartAddress) bool {
@@ -295,8 +311,19 @@ func (im *Importer) Forget(cacheID string) {
 	delete(im.caches, cacheID)
 }
 
+// ForgetWiped forgets an engine cache that was wiped: what the importer knows
+// of it, as Forget does, and its imports in the index, since its engine
+// entries are gone.
+func (im *Importer) ForgetWiped(ctx context.Context, cacheID string) error {
+	im.Forget(cacheID)
+	return im.cfg.Meta.ForgetImports(ctx, im.cfg.Scope, cacheID)
+}
+
 // Pruned forgets the engine entries a cache dropped, so they are not
-// offered parts.
+// offered parts. Their imports stay in the index: a prune drops retention
+// edges, and an entry another one depends on lives on, so a later export may
+// still name it. Engine numbers are never reused within a cache, so a stale
+// import names nothing.
 func (im *Importer) Pruned(cacheID string, generation uint64, numbers []uint64) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
@@ -472,14 +499,18 @@ func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *
 	if err := env.Decode(&reply); err != nil {
 		return MergedBundle{}, nil, err
 	}
-	return im.applyMerged(eng, st, c, mb, reply)
+	return im.applyMerged(ctx, eng, st, c, mb, reply)
 }
 
 // applyMerged records a merged reply in st, and returns the offers of the
 // parts the merged entries lack. A reply that arrives after st was reset or
 // replaced is discarded with errStateReset, so it can't repopulate the state
 // of a wiped cache or of another generation.
-func (im *Importer) applyMerged(eng Engine, st *cacheState, c Candidate, mb MergeBundle, reply protocol.Merged) (MergedBundle, []pendingOffer, error) {
+//
+// The engine entries the values landed on are recorded in the index as the
+// cache's imports first. If that fails, the merge counts as failed, and is
+// sent again at a later sync, which the engine keeps as it is.
+func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState, c Candidate, mb MergeBundle, reply protocol.Merged) (MergedBundle, []pendingOffer, error) {
 	byOrdinal := make(map[dagql.TransferOrdinal]*protocol.MergedValue, len(reply.Values))
 	for i := range reply.Values {
 		v := &reply.Values[i]
@@ -604,6 +635,23 @@ func (im *Importer) applyMerged(eng Engine, st *cacheState, c Candidate, mb Merg
 	}
 
 	im.mu.Lock()
+	current := im.currentLocked(eng, st)
+	im.mu.Unlock()
+	if !current {
+		return MergedBundle{}, nil, errStateReset
+	}
+	imports := make([]metastore.Import, 0, len(values))
+	for _, n := range slices.Sorted(maps.Keys(values)) {
+		imports = append(imports, metastore.Import{Number: n, Engine: values[n].Number})
+	}
+	if _, err := im.cfg.Meta.RecordImports(ctx, im.cfg.Scope, eng.CacheID(), eng.Generation(), imports); err != nil {
+		if ctx.Err() != nil {
+			return MergedBundle{}, nil, &connectionError{context.Cause(ctx)}
+		}
+		return MergedBundle{}, nil, err
+	}
+
+	im.mu.Lock()
 	if !im.currentLocked(eng, st) {
 		im.mu.Unlock()
 		return MergedBundle{}, nil, errStateReset
@@ -613,7 +661,17 @@ func (im *Importer) applyMerged(eng Engine, st *cacheState, c Candidate, mb Merg
 	for n, v := range values {
 		st.values[n] = v
 	}
+	var copies map[uint64]Value
+	if im.cfg.Imported != nil {
+		copies = make(map[uint64]Value, len(values))
+		for n, v := range values {
+			copies[n] = v.clone()
+		}
+	}
 	im.mu.Unlock()
+	if im.cfg.Imported != nil {
+		im.cfg.Imported(eng.CacheID(), eng.Generation(), copies)
+	}
 	im.log.Info("import: merged", "cacheID", eng.CacheID(), "bundle", c.Bundle,
 		"roots", len(c.Roots), "values", len(reply.Values), "retained", len(out.Retained),
 		"expired", len(out.Expired), "offers", len(offers))
@@ -916,11 +974,7 @@ func (im *Importer) State(cacheID string) (State, bool) {
 	})
 	// Copies: offers append to the live slices.
 	for n, v := range st.values {
-		cp := *v
-		cp.Deps = slices.Clone(v.Deps)
-		cp.Complete = slices.Clone(v.Complete)
-		cp.Offered = slices.Clone(v.Offered)
-		out.Values[n] = cp
+		out.Values[n] = v.clone()
 	}
 	return out, true
 }

@@ -17,7 +17,9 @@
 #      entries and the service has merged them into B, then runs the same
 #      pipeline on B;
 #   6. checks that B's result is A's (the exec didn't run again on B), that B
-#      read the layers from MinIO, and prints both runs' wall-clock times.
+#      read the layers from MinIO, that the index holds A's entries plus only
+#      what B built itself, each once (#35), and prints both runs'
+#      wall-clock times.
 #
 # Everything is left running afterwards so it can be inspected: `dev.sh
 # e2e-down` stops it. Logs and results go to E2E_DIR.
@@ -341,8 +343,32 @@ printf 'took %ss. Output:\n%s\n' "$time_verify" "$verified" >&2
 
 stop_trace
 docker compose -f "$here/compose.yaml" exec -T minio cat /tmp/e2e-trace.log >"$E2E_DIR/minio-trace-b.log" || true
+
+log "Waiting for the service to store B's new entries, and merge them into A"
+wait_for "$E2E_TIMEOUT" "all of B's retained entries to be stored" \
+	sh -c "curl -fsS '$debug_url/debug/engines/$conn_b/entries' | jq -e '[.[] | select(.retained)] | length > 0 and all(.stored)'"
+wait_for "$E2E_TIMEOUT" "a merge into A" \
+	sh -c "curl -fsS '$debug_url/debug/engines/$conn_a/imports' | jq -e '.merged | length > 0'"
+curl -fsS "$debug_url/debug/engines/$conn_b/entries" >"$E2E_DIR/entries-b.json"
 curl -fsS "$debug_url/debug/engines/$conn_b/imports" >"$E2E_DIR/imports-b.json"
+curl -fsS "$debug_url/debug/engines/$conn_a/imports" >"$E2E_DIR/imports-a.json"
 index_json >"$E2E_DIR/index-final.json"
+# The index must hold A's entries, unchanged, and only the entries B built
+# itself (the verify exec's), each once (#35): B's imports keep A's numbers,
+# so no number is handed out for them, and none of B's entries is one it
+# imported. Nothing expires during a run, so every number handed out is an
+# entry.
+entries_after_a="$(jq '.entries | length' "$E2E_DIR/index-after-a.json")"
+entries_final="$(jq '.entries | length' "$E2E_DIR/index-final.json")"
+entries_b="$(jq --arg b "$cache_b" '[.entries[] | select(.source.cacheID == $b)] | length' "$E2E_DIR/index-final.json")"
+numbers_final="$(jq '.nextNumber - 1' "$E2E_DIR/index-final.json")"
+a_unchanged="$(jq -n --slurpfile before "$E2E_DIR/index-after-a.json" --slurpfile after "$E2E_DIR/index-final.json" \
+	'$before[0].entries | to_entries | all(.key as $k | .value.source == $after[0].entries[$k].source)')"
+reexported="$(jq -n --arg b "$cache_b" --slurpfile idx "$E2E_DIR/index-final.json" --slurpfile im "$E2E_DIR/imports-b.json" \
+	'[$im[0].values[].number] as $imported | [$idx[0].entries[] | select(.source.cacheID == $b and (.source.number | IN($imported[])))] | length')"
+# The merges into A carry only B's new entries, not A's own back.
+echoed="$(jq -n --slurpfile before "$E2E_DIR/index-after-a.json" --slurpfile im "$E2E_DIR/imports-a.json" \
+	'[$im[0].merged[].roots[] | tostring | select(IN($before[0].entries | keys[]))] | length')"
 grep 'GetObject' "$E2E_DIR/minio-trace-b.log" | grep '/blobs/' >"$E2E_DIR/minio-blob-gets-b.log" || true
 blob_gets="$(grep -c . "$E2E_DIR/minio-blob-gets-b.log" || true)"
 # Every layer of A's chain must be among them, not just some.
@@ -371,6 +397,12 @@ if [[ "$sums_a" == "$sums_b" ]]; then
 	echo "layers:      the layer files on B are A's (checksums match A's stamps)"
 else
 	echo "WRONG LAYERS: the layer files on B are not A's"
+	ok=0
+fi
+if ((entries_b > 0 && entries_final == entries_after_a + entries_b && numbers_final == entries_final && reexported == 0 && echoed == 0)) && [[ "$a_unchanged" == true ]]; then
+	echo "index:       ${entries_final} entries: A's ${entries_after_a}, unchanged, and ${entries_b} new from B's verify exec; no import stored again, nothing echoed to A"
+else
+	echo "DUPLICATES:  the index has ${entries_final} entries (A's ${entries_after_a}, ${entries_b} from B, ${reexported} of them B's imports), ${numbers_final} numbers handed out, A's unchanged: ${a_unchanged}, ${echoed} of A's own merged back into A"
 	ok=0
 fi
 if ((blob_gets > 0 && ${#missing_layers[@]} == 0)); then
