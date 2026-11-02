@@ -6,6 +6,10 @@
 //   - bundles: <prefix>/<scope>/bundles/<id>.json, one per exported
 //     dagql.ValueBundle. A bundle's ID is the SHA-256 of its JSON, so a bundle
 //     is written once and never changes.
+//   - resolutions: <prefix>/<scope>/resolutions/<id>.json, one per export:
+//     the service number each of a bundle's values resolved to when it was
+//     recorded, which merges of the bundle send. Content-addressed like
+//     bundles. See Resolution.
 //   - an index: <prefix>/<scope>/index.json, one object naming every entry
 //     the scope stores, its roots, expiries and dependencies, and which
 //     engine entry numbers map to which service numbers. See Index.
@@ -287,6 +291,14 @@ func (s *Store) readIndex(ctx context.Context, scope string) (*Index, string, er
 // must decide only from the index it is given. An error from change ends the
 // update with that error and writes nothing.
 func (s *Store) UpdateIndex(ctx context.Context, scope string, change func(*Index) error) (*Index, error) {
+	return s.updateIndex(ctx, scope, change, nil)
+}
+
+// updateIndex is UpdateIndex, calling beforeWrite, when not nil, with each
+// changed and valid index just before its conditional write: what it stores
+// is stored before any index that may refer to it. An error from it ends the
+// update with that error and writes no index.
+func (s *Store) updateIndex(ctx context.Context, scope string, change, beforeWrite func(*Index) error) (*Index, error) {
 	key, err := s.IndexKey(scope)
 	if err != nil {
 		return nil, err
@@ -314,6 +326,11 @@ func (s *Store) UpdateIndex(ctx context.Context, scope string, change func(*Inde
 		body, err := json.Marshal(idx)
 		if err != nil {
 			return nil, fmt.Errorf("encode index: %w", err)
+		}
+		if beforeWrite != nil {
+			if err := beforeWrite(idx); err != nil {
+				return nil, err
+			}
 		}
 		cond := Condition{IfMatch: etag}
 		if etag == "" {

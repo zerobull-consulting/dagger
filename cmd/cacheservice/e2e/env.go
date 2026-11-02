@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -122,6 +123,10 @@ type Env struct {
 	// root is the run's own test: what the run starts is cleaned up when it
 	// ends, not when a scenario does, since later scenarios reuse it.
 	root *testing.T
+
+	mu sync.Mutex
+	// services are every service the run started (Services).
+	services []*Service
 }
 
 // New starts a run: it skips unless EnvEnable is set, builds the engine image
@@ -321,6 +326,18 @@ func (e *Env) Bundle(id string) *dagql.ValueBundle {
 	return b
 }
 
+// Resolution reads a stored resolution from MinIO.
+func (e *Env) Resolution(id string) *metastore.Resolution {
+	e.T.Helper()
+	ctx, cancel := e.ctx()
+	defer cancel()
+	r, err := e.Meta.GetResolution(ctx, e.Scope, id)
+	if err != nil {
+		e.T.Fatalf("read resolution %s: %v", id, err)
+	}
+	return r
+}
+
 // BundleIDs lists the stored bundles, sorted.
 func (e *Env) BundleIDs() []string {
 	e.T.Helper()
@@ -372,9 +389,10 @@ func (e *Env) DeleteBlob(d digest.Digest) {
 }
 
 // CheckConsistent checks, reading MinIO directly, that what the store
-// publishes is whole (#12): the index names no bundle that isn't stored, and
-// no stored bundle names a layer blob that isn't, besides those a scenario
-// deleted on purpose (DeleteBlob). Each failure says what is missing.
+// publishes is whole (#12): the index names no bundle or resolution that
+// isn't stored, and no stored bundle names a layer blob that isn't, besides
+// those a scenario deleted on purpose (DeleteBlob). Each failure says what
+// is missing.
 func (e *Env) CheckConsistent(t *testing.T, when string) {
 	t.Helper()
 	idx := e.Index()
@@ -383,13 +401,22 @@ func (e *Env) CheckConsistent(t *testing.T, when string) {
 	for _, id := range ids {
 		stored[id] = true
 	}
-	var missingBundles []string
+	resPrefix := e.S3Config.Prefix + "/" + e.Scope + "/resolutions/"
+	resolutions := map[string]bool{}
+	for _, key := range e.listKeys(resPrefix) {
+		resolutions[strings.TrimSuffix(strings.TrimPrefix(key, resPrefix), ".json")] = true
+	}
+	var missingBundles, missingResolutions []string
 	for n, entry := range idx.Entries {
 		if !stored[entry.Bundle] {
 			missingBundles = append(missingBundles, fmt.Sprintf("entry %d's bundle %s", n, Short(entry.Bundle)))
 		}
+		if entry.Resolution == "" || !resolutions[entry.Resolution] {
+			missingResolutions = append(missingResolutions, fmt.Sprintf("entry %d's resolution %q", n, Short(entry.Resolution)))
+		}
 	}
 	slices.Sort(missingBundles)
+	slices.Sort(missingResolutions)
 	blobs := map[string]bool{}
 	for _, key := range e.listKeys(e.S3Config.Prefix + "/blobs/") {
 		blobs[key] = true
@@ -430,6 +457,8 @@ func (e *Env) CheckConsistent(t *testing.T, when string) {
 	}
 	Check(t, len(missingBundles) == 0, "S3 consistent %s: the index's %d entries are all in its stored bundles (%d stored; missing: %v)",
 		when, len(idx.Entries), len(ids), missingBundles)
+	Check(t, len(missingResolutions) == 0, "S3 consistent %s: the index's %d entries each name a stored resolution (%d stored; missing: %v)",
+		when, len(idx.Entries), len(resolutions), missingResolutions)
 	Check(t, len(missingBlobs) == 0, "S3 consistent %s: the %d stored bundles name %d layer blobs, all stored (missing: %v; %d deleted on purpose)",
 		when, len(ids), len(named), missingBlobs, deleted)
 }

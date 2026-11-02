@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +116,9 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 	}
 	e.root.Cleanup(stop)
 	s := &Service{Service: svc, Name: name, URL: "http://" + ln.Addr().String(), Logs: logs, opts: opts, stop: stop}
+	e.mu.Lock()
+	e.services = append(e.services, s)
+	e.mu.Unlock()
 	t.Logf("service %s on %s (GET expiry %s, import poll %s)", name, s.URL, cfg.GetExpiry, poll)
 	return s
 }
@@ -123,6 +127,14 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 // listener and its engines' connections, and ends what it runs. Its
 // in-memory state goes with it.
 func (s *Service) Stop() { s.stop() }
+
+// Services are every service the run started, stopped ones included, in
+// the order they started.
+func (e *Env) Services() []*Service {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.services)
+}
 
 // RestartService stops svc, waits down, and starts a new service, name, with
 // the same options on the same address, as a restart of the service's

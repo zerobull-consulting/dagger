@@ -114,8 +114,14 @@ records into it. Each scope (a team, a tenant) has:
   is written once (`If-None-Match: *`) and never changes. Storing it again
   writes nothing. Reading it checks its content against the ID. Only bundles
   of the version this engine imports (`dagql.ValueBundleVersion`) are stored.
+- **resolutions**, at `<prefix>/<scope>/resolutions/<id>.json`: one per
+  export, the service number each of the bundle's values resolved to when
+  the export was recorded, which merges of that bundle send (see
+  [Imported entries](#imported-entries)). Content-addressed and written once,
+  like bundles.
 - **an index**, at `<prefix>/<scope>/index.json`: every stored entry (the
-  bundle and ordinal holding its record, its source engine entry, replacement
+  bundle and ordinal holding its record, the resolution of the export that
+  wrote it, its source engine entry, replacement
   count, expiry, and the entries it keeps alive: its dependencies and the
   owners of its pending offers and outputs, as dagql's importer walks them,
   and the parts its bundle holds outputs of), the retained roots and their
@@ -226,6 +232,61 @@ stored entry landed on as the cache's import (`Index.RecordImports`):
   a record per part.
 - Indexes written before imports have entries with no parts. A record of an
   imported value with any part replaces such an entry once.
+
+**Each export's resolution is stored
+([#47](https://github.com/zerobull-consulting/dagger/issues/47)).** A bundle
+names its values by the exporting engine's numbers (`SenderNumber`), and
+those of imported values resolve through the cache's imported mapping, which
+doesn't last: an import moves when the engine has the stored entry merged
+onto another entry (it pruned it, restarted, and had it merged again), and a
+wipe drops them all. Resolving a stored bundle through the mapping at merge
+time then failed with "value N, which a root needs, is no longer stored", for
+every engine, at every sync. Bundles never change, so how they resolved
+doesn't either: `Store.Record` stores it, and merges use it.
+
+- **What and where.** A `metastore.Resolution` is the bundle's ID, the
+  exporting `cacheID`, and the service number of each value by ordinal. It
+  is its own immutable object, keyed by the SHA-256 of its JSON, and each
+  record the export writes names it (`Entry.Resolution`). A bundle two caches
+  exported resolves to different numbers, so each gets its own resolution
+  (the `cacheID` is in it); two exports that resolve a bundle the same way
+  share one. This is the shape of
+  [#46](https://github.com/zerobull-consulting/dagger/issues/46)'s record
+  descriptions (immutable, one per export, keyed by content), which can
+  absorb it by adding each record's dependencies, parts, generation and
+  replacements, with entries naming a (description, ordinal) as they name a
+  (resolution, ordinal) now.
+- **Cost.** One more conditional PUT per recorded export (`If-None-Match:
+  *`; a resolution already stored costs a GET to check it), about 8 bytes of
+  JSON per value plus the IDs, and one more when a lost index write changes
+  the numbers. The index grows by one ID, about 80 bytes, per entry. The
+  importer reads a resolution once per bundle and keeps it in memory, like
+  bundles.
+- **Write order.** Bundle, then resolution, then index. The resolution is
+  stored inside the index update, after the change resolved the values
+  against the index it read and before the conditional write. A write that
+  loses reads the newer index, resolves again (numbers may change), and
+  stores that resolution, if it differs, before trying again. So the index
+  never names a resolution that isn't stored, and `UpdateIndex`'s
+  compare-and-swap is unchanged. A service that stops between the resolution
+  and the index write leaves a resolution nothing names, and the export
+  isn't recorded, as when it stops after storing the bundle
+  (`TestRecordStopsAfterResolution`, `TestRecordWritesResolutionBeforeIndex`).
+- **The index still decides what is stored.** A merge sends a value's
+  resolved number only while the index has that entry; otherwise it gets a
+  placeholder, or the merge fails if a merged root needs it. So a resolution
+  keeps no entry alive, and never names one `DropExpired` dropped: numbers
+  are never reused (`TestResolutionAndDropExpired`,
+  `TestBuildMergeDroppedValues`). It doesn't depend on imports at all, so
+  #12's generation fence on recording imports, and wipes racing them, don't
+  change it. An entry still names one record (#37): the resolution is of the
+  export that wrote it.
+- **Records stored before resolutions** name none, and their bundles resolve
+  through the cache's current mappings, as before
+  (`TestLegacyBundleResolvesThroughCurrentMappings`). There is nothing to
+  backfill from once an import has moved, a backfill at startup would cost a
+  pass over every entry and bundle, and no deployment held such bundles. A
+  record gets a resolution when its value is exported again.
 
 `DropExpired` drops expired roots, expired entries and, transitively, the
 entries that depend on them, then every entry no remaining root depends on,
@@ -379,8 +440,9 @@ again whenever another engine's export is stored, and every `-import-poll`
 **One sync.**
 
 1. **Plan.** The index's live roots, grouped by the bundle that holds each
-   one's current record and the engine cache that exported it (identical
-   exports from two caches share a bundle, but not sender numbers). Roots
+   one's current record, the engine cache that exported it (identical
+   exports from two caches share a bundle, but not sender numbers), and the
+   resolution the record names. Roots
    that have expired, or whose entry or any entry it depends on has, are
    left out, as `DropExpired` would drop them, and so are an engine's own
    exports: its cache has them. A bundle
@@ -388,7 +450,10 @@ again whenever another engine's export is stored, and every `-import-poll`
    needs now, is not merged again.
 2. **Merge.** Each bundle is rewritten for the engine: each value's
    `SenderNumber` becomes its service number, which the engine keeps as its
-   Cloud holding; the roots are the planned ones with the index's expiries;
+   Cloud holding. The number is the bundle's stored resolution's: how its
+   values resolved when it was recorded, not through the exporting cache's
+   mappings now, which move as that cache's imports do (see
+   [Imported entries](#imported-entries)); the roots are the planned ones with the index's expiries;
    and each output's chain gets a presigned GET per layer, with the scope as
    its renewal key. Records name each other by ordinal, so values are not
    dropped or renumbered, and the engine refuses a bundle with a value
@@ -452,14 +517,7 @@ once per restart, not per poll; a merge carries records and GETs, not layers;
 an engine whose GC pruned the entries prunes them again if they stay unused;
 and a marker would add a store write to every prune event. Pinned by
 `TestServiceRestartMergesPrunedEntriesAgainOnce`; the real-engine
-`service-restart` scenario measures it ([Resilience](#resilience)). A bundle that holds an engine's imports names them
-by the engine numbers they landed on, resolved through the cache's current
-imported mapping; once those imports move (the engine pruned them, restarted
-and had them merged again) or are dropped (a wipe), the bundle can't be
-merged into any engine again
-([#47](https://github.com/zerobull-consulting/dagger/issues/47), pinned by
-`TestKnownGapBundleOfMovedImportsUnmergeable`; found by the real-engine run,
-where C's verify export fails to merge after the `prune` scenario). An
+`service-restart` scenario measures it ([Resilience](#resilience)). An
 engine's own exports are never merged back into it, even after it pruned
 them. Entries an engine prunes, or answers
 `gone` for, are not merged into it again until it restarts: merging them back
@@ -813,14 +871,21 @@ merged into B within 187ms of its `hello`.
 
 **Known gaps.** An export pending or in flight when the service stops is lost
 until a later session names its entries
-([#45](https://github.com/zerobull-consulting/dagger/issues/45)). And the
-first run of `service-restart` found that a bundle holding imports can no
-longer be merged once its cache's imports moved
-([#47](https://github.com/zerobull-consulting/dagger/issues/47), see
-[Import path](#import-path)): C's verify export from `renew`, after `prune`
-restarted C. The old service had merged it into B before; the new one can't.
-The scenario expects only the bundles still mergeable, and logs the other as
-`GAP`.
+([#45](https://github.com/zerobull-consulting/dagger/issues/45)).
+
+**Fixed since: bundles of moved imports.** The first run of
+`service-restart` found that a bundle holding imports could no longer be
+merged once its cache's imports moved
+([#47](https://github.com/zerobull-consulting/dagger/issues/47)): C's verify
+export from `renew`, after `prune` restarted C. Each export's resolution is
+now stored (see [Imported entries](#imported-entries)). `prune` checks that
+C's imports moved and that resolving C's bundle through C's current mappings
+would fail, and that it merges with its stored resolution; `superseded`'s
+engine F, the first started after that, gets C's entries from it;
+`service-restart` checks that every bundle B had is merged into it again, C's
+included; and the run fails if any service logged a merge that failed with
+"is no longer stored". `TestBundleOfMovedImportsMerges` (fake engine, and
+MinIO) reproduces it in the service.
 
 From a run on 2026-11-02, in the same setup as above, each scenario's cost
 on top of the run (42s together; the whole run took 1m58s with the binaries

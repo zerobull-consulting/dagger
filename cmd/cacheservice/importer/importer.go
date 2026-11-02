@@ -115,9 +115,10 @@ type Importer struct {
 	log  *slog.Logger
 	sign Signer
 
-	mu      sync.Mutex
-	caches  map[string]*cacheState
-	bundles map[string]*dagql.ValueBundle
+	mu          sync.Mutex
+	caches      map[string]*cacheState
+	bundles     map[string]*dagql.ValueBundle
+	resolutions map[string]*metastore.Resolution
 }
 
 // New returns an Importer for cfg.
@@ -148,11 +149,12 @@ func New(cfg Config) (*Importer, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Importer{
-		cfg:     cfg,
-		log:     log,
-		sign:    StoreSigner(cfg.Blobs),
-		caches:  map[string]*cacheState{},
-		bundles: map[string]*dagql.ValueBundle{},
+		cfg:         cfg,
+		log:         log,
+		sign:        StoreSigner(cfg.Blobs),
+		caches:      map[string]*cacheState{},
+		bundles:     map[string]*dagql.ValueBundle{},
+		resolutions: map[string]*metastore.Resolution{},
 	}, nil
 }
 
@@ -559,6 +561,28 @@ func (im *Importer) bundle(ctx context.Context, id string) (*dagql.ValueBundle, 
 	return b, nil
 }
 
+// resolution reads a stored resolution, through a small in-memory cache:
+// resolutions never change.
+func (im *Importer) resolution(ctx context.Context, id string) (*metastore.Resolution, error) {
+	im.mu.Lock()
+	r := im.resolutions[id]
+	im.mu.Unlock()
+	if r != nil {
+		return r, nil
+	}
+	r, err := im.cfg.Meta.GetResolution(ctx, im.cfg.Scope, id)
+	if err != nil {
+		return nil, err
+	}
+	im.mu.Lock()
+	if len(im.resolutions) >= maxCachedBundles {
+		clear(im.resolutions)
+	}
+	im.resolutions[id] = r
+	im.mu.Unlock()
+	return r, nil
+}
+
 // merge merges one bundle, records what the engine kept, and returns the
 // offers of the stored parts its entries lack.
 func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *metastore.Index, c Candidate) (MergedBundle, []pendingOffer, error) {
@@ -566,7 +590,13 @@ func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *
 	if err != nil {
 		return MergedBundle{}, nil, fmt.Errorf("read bundle: %w", err)
 	}
-	mb, err := BuildMerge(ctx, idx, c.Bundle, stored, c.Roots, im.sign, im.cfg.Scope)
+	var res *metastore.Resolution
+	if c.Resolution != "" {
+		if res, err = im.resolution(ctx, c.Resolution); err != nil {
+			return MergedBundle{}, nil, fmt.Errorf("read resolution: %w", err)
+		}
+	}
+	mb, err := BuildMerge(ctx, idx, c.Bundle, stored, res, c.Roots, im.sign, im.cfg.Scope)
 	if err != nil {
 		return MergedBundle{}, nil, err
 	}

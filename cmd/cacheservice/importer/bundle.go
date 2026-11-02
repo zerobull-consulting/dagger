@@ -16,30 +16,41 @@ import (
 )
 
 // Candidate is a stored bundle to merge into an engine cache, the engine
-// cache that exported the roots, and the service numbers of the roots to
-// merge it with.
+// cache that exported the roots, the resolution their records name, and
+// the service numbers of the roots to merge it with.
 //
 // Bundle IDs are content hashes, so two engine caches that export identical
 // bundles share one: the roots of each are a candidate of their own, since
-// the bundle's sender numbers are each cache's own.
+// the bundle's sender numbers are each cache's own. Roots whose records name
+// different resolutions of one bundle and cache (it was recorded twice, and
+// resolved differently) are candidates of their own too, since a merge sends
+// one resolution.
 type Candidate struct {
-	Bundle string   `json:"bundle"`
-	Source string   `json:"source"`
-	Roots  []uint64 `json:"roots"`
+	Bundle string `json:"bundle"`
+	Source string `json:"source"`
+	// Resolution is the ID of the stored resolution the roots' records
+	// name, or empty for records stored before resolutions were.
+	Resolution string   `json:"resolution,omitempty"`
+	Roots      []uint64 `json:"roots"`
 }
 
-// Key names the candidate's bundle and source, for what the importer keeps
-// per merge.
-func (c Candidate) Key() string { return c.Bundle + "/" + c.Source }
+// Key names the candidate's bundle, source and resolution, for what the
+// importer keeps per merge.
+func (c Candidate) Key() string {
+	if c.Resolution == "" {
+		return c.Bundle + "/" + c.Source
+	}
+	return c.Bundle + "/" + c.Source + "/" + c.Resolution
+}
 
 // Plan returns the bundles to merge into the engine cache cacheID, from the
-// scope's index at nowUnix: one per bundle and source cache that hold the
+// scope's index at nowUnix: one per bundle, source cache and resolution that hold the
 // current record of at least one live root, with those roots. A root is left
 // out when it or its entry has expired, or an entry it depends on has, or
 // when it came from cacheID itself, since that cache already has it. Bundles come in order of their lowest root, so older
 // entries are merged first.
 func Plan(idx *metastore.Index, cacheID string, nowUnix int64) []Candidate {
-	type key struct{ bundle, source string }
+	type key struct{ bundle, source, resolution string }
 	byBundle := map[key][]uint64{}
 	dead := deadEntries(idx, nowUnix)
 	for n, root := range idx.Roots {
@@ -50,16 +61,16 @@ func Plan(idx *metastore.Index, cacheID string, nowUnix int64) []Candidate {
 		if e.Source.CacheID == cacheID {
 			continue
 		}
-		k := key{e.Bundle, e.Source.CacheID}
+		k := key{e.Bundle, e.Source.CacheID, e.Resolution}
 		byBundle[k] = append(byBundle[k], n)
 	}
 	out := make([]Candidate, 0, len(byBundle))
 	for k, roots := range byBundle {
 		slices.Sort(roots)
-		out = append(out, Candidate{Bundle: k.bundle, Source: k.source, Roots: roots})
+		out = append(out, Candidate{Bundle: k.bundle, Source: k.source, Resolution: k.resolution, Roots: roots})
 	}
 	slices.SortFunc(out, func(a, b Candidate) int {
-		return cmp.Or(cmp.Compare(a.Roots[0], b.Roots[0]), cmp.Compare(a.Bundle, b.Bundle), cmp.Compare(a.Source, b.Source))
+		return cmp.Or(cmp.Compare(a.Roots[0], b.Roots[0]), cmp.Compare(a.Bundle, b.Bundle), cmp.Compare(a.Source, b.Source), cmp.Compare(a.Resolution, b.Resolution))
 	})
 	return out
 }
@@ -140,10 +151,18 @@ type MergeBundle struct {
 const expiredRoot = 1
 
 // BuildMerge rewrites stored bundle bundleID for a merge of the given roots,
-// by service number, as the index idx describes them:
+// by service number, as the index idx and the bundle's stored resolution res
+// describe them:
 //
 //   - each value's SenderNumber becomes its service number, which the engine
-//     keeps as its Cloud holding's number;
+//     keeps as its Cloud holding's number. That is the number res gives it:
+//     how Record resolved the value when it recorded the bundle. The source
+//     cache's mappings may have changed since: the entries it had imported
+//     move when they are merged into it again, and are dropped when it is
+//     wiped (#47), and res doesn't depend on them. Every root's record must
+//     name res. A nil res is for records stored before resolutions were,
+//     which name none: their values resolve through the source cache's
+//     current mappings, exported or imported, as before;
 //   - the given roots are merged, each with the index's expiry for it;
 //   - each output's chain gets a download address per layer from sign, and
 //     renewalKey, which the engine names when it asks for fresh addresses.
@@ -156,11 +175,20 @@ const expiredRoot = 1
 // entry the index has since dropped, has no service number: it gets a
 // placeholder at or above the index's next number, which no stored entry
 // has, and is never merged. A value a given root needs must still be stored.
+// Whether an entry is stored is always the index's to say, not res's: a
+// value whose entry DropExpired dropped since gets a placeholder too.
 //
 // The stored bundle is not changed.
-func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stored *dagql.ValueBundle, roots []uint64, sign Signer, renewalKey string) (MergeBundle, error) {
+func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stored *dagql.ValueBundle, res *metastore.Resolution, roots []uint64, sign Signer, renewalKey string) (MergeBundle, error) {
 	if err := metastore.ValidateBundle(stored); err != nil {
 		return MergeBundle{}, fmt.Errorf("bundle %s: %w", bundleID, err)
+	}
+	resID := ""
+	if res != nil {
+		var err error
+		if resID, _, err = metastore.ResolutionID(res); err != nil {
+			return MergeBundle{}, err
+		}
 	}
 	if len(roots) == 0 {
 		return MergeBundle{}, errors.New("no roots")
@@ -189,24 +217,42 @@ func BuildMerge(ctx context.Context, idx *metastore.Index, bundleID string, stor
 		} else if source != e.Source.CacheID {
 			return MergeBundle{}, fmt.Errorf("roots from caches %q and %q in one bundle", source, e.Source.CacheID)
 		}
+		if e.Resolution != resID {
+			if resID == "" {
+				return MergeBundle{}, fmt.Errorf("root %d's record names resolution %s, and none was given", n, e.Resolution)
+			}
+			return MergeBundle{}, fmt.Errorf("root %d's record names resolution %q, not %s", n, e.Resolution, resID)
+		}
 		rootOrdinals = append(rootOrdinals, dagql.TransferredRoot{Ordinal: e.Ordinal, ExpiresAtUnix: idx.Roots[n].ExpiresAtUnix})
 	}
 	slices.SortFunc(rootOrdinals, func(a, b dagql.TransferredRoot) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
-	mapping := idx.Caches[source]
-	if mapping == nil {
-		return MergeBundle{}, fmt.Errorf("no mapping for cache %q", source)
-	}
-
 	numbers := make(map[dagql.TransferOrdinal]uint64, len(stored.Values))
-	for _, v := range stored.Values {
-		// A value the source cache had imported names the stored entry it
-		// came from.
-		m, ok := mapping.Lookup(v.SenderNumber)
-		if !ok {
-			continue
+	if res != nil {
+		if err := res.Check(bundleID, source, stored); err != nil {
+			return MergeBundle{}, fmt.Errorf("bundle %s: %w", bundleID, err)
 		}
-		if _, stored := idx.Entries[m.Number]; stored {
-			numbers[v.Ordinal] = m.Number
+		for _, v := range stored.Values {
+			n, _ := res.Number(v.Ordinal)
+			if _, ok := idx.Entries[n]; ok {
+				numbers[v.Ordinal] = n
+			}
+		}
+	} else {
+		// A record stored before resolutions: resolve through the
+		// source cache's current mappings. A value the cache had imported
+		// names the stored entry it came from, while the import stays.
+		mapping := idx.Caches[source]
+		if mapping == nil {
+			return MergeBundle{}, fmt.Errorf("no mapping for cache %q", source)
+		}
+		for _, v := range stored.Values {
+			m, ok := mapping.Lookup(v.SenderNumber)
+			if !ok {
+				continue
+			}
+			if _, ok := idx.Entries[m.Number]; ok {
+				numbers[v.Ordinal] = m.Number
+			}
 		}
 	}
 	for _, o := range closure(stored, rootOrdinals) {
