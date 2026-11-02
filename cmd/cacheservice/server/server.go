@@ -48,6 +48,10 @@ type S3Options struct {
 	// ImportPoll is how often the import path looks for stored entries a
 	// connected engine lacks; 0 means only on hello and after an export.
 	ImportPoll time.Duration
+	// NoEngineWait is how long an export waits for its engine to connect,
+	// or to reconnect after its connection was lost mid-export; 0 means
+	// the export path's default (10s).
+	NoEngineWait time.Duration
 }
 
 // EnableS3 turns on the export path, and the import path unless
@@ -68,8 +72,9 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	}
 	s.logger.Info("export path on", "bucket", cfg.Bucket, "prefix", cfg.Prefix, "scope", opts.Scope)
 	if err := s.EnableExport(ctx, ExportConfig{
-		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: opts.Scope},
-		Tracker:  opts.Tracker,
+		Exporter:     exporter.Config{Blobs: blobs, Meta: meta, Scope: opts.Scope},
+		Tracker:      opts.Tracker,
+		NoEngineWait: opts.NoEngineWait,
 	}); err != nil {
 		return err
 	}

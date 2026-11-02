@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
@@ -25,6 +27,9 @@ type Service struct {
 	// Logs records everything it logs, at every level. It also goes to
 	// RunDir/<name>.log.
 	Logs *LogRecorder
+
+	opts ServiceOptions
+	stop func()
 }
 
 // ServiceOptions configure a service.
@@ -35,7 +40,14 @@ type ServiceOptions struct {
 	// ImportPoll is how often it looks for entries a connected engine
 	// lacks (0: server.DefaultImportPoll).
 	ImportPoll time.Duration
+	// Addr is the address to listen on (host:port); empty picks a free
+	// port on the bridge gateway.
+	Addr string
 }
+
+// noEngineWait is how long an export waits for its engine to reconnect:
+// short, so the scenarios that drop connections don't wait the default 10s.
+const noEngineWait = 2 * time.Second
 
 // StartService starts a service on the run's bucket prefix and scope. Two
 // services on one run are replicas of each other.
@@ -62,16 +74,21 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := server.New(logger, "")
 	if err := svc.EnableS3(ctx, cfg, server.S3Options{
-		Scope:      e.Scope,
-		Tracker:    exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},
-		ImportPoll: poll,
+		Scope:        e.Scope,
+		Tracker:      exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},
+		ImportPoll:   poll,
+		NoEngineWait: noEngineWait,
 	}); err != nil {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
 	}
 	// On the bridge gateway only: it takes any token and any OTLP request,
 	// so it isn't exposed beyond this host.
-	ln, err := net.Listen("tcp", net.JoinHostPort(e.Gateway, "0"))
+	addr := opts.Addr
+	if addr == "" {
+		addr = net.JoinHostPort(e.Gateway, "0")
+	}
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
@@ -82,18 +99,42 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 			logger.Error("serve", "error", err)
 		}
 	}()
-	e.root.Cleanup(func() {
-		svc.CloseEngines()
-		shutdown, done := context.WithTimeout(context.Background(), 5*time.Second)
-		defer done()
-		_ = srv.Shutdown(shutdown)
-		cancel()
-		svc.Wait()
-		_ = logFile.Close()
-	})
-	s := &Service{Service: svc, Name: name, URL: "http://" + ln.Addr().String(), Logs: logs}
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			// Stop taking requests first, so no engine connects to the
+			// service as it goes away.
+			shutdown, done := context.WithTimeout(context.Background(), 5*time.Second)
+			defer done()
+			_ = srv.Shutdown(shutdown)
+			svc.CloseEngines()
+			cancel()
+			svc.Wait()
+			_ = logFile.Close()
+		})
+	}
+	e.root.Cleanup(stop)
+	s := &Service{Service: svc, Name: name, URL: "http://" + ln.Addr().String(), Logs: logs, opts: opts, stop: stop}
 	t.Logf("service %s on %s (GET expiry %s, import poll %s)", name, s.URL, cfg.GetExpiry, poll)
 	return s
+}
+
+// Stop stops the service, as its process ending would: it closes its
+// listener and its engines' connections, and ends what it runs. Its
+// in-memory state goes with it.
+func (s *Service) Stop() { s.stop() }
+
+// RestartService stops svc, waits down, and starts a new service, name, with
+// the same options on the same address, as a restart of the service's
+// process. Engines pointed at svc reconnect to it with their backoff; Attach
+// them to it.
+func (e *Env) RestartService(svc *Service, name string, down time.Duration) *Service {
+	e.T.Helper()
+	svc.Stop()
+	time.Sleep(down)
+	opts := svc.opts
+	opts.Addr = strings.TrimPrefix(svc.URL, "http://")
+	return e.StartService(name, opts)
 }
 
 // EngineInfo is the connection's entry in Engines.

@@ -18,6 +18,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
@@ -453,6 +454,110 @@ func TestExportOneRootTooLarge(t *testing.T) {
 	}
 }
 
+// mergeSize is what the exporter estimates for the merge of an export of
+// roots, with an fs output each.
+func (e *testEnv) mergeSize(t *testing.T, roots ...uint64) int {
+	t.Helper()
+	capt, err := e.cache.Capture(protocol.Export{Roots: roots, Outputs: fsOutputs(roots...)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripVolatile(capt.Bundle)
+	data, err := json.Marshal(capt.Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return importer.MergeSize(capt.Bundle, len(data), e.x.addressSize(context.Background()), "team")
+}
+
+// manyLayers is a chain of n distinct layers, as a deep image has: its
+// merge carries a presigned GET for each.
+func manyLayers(name string, n int) [][]byte {
+	out := make([][]byte, n)
+	for i := range out {
+		out[i] = layer(fmt.Sprintf("%s-%d", name, i))
+	}
+	return out
+}
+
+// The import path sends a stored bundle whole, with a presigned GET per
+// layer of each chain, and can't split it (#12). An export whose bundle
+// would make a merge over the import path's limit is split like one too
+// large for a message, and each half, under the limit, is stored.
+func TestExportSplitsBundleTooLargeToImport(t *testing.T) {
+	probe := newTestEnv(t, nil)
+	add := func(e *testEnv) {
+		e.cache.Add(fakeengine.Entry{Number: 1, Layers: manyLayers("one", 8)})
+		e.cache.Add(fakeengine.Entry{Number: 2, Layers: manyLayers("two", 8)})
+	}
+	add(probe)
+	one, two, both := probe.mergeSize(t, 1), probe.mergeSize(t, 2), probe.mergeSize(t, 1, 2)
+	limit := both - 1
+	if one > limit || two > limit {
+		t.Fatalf("merge sizes: %d and %d alone, %d together", one, two, both)
+	}
+
+	e := newTestEnv(t, func(c *Config) { c.MaxMergeBytes = limit })
+	add(e)
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{1, 2}, Outputs: fsOutputs(1, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(res.Stored)
+	if !slices.Equal(res.Stored, []uint64{1, 2}) || len(res.Bundles) != 2 || len(res.Failed) != 0 {
+		t.Fatalf("want both roots stored, each in its own bundle: %+v", res)
+	}
+	// The first export, of both, was released without an upload of any
+	// blob: an empty upload, then one per half.
+	uploads := e.eng.uploadMaps()
+	if len(uploads) != 3 || len(uploads[0]) != 0 || len(uploads[1]) != 8 || len(uploads[2]) != 8 {
+		t.Fatalf("uploads of %v blobs, want 0 (the release), 8 and 8", mapSizes(uploads))
+	}
+	if e.cache.InFlight() != 0 {
+		t.Fatalf("%d exports still hold their chains", e.cache.InFlight())
+	}
+}
+
+// A root whose bundle alone is too large to import fails, with why, and
+// nothing is stored: no blob, no bundle, no index entry.
+func TestExportOneRootBundleTooLargeToImport(t *testing.T) {
+	probe := newTestEnv(t, nil)
+	probe.cache.Add(fakeengine.Entry{Number: 1, Layers: manyLayers("one", 8)})
+	limit := probe.mergeSize(t, 1) - 1
+
+	e := newTestEnv(t, func(c *Config) { c.MaxMergeBytes = limit })
+	e.cache.Add(fakeengine.Entry{Number: 1, Layers: manyLayers("one", 8)})
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{1}, Outputs: fsOutputs(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Stored) != 0 || len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Error, "too large to import") {
+		t.Fatalf("want root 1 failed as too large to import: %+v", res)
+	}
+	if puts := e.blobs.Puts(); puts != 0 {
+		t.Fatalf("%d blobs uploaded for a bundle that isn't stored", puts)
+	}
+	idx, err := e.meta.Index(ctx, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Entries) != 0 || slices.ContainsFunc(e.objects.Keys(), func(k string) bool { return strings.Contains(k, "/bundles/") }) {
+		t.Fatalf("stored anyway: %d index entries, objects %v", len(idx.Entries), e.objects.Keys())
+	}
+	if e.cache.InFlight() != 0 {
+		t.Fatalf("%d exports still hold their chains", e.cache.InFlight())
+	}
+}
+
+func mapSizes(ms []map[digest.Digest]string) []int {
+	out := make([]int, len(ms))
+	for i, m := range ms {
+		out[i] = len(m)
+	}
+	return out
+}
+
 func TestExportUploadRequestTooLarge(t *testing.T) {
 	// Room for an export request and an upload of one URL, not two.
 	e := newTestEnv(t, func(c *Config) { c.MaxMessageBytes = 520 })
@@ -517,6 +622,12 @@ type failingStore struct{ blobstore.Store }
 
 func (failingStore) Has(context.Context, digest.Digest) (bool, error) {
 	return false, errors.New("s3 down")
+}
+
+// PresignGet fails too: the exporter then sizes merges with
+// importer.DefaultAddressBytes.
+func (failingStore) PresignGet(context.Context, digest.Digest) (blobstore.Address, error) {
+	return blobstore.Address{}, errors.New("can't sign")
 }
 
 func TestExportEngineError(t *testing.T) {

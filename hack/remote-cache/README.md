@@ -143,6 +143,17 @@ with a fake engine cache served through the engine's own `remotecache.Run`:
   startup, turns on the export and import paths against MinIO, and refuses a
   missing bucket.
 
+`cmd/cacheservice/server/minio_import_test.go` checks the import path the same
+way: a fresh engine has the build merged and pulls its layers from MinIO
+(`TestMinIOImportFreshEngine`), renews expired GETs (`TestMinIOImportRenew`),
+doesn't export its imports back (`TestMinIOImportsNotReexported`), and stored
+bundles hold no GETs (`TestMinIOStoredBundlesHoldNoAddresses`).
+`TestMinIOImportBundleNearMergeLimit` exports a bundle whose merge, with
+MinIO's presigned GETs, is just under the import path's limit, just over it,
+and over it only once the GETs are added, and checks that each is stored
+(split when over) and imported
+([#12](https://github.com/zerobull-consulting/dagger/issues/12)).
+
 Each run writes under its own `test/` prefix in the bucket and deletes it
 afterwards. The `Remote cache tests` workflow runs them on every pull request.
 
@@ -246,9 +257,34 @@ the main service's exports by polling the index.
 | `prune` | [#32](https://github.com/zerobull-consulting/dagger/issues/32) | Prunes C's cache with `{ engine { localCache { prune } } }` (with no arguments, it drops every releasable entry), waits 5 import polls, syncs C 3 times by hand (`Service.Import`), then restarts C on the same volume. Starts the replica and C if `renew` didn't run. | The prune reaches the replica (`engine.prune`) and the importer forgets the pruned values; nothing is merged or offered to C over the polls and syncs; after the restart (a new generation), the replica merges the entries into C again. |
 | `superseded` | [#32](https://github.com/zerobull-consulting/dagger/issues/32), [#27](https://github.com/zerobull-consulting/dagger/issues/27) | Writes a Dang module (`ttlmod` in the run's directory) whose function `stamp2` has a cache TTL of `E2E_TTL` seconds, runs it on A, waits for it to expire, and runs it again. Then starts engine F, empty, waits until both bundles are merged into it, and reads the value on it. | A replaced the value in place, the index kept its service number and moved it to a newer bundle, and F's call resolved to the imported entry (its `withExec` hit; a function with a TTL is evaluated on every call). It reports which record F got by the layer it read: the newer one passes; the older one is logged as `GAP` (#27), without failing; neither fails. |
 
+The resilience scenarios ([#12](https://github.com/zerobull-consulting/dagger/issues/12))
+run last, since they break things on purpose. Each ends with two checks:
+S3 is consistent (read from MinIO directly: the index names no bundle that
+isn't stored, and no stored bundle names a layer blob that isn't, besides
+the one `renew` deleted), and the engines work: B runs the pipeline A built
+during the fault, and gets its exec as a cache hit with A's output. They
+inject faults with the S3 proxy (`Fault`: an S3 error for some requests, or
+a stall until removed), `Service.CloseEngine`, `Engine.RestartAsync` and
+`Env.RestartService`.
+
+| Scenario | What it does | Passes when |
+| --- | --- | --- |
+| `disconnect` | Stalls blob PUTs in the S3 proxy, runs a new pipeline on A (an exec writing 1MB), and once its export's upload is stalled, drops A's WebSocket (`Service.CloseEngine`, no close frame). Then ends the stall. | A reconnects (same cache and generation, new connection); the export on the dropped connection is logged interrupted, not failed; nothing of it was published while it was cut; it runs again on the new connection and is stored, with the layer that was in flight. |
+| `engine-restart` | As `disconnect`, but restarts A's container (`docker restart`) while the upload is stalled. | A restarted cleanly (same cache ID, generation one higher); the cut export was interrupted, not failed, and published nothing; it ran again on the new generation, under the same entry numbers, and was stored as that generation's, with the layer that was in flight. |
+| `s3-faults` | First injects, for one export of a new pipeline on A, 503 `SlowDown` for 2 blob PUTs (the engine's), 500 `InternalError` for 1 bundle PUT and 503 `SlowDown` for 2 index PUTs (the service's). Then answers every S3 request with 503 while A runs another pipeline, until its export has failed, and lifts it. | Each faulted request was made again and succeeded: the blob PUTs by the export path, which retries the export with backoff (1s, then 2s), the bundle and index writes by the service's S3 client. The first export is stored, and none failed. While S3 was down, the export failed and published nothing (the index and bundles as before); once back, it was stored. |
+| `service-restart` | Stalls blob PUTs, runs a new pipeline on A, and once its upload is stalled, stops the main service and starts a new one on the same address and scope 2s later (`Env.RestartService`). Then runs the pipeline on A again. | A and B reconnect with their backoff; the new service merges into B every bundle B had that is still live and mergeable, once (none more over 3 syncs by hand), and nothing of A's own into A; A's next session is exported and stored. The export cut by the restart is not tried again by the new service: logged as `GAP` ([#45](https://github.com/zerobull-consulting/dagger/issues/45)), without failing. Bundles B had that expired since, or that no engine can be merged any more ([#47](https://github.com/zerobull-consulting/dagger/issues/47)), aren't expected; the latter are logged as `GAP`. |
+
+They add about 42s to the run: see
+[`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#resilience)
+for what each costs, and for the cases of #12 tested only with fake engines
+(a stalled upload, which the engine gives up on after a minute without
+progress, and oversized bundles).
+
 Each check is logged as `ok` or `FAIL`; a failed check fails its scenario
 without stopping it. Run some scenarios only with
-`E2E_SCENARIOS="renew prune" ./hack/remote-cache/dev.sh e2e`, or pass `go
+`E2E_SCENARIOS="renew prune" ./hack/remote-cache/dev.sh e2e` (the names:
+`reexport`, `renew`, `prune`, `superseded`, `disconnect`, `engine-restart`,
+`s3-faults`, `service-restart`), or pass `go
 test` flags after `e2e`, such as `-run 'TestRealEngines/^renew$'`. The first
 part always runs.
 

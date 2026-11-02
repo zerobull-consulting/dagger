@@ -59,3 +59,15 @@ func TestMinIOStoredBundlesHoldNoAddresses(t *testing.T) {
 	h, _ := newMinIOExportHarness(t)
 	testStoredBundlesHoldNoAddresses(t, h)
 }
+
+// #12's merge-size gap against MinIO, whose presigned GETs are full S3
+// URLs: a bundle near the import path's limit is stored, split if its merge
+// would be over, and imported.
+func TestMinIOImportBundleNearMergeLimit(t *testing.T) {
+	for _, tc := range nearMergeLimitCases {
+		t.Run(tc.name, func(t *testing.T) {
+			blobs, meta, _ := newMinIOStores(t)
+			testImportBundleNearMergeLimit(t, blobs, meta, tc)
+		})
+	}
+}
