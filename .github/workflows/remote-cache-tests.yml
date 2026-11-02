@@ -151,7 +151,7 @@ jobs:
       # the engines' logs when it failed.
       - name: Upload the run's files
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-runs
           path: ${{ runner.temp }}/e2e/runs
