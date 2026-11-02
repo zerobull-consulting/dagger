@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -437,5 +438,48 @@ func TestTrackerInterrupted(t *testing.T) {
 	}
 	if e := tr.Entries("c"); !e[0].Stored || e[1].Failures != 0 {
 		t.Fatalf("entries %+v", e)
+	}
+}
+
+// An imported entry is the stored value: not exported while it has the
+// merge's replacement count and parts, exported once it changes.
+func TestTrackerImportedNotExported(t *testing.T) {
+	tr := newTestTracker()
+	tr.Imported("c", 1, []ImportedValue{
+		{Number: 1, Parts: []dagql.PersistedPartAddress{{Part: "fs"}}},
+		{Number: 2, Parts: []dagql.PersistedPartAddress{{Part: "fs"}}},
+	})
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Observe(state(2, 10, fsPart, metaPart), t0)
+	tr.Observe(state(3, 10, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 3, t0)
+	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{2, 3}) {
+		t.Fatalf("exported %v, want 2 (a new part) and 3 (not imported)", got)
+	}
+	if es := tr.Entries("c"); !es[0].Stored {
+		t.Fatalf("entries %+v", es)
+	}
+	// A pruned import is forgotten: its next value is the engine's own.
+	tr.Pruned("c", 1, []Drop{{Number: 1, DroppedAtUnixNano: 5}})
+	if got := roots(tr.All("c", t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after prune: %v", got)
+	}
+}
+
+// Intentional: an unchanged import whose spans report a later expiry is not
+// exported, as a stored entry isn't (exportedValue compares replacements and
+// parts only). An export couldn't change the expiry anyway: the index keeps
+// an imported value's record, whose expiry the entry has, unless the export
+// holds more parts (see metastore's TestRecordImportKeepsRecordExpiry).
+func TestTrackerImportedIgnoresExpiry(t *testing.T) {
+	tr := newTestTracker()
+	tr.Imported("c", 1, []ImportedValue{{Number: 1, Parts: []dagql.PersistedPartAddress{{Part: "fs"}}}})
+	o := state(1, 10, fsPart)
+	o.Expires = t0.Add(time.Hour).Unix()
+	o.RetentionExp = t0.Add(2 * time.Hour).Unix()
+	tr.Observe(o, t0)
+	tr.SessionEnded("c", 1, "s1", 1, t0)
+	if got := roots(tr.Due(t0)); len(got) != 0 {
+		t.Fatalf("exported %v", got)
 	}
 }
