@@ -201,3 +201,62 @@ func TestWipedCacheImportsDropped(t *testing.T) {
 		t.Fatal("the importer still knows the wiped cache")
 	}
 }
+
+// #31: an engine that had entries merged into it holds their parts as
+// offers, with this service's presigned GETs, until it pulls them, and
+// exports them in its records as they are. The stored bundle keeps the
+// offers, but none of the addresses: another engine that merges it renews
+// them through its own session instead of reading the store with GETs this
+// service didn't sign for it, and that it would never renew.
+func TestStoredBundlesHoldNoAddresses(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	testStoredBundlesHoldNoAddresses(t, h)
+}
+
+func testStoredBundlesHoldNoAddresses(t *testing.T, h *exportHarness) {
+	t.Helper()
+	ctx := context.Background()
+	layers := h.buildRecipes()
+	h.exportBuild()
+	h.waitIndex(10, 11)
+
+	// B has A's build merged, as offers it hasn't pulled, and builds a new
+	// entry over the exec.
+	b := fakeengine.New("cache-b", 1)
+	h.connectEngine(b)
+	base := waitLookup(t, b, "from(alpine)", hasOffer)
+	exec := waitLookup(t, b, "withExec(make)", hasOffer)
+	if len(exec.Offer.Chain.Addresses) == 0 || exec.Offer.Chain.RenewalKey == "" {
+		t.Fatalf("B's merged offer: %+v", exec.Offer.Chain)
+	}
+	waitImports(t, h.meta, b.ID, 2)
+	b.Add(fakeengine.Entry{Number: 2000, Recipe: "withExec(test)", Deps: []uint64{exec.Number}, Layers: [][]byte{layers[0], layers[1], testLayer("test")}})
+	h.postSpansOf(b, "b-1", cacheSpan(base.Number), cacheSpan(exec.Number, itoa(base.Number)), cacheSpan(2000, itoa(exec.Number)), carrierSpan(3))
+	idx := waitMapped(t, h.meta, b.ID, 2000)
+
+	bundle, err := h.meta.GetBundle(ctx, testScope, idx.Entries[idx.Caches[b.ID].Numbers[2000].Number].Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offers := 0
+	for _, v := range bundle.Values {
+		for _, o := range v.Record.Envelope.PendingOffers {
+			offers++
+			if len(o.Chain.Addresses) != 0 {
+				t.Fatalf("value %d: stored offer has addresses %v", v.Ordinal, o.Chain.Addresses)
+			}
+			if o.Chain.RenewalKey != testScope || len(o.Chain.Layers) == 0 {
+				t.Fatalf("value %d: stored offer %+v", v.Ordinal, o.Chain)
+			}
+		}
+	}
+	// The imported base and exec are in the new entry's closure, as offers.
+	if offers != 2 {
+		t.Fatalf("stored bundle has %d offers, want 2", offers)
+	}
+	for _, o := range bundle.Outputs {
+		if o.Chain != nil && len(o.Chain.Addresses) != 0 {
+			t.Fatalf("output %d: stored chain has addresses", o.Ordinal)
+		}
+	}
+}

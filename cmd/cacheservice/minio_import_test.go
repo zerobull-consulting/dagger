@@ -53,3 +53,9 @@ func TestMinIOImportsNotReexported(t *testing.T) {
 	h, _ := newMinIOExportHarness(t)
 	testImportsNotReexported(t, h)
 }
+
+// #31 against MinIO: stored bundles hold no presigned GETs.
+func TestMinIOStoredBundlesHoldNoAddresses(t *testing.T) {
+	h, _ := newMinIOExportHarness(t)
+	testStoredBundlesHoldNoAddresses(t, h)
+}

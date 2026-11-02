@@ -328,6 +328,11 @@ func summarize(env protocol.Envelope) []any {
 		if env.Decode(&b) == nil {
 			return []any{"renewalKey", b.RenewalKey, "layers", len(b.Layers), "neededBlob", b.NeededBlob}
 		}
+	case protocol.TypeRenewed:
+		var b protocol.Renewed
+		if env.Decode(&b) == nil {
+			return []any{"addresses", len(b.Addresses), "unavailable", b.Unavailable}
+		}
 	case protocol.TypeExported:
 		var b protocol.Exported
 		if env.Decode(&b) == nil {

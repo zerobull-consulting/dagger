@@ -12,6 +12,7 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -21,6 +22,9 @@ import (
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 	"github.com/dagger/dagger/engine/snapshots"
 )
+
+// layerCreatedAt is every fake layer's creation time.
+var layerCreatedAt = time.Date(2026, 11, 2, 7, 52, 43, 412316627, time.UTC)
 
 // FSPart is the part address the fake's layers belong to.
 var FSPart = dagql.PersistedPartAddress{Part: "fs"}
@@ -55,6 +59,11 @@ type Cache struct {
 	// NoMergeOffers makes merges place no offers, as when the engine's
 	// part is being computed, so only an offer can place them.
 	NoMergeOffers bool
+	// CreatedAtAnnotation makes exports annotate a layer the cache exported
+	// before with buildkit/createdat, as the real engine does: a layer it
+	// compresses for an export has no creation time in its metadata yet, and
+	// every later export of it reads one back.
+	CreatedAtAnnotation bool
 
 	mu      sync.Mutex
 	entries map[uint64]*Entry
@@ -70,6 +79,9 @@ type Cache struct {
 	// offerHook, when set, decides an offer's outcome before the fake does.
 	offerHook func(number uint64, offer protocol.CloudPart) protocol.OfferOutcome
 
+	// compressed are the layers an export has compressed.
+	compressed map[digest.Digest]bool
+
 	renewals chan *dagql.RenewalRequest
 	renewed  map[dagql.RenewalRequestID]chan dagql.RenewalReply
 	renewSeq uint64
@@ -82,6 +94,7 @@ func New(id string, generation uint64) *Cache {
 		Generation: generation,
 		entries:    map[uint64]*Entry{},
 		next:       1000,
+		compressed: map[digest.Digest]bool{},
 		renewals:   make(chan *dagql.RenewalRequest),
 		renewed:    map[dagql.RenewalRequestID]chan dagql.RenewalReply{},
 	}
@@ -213,6 +226,11 @@ func (c *Cache) Capture(req protocol.Export) (Capture, error) {
 		if e.Recipe != "" {
 			v.Record.Call = &dagql.ResultCall{Field: e.Recipe}
 		}
+		// As the engine does, a part offered and not yet pulled is exported
+		// in the record, as the offer it holds, addresses and all.
+		if e.Offer != nil {
+			v.Record.Envelope.PendingOffers = []dagql.PersistedPartOffer{*e.Offer}
+		}
 		for _, d := range e.Deps {
 			v.DependencyIDs = append(v.DependencyIDs, uint64(ordinal[d]))
 		}
@@ -231,11 +249,17 @@ func (c *Cache) Capture(req protocol.Export) (Capture, error) {
 		for _, l := range e.Layers {
 			d := digest.FromBytes(l)
 			capt.Blobs[d] = l
-			chain.Layers = append(chain.Layers, snapshots.ExportLayer{Descriptor: ocispecs.Descriptor{
+			created := layerCreatedAt
+			layer := snapshots.ExportLayer{CreatedAt: &created, Descriptor: ocispecs.Descriptor{
 				MediaType: ocispecs.MediaTypeImageLayerGzip,
 				Digest:    d,
 				Size:      int64(len(l)),
-			}})
+			}}
+			if c.CreatedAtAnnotation && c.compressed[d] {
+				layer.Descriptor.Annotations = map[string]string{"buildkit/createdat": created.Format(time.RFC3339Nano)}
+			}
+			c.compressed[d] = true
+			chain.Layers = append(chain.Layers, layer)
 		}
 		b.Outputs = append(b.Outputs, dagql.TransferredOutput{
 			Ordinal: ordinal[o.Number],
