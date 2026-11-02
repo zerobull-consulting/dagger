@@ -20,6 +20,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -561,5 +562,63 @@ func TestNeededBlobsConflictingSizes(t *testing.T) {
 	capt.Bundle.Outputs[0].Chain.Layers[0].Descriptor.Size++
 	if _, err := neededBlobs(capt.Bundle); err == nil {
 		t.Fatal("conflicting sizes accepted")
+	}
+}
+
+// Known gap (#37): an importing engine's export of an imported value whose
+// bundle holds a part the stored record lacks, but lacks one it holds, is
+// reported as stored, though the index kept the stored record and the new
+// part isn't in it. The tracker then counts the value as stored and doesn't
+// try again. Replacing the stored record would lose its part, and an entry
+// names one record, so the parts of two bundles can't be combined. See
+// metastore's TestRecordKnownGapImportWithOtherParts and "Imported entries"
+// in README.md.
+func TestExportKnownGapImportWithOtherParts(t *testing.T) {
+	e := newTestEnv(t, nil)
+	ctx := context.Background()
+	// Another cache's record of the value, with fs and execMeta parts.
+	stored := &dagql.ValueBundle{
+		Version: dagql.ValueBundleVersion,
+		Roots:   []dagql.TransferredRoot{{Ordinal: 1}},
+		Values:  []dagql.TransferredValue{{Ordinal: 1, SenderNumber: 5, Record: dagql.PersistedRecord{ResultID: 5}}},
+		Outputs: []dagql.TransferredOutput{
+			{Ordinal: 1, Address: dagql.PersistedPartAddress{Part: "fs"}, State: "completed"},
+			{Ordinal: 1, Address: dagql.PersistedPartAddress{Part: "execMeta"}, State: "completed"},
+		},
+	}
+	rec, err := e.meta.Record(ctx, "team", stored, "cache-z", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := rec.Numbers[1]
+	before := rec.Index.Entries[n]
+	// Merged into this engine on entry 20, which exports it with another
+	// part only.
+	if _, err := e.meta.RecordImports(ctx, "team", e.cache.ID, e.cache.Generation, []metastore.Import{{Number: n, Engine: 20}}); err != nil {
+		t.Fatal(err)
+	}
+	e.cache.Add(fakeengine.Entry{Number: 20, Layers: [][]byte{layer("base")}})
+	e.eng.mangle = func(c *fakeengine.Capture) {
+		for i := range c.Bundle.Outputs {
+			c.Bundle.Outputs[i].Address.Part = "newPart"
+		}
+	}
+
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{20}, Outputs: fsOutputs(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reported as stored...
+	if !slices.Equal(res.Stored, []uint64{20}) || len(res.Failed) != 0 {
+		t.Fatalf("result %+v", res)
+	}
+	// ...but the index kept the stored record: the new part isn't in it.
+	idx, err := e.meta.Index(ctx, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := idx.Entries[n]
+	if after.Bundle != before.Bundle || after.Source.CacheID != "cache-z" || slices.Contains(after.Parts, `{"part":"newPart"}`) || idx.NextNumber != n+1 {
+		t.Fatalf("entry %d: %+v (next %d)", n, after, idx.NextNumber)
 	}
 }

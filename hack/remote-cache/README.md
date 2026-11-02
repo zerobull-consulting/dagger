@@ -204,11 +204,17 @@ engines A and B new, empty cache volumes. Then it:
    /debug/engines/{conn}/entries`, and `index.json` in MinIO), and merged
    them into B (`GET /debug/engines/{conn}/imports`);
 6. runs the same pipeline on B, then one more exec on B that checksums both
-   layer files, while tracing MinIO's requests (`mc admin trace`).
+   layer files, while tracing MinIO's requests (`mc admin trace`);
+7. waits until the service has stored B's new entries and merged them into
+   A, and reads the index again (`index-final.json`).
 
 It passes when B's stamps are A's (the execs didn't run again), B's
-`withExec` spans are hits, the layer files on B have A's checksums, and MinIO
-served B's engine the layer blobs. It prints the wall-clock time of each run.
+`withExec` spans are hits, the layer files on B have A's checksums, MinIO
+served B's engine the layer blobs, and the index holds A's entries,
+unchanged, plus only the entries B's verify exec built, each once: none of
+B's entries is one it imported, every service number handed out is an entry,
+and no merge into A carries A's own entries back
+([#35](https://github.com/zerobull-consulting/dagger/issues/35)). It prints the wall-clock time of each run.
 What a run showed is in
 [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#real-engine-run).
 

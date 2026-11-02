@@ -233,7 +233,7 @@ func (s *service) trackEvent(kind, cache, body string) {
 			p.tracker.Started(cacheID, generation, ev.WipedCache)
 		}
 		if s.imports != nil && ev.WipedCache != "" {
-			s.imports.importer.Forget(ev.WipedCache)
+			s.forgetWiped(ev.WipedCache)
 		}
 	case telemetryattrs.EngineEventPrune:
 		var ev telemetryattrs.EnginePruneEvent
