@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -107,7 +108,13 @@ func (s *state) checkHeldMergeable(t *testing.T, held []heldBundle, when string)
 		stored := s.env.Bundle(c.Bundle)
 		_, err := importer.BuildMerge(context.Background(), idx, c.Bundle, stored, s.env.Resolution(c.Resolution), c.Roots, noSign, s.env.Scope)
 		Check(t, err == nil, "%s: bundle %s builds a merge with its stored resolution (error: %v)", when, h, err)
-		if _, err := importer.BuildMerge(context.Background(), idx, c.Bundle, stored, nil, c.Roots, noSign, s.env.Scope); err != nil {
+		// As before #47 was fixed: the same index, with records that name
+		// no resolution, resolved through the cache's current mappings.
+		legacy := cloneIndex(t, idx)
+		for _, e := range legacy.Entries {
+			e.Resolution = ""
+		}
+		if _, err := importer.BuildMerge(context.Background(), legacy, c.Bundle, stored, nil, c.Roots, noSign, s.env.Scope); err != nil && strings.Contains(err.Error(), "is no longer stored") {
 			wouldHaveFailed = append(wouldHaveFailed, fmt.Sprintf("%s: %v", Short(h.ID), err))
 		}
 	}
@@ -155,4 +162,17 @@ func staleMergeFailures(env *Env) []string {
 		}
 	}
 	return out
+}
+
+func cloneIndex(t *testing.T, idx *metastore.Index) *metastore.Index {
+	t.Helper()
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out metastore.Index
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	return &out
 }
