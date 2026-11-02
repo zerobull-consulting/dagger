@@ -333,3 +333,59 @@ func TestPromoteAll(t *testing.T) {
 		t.Fatalf("peak %d promotions at once, want 2..%d", store.peak, maxConcurrentPromotions)
 	}
 }
+
+// A context that ends while PromoteAll waits for a slot fails the blobs not
+// yet scheduled, each with the context's error: none is reported stored,
+// whether listed once or twice, and whatever the blobs scheduled before it
+// did.
+func TestPromoteAllCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	store := &blockingPromoteStore{fakeStore: newFakeStore(), release: release}
+	var blobs []Blob
+	for i := range maxConcurrentPromotions + 3 {
+		blobs = append(blobs, Blob{Digest: digest.FromString(strings.Repeat("y", i+1)), Size: 1})
+	}
+	last := blobs[len(blobs)-1]
+	blobs = append(blobs, last)
+	done := make(chan []PromoteResult)
+	go func() { done <- PromoteAll(ctx, store, testStage, blobs) }()
+	// The first maxConcurrentPromotions hold every slot; then cancel, and
+	// let them finish as promoted.
+	for store.started() < maxConcurrentPromotions {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	// The slots stay held until release, so the loop can only take the
+	// canceled context for the rest; give it time to get through them.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	res := <-done
+	for i, r := range res {
+		scheduled := i < maxConcurrentPromotions
+		if scheduled != r.Stored() || !scheduled && !errors.Is(r.Err, context.Canceled) {
+			t.Fatalf("result %d (scheduled %v): %+v", i, scheduled, r)
+		}
+	}
+}
+
+type blockingPromoteStore struct {
+	*fakeStore
+	release chan struct{}
+	mu      sync.Mutex
+	n       int
+}
+
+func (b *blockingPromoteStore) started() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
+}
+
+func (b *blockingPromoteStore) Promote(ctx context.Context, s Stage, d digest.Digest, size int64) (Promotion, error) {
+	b.mu.Lock()
+	b.n++
+	b.mu.Unlock()
+	<-b.release
+	return b.fakeStore.Promote(ctx, s, d, size)
+}

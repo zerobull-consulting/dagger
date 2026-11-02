@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	"github.com/prometheus/client_golang/prometheus"
@@ -142,7 +143,7 @@ func TestExportReportedButNotUploaded(t *testing.T) {
 type promoteFailStore struct{ *blobstore.MemStore }
 
 func (promoteFailStore) Promote(context.Context, blobstore.Stage, digest.Digest, int64) (blobstore.Promotion, error) {
-	return blobstore.Promotion{}, errors.New("s3 down")
+	return blobstore.Promotion{Duration: time.Second}, errors.New("s3 down")
 }
 
 // A promotion the store fails leaves the blob unstored: the export is tried
@@ -173,6 +174,10 @@ func TestExportPromotionFailureNotPublished(t *testing.T) {
 	}
 	if got := metricstest.Value(t, reg, "cacheservice_blob_promotions_total", map[string]string{"scope": "team", "outcome": metrics.PromotionError}); got != 2*DefaultUploadAttempts {
 		t.Fatalf("failed promotions: %v", got)
+	}
+	// A failed promotion's time is measured too, not as 0s.
+	if s := metricstest.Read(t, reg, "cacheservice_blob_promotion_duration_seconds", map[string]string{"scope": "team"}); s.Count != 2*DefaultUploadAttempts || s.Sum != 2*DefaultUploadAttempts {
+		t.Fatalf("promotion durations %+v, want each failed one's 1s", s)
 	}
 }
 

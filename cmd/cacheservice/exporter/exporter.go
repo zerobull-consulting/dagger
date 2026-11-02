@@ -508,7 +508,7 @@ func (x *Exporter) promote(ctx context.Context, eng Engine, stage blobstore.Stag
 			if ctx.Err() != nil {
 				return done, context.Cause(ctx)
 			}
-			x.cfg.Metrics.BlobPromotion(x.cfg.Scope, metrics.PromotionError, "", 0, 0)
+			x.cfg.Metrics.BlobPromotion(x.cfg.Scope, metrics.PromotionError, "", 0, r.Duration)
 			x.log.Warn("export: blob promotion failed; asking for it again", "digest", r.Digest, "error", r.Err)
 			continue
 		}
