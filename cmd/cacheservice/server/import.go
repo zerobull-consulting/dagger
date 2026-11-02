@@ -197,18 +197,18 @@ func (s *Service) waitImports() {
 // syncs the engine now, and answers with what was merged and offered.
 func (s *Service) serveImport(w http.ResponseWriter, r *http.Request) {
 	if s.imports == nil {
-		http.Error(w, "the import path is off: no store is configured", http.StatusConflict)
+		writeDebugError(w, ErrImportOff)
 		return
 	}
-	c := s.debugConn(w, r)
-	if c == nil {
+	conn, ok := debugConnID(w, r)
+	if !ok {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Hour)
 	defer cancel()
-	res, err := s.imports.importer.Sync(ctx, c)
+	res, err := s.Import(ctx, conn)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeDebugError(w, err)
 		return
 	}
 	writeJSON(w, res)
@@ -218,16 +218,17 @@ func (s *Service) serveImport(w http.ResponseWriter, r *http.Request) {
 // bundles merged into it, and the entries they landed on.
 func (s *Service) serveImports(w http.ResponseWriter, r *http.Request) {
 	if s.imports == nil {
-		http.Error(w, "the import path is off: no store is configured", http.StatusConflict)
+		writeDebugError(w, ErrImportOff)
 		return
 	}
-	c := s.debugConn(w, r)
-	if c == nil {
-		return
-	}
-	st, ok := s.imports.importer.State(c.CacheID())
+	conn, ok := debugConnID(w, r)
 	if !ok {
-		st = importer.State{CacheID: c.CacheID(), Generation: c.Generation(), Merged: []importer.MergedBundle{}, Values: map[uint64]importer.Value{}}
+		return
+	}
+	st, err := s.Imports(conn)
+	if err != nil {
+		writeDebugError(w, err)
+		return
 	}
 	writeJSON(w, st)
 }
