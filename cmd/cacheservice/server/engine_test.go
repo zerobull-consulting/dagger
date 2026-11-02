@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -55,7 +55,7 @@ func (fakeAdapter) ReplyRenewal(dagql.RenewalReply) dagql.RenewalReplyDispositio
 
 // waitEngines waits until the service has n welcomed engines, and returns
 // their connections.
-func waitEngines(t *testing.T, svc *service, n int) []*engineConn {
+func waitEngines(t *testing.T, svc *Service, n int) []*engineConn {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -75,8 +75,8 @@ func waitEngines(t *testing.T, svc *service, n int) []*engineConn {
 }
 
 func TestEngineConnectsAndReconnects(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	srv := httptest.NewServer(svc.handler())
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -140,8 +140,8 @@ func TestEngineConnectsAndReconnects(t *testing.T) {
 }
 
 func TestEngineWithoutTokenRejected(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	srv := httptest.NewServer(svc.handler())
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + protocol.EnginePath)
@@ -155,10 +155,10 @@ func TestEngineWithoutTokenRejected(t *testing.T) {
 }
 
 func TestDebugRequest(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	srv := httptest.NewServer(svc.handler())
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
-	debug := httptest.NewServer(svc.debugHandler())
+	debug := httptest.NewServer(svc.DebugHandler())
 	defer debug.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,8 +200,8 @@ func TestDebugRequest(t *testing.T) {
 }
 
 func TestBlobPut(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	srv := httptest.NewServer(svc.handler())
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
 
 	put := func(dgst, body string) int {

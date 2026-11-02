@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"io"
@@ -11,7 +11,7 @@ import (
 // serveBlobPut stands in for a presigned PUT: it reads the blob, checks it
 // against the digest in its path, logs it, and stores nothing. Give the engine
 // http://<host>:<port>/blobs/<digest> as an upload address.
-func (s *service) serveBlobPut(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveBlobPut(w http.ResponseWriter, r *http.Request) {
 	want, err := digest.Parse(r.PathValue("digest"))
 	if err != nil {
 		http.Error(w, "bad digest", http.StatusBadRequest)

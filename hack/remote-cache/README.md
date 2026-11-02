@@ -85,7 +85,7 @@ anchor in `compose.yaml` and this section.
 `dev.sh test` runs every `TestMinIO*` test under `cmd/cacheservice`. Each test
 skips unless `CACHESERVICE_S3_ENDPOINT` is set.
 
-`cmd/cacheservice/minio_test.go` checks what the storage work relies on,
+`cmd/cacheservice/server/minio_test.go` checks what the storage work relies on,
 through the raw SDK:
 
 - `TestMinIOPresignedPutGet`: a blob keyed by its digest goes up through a
@@ -130,7 +130,7 @@ through the raw SDK:
 - `TestMinIOMetastoreRestart`: a new store reads what the old one wrote and
   numbers new entries after the old ones.
 
-`cmd/cacheservice/minio_export_test.go` checks the export path end to end,
+`cmd/cacheservice/server/minio_export_test.go` checks the export path end to end,
 with a fake engine cache served through the engine's own `remotecache.Run`:
 
 - `TestMinIOExportBuild`: after a build's session ends, the engine has
@@ -139,6 +139,9 @@ with a fake engine cache served through the engine's own `remotecache.Run`:
   same bundle and hands out no new numbers.
 - `TestMinIOExportSharedLayer`: a second build that shares the base layer
   uploads only its own.
+- `TestMinIOEnableS3`: `server.EnableS3`, what `cacheservice` runs at
+  startup, turns on the export and import paths against MinIO, and refuses a
+  missing bucket.
 
 Each run writes under its own `test/` prefix in the bucket and deletes it
 afterwards. The `Remote cache tests` workflow runs them on every pull request.

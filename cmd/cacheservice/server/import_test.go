@@ -1,4 +1,4 @@
-package main
+package server
 
 // The import path (#8): a second engine with an empty cache gets the entries
 // a first engine exported merged into it, and reads their layers from the
@@ -284,7 +284,7 @@ func TestImportRenew(t *testing.T) {
 
 // Without a store, renew is unavailable, and the import hooks are off.
 func TestImportOff(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
+	svc := New(slog.New(slog.DiscardHandler), "")
 	if got := svc.renew(context.Background(), protocol.Renew{RenewalKey: testScope}); !got.Unavailable {
 		t.Fatalf("renewed %+v", got)
 	}

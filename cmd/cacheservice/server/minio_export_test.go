@@ -1,4 +1,4 @@
-package main
+package server
 
 // The export path against MinIO (#7): an engine, through its own
 // remotecache.Run, uploads a build's layers straight to S3 through presigned
@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"slices"
@@ -130,5 +131,44 @@ func TestMinIOExportSharedLayer(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(res.Uploaded[0]), "sha256:") {
 		t.Fatalf("uploaded %v", res.Uploaded)
+	}
+}
+
+// EnableS3 turns on the export and import paths against MinIO, or the export
+// path alone with NoImport, and refuses a bucket it can't write to.
+func TestMinIOEnableS3(t *testing.T) {
+	env := newMinIOTestEnv(t)
+	cfg, err := blobstore.S3ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+	cfg.Bucket = env.bucket
+	cfg.Prefix = env.prefix
+	if os.Getenv(blobstore.EnvPathStyle) == "" {
+		cfg.PathStyle = true
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, noImport := range []bool{false, true} {
+		svc := New(slog.New(slog.DiscardHandler), "")
+		if err := svc.EnableS3(ctx, cfg, S3Options{Scope: testScope, NoImport: noImport}); err != nil {
+			t.Fatalf("NoImport %v: %v", noImport, err)
+		}
+		if svc.export == nil {
+			t.Fatalf("NoImport %v: export path off", noImport)
+		}
+		if (svc.imports == nil) != noImport {
+			t.Fatalf("NoImport %v: import path on: %v", noImport, svc.imports != nil)
+		}
+	}
+
+	bad := cfg
+	bad.Bucket = "no-such-bucket-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	if err := New(slog.New(slog.DiscardHandler), "").EnableS3(ctx, bad, S3Options{Scope: testScope}); err == nil {
+		t.Fatal("EnableS3 accepted a missing bucket")
 	}
 }
