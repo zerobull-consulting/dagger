@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 )
@@ -92,7 +93,9 @@ func testImportsNotReexported(t *testing.T, h *exportHarness) {
 
 	// A gets only the new entry merged: no echo of its own build.
 	waitLookup(t, h.cache, "withExec(test)", hasOffer)
-	st := h.debugImports(h.engine)
+	// The engine has the merge before the importer commits it: wait for
+	// the importer's state too.
+	st := waitMerged(t, h, h.engine)
 	if len(st.Merged) != 1 || !slices.Equal(st.Merged[0].Roots, []uint64{newN}) {
 		t.Fatalf("A's merges %+v", st.Merged)
 	}
@@ -159,4 +162,21 @@ func waitTracked(t *testing.T, h *exportHarness, cacheID string, numbers ...uint
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %v tracked as stored: %+v", numbers, h.svc.export.tracker.Entries(cacheID))
+}
+
+// waitMerged waits until the importer has committed a merge into c, and
+// returns its state.
+func waitMerged(t *testing.T, h *exportHarness, c *engineConn) importer.State {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := h.debugImports(c)
+		if len(st.Merged) > 0 {
+			return st
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a merge into %s", c.CacheID())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
