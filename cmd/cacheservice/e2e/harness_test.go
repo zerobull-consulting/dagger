@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,67 @@ func TestS3ProxyRecords(t *testing.T) {
 	}
 	if time.Since(rest[0].Time) > time.Minute {
 		t.Fatalf("request time %s", rest[0].Time)
+	}
+}
+
+// Faults answer matching requests with an S3 error up to their count, or
+// stall them until removed, and are recorded; other requests reach the
+// store.
+func TestS3ProxyFaults(t *testing.T) {
+	var reached []string
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Method+" "+r.URL.Path)
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	defer store.Close()
+	p := StartS3Proxy(t, "127.0.0.1", store.URL)
+	put := func(path string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPut, p.URL+path, strings.NewReader("data"))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable && !strings.Contains(string(body), "<Code>SlowDown</Code>") {
+			t.Fatalf("error body %q", body)
+		}
+		return resp.StatusCode
+	}
+	slow := p.Inject(&Fault{Name: "slow", Match: Methods("/blobs/", http.MethodPut), Status: http.StatusServiceUnavailable, Code: "SlowDown", Count: 2})
+	got := []int{put("/b/blobs/sha256/1"), put("/b/other"), put("/b/blobs/sha256/1"), put("/b/blobs/sha256/1")}
+	if !slices.Equal(got, []int{503, 200, 503, 200}) || p.Hits(slow) != 2 {
+		t.Fatalf("statuses %v, hits %d", got, p.Hits(slow))
+	}
+	if !slices.Equal(reached, []string{"PUT /b/other", "PUT /b/blobs/sha256/1"}) {
+		t.Fatalf("the store got %v", reached)
+	}
+	if rs := p.Since(0); rs[0].Fault != "slow" || rs[0].Status != 503 || rs[1].Fault != "" {
+		t.Fatalf("recorded %+v", rs)
+	}
+
+	stall := p.Inject(&Fault{Name: "stall", Match: Methods("/stalled")})
+	done := make(chan int, 1)
+	go func() { done <- put("/b/stalled") }()
+	deadline := time.Now().Add(5 * time.Second)
+	for p.Hits(stall) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the request didn't reach the stall")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case code := <-done:
+		t.Fatalf("a stalled request was answered %d", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+	p.Remove(stall)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("a released request was answered %d", code)
+	}
+	if rs := p.Since(0); !rs[len(rs)-1].Stalled || rs[len(rs)-1].Status != 200 {
+		t.Fatalf("recorded %+v", rs[len(rs)-1])
 	}
 }
 

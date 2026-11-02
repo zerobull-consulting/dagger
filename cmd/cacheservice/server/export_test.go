@@ -50,6 +50,13 @@ type exportHarness struct {
 
 func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*ExportConfig)) *exportHarness {
 	t.Helper()
+	return newExportHarnessWith(t, blobs, meta, modify, nil)
+}
+
+// newExportHarnessWith is newExportHarness, with the import path's
+// configuration changed by modifyImport too.
+func newExportHarnessWith(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*ExportConfig), modifyImport func(*ImportConfig)) *exportHarness {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := New(slog.New(slog.DiscardHandler), "")
 	cfg := ExportConfig{
@@ -65,7 +72,11 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 		t.Fatal(err)
 	}
 	// The import path too: it syncs on hello and after each stored export.
-	if err := svc.EnableImport(ctx, ImportConfig{Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: testScope}}); err != nil {
+	importCfg := ImportConfig{Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: testScope}}
+	if modifyImport != nil {
+		modifyImport(&importCfg)
+	}
+	if err := svc.EnableImport(ctx, importCfg); err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(svc.Handler())
@@ -90,6 +101,14 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 // newMemExportHarness uses in-memory stores.
 func newMemExportHarness(t *testing.T, modify func(*ExportConfig)) (*exportHarness, *blobstore.MemStore) {
 	t.Helper()
+	blobs, meta := newMemStores(t)
+	return newExportHarness(t, blobs, meta, modify), blobs
+}
+
+// newMemStores are in-memory blob and metadata stores, the blob store
+// served over HTTP for presigned URLs.
+func newMemStores(t *testing.T) (*blobstore.MemStore, *metastore.Store) {
+	t.Helper()
 	blobs := blobstore.NewMemStore("")
 	blobSrv := httptest.NewServer(blobs)
 	t.Cleanup(blobSrv.Close)
@@ -98,7 +117,7 @@ func newMemExportHarness(t *testing.T, modify func(*ExportConfig)) (*exportHarne
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newExportHarness(t, blobs, meta, modify), blobs
+	return blobs, meta
 }
 
 func testLayer(s string) []byte { return []byte(strings.Repeat(s, 512)) }
