@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -37,7 +37,7 @@ const testScope = "team"
 // cache connected to it through the engine's own remotecache.Run.
 type exportHarness struct {
 	t      *testing.T
-	svc    *service
+	svc    *Service
 	srv    *httptest.Server
 	debug  *httptest.Server
 	cache  *fakeengine.Cache
@@ -48,11 +48,11 @@ type exportHarness struct {
 	ctx context.Context
 }
 
-func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*exportConfig)) *exportHarness {
+func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*ExportConfig)) *exportHarness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	cfg := exportConfig{
+	svc := New(slog.New(slog.DiscardHandler), "")
+	cfg := ExportConfig{
 		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
 		Tracker:  exporter.TrackerConfig{QuietPeriod: time.Minute, EndGrace: 50 * time.Millisecond},
 		Tick:     10 * time.Millisecond,
@@ -60,16 +60,16 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 	if modify != nil {
 		modify(&cfg)
 	}
-	err := svc.enableExport(ctx, cfg)
+	err := svc.EnableExport(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The import path too: it syncs on hello and after each stored export.
-	if err := svc.enableImport(ctx, importConfig{Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: testScope}}); err != nil {
+	if err := svc.EnableImport(ctx, ImportConfig{Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: testScope}}); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(svc.handler())
-	debug := httptest.NewServer(svc.debugHandler())
+	srv := httptest.NewServer(svc.Handler())
+	debug := httptest.NewServer(svc.DebugHandler())
 	cache := fakeengine.New("cache-a", 4)
 	done := make(chan error, 1)
 	go func() {
@@ -78,8 +78,7 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 	t.Cleanup(func() {
 		cancel()
 		<-done
-		svc.waitExports()
-		svc.waitImports()
+		svc.Wait()
 		srv.Close()
 		debug.Close()
 	})
@@ -89,7 +88,7 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 }
 
 // newMemExportHarness uses in-memory stores.
-func newMemExportHarness(t *testing.T, modify func(*exportConfig)) (*exportHarness, *blobstore.MemStore) {
+func newMemExportHarness(t *testing.T, modify func(*ExportConfig)) (*exportHarness, *blobstore.MemStore) {
 	t.Helper()
 	blobs := blobstore.NewMemStore("")
 	blobSrv := httptest.NewServer(blobs)
@@ -348,7 +347,7 @@ func TestExportHookExportsTracked(t *testing.T) {
 
 // Busy roots are exported again once they settle.
 func TestExportRetriesBusy(t *testing.T) {
-	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Tracker.BusyBackoff = 50 * time.Millisecond })
+	h, _ := newMemExportHarness(t, func(c *ExportConfig) { c.Tracker.BusyBackoff = 50 * time.Millisecond })
 	h.build()
 	h.cache.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Busy: true, Layers: [][]byte{testLayer("base")}})
 	h.postSpans("session-1", cacheSpan(11, "10"), carrierSpan(1))
@@ -385,7 +384,7 @@ func TestExportEngineEvents(t *testing.T) {
 
 // A session whose engine isn't connected waits for it.
 func TestExportWaitsForEngine(t *testing.T) {
-	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.NoEngineWait = 20 * time.Millisecond })
+	h, _ := newMemExportHarness(t, func(c *ExportConfig) { c.NoEngineWait = 20 * time.Millisecond })
 	other := &exportHarness{t: t, srv: h.srv, cache: fakeengine.New("cache-b", 1)}
 	other.postSpans("session-1", cacheSpan(5), carrierSpan(1))
 	time.Sleep(100 * time.Millisecond)
@@ -396,8 +395,8 @@ func TestExportWaitsForEngine(t *testing.T) {
 }
 
 func TestExportHookOff(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	debug := httptest.NewServer(svc.debugHandler())
+	svc := New(slog.New(slog.DiscardHandler), "")
+	debug := httptest.NewServer(svc.DebugHandler())
 	defer debug.Close()
 	for _, req := range []struct{ method, path string }{
 		{http.MethodPost, "/debug/engines/1/export"},
@@ -459,7 +458,7 @@ func TestParseEngineCache(t *testing.T) {
 // When one of the hook's batches fails, the batches after it go back to the
 // scheduler instead of staying in flight.
 func TestExportHookRequeuesBatchesNotRun(t *testing.T) {
-	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Tick = time.Hour })
+	h, _ := newMemExportHarness(t, func(c *ExportConfig) { c.Tick = time.Hour })
 	// 1 depends on an entry the cache doesn't have, so the first batch's
 	// capture fails.
 	h.cache.Add(fakeengine.Entry{Number: 1, Deps: []uint64{9999}})
@@ -489,7 +488,7 @@ func TestExportHookRequeuesBatchesNotRun(t *testing.T) {
 // An export whose reply comes after the service gave up waiting is released,
 // so the engine doesn't hold its chains and slot until it disconnects.
 func TestExportLateReplyReleased(t *testing.T) {
-	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Exporter.ExportTimeout = 100 * time.Millisecond })
+	h, _ := newMemExportHarness(t, func(c *ExportConfig) { c.Exporter.ExportTimeout = 100 * time.Millisecond })
 	h.build()
 	release := h.cache.Hold()
 	code, _ := h.debugExport(`{"roots":[11],"outputs":[{"number":11,"address":{"part":"fs"}}]}`)
@@ -512,7 +511,7 @@ func TestExportLateReplyReleased(t *testing.T) {
 // An explicit export cut short (here, by its HTTP request ending) is not a
 // failure of its roots: they wait to be tried again.
 func TestExportHookInterruptedNotFailed(t *testing.T) {
-	h, _ := newMemExportHarness(t, func(c *exportConfig) { c.Tick = time.Hour })
+	h, _ := newMemExportHarness(t, func(c *ExportConfig) { c.Tick = time.Hour })
 	h.build()
 	h.postSpans("session-1", cacheSpan(11, "10"))
 	release := h.cache.Hold()
