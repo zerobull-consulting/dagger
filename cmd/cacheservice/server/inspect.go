@@ -96,15 +96,12 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 		if err != nil {
 			return exporter.Result{}, &ExportConflictError{err}
 		}
-		res, err := p.exporter.Export(ctx, c, req)
-		s.recordExport(ctx, c, b, res, err)
-		return res, err
+		return s.exportBatch(ctx, c, b)
 	}
 	var all exporter.Result
 	batches := p.tracker.All(c.CacheID(), p.now())
 	for i, b := range batches {
-		res, err := p.exporter.Export(ctx, c, b.Request)
-		s.recordExport(ctx, c, b, res, err)
+		res, err := s.exportBatch(ctx, c, b)
 		if err != nil {
 			// Hand the batches not run back to the scheduler.
 			for _, rest := range batches[i+1:] {
@@ -143,7 +140,7 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 	if err != nil {
 		return importer.Result{}, err
 	}
-	return s.imports.importer.Sync(ctx, c)
+	return s.syncMeasured(ctx, c)
 }
 
 // debugConnID reads the {conn} path value, and answers 400 when it isn't a
