@@ -75,11 +75,16 @@ measures is in [`metrics`](metrics/).
 
 [`blobstore`](blobstore) stores layer blobs in S3 for the service
 ([#5](https://github.com/zerobull-consulting/dagger/issues/5)). The export path
-uses it. Blobs never pass through the service on their way in or out: it
-hands the engine presigned URLs, so the engine never holds S3 credentials.
-An upload goes to a staging key, and reaches the blob's digest key only once
-the service has checked its content
-([#23](https://github.com/zerobull-consulting/dagger/issues/23)).
+uses it. Engines upload and download blobs directly: the service hands them
+presigned URLs, so an engine never holds S3 credentials, and its uploads and
+downloads never pass through the service. An upload goes to a staging key,
+and reaches the blob's digest key only once the service has checked its
+content ([#23](https://github.com/zerobull-consulting/dagger/issues/23)).
+Usually the store hashes it as it copies it; the exception is a
+service-hashed promotion (a blob over 5 GiB, `CACHESERVICE_S3_HASH_IN_SERVICE`,
+or a store that returns no checksum), which reads the blob once through the
+service, over its network to S3, with a 32 KiB buffer (see
+[Verification and promotion](#verification-and-promotion)).
 
 **Keys.** The service uses each namespace's view of the store (`Namespace`),
 next to the namespace's metadata and apart from every other namespace's blobs

@@ -1,9 +1,10 @@
 // Package blobstore stores the remote cache's layer blobs, keyed by digest.
 //
-// Blobs never pass through the service on their way in or out. The service
-// hands the engine a presigned PUT for each blob it needs, and a presigned
-// GET for each blob it offers, so the engine never holds the store's
-// credentials.
+// Engines upload and download blobs directly. The service hands the engine a
+// presigned PUT for each blob it needs, and a presigned GET for each blob it
+// offers, so the engine never holds the store's credentials and its uploads
+// and downloads never pass through the service. The one read through the
+// service is a service-hashed promotion (see S3Store.Promote).
 //
 // An upload doesn't go to the blob's digest key. A presigned PUT bounds the
 // body's size, not its content, so it goes to a staging key of its own,
