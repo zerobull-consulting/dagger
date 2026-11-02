@@ -73,6 +73,11 @@ type Metrics struct {
 	bundleReads         *prometheus.CounterVec
 	bundleReadBytes     *prometheus.CounterVec
 	importBundleCache   *prometheus.CounterVec
+	resolutionWrites    *prometheus.CounterVec
+	resolutionWriteSize *prometheus.HistogramVec
+	resolutionReads     *prometheus.CounterVec
+	resolutionReadBytes *prometheus.CounterVec
+	importResCache      *prometheus.CounterVec
 	importSyncs         *prometheus.CounterVec
 	importSyncDuration  prometheus.Histogram
 	exportBatches       *prometheus.CounterVec
@@ -161,6 +166,27 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "import_bundle_cache_total",
 			Help: "Bundles the import path needed, by result: hit (in its memory) or miss (read from the store).",
 		}, []string{"result"}),
+		resolutionWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "resolution_writes_total",
+			Help: "Bundle resolutions stored (one per recorded export, more when its index write lost), by outcome: written, or existing (already stored, nothing written).",
+		}, []string{"scope", "outcome"}),
+		resolutionWriteSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "resolution_write_size_bytes",
+			Help:    "Size of each resolution stored, written or existing.",
+			Buckets: sizeBuckets,
+		}, []string{"scope"}),
+		resolutionReads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "resolution_reads_total",
+			Help: "Bundle resolutions read from the store.",
+		}, []string{"scope"}),
+		resolutionReadBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "resolution_read_bytes_total",
+			Help: "Bytes of resolutions read from the store.",
+		}, []string{"scope"}),
+		importResCache: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "import_resolution_cache_total",
+			Help: "Resolutions the import path needed, by result: hit (in its memory) or miss (read from the store).",
+		}, []string{"result"}),
 		importSyncs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "import_syncs_total",
 			Help: "Import syncs of one engine, by outcome: ok or error.",
@@ -203,7 +229,8 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.indexConflicts, m.indexWriteBytes,
 		m.indexSizeBytes, m.indexEntries, m.indexRoots, m.indexCaches,
 		m.bundleWrites, m.bundleWriteSize, m.bundleReads, m.bundleReadBytes,
-		m.importBundleCache, m.importSyncs, m.importSyncDuration,
+		m.resolutionWrites, m.resolutionWriteSize, m.resolutionReads, m.resolutionReadBytes,
+		m.importBundleCache, m.importResCache, m.importSyncs, m.importSyncDuration,
 		m.exportBatches, m.exportBatchDuration, m.exportBatchRoots,
 		m.exportRoots, m.exportBlobs, m.exportBundles,
 	}
@@ -308,6 +335,38 @@ func (m *Metrics) BundleRead(scope string, bytes int) {
 	}
 	m.bundleReads.WithLabelValues(scope).Inc()
 	m.bundleReadBytes.WithLabelValues(scope).Add(float64(bytes))
+}
+
+// ResolutionWrite records a stored resolution and its size; outcome is
+// BundleWritten or BundleExisting.
+func (m *Metrics) ResolutionWrite(scope, outcome string, bytes int) {
+	if m == nil {
+		return
+	}
+	m.resolutionWrites.WithLabelValues(scope, outcome).Inc()
+	m.resolutionWriteSize.WithLabelValues(scope).Observe(float64(bytes))
+}
+
+// ResolutionRead records a resolution read from the store.
+func (m *Metrics) ResolutionRead(scope string, bytes int) {
+	if m == nil {
+		return
+	}
+	m.resolutionReads.WithLabelValues(scope).Inc()
+	m.resolutionReadBytes.WithLabelValues(scope).Add(float64(bytes))
+}
+
+// ImportResolutionCache records whether a resolution the import path needed
+// was in its memory.
+func (m *Metrics) ImportResolutionCache(hit bool) {
+	if m == nil {
+		return
+	}
+	result := "miss"
+	if hit {
+		result = "hit"
+	}
+	m.importResCache.WithLabelValues(result).Inc()
 }
 
 // ImportBundleCache records whether a bundle the import path needed was in

@@ -128,6 +128,7 @@ func TestMinIOMetastoreRecord(t *testing.T) {
 	for _, key := range []string{
 		cfg.Prefix + "/s1/index.json",
 		cfg.Prefix + "/s1/bundles/" + r.BundleID + ".json",
+		cfg.Prefix + "/s1/resolutions/" + r.ResolutionID + ".json",
 	} {
 		if _, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &cfg.Bucket, Key: aws.String(key)}); err != nil {
 			t.Errorf("%s: %v", key, err)
@@ -138,9 +139,10 @@ func TestMinIOMetastoreRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r2.BundleID != r.BundleID || fmt.Sprint(r2.Numbers) != fmt.Sprint(r.Numbers) || r2.Index.NextNumber != 4 {
+	if r2.BundleID != r.BundleID || r2.ResolutionID != r.ResolutionID || fmt.Sprint(r2.Numbers) != fmt.Sprint(r.Numbers) || r2.Index.NextNumber != 4 {
 		t.Fatalf("re-record: %+v", r2)
 	}
+	checkResolution(t, s, "s1", r2, "cache-a")
 	if _, err := s.GetBundle(ctx, "s1", "0000000000000000000000000000000000000000000000000000000000000000"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing bundle: %v, want ErrNotFound", err)
 	}
@@ -194,6 +196,50 @@ func TestMinIOMetastoreConcurrentWriters(t *testing.T) {
 		if c := idx.Caches[fmt.Sprintf("cache-%d", w)]; c == nil || len(c.Numbers) != perWriter*3 {
 			t.Fatalf("cache-%d: %+v", w, c)
 		}
+	}
+	// Every record names a stored resolution that gives it its number,
+	// however many times its writer lost the index to another.
+	reader := newMinIOStore(t, cfg)
+	for n, e := range idx.Entries {
+		res, err := reader.GetResolution(ctx, "s1", e.Resolution)
+		if err != nil {
+			t.Fatalf("entry %d: %v", n, err)
+		}
+		if got, _ := res.Number(e.Ordinal); got != n || res.CacheID != e.Source.CacheID || res.Bundle != e.Bundle {
+			t.Fatalf("entry %d: resolution %+v gives ordinal %d %d", n, res, e.Ordinal, got)
+		}
+	}
+}
+
+// #47 against MinIO: a bundle holding imports keeps its resolution after
+// they move and are forgotten.
+func TestMinIOMetastoreResolutionOfImports(t *testing.T) {
+	ctx := context.Background()
+	cfg := minioConfig(t)
+	s := newMinIOStore(t, cfg)
+	a, err := s.Record(ctx, "s1", chain(10), "cache-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordImports(ctx, "s1", "cache-b", 1, []Import{{a.Numbers[1], 20}, {a.Numbers[2], 21}}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Record(ctx, "s1", testBundle([]val{{sender: 20}, {sender: 21, deps: []uint64{1}}, {sender: 22, deps: []uint64{2}}}, root(3, 0)), "cache-b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordImports(ctx, "s1", "cache-b", 2, []Import{{a.Numbers[1], 30}, {a.Numbers[2], 31}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ForgetImports(ctx, "s1", "cache-b"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := newMinIOStore(t, cfg).GetResolution(ctx, "s1", b.ResolutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint64{a.Numbers[1], a.Numbers[2], b.Numbers[3]}; fmt.Sprint(res.Numbers) != fmt.Sprint(want) {
+		t.Fatalf("resolution %v, want %v", res.Numbers, want)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 )
 
@@ -383,9 +384,8 @@ func (s *state) serviceRestart(t *testing.T) {
 	reconnect := time.Since(start)
 	// The redo: what B had is merged into it again, less what expired since
 	// (the superseded scenario's value has a TTL), which no plan merges.
-	// And less what no engine can be merged any more (known gap #47: a
-	// bundle holding imports of a cache whose imports moved since, as C's
-	// after the prune scenario).
+	// C's bundles holding its imports, unmergeable before #47 was fixed
+	// once prune had moved them, are merged again too.
 	live := map[string]bool{}
 	var unmergeable []string
 	idxNow := env.Index()
@@ -393,15 +393,23 @@ func (s *state) serviceRestart(t *testing.T) {
 		if !mergedBefore[c.Bundle] {
 			continue
 		}
+		var res *metastore.Resolution
+		if c.Resolution != "" {
+			res = env.Resolution(c.Resolution)
+		}
 		noSign := func(context.Context, digest.Digest) (dagql.BlobAddress, error) { return dagql.BlobAddress{}, nil }
-		if _, err := importer.BuildMerge(context.Background(), idxNow, c.Bundle, env.Bundle(c.Bundle), c.Roots, noSign, env.Scope); err != nil {
+		if _, err := importer.BuildMerge(context.Background(), idxNow, c.Bundle, env.Bundle(c.Bundle), res, c.Roots, noSign, env.Scope); err != nil {
 			unmergeable = append(unmergeable, fmt.Sprintf("%s (%v)", Short(c.Bundle), err))
 			continue
 		}
 		live[c.Bundle] = true
 	}
-	for _, u := range unmergeable {
-		t.Logf("GAP   bundle %s, merged into B before the restart, can't be merged into any engine now (known gap #47)", u)
+	Check(t, len(unmergeable) == 0, "every live bundle B had before the restart builds a merge (unmergeable: %v)", unmergeable)
+	var heldBefore []heldBundle
+	for _, h := range s.cHeld {
+		if mergedBefore[h.ID] {
+			heldBefore = append(heldBefore, h)
+		}
 	}
 	env.WaitFor(env.Settings.Timeout, "the new service to merge into B what the old one had", func() (bool, error) {
 		st, err := s.main.Imports(b.Conn)
@@ -416,6 +424,11 @@ func (s *state) serviceRestart(t *testing.T) {
 		return true, nil
 	})
 	redone := s.imports(s.main, b)
+	if len(heldBefore) > 0 {
+		s.waitHeldMerged(t, s.main, b, heldBefore, "after the service restart")
+	} else {
+		t.Logf("B had none of C's bundles holding its imports before the restart (prune didn't run, or B wasn't merged them): not checking them (#47)")
+	}
 	// The redo's cost: from B's hello to the new service's last merge into
 	// it, from the service's own log.
 	mergeLogs := s.main.Logs.Since(0, "import: merged", func(r LogRecord) bool { return r.Attr("cacheID") == b.CacheID() })
@@ -487,6 +500,10 @@ func (s *state) serviceRestart(t *testing.T) {
 		"exports resumed: A's next session of the pipeline (a local hit, same output) was exported and stored, with the layer that was in flight (bundles %v)", shorts(holding))
 	env.CheckConsistent(t, "after the service restart")
 	s.checkServing(t, s.main, b, bundleIDs(stored), query, want, "service-restart-run-b")
+	// #47: across the whole run, every service, no merge failed because a
+	// value its roots need was no longer stored.
+	stale := staleMergeFailures(env)
+	Check(t, len(stale) == 0, "no merge in the run failed with \"is no longer stored\", in any of the %d services' logs (seen: %v)", len(env.Services()), stale)
 }
 
 func digestStrings(ds []digest.Digest) []string {

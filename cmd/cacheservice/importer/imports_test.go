@@ -10,6 +10,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -228,5 +229,64 @@ func TestSyncRetriesImportsNotMerge(t *testing.T) {
 	}
 	if st, _ := f.im.State("cache-b"); len(st.Merged) != 1 || len(st.Failures) != 0 {
 		t.Fatalf("state %+v", st)
+	}
+}
+
+// #47, through Sync: C has A's entries merged, exports a bundle built on
+// them, and then its imports move (it pruned them, restarted, and had them
+// merged again) or are dropped (it was wiped). A fresh engine still gets C's
+// bundle merged, with base and exec on A's service numbers.
+func TestSyncMergesBundleOfMovedImports(t *testing.T) {
+	for name, change := range map[string]func(*fixture, map[dagql.TransferOrdinal]uint64) error{
+		"moved": func(f *fixture, a map[dagql.TransferOrdinal]uint64) error {
+			_, err := f.meta.RecordImports(context.Background(), scope, "cache-c", 2, []metastore.Import{{Number: a[1], Engine: 201}, {Number: a[2], Engine: 202}})
+			return err
+		},
+		"wiped": func(f *fixture, _ map[dagql.TransferOrdinal]uint64) error {
+			return f.meta.ForgetImports(context.Background(), scope, "cache-c")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, _ := newImportsFixture(t, metastore.NewMemObjects())
+			ctx := context.Background()
+			a := f.store(chainBundle(10, "base", "exec"), "cache-a")
+			c := &scriptedEngine{cacheID: "cache-c", generation: 1, onMerge: landAll(true), onOffer: answerAll(protocol.OfferAccepted)}
+			if _, err := f.im.Sync(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			// C's export names base and exec by the entries they landed
+			// on, 101 and 102, and builds test on them.
+			cRec := f.store(chainBundle(101, "base", "exec", "test"), "cache-c")
+			if cRec.Numbers[1] != a.Numbers[1] || cRec.Numbers[2] != a.Numbers[2] {
+				t.Fatalf("C's export recorded as %v, want base and exec on A's %v", cRec.Numbers, a.Numbers)
+			}
+			if err := change(f, a.Numbers); err != nil {
+				t.Fatal(err)
+			}
+
+			fresh := &scriptedEngine{cacheID: "cache-fresh", generation: 1, onMerge: landAll(true), onOffer: answerAll(protocol.OfferAccepted)}
+			res, err := f.im.Sync(ctx, fresh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res.Failed) != 0 {
+				t.Fatalf("merges failed: %+v", res.Failed)
+			}
+			fresh.mu.Lock()
+			merges := slices.Clone(fresh.merges)
+			fresh.mu.Unlock()
+			var got []uint64
+			for _, m := range merges {
+				if len(m.Bundle.Values) == 3 {
+					for _, v := range m.Bundle.Values {
+						got = append(got, v.SenderNumber)
+					}
+				}
+			}
+			want := []uint64{cRec.Numbers[1], cRec.Numbers[2], cRec.Numbers[3]}
+			if !slices.Equal(got, want) {
+				t.Fatalf("C's bundle merged with numbers %v (merges %d), want %v", got, len(merges), want)
+			}
+		})
 	}
 }

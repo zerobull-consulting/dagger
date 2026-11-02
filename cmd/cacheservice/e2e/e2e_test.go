@@ -67,6 +67,9 @@ type state struct {
 	// The replica, and engine C on it, once a scenario started them.
 	replica *Service
 	c       *Engine
+	// cHeld are C's stored bundles that hold entries C had imported, which
+	// prune found and moved (#47).
+	cHeld []heldBundle
 }
 
 // TestRealEngines runs the remote cache with real engines. Engine A builds
@@ -560,6 +563,10 @@ func (s *state) prune(t *testing.T) {
 	}
 	before := s.imports(s.replica, c)
 	env.Save("prune-imports-before", before)
+	// #47: C's verify exec (renew) was exported on the entries C had
+	// imported from A. The restart below moves those imports.
+	held := s.heldImports(env.Index(), cacheC)
+	env.Save("prune-held-imports", held)
 	beforeBundles := map[string]bool{}
 	for _, m := range before.Merged {
 		beforeBundles[m.Bundle] = true
@@ -616,6 +623,24 @@ func (s *state) prune(t *testing.T) {
 	time.Sleep(time.Second)
 	restarted := s.imports(s.replica, c)
 	env.Save("prune-imports-restarted", restarted)
+	// The restarted C had A's entries merged onto new engine entries: wait
+	// until the index records them, then check C's older bundle (#47).
+	idxRestarted := env.Index()
+	env.WaitFor(env.Settings.Timeout, "the replica to record C's new imports", func() (bool, error) {
+		idxRestarted = env.Index()
+		moved := 0
+		for _, h := range held {
+			moved += s.movedImports(idxRestarted, cacheC, h)
+		}
+		return moved > 0, nil
+	})
+	moved := 0
+	for _, h := range held {
+		moved += s.movedImports(idxRestarted, cacheC, h)
+	}
+	env.Save("prune-index-restarted", idxRestarted)
+	wouldHaveFailed := s.checkHeldMergeable(t, held, "after C's imports moved")
+	s.cHeld = held
 
 	disk := func(res map[string]any) string { return Field(res, "engine.localCache.entrySet.diskSpaceBytes") }
 	resultIDs := 0
@@ -630,6 +655,11 @@ func (s *state) prune(t *testing.T) {
 	Check(t, len(pruned.Values) == len(polled.Values) && len(pruned.Merged) == len(polled.Merged), "the importer's state for C is as the prune left it")
 	Check(t, restarted.Generation > genC && len(restarted.Values) >= len(before.Values),
 		"after C restarted (generation %d, was %d), the replica merged %d bundles into it again, %d values", restarted.Generation, genC, len(restarted.Merged), len(restarted.Values))
+	Check(t, len(held) > 0, "C has stored bundles holding entries it imported from A: %v", held)
+	Check(t, moved > 0 && len(wouldHaveFailed) > 0,
+		"#47 reproduced: %d of those imported values moved to new engine entries of C, and resolving C's bundles through its current mappings fails (%v)", moved, wouldHaveFailed)
+	stale := staleMergeFailures(env)
+	Check(t, len(stale) == 0, "no merge so far in the run failed with \"is no longer stored\" (seen: %v)", stale)
 }
 
 // supersededRecord is one stored record of the superseded scenario's value.
@@ -752,6 +782,13 @@ func (s *state) superseded(t *testing.T) {
 	})
 	importsF := s.imports(s.main, f)
 	env.Save("superseded-imports-f", importsF)
+	// #47: F is the first engine started since C's imports moved (prune),
+	// and gets C's bundles holding them merged.
+	if len(s.cHeld) > 0 {
+		s.waitHeldMerged(t, s.main, f, s.cHeld, "a fresh engine after C's imports moved")
+	} else {
+		t.Logf("prune didn't run, or found no bundle of C's holding imports: not checking that F gets one (#47)")
+	}
 	// The second value has to reach F, and F has to read it, before its
 	// TTL runs out; otherwise the checks below would fail for the wrong
 	// reason.
