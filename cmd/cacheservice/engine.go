@@ -39,6 +39,8 @@ type service struct {
 
 	// export is the export path, nil when it is off.
 	export *exportPath
+	// imports is the import path, nil when it is off.
+	imports *importPath
 }
 
 func newService(logger *slog.Logger, dumpDir string) *service {
@@ -146,6 +148,10 @@ func (c *engineConn) serve(ctx context.Context) error {
 	if err := c.reply(ctx, env, protocol.TypeWelcome, protocol.Welcome{}); err != nil {
 		return err
 	}
+	// The import sync loop ends with the connection.
+	importCtx, stopImports := context.WithCancel(ctx)
+	defer stopImports()
+	c.svc.startImports(importCtx, c)
 	for {
 		env, err := c.read(ctx)
 		if err != nil {
@@ -193,8 +199,14 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 	}
 	switch env.Type {
 	case protocol.TypeRenew:
-		// Nothing is stored, so no layer can be renewed.
-		go func() { _ = c.reply(ctx, env, protocol.TypeRenewed, protocol.Renewed{Unavailable: true}) }()
+		go func() {
+			var req protocol.Renew
+			if err := env.Decode(&req); err != nil {
+				_ = c.replyError(ctx, env, err.Error())
+				return
+			}
+			_ = c.reply(ctx, env, protocol.TypeRenewed, c.svc.renew(ctx, req))
+		}()
 	default:
 		go func() { _ = c.replyError(ctx, env, fmt.Sprintf("unexpected request %q", env.Type)) }()
 	}
@@ -373,6 +385,8 @@ func (s *service) debugHandler() http.Handler {
 	mux.HandleFunc("POST /debug/engines/{conn}/request", s.sendRequest)
 	mux.HandleFunc("POST /debug/engines/{conn}/export", s.serveExport)
 	mux.HandleFunc("GET /debug/engines/{conn}/entries", s.serveEntries)
+	mux.HandleFunc("POST /debug/engines/{conn}/import", s.serveImport)
+	mux.HandleFunc("GET /debug/engines/{conn}/imports", s.serveImports)
 	return mux
 }
 
