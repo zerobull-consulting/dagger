@@ -94,10 +94,13 @@ type Config struct {
 	MaxMessageBytes int
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
-	// Imported, when set, is called after each committed merge with what
-	// it left in the engine cache: the engine entry each stored entry
-	// landed on, by service number. The export path uses it to know an
-	// unchanged import is already stored.
+	// Imported, when set, is called with the engine cache's imports, by
+	// service number: the engine entry each stored entry landed on, with
+	// its replacement count and parts. It is called after each committed
+	// merge, with the values the index recorded as imports, and after each
+	// offer round that changed an import's parts or replacement count,
+	// with those values. The export path uses it to know an unchanged
+	// import is already stored.
 	Imported func(cacheID string, generation uint64, values map[uint64]Value)
 }
 
@@ -334,11 +337,10 @@ func (im *Importer) Forget(cacheID string) {
 	delete(im.caches, cacheID)
 }
 
-// ForgetWiped forgets an engine cache that was wiped: what the importer knows
-// of it, as Forget does, and its imports in the index, since its engine
-// entries are gone.
-func (im *Importer) ForgetWiped(ctx context.Context, cacheID string) error {
-	im.Forget(cacheID)
+// ForgetImports drops a wiped engine cache's imports from the index, since
+// its engine entries are gone. Call Forget first: a merge whose imports land
+// after this drop finds the cache forgotten, and drops them again.
+func (im *Importer) ForgetImports(ctx context.Context, cacheID string) error {
 	return im.cfg.Meta.ForgetImports(ctx, im.cfg.Scope, cacheID)
 }
 
@@ -420,6 +422,10 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 			}
 			im.log.Warn("import: merge failed", "cacheID", cacheID, "bundle", c.Bundle, "roots", len(c.Roots), "error", err)
 			res.Failed = append(res.Failed, FailedBundle{Bundle: c.Bundle, Error: err.Error()})
+			var idxErr *indexError
+			if errors.As(err, &idxErr) {
+				continue
+			}
 			im.mu.Lock()
 			st.failures[c.Key()]++
 			im.mu.Unlock()
@@ -458,6 +464,16 @@ var errStateReset = errors.New("engine cache state reset during sync")
 func (im *Importer) currentLocked(eng Engine, st *cacheState) bool {
 	return im.caches[eng.CacheID()] == st && st.generation == eng.Generation()
 }
+
+// indexError is a merge the engine committed whose imports could not be
+// recorded in the index. The bundle isn't at fault, so it doesn't count
+// against MergeAttempts: giving up on it would leave the engine holding
+// values the index doesn't know are imports, which it would then export
+// back. The merge is sent again at the next sync.
+type indexError struct{ err error }
+
+func (e *indexError) Error() string { return "record imports: " + e.err.Error() }
+func (e *indexError) Unwrap() error { return e.err }
 
 // connectionError is a request that failed for the connection, not the
 // request: the sync stops.
@@ -531,8 +547,10 @@ func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *
 // of a wiped cache or of another generation.
 //
 // The engine entries the values landed on are recorded in the index as the
-// cache's imports first. If that fails, the merge counts as failed, and is
-// sent again at a later sync, which the engine keeps as it is.
+// cache's imports first. If that fails, the merge isn't committed, and is
+// sent again at the next sync, which the engine keeps as it is. The failure
+// is the index's, not the bundle's, so it doesn't count against
+// MergeAttempts (see indexError).
 func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState, c Candidate, mb MergeBundle, reply protocol.Merged) (MergedBundle, []pendingOffer, error) {
 	byOrdinal := make(map[dagql.TransferOrdinal]*protocol.MergedValue, len(reply.Values))
 	for i := range reply.Values {
@@ -672,7 +690,7 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 		if ctx.Err() != nil {
 			return MergedBundle{}, nil, &connectionError{context.Cause(ctx)}
 		}
-		return MergedBundle{}, nil, err
+		return MergedBundle{}, nil, &indexError{err}
 	}
 	// Only the imports the index took are the stored values: one the index
 	// skipped landed on an entry the cache exported itself.

@@ -178,8 +178,12 @@ stored entry landed on as the cache's import (`Index.RecordImports`):
   exports it again, even if that cache's record says it expires later
   (`TestRecordImportKeepsRecordExpiry`). This is intentional: merges send the
   record with the expiry it holds, so a later expiry in the index would offer
-  engines an entry whose record they treat as expired. The importing cache's
-  retention goes on the root, which takes the later expiry. The tracker
+  engines an entry whose record they treat as expired. So an imported value's
+  retention ends when its record expires: the root takes the importing
+  cache's later expiry, but `DropExpired` drops a root whose entry has
+  expired, whatever the root's own expiry. The importing engine's copy came
+  from the merge with the record's expiry, so it expires then too, unless
+  that engine built the value itself. The tracker
   likewise doesn't export an unchanged import for a later expiry, as it
   doesn't for a stored entry (`TestTrackerImportedIgnoresExpiry`).
 - **Known gap:** a record of an imported value that holds a part the stored
@@ -322,9 +326,10 @@ again whenever another engine's export is stored, and every `-import-poll`
    /debug/engines/{conn}/imports`), records each landed entry in the index as
    the cache's import, and tells the export path's tracker the ones the index
    took (not those that landed on an entry the cache exported itself). If
-   the index can't be updated, the merge counts as failed and is sent again
-   later. If the cache was wiped while the imports were written, they are
-   dropped again.
+   the index can't be updated, the merge isn't committed, and is sent again
+   at the next sync; this doesn't count against the merge's attempts, since
+   the bundle isn't at fault. If the cache was wiped while the imports were
+   written, they are dropped again.
 3. **Offer.** A stored part a merged entry has neither complete nor offered
    is offered to that entry, by the engine's number, with fresh GETs and the
    owner's dependencies and the value's services mapped to the engine's

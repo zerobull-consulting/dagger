@@ -163,3 +163,61 @@ func TestSyncImportsRacingNewGeneration(t *testing.T) {
 		t.Fatalf("imports %+v", c)
 	}
 }
+
+// failIndexPuts fails index writes that hold imports while n > 0.
+type failIndexPuts struct {
+	metastore.Objects
+	mu sync.Mutex
+	n  int
+}
+
+func (o *failIndexPuts) Put(ctx context.Context, key string, body []byte, cond metastore.Condition) (string, error) {
+	if strings.HasSuffix(key, "/index.json") && strings.Contains(string(body), `"imported"`) {
+		o.mu.Lock()
+		fail := o.n > 0
+		o.n--
+		o.mu.Unlock()
+		if fail {
+			return "", errors.New("store unavailable")
+		}
+	}
+	return o.Objects.Put(ctx, key, body, cond)
+}
+
+// A merge whose imports can't be recorded isn't committed, and is sent again
+// at the next sync, however many times the index fails: the bundle isn't at
+// fault, and giving up would leave the engine's values unrecorded as imports.
+func TestSyncIndexFailureDoesNotCountAgainstMerge(t *testing.T) {
+	objects := &failIndexPuts{Objects: metastore.NewMemObjects()}
+	f, calls := newImportsFixture(t, objects)
+	f.store(chainBundle(10, "base"), "cache-a")
+	objects.n = DefaultMergeAttempts + 1
+	eng := &scriptedEngine{cacheID: "cache-b", generation: 1, onMerge: landAll(false)}
+	ctx := context.Background()
+	for i := range DefaultMergeAttempts + 1 {
+		res, err := f.im.Sync(ctx, eng)
+		if err != nil || len(res.Failed) != 1 || len(res.Merged) != 0 {
+			t.Fatalf("sync %d: %+v, %v", i, res, err)
+		}
+	}
+	if st, _ := f.im.State("cache-b"); len(st.Merged) != 0 || len(st.Failures) != 0 {
+		t.Fatalf("state %+v", st)
+	}
+	res, err := f.im.Sync(ctx, eng)
+	if err != nil || len(res.Merged) != 1 {
+		t.Fatalf("after the index recovered: %+v, %v", res, err)
+	}
+	idx, err := f.meta.Index(ctx, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := idx.Caches["cache-b"]; c == nil || len(c.Imported) != 1 {
+		t.Fatalf("imports %+v", c)
+	}
+	if merges, _ := eng.counts(); merges != DefaultMergeAttempts+2 {
+		t.Fatalf("%d merges", merges)
+	}
+	if len(calls.all()) != 1 {
+		t.Fatalf("export path told %d times", len(calls.all()))
+	}
+}

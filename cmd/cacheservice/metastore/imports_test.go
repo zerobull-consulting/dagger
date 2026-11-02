@@ -2,6 +2,7 @@ package metastore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -266,10 +267,12 @@ func TestRecordKnownGapImportWithOtherParts(t *testing.T) {
 // expiry, even when the importing cache's record says it expires later. An
 // entry's expiry is its record's: merges send the record, with the expiry it
 // holds, so an index expiry later than the record's would offer engines an
-// entry whose record they then treat as expired. The importing cache's
-// retention is kept where it belongs, on the root, which takes the later
-// expiry. A record that replaces the stored one (more parts) brings its own
-// expiry with it.
+// entry whose record they then treat as expired. So the importing cache's
+// retention ends at the record's expiry: its root takes the later expiry,
+// but DropExpired drops a root whose entry has expired, whatever the root's
+// own expiry. The importing engine's copy came from the merge with the
+// record's expiry, so it expires then too. A record that replaces the stored
+// one (more parts) brings its own expiry with it.
 func TestRecordImportKeepsRecordExpiry(t *testing.T) {
 	idx := NewIndex()
 	b := withParts(testBundle([]val{{sender: 10, expires: 100}}, root(1, 150)), 1, "fs")
@@ -288,6 +291,12 @@ func TestRecordImportKeepsRecordExpiry(t *testing.T) {
 	if r := idx.Roots[1]; r.ExpiresAtUnix != 300 {
 		t.Fatalf("root 1 %+v: want the later retention, 300", r)
 	}
+	// The root's later expiry doesn't outlive the record's: at 100, the
+	// entry and its root go.
+	dropped := cloneIndex(t, idx).DropExpired(100)
+	if !slices.Equal(dropped, []uint64{1}) {
+		t.Fatalf("dropped at the record's expiry: %v, want [1]", dropped)
+	}
 
 	// With more parts, the record replaces the stored one, expiry and all.
 	more := withParts(testBundle([]val{{sender: 100, expires: 200}}, root(1, 300)), 1, "fs", "execMeta")
@@ -297,4 +306,18 @@ func TestRecordImportKeepsRecordExpiry(t *testing.T) {
 	if e := idx.Entries[1]; e.ExpiresAtUnix != 200 || e.Source.CacheID != "cache-b" {
 		t.Fatalf("entry 1 %+v: want cache-b's record, expiring at 200", e)
 	}
+}
+
+// cloneIndex copies an index through its JSON.
+func cloneIndex(t *testing.T, idx *Index) *Index {
+	t.Helper()
+	body, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, err := decodeIndex(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cp
 }

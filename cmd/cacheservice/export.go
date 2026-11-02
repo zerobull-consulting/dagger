@@ -233,12 +233,7 @@ func (s *service) trackEvent(kind, cache, body string) {
 			p.tracker.Started(cacheID, generation, ev.WipedCache)
 		}
 		if s.imports != nil && ev.WipedCache != "" {
-			// Its imports in the index go too: its entries are gone.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			if err := s.imports.importer.ForgetWiped(ctx, ev.WipedCache); err != nil {
-				s.logger.Warn("forgetting a wiped cache's imports failed", "cacheID", ev.WipedCache, "error", err)
-			}
+			s.forgetWiped(ev.WipedCache)
 		}
 	case telemetryattrs.EngineEventPrune:
 		var ev telemetryattrs.EnginePruneEvent

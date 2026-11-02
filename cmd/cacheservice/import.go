@@ -146,6 +146,33 @@ func (s *service) triggerImports(except string) {
 	}
 }
 
+// forgetWiped forgets a wiped engine cache: what the importer knows of it,
+// now, and its imports in the index, in the background, so the telemetry
+// request that reported the wipe doesn't wait on the store. A merge whose
+// imports land after the index write finds the cache forgotten, and drops
+// them again. A write cut short by the service stopping leaves the dead
+// cache's imports in the index; its ID never connects again, so nothing
+// uses them, and they go when their entries are dropped.
+func (s *service) forgetWiped(cacheID string) {
+	p := s.imports
+	p.importer.Forget(cacheID)
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return
+	}
+	p.wg.Add(1)
+	p.mu.Unlock()
+	go func() {
+		defer p.wg.Done()
+		ctx, cancel := context.WithTimeout(p.ctx, time.Minute)
+		defer cancel()
+		if err := p.importer.ForgetImports(ctx, cacheID); err != nil {
+			s.logger.Warn("forgetting a wiped cache's imports failed", "cacheID", cacheID, "error", err)
+		}
+	}()
+}
+
 // renew answers an engine's renew: fresh download addresses when the import
 // path is on and every layer is stored, unavailable otherwise.
 func (s *service) renew(ctx context.Context, req protocol.Renew) protocol.Renewed {

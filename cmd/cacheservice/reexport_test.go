@@ -14,6 +14,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
 func TestImportsNotReexported(t *testing.T) {
@@ -178,5 +179,25 @@ func waitMerged(t *testing.T, h *exportHarness, c *engineConn) importer.State {
 			t.Fatalf("timed out waiting for a merge into %s", c.CacheID())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A wiped cache's imports leave the index, written in the background so the
+// telemetry request that reported the wipe doesn't wait on the store.
+func TestWipedCacheImportsDropped(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	h.buildRecipes()
+	h.exportBuild()
+	b := fakeengine.New("cache-b", 1)
+	h.connectEngine(b)
+	waitImports(t, h.meta, b.ID, 2)
+
+	h.postEvent(telemetryattrs.EngineEventStart, `{"wipedCache":"cache-b"}`)
+	idx := waitIndexFor(t, h.meta, func(idx *metastore.Index) bool { return idx.Caches[b.ID] == nil })
+	if len(idx.Entries) != 2 {
+		t.Fatalf("entries %d: the wipe dropped A's entries", len(idx.Entries))
+	}
+	if _, ok := h.svc.imports.importer.State(b.ID); ok {
+		t.Fatal("the importer still knows the wiped cache")
 	}
 }
