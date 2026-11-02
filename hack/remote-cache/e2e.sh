@@ -76,6 +76,25 @@ wait_for() {
 	done
 }
 
+# stop_service PID: stops a cacheservice and waits until it has exited. On
+# SIGTERM it drains, finishing exports and imports in flight (up to 5s), and
+# may still write to MinIO meanwhile: a reset before it exits would not be
+# from empty.
+stop_service() {
+	local pid="$1" i
+	kill "$pid" 2>/dev/null || return 0
+	for i in $(seq 30); do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 0.5
+	done
+	kill -9 "$pid" 2>/dev/null || true
+	for i in $(seq 10); do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 0.5
+	done
+	die "cacheservice (pid $pid) did not exit"
+}
+
 stop_all() {
 	local e
 	for e in "${engines[@]}"; do
@@ -83,7 +102,7 @@ stop_all() {
 		docker volume rm -f "$(volume "$e")" >/dev/null 2>&1 || true
 	done
 	if [[ -f "$E2E_DIR/cacheservice.pid" ]]; then
-		kill "$(cat "$E2E_DIR/cacheservice.pid")" 2>/dev/null || true
+		stop_service "$(cat "$E2E_DIR/cacheservice.pid")"
 		rm -f "$E2E_DIR/cacheservice.pid"
 	fi
 	stop_trace
@@ -279,8 +298,10 @@ stamp_a="$(stamp run-a)"
 printf 'A took %ss. Stamp:\n%s\n' "$time_a" "$stamp_a" >&2
 
 log "Waiting for the service to store A's entries in MinIO"
-wait_for "$E2E_TIMEOUT" "A's export to reach the index" \
-	sh -c "curl -fsS '$debug_url/debug/engines/$conn_a/entries' | jq -e '[.[] | select(.stored)] | length > 0'"
+# Every retained entry, not just the first: a session can be exported in
+# several batches, and the index read below must hold all of them.
+wait_for "$E2E_TIMEOUT" "all of A's retained entries to reach the index" \
+	sh -c "curl -fsS '$debug_url/debug/engines/$conn_a/entries' | jq -e '[.[] | select(.retained)] | length > 0 and all(.stored)'"
 index_json >"$E2E_DIR/index-after-a.json"
 jq -e '(.entries // {}) | length > 0' "$E2E_DIR/index-after-a.json" >/dev/null ||
 	die "the index in MinIO has no entries: $E2E_DIR/index-after-a.json"
