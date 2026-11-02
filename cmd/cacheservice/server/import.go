@@ -122,9 +122,7 @@ func (s *Service) startImports(connCtx context.Context, c *engineConn) {
 
 // syncImports syncs one engine and logs what it did.
 func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Result {
-	start := time.Now()
-	res, err := s.imports.importer.Sync(metrics.WithCaller(ctx, metrics.CallerImport), c)
-	s.metrics.ImportSync(err != nil, time.Since(start))
+	res, err := s.syncMeasured(ctx, c)
 	if err != nil && ctx.Err() == nil && s.connected(c) {
 		c.logger.Warn("import sync failed", "error", err)
 	}
@@ -133,6 +131,16 @@ func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Resul
 			"accepted", res.Offers.Accepted, "alreadyComplete", res.Offers.AlreadyComplete)
 	}
 	return res
+}
+
+// syncMeasured syncs one engine, measures the sync, and labels its index
+// reads and updates as the import path's, whether a sync loop or the debug
+// API asked for it.
+func (s *Service) syncMeasured(ctx context.Context, c *engineConn) (importer.Result, error) {
+	start := time.Now()
+	res, err := s.imports.importer.Sync(metrics.WithCaller(ctx, metrics.CallerImport), c)
+	s.metrics.ImportSync(err != nil, time.Since(start))
+	return res, err
 }
 
 // triggerImports syncs every connected engine but those of cache except,

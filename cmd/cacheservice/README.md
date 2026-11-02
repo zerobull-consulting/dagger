@@ -448,8 +448,10 @@ paths record into them through their metadata store. All are prefixed
 | `export_bundles_total` | | Bundles published |
 
 `caller` is `export` or `import` for the path that read or updated the index,
-and `other` for the rest (a wiped cache's imports leaving the index, the
-debug API's reads). The Go runtime and process collectors are served too.
+whether its scheduler, its sync loop or the debug API ran it, and `other` for
+the rest (a wiped cache's imports leaving the index). Debug-triggered exports
+and imports count in the export and import metrics too. `bundle_reads_total`
+counts the read `PutBundle` makes when the bundle is already stored. The Go runtime and process collectors are served too.
 
 What to watch:
 

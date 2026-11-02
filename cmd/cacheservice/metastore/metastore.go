@@ -202,6 +202,7 @@ func (s *Store) PutBundle(ctx context.Context, scope string, bundle *dagql.Value
 		// that what is there is this bundle.
 		stored, _, err := s.objects.Get(ctx, key)
 		if err == nil {
+			s.metrics.BundleRead(scope, len(stored))
 			if !bytes.Equal(stored, body) {
 				return "", fmt.Errorf("put bundle %s: %w", id, ErrCorruptBundle)
 			}

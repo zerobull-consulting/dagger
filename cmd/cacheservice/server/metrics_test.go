@@ -42,7 +42,7 @@ func TestMetricsOfExportAndImport(t *testing.T) {
 	h.buildRecipes()
 	h.exportBuild()
 	b := fakeengine.New("cache-b", 1)
-	h.connectEngine(b)
+	eng := h.connectEngine(b)
 	waitLookup(t, b, "withExec(make)", hasOffer)
 
 	svc := h.svc
@@ -60,6 +60,17 @@ func TestMetricsOfExportAndImport(t *testing.T) {
 	waitMetric(t, svc, "cacheservice_import_bundle_cache_total", map[string]string{"result": "miss"}, 1)
 	waitMetric(t, svc, "cacheservice_import_syncs_total", map[string]string{"outcome": metrics.OutcomeOK}, 1)
 	waitMetric(t, svc, "cacheservice_index_entries", map[string]string{"scope": testScope}, 2)
+
+	// A sync the debug API asks for is measured as the import path's too.
+	syncs := map[string]string{"outcome": metrics.OutcomeOK}
+	before := metricstest.Value(t, svc.registry, "cacheservice_import_syncs_total", syncs)
+	importReads := map[string]string{"scope": testScope, "caller": metrics.CallerImport}
+	readsBefore := metricstest.Value(t, svc.registry, "cacheservice_index_reads_total", importReads)
+	if code, _ := h.debugImport(eng); code != http.StatusOK {
+		t.Fatalf("debug import: %d", code)
+	}
+	waitMetric(t, svc, "cacheservice_import_syncs_total", syncs, before+1)
+	waitMetric(t, svc, "cacheservice_index_reads_total", importReads, readsBefore+1)
 
 	resp, err := http.Get(h.debug.URL + "/metrics")
 	if err != nil {

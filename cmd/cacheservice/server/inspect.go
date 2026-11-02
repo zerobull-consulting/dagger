@@ -140,7 +140,7 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 	if err != nil {
 		return importer.Result{}, err
 	}
-	return s.imports.importer.Sync(ctx, c)
+	return s.syncMeasured(ctx, c)
 }
 
 // debugConnID reads the {conn} path value, and answers 400 when it isn't a

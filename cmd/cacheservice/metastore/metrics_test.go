@@ -151,6 +151,10 @@ func TestMetricsBundles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The second store read the stored bundle to compare it.
+	if got := metricstest.Value(t, reg, "cacheservice_bundle_reads_total", map[string]string{"scope": "s1"}); got != 1 {
+		t.Fatalf("bundle reads %v after storing it again, want 1", got)
+	}
 	if _, err := s.GetBundle(ctx, "s1", id); err != nil {
 		t.Fatal(err)
 	}
@@ -161,8 +165,8 @@ func TestMetricsBundles(t *testing.T) {
 	}{
 		{"cacheservice_bundle_writes_total", map[string]string{"scope": "s1", "outcome": metrics.BundleWritten}, 1},
 		{"cacheservice_bundle_writes_total", map[string]string{"scope": "s1", "outcome": metrics.BundleExisting}, 1},
-		{"cacheservice_bundle_reads_total", map[string]string{"scope": "s1"}, 1},
-		{"cacheservice_bundle_read_bytes_total", map[string]string{"scope": "s1"}, float64(len(body))},
+		{"cacheservice_bundle_reads_total", map[string]string{"scope": "s1"}, 2},
+		{"cacheservice_bundle_read_bytes_total", map[string]string{"scope": "s1"}, float64(2 * len(body))},
 	} {
 		if got := metricstest.Value(t, reg, c.name, c.labels); got != c.want {
 			t.Errorf("%s%v = %v, want %v", c.name, c.labels, got, c.want)
