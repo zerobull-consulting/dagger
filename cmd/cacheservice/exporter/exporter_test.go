@@ -143,11 +143,12 @@ func (e *fakeEngine) uploadMaps() []map[digest.Digest]string {
 }
 
 type testEnv struct {
-	blobs *blobstore.MemStore
-	meta  *metastore.Store
-	x     *Exporter
-	cache *fakeengine.Cache
-	eng   *fakeEngine
+	blobs   *blobstore.MemStore
+	objects *metastore.MemObjects
+	meta    *metastore.Store
+	x       *Exporter
+	cache   *fakeengine.Cache
+	eng     *fakeEngine
 }
 
 func newTestEnv(t *testing.T, modify func(*Config)) *testEnv {
@@ -156,7 +157,8 @@ func newTestEnv(t *testing.T, modify func(*Config)) *testEnv {
 	srv := httptest.NewServer(blobs)
 	t.Cleanup(srv.Close)
 	blobs.SetBaseURL(srv.URL)
-	meta, err := metastore.New(metastore.Config{Objects: metastore.NewMemObjects()})
+	objects := metastore.NewMemObjects()
+	meta, err := metastore.New(metastore.Config{Objects: objects})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +172,7 @@ func newTestEnv(t *testing.T, modify func(*Config)) *testEnv {
 	}
 	x.sleep = func(context.Context, time.Duration) error { return nil }
 	cache := fakeengine.New("cache-a", 2)
-	return &testEnv{blobs: blobs, meta: meta, x: x, cache: cache, eng: newFakeEngine(cache)}
+	return &testEnv{blobs: blobs, objects: objects, meta: meta, x: x, cache: cache, eng: newFakeEngine(cache)}
 }
 
 func fsOutputs(numbers ...uint64) []protocol.ExportOutput {
@@ -266,6 +268,46 @@ func TestRepeatedExportUploadsNothingNew(t *testing.T) {
 	}
 	if len(idx.Entries) != 2 || idx.NextNumber != 3 {
 		t.Fatalf("index after repeat: %d entries, next %d", len(idx.Entries), idx.NextNumber)
+	}
+}
+
+// A real engine annotates a layer with buildkit/createdat only once it has
+// compressed it, so its first export of an exec's layers leaves the
+// annotation out and the next one has it (#30). The repeat must still store
+// the same bundle: a new one would move the entries in the index and be
+// merged again into every engine.
+func TestRepeatedExportCreatedAtAnnotationSameBundle(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.cache.CreatedAtAnnotation = true
+	e.addBuild()
+	ctx := context.Background()
+	req := Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)}
+	first, err := e.x.Export(ctx, e.eng, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := slices.Sorted(slices.Values(e.objects.Keys()))
+	second, err := e.x.Export(ctx, e.eng, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Bundles) != 1 || !slices.Equal(first.Bundles, second.Bundles) {
+		t.Fatalf("bundles: %v then %v", first.Bundles, second.Bundles)
+	}
+	if got := slices.Sorted(slices.Values(e.objects.Keys())); !slices.Equal(got, keys) {
+		t.Fatalf("objects: %v, then %v", keys, got)
+	}
+	// What is stored has no annotation, and keeps the layers' creation time.
+	b, err := e.meta.GetBundle(ctx, "team", first.Bundles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range b.Outputs {
+		for _, l := range o.Chain.Layers {
+			if len(l.Descriptor.Annotations) != 0 || l.CreatedAt == nil {
+				t.Fatalf("stored layer %s: annotations %v, createdAt %v", l.Descriptor.Digest, l.Descriptor.Annotations, l.CreatedAt)
+			}
+		}
 	}
 }
 

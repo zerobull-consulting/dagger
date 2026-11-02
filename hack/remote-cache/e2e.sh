@@ -21,16 +21,42 @@
 #      what B built itself, each once (#35), and prints both runs'
 #      wall-clock times.
 #
+# Then the scenarios in E2E_SCENARIOS, in this order (all by default):
+#
+#   reexport    (#30) A's stored entries exported again upload nothing, keep
+#               their numbers and write no bundle; a second pipeline over
+#               alpine uploads only its own layers.
+#   renew       (#31) a second service, a replica on the same scope with
+#               presigned GETs that last E2E_GET_EXPIRY seconds, merges A's
+#               entries into new engines C and D. Once the GETs expired, C
+#               reads the layers through renew; then exec2's layer is
+#               deleted from MinIO, and D's read degrades to a cache miss.
+#   prune       (#32) C prunes its cache; the replica, polling every
+#               E2E_IMPORT_POLL seconds, doesn't merge the entries into it
+#               again until C restarts. Starts the replica and C if renew
+#               didn't.
+#   superseded  (#32, #27) a Dang module function with a cache TTL of
+#               E2E_TTL seconds runs on A, expires, and runs again, which
+#               replaces its value; the service stores both. A new engine F
+#               then imports, and reads the value: which record it got is
+#               reported.
+#
+# Each prints its checks as it ends; the run fails if any check failed.
 # Everything is left running afterwards so it can be inspected: `dev.sh
 # e2e-down` stops it. Logs and results go to E2E_DIR.
 #
 # Settings: E2E_DIR (default: $TMPDIR/dagger-remote-cache-e2e), E2E_BASE_IMAGE
 # (the release image the binaries are copied over), E2E_SKIP_BUILD=1 (reuse
 # the binaries in E2E_DIR/bin), CACHESERVICE_PORT (8090),
-# CACHESERVICE_DEBUG_PORT (8091), E2E_TIMEOUT (seconds to wait for the
-# export and the merge, 180), E2E_CA_FILE (a CA bundle the engines should
-# trust, for hosts behind a TLS-intercepting proxy).
-set -euo pipefail
+# CACHESERVICE_DEBUG_PORT (8091), REPLICA_PORT (8092), REPLICA_DEBUG_PORT
+# (8093), E2E_TIMEOUT (seconds to wait for the export and the merge, 180),
+# E2E_CA_FILE (a CA bundle the engines should trust, for hosts behind a
+# TLS-intercepting proxy), E2E_SCENARIOS ("reexport renew prune
+# superseded"), E2E_GET_EXPIRY (30), E2E_IMPORT_POLL (2), E2E_TTL (30).
+set -eEuo pipefail
+# A command that fails where nothing expected it to says where, rather than
+# ending the run silently.
+trap 'echo "e2e: line ${LINENO}: \"${BASH_COMMAND}\" failed (exit $?)" >&2' ERR
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
@@ -42,8 +68,23 @@ repo="$(cd "$here/../.." && pwd)"
 : "${CACHESERVICE_DEBUG_PORT:=8091}"
 : "${E2E_TIMEOUT:=180}"
 : "${E2E_SCOPE:=default}"
+: "${REPLICA_PORT:=8092}"
+: "${REPLICA_DEBUG_PORT:=8093}"
+: "${E2E_SCENARIOS:=reexport renew prune superseded}"
+: "${E2E_GET_EXPIRY:=30}"
+: "${E2E_IMPORT_POLL:=2}"
+: "${E2E_TTL:=30}"
 
-engines=(a b)
+all_scenarios=(reexport renew prune superseded)
+for sc in $E2E_SCENARIOS; do
+	[[ " ${all_scenarios[*]} " == *" $sc "* ]] || {
+		echo "e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: ${all_scenarios[*]})" >&2
+		exit 2
+	}
+done
+wanted() { [[ " $E2E_SCENARIOS " == *" $1 "* ]]; }
+
+engines=(a b c d f)
 container() { echo "dagger-remote-cache-e2e-$1"; }
 volume() { echo "dagger-remote-cache-e2e-$1"; }
 
@@ -52,6 +93,14 @@ volume() { echo "dagger-remote-cache-e2e-$1"; }
 gateway="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
 service_url="http://${gateway}:${CACHESERVICE_PORT}"
 debug_url="http://127.0.0.1:${CACHESERVICE_DEBUG_PORT}"
+replica_url="http://${gateway}:${REPLICA_PORT}"
+replica_debug_url="http://127.0.0.1:${REPLICA_DEBUG_PORT}"
+
+# svc_url and svc_debug SERVICE: the addresses of the main service or the
+# replica.
+svc_url() { if [[ "$1" == replica ]]; then echo "$replica_url"; else echo "$service_url"; fi; }
+svc_debug() { if [[ "$1" == replica ]]; then echo "$replica_debug_url"; else echo "$debug_url"; fi; }
+svc_log() { if [[ "$1" == replica ]]; then echo "$E2E_DIR/replica.log"; else echo "$E2E_DIR/cacheservice.log"; fi; }
 
 dev() { MINIO_BIND_ADDR="$gateway" "$here/dev.sh" "$@"; }
 
@@ -103,10 +152,12 @@ stop_all() {
 		docker rm -f "$(container "$e")" >/dev/null 2>&1 || true
 		docker volume rm -f "$(volume "$e")" >/dev/null 2>&1 || true
 	done
-	if [[ -f "$E2E_DIR/cacheservice.pid" ]]; then
-		stop_service "$(cat "$E2E_DIR/cacheservice.pid")"
-		rm -f "$E2E_DIR/cacheservice.pid"
-	fi
+	for pidfile in cacheservice.pid replica.pid; do
+		if [[ -f "$E2E_DIR/$pidfile" ]]; then
+			stop_service "$(cat "$E2E_DIR/$pidfile")"
+			rm -f "$E2E_DIR/$pidfile"
+		fi
+	done
 	stop_trace
 }
 
@@ -171,24 +222,63 @@ start_service() {
 		die "cacheservice exited: $E2E_DIR/cacheservice.log"
 }
 
-# start_engine NAME: starts an engine with a new, empty cache volume and
-# prints its connection number at the service.
+# start_replica: a second cacheservice on the same bucket and scope, as
+# another replica of the service would be, with presigned GETs that last
+# E2E_GET_EXPIRY seconds and an import poll of E2E_IMPORT_POLL seconds. It
+# learns of the main service's exports by polling the index.
+start_replica() {
+	if [[ -f "$E2E_DIR/replica.pid" ]] && kill -0 "$(cat "$E2E_DIR/replica.pid")" 2>/dev/null; then
+		return
+	fi
+	log "Starting a replica of cacheservice on ${gateway}:${REPLICA_PORT}: GETs last ${E2E_GET_EXPIRY}s, import poll ${E2E_IMPORT_POLL}s"
+	CACHESERVICE_S3_GET_EXPIRY="${E2E_GET_EXPIRY}s" "$E2E_DIR/bin/cacheservice" -v \
+		-listen "${gateway}:${REPLICA_PORT}" \
+		-debug-listen "127.0.0.1:${REPLICA_DEBUG_PORT}" \
+		-scope "$E2E_SCOPE" \
+		-import-poll "${E2E_IMPORT_POLL}s" \
+		>"$E2E_DIR/replica.log" 2>&1 &
+	echo $! >"$E2E_DIR/replica.pid"
+	wait_for 30 "the replica" curl -fsS "$replica_debug_url/debug/engines"
+	kill -0 "$(cat "$E2E_DIR/replica.pid")" 2>/dev/null ||
+		die "the replica exited: $E2E_DIR/replica.log"
+}
+
+# start_engine NAME [SERVICE]: starts an engine with a new, empty cache
+# volume, pointed at the main service or the replica, and prints its
+# connection number there.
 start_engine() {
-	local name="$1" before conn
-	before="$(curl -fsS "$debug_url/debug/engines" | jq -r '[.[].conn] | max // 0')"
+	local name="$1" svc="${2:-main}" url dbg before
+	url="$(svc_url "$svc")"
+	dbg="$(svc_debug "$svc")"
+	before="$(curl -fsS "$dbg/debug/engines" | jq -r '[.[].conn] | max // 0')"
+	docker rm -f "$(container "$name")" >/dev/null 2>&1 || true
+	docker volume rm -f "$(volume "$name")" >/dev/null 2>&1 || true
 	docker run -d --privileged \
 		--name "$(container "$name")" \
 		--hostname "e2e-engine-${name}" \
 		-v "$(volume "$name"):/var/lib/dagger" \
-		-e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$service_url" \
+		-e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
 		-e DAGGER_CLOUD_TOKEN="e2e-engine-${name}" \
-		-e DAGGER_CLOUD_URL="$service_url" \
+		-e DAGGER_CLOUD_URL="$url" \
 		"$E2E_IMAGE" --debug >/dev/null
-	wait_for 120 "engine ${name} to connect to the service" \
-		sh -c "curl -fsS '$debug_url/debug/engines' | jq -e '[.[] | select(.conn > $before and .engineName == \"e2e-engine-${name}\")] | length > 0'"
-	conn="$(curl -fsS "$debug_url/debug/engines" |
-		jq -r "[.[] | select(.conn > $before and .engineName == \"e2e-engine-${name}\")][0].conn")"
-	echo "$conn"
+	wait_conn "$name" "$svc" "$before"
+}
+
+# wait_conn NAME SERVICE AFTER: waits for engine NAME to connect to SERVICE
+# with a connection number above AFTER, and prints it.
+wait_conn() {
+	local name="$1" dbg sel
+	dbg="$(svc_debug "$2")"
+	sel="[.[] | select(.conn > $3 and .engineName == \"e2e-engine-${name}\")]"
+	wait_for 120 "engine ${name} to connect to the ${2} service" \
+		sh -c "curl -fsS '$dbg/debug/engines' | jq -e '$sel | length > 0'"
+	curl -fsS "$dbg/debug/engines" | jq -r "${sel}[-1].conn"
+}
+
+# engine_field SERVICE CONN FIELD: a field of a connection, as the service
+# lists it.
+engine_field() {
+	curl -fsS "$(svc_debug "$1")/debug/engines" | jq -r ".[] | select(.conn == $2) | .$3"
 }
 
 # The pipeline: alpine, then two execs that each write 4MB of random data and
@@ -214,11 +304,13 @@ verify() {
 	EOF
 }
 
-# run_query NAME OUT: runs the query on stdin on an engine through the CLI,
-# with the CLI's telemetry pointed at the service, and writes the result to
-# OUT.json and the CLI's output to OUT.log. Prints the elapsed seconds.
-run_query() {
-	local name="$1" out="$2" start end
+# run_cli NAME OUT SERVICE ARGS...: runs the dagger CLI with ARGS, and stdin,
+# on an engine, with the CLI's telemetry pointed at SERVICE (main or
+# replica), and writes its stdout to OUT.json and its stderr to OUT.log.
+# Prints the elapsed seconds.
+run_cli() {
+	local name="$1" out="$2" svc="$3" start end
+	shift 3
 	start="$(now)"
 	# An inherited TRACEPARENT (some CI and sandboxes set one, unsampled)
 	# makes the CLI's trace unsampled, and then the engine records no session
@@ -227,14 +319,17 @@ run_query() {
 		-u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT -u OTEL_EXPORTER_OTLP_LOGS_ENDPOINT \
 		_EXPERIMENTAL_DAGGER_RUNNER_HOST="docker-container://$(container "$name")" \
 		DAGGER_CLOUD_TOKEN="e2e-cli" \
-		DAGGER_CLOUD_URL="$service_url" \
+		DAGGER_CLOUD_URL="$(svc_url "$svc")" \
 		DAGGER_NO_NAG=1 \
-		"$E2E_DIR/bin/dagger" --progress=plain query \
+		"$E2E_DIR/bin/dagger" --progress=plain "$@" \
 		>"$E2E_DIR/${out}.json" 2>"$E2E_DIR/${out}.log" ||
-		die "the query on ${name} failed: $E2E_DIR/${out}.log"
+		die "the CLI on ${name} failed: $E2E_DIR/${out}.log"
 	end="$(now)"
 	elapsed "$start" "$end"
 }
+
+# run_query NAME OUT [SERVICE]: runs the query on stdin on an engine.
+run_query() { run_cli "$1" "$2" "${3:-main}" query; }
 
 stamp() { jq -r '.container.from.withExec.withExec.file.contents' "$E2E_DIR/$1.json"; }
 
@@ -246,7 +341,8 @@ mc_minio() {
 index_json() { mc_minio "mc cat local/${CACHESERVICE_S3_BUCKET}/${CACHESERVICE_S3_PREFIX:+${CACHESERVICE_S3_PREFIX}/}${E2E_SCOPE}/index.json"; }
 
 # MinIO's request trace, from start_trace until stop_trace, in the MinIO
-# container's /tmp/e2e-trace.log.
+# container's /tmp/e2e-trace.log. stop_trace OUT also copies it to
+# E2E_DIR/OUT.
 start_trace() {
 	docker compose -f "$here/compose.yaml" exec -d minio sh -c \
 		'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && echo $$ >/tmp/e2e-trace.pid && exec mc admin trace local >/tmp/e2e-trace.log 2>&1'
@@ -255,7 +351,34 @@ start_trace() {
 stop_trace() {
 	docker compose -f "$here/compose.yaml" exec -T minio sh -c \
 		'[ -f /tmp/e2e-trace.pid ] && kill $(cat /tmp/e2e-trace.pid); rm -f /tmp/e2e-trace.pid' >/dev/null 2>&1 || true
+	if [[ -n "${1:-}" ]]; then
+		docker compose -f "$here/compose.yaml" exec -T minio cat /tmp/e2e-trace.log >"$E2E_DIR/$1" || true
+	fi
 }
+
+scope_key() { echo "${CACHESERVICE_S3_PREFIX:+${CACHESERVICE_S3_PREFIX}/}${E2E_SCOPE}/$1"; }
+bundle_json() { mc_minio "mc cat local/${CACHESERVICE_S3_BUCKET}/$(scope_key "bundles/$1.json")"; }
+# bundle_objects: the stored bundles' keys, one per line.
+bundle_objects() { mc_minio "mc ls local/${CACHESERVICE_S3_BUCKET}/$(scope_key bundles/)" | awk '{print $NF}' | sort; }
+
+# log_lines FILE: the number of lines in a log, to read what comes after.
+log_lines() { wc -l <"$1"; }
+# log_since FILE LINE: a log from line LINE on.
+log_since() { tail -n +"$(($2 + 1))" "$1"; }
+
+# Each scenario's checks: check OK TEXT prints TEXT, prefixed with FAIL when
+# OK isn't 1, and counts the failures.
+failures=0
+check() {
+	if [[ "$1" == 1 ]]; then
+		printf '  ok    %s\n' "$2"
+	else
+		printf '  FAIL  %s\n' "$2"
+		failures=$((failures + 1))
+	fi
+}
+# ok_if CONDITION...: 1 if the command succeeds, else 0, for check.
+ok_if() { if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
 
 # cache_spans CACHEID FROM-LINE: the service's cache span log lines for a
 # cache, from a line of its log on.
@@ -283,7 +406,8 @@ if ((!own_service)) && curl -fsS -o /dev/null "$debug_url/debug/engines" 2>/dev/
 	die "a cacheservice already answers on ${debug_url}: stop it first (dev.sh e2e-down, with the E2E_DIR it was started with)"
 fi
 stop_all
-rm -rf "$E2E_DIR/"{run-,verify-,minio-,imports-,entries-,index}* "$E2E_DIR/cacheservice.log"
+mkdir -p "$E2E_DIR"
+find "$E2E_DIR" -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
 build
 start_minio
 start_service
@@ -416,4 +540,372 @@ echo "timings:     A ${time_a}s (empty cache, builds)"
 echo "             B ${time_b}s (empty cache, entries merged from S3)"
 echo "             B verify ${time_verify}s (one new exec, layers pulled from MinIO)"
 echo "files:       $E2E_DIR"
-((ok)) || exit 1
+((ok)) || failures=$((failures + 1))
+
+# The checks for the verify exec, against A's: which lines of its output are
+# A's. verify_lines OUT: the verify output in OUT.json.
+verify_output() { jq -r '.container.from.withExec.withExec.withExec.stdout' "$E2E_DIR/$1.json"; }
+cache_of() { engine_field "$1" "$2" cacheID; }
+
+# ---------------------------------------------------------------------------
+# #30: a repeated export uploads nothing new.
+scenario_reexport() {
+	log "#30: exporting A's stored entries again (POST /debug/engines/$conn_a/export)"
+	local req res t0 t1 alpine line puts uploaded present new_bundles
+	curl -fsS "$debug_url/debug/engines/$conn_a/entries" >"$E2E_DIR/reexport-entries-a.json"
+	# Every stored root, with every part the tracker knows of, as the
+	# tracker's own export sends them.
+	req="$(jq -c '[.[] | select(.retained and .stored)]
+		| {roots: [.[].number], outputs: [.[] as $e | ($e.parts // [])[] | {number: $e.number, address: fromjson}]}' \
+		"$E2E_DIR/reexport-entries-a.json")"
+	echo "$req" >"$E2E_DIR/reexport-request.json"
+	index_json >"$E2E_DIR/reexport-index-before.json"
+	bundle_objects >"$E2E_DIR/reexport-bundles-before.txt"
+	t0="$(now)"
+	curl -fsS -XPOST "$debug_url/debug/engines/$conn_a/export" -d "$req" >"$E2E_DIR/reexport-result.json" ||
+		die "the export hook failed: $E2E_DIR/reexport-result.json"
+	t1="$(now)"
+	index_json >"$E2E_DIR/reexport-index-after.json"
+	bundle_objects >"$E2E_DIR/reexport-bundles-after.txt"
+	res="$E2E_DIR/reexport-result.json"
+	jq -c '{stored, uploaded: (.uploaded // []), present: (.present // []), bundles}' "$res" >&2
+
+	echo "#30, repeated export ($(elapsed "$t0" "$t1")s):"
+	check "$(ok_if jq -e --argjson req "$req" '(.stored // [] | sort) == ($req.roots | sort)' "$res")" \
+		"every root stored again: $(jq -c '.stored' "$res")"
+	check "$(ok_if jq -e '(.uploaded // []) | length == 0' "$res")" \
+		"no blob uploaded (uploaded: $(jq -c '.uploaded // []' "$res"))"
+	local missing=0
+	while read -r d; do
+		jq -e --arg d "$d" '(.present // []) | index($d)' "$res" >/dev/null || missing=$((missing + 1))
+	done <"$E2E_DIR/layers-a.txt"
+	check "$(ok_if test "$missing" = 0)" \
+		"every blob present: $(jq '.present // [] | length' "$res") blobs, all $(grep -c . "$E2E_DIR/layers-a.txt") fs layers of A's chain among them"
+	check "$(ok_if jq -e -n --slurpfile b "$E2E_DIR/reexport-index-before.json" --slurpfile a "$E2E_DIR/reexport-index-after.json" \
+		'$b[0].entries == $a[0].entries and $b[0].nextNumber == $a[0].nextNumber')" \
+		"the index is unchanged: the entries keep their service numbers and bundles ($(jq '.entries | length' "$E2E_DIR/reexport-index-after.json") entries, next number $(jq '.nextNumber' "$E2E_DIR/reexport-index-after.json"))"
+	check "$(ok_if cmp -s "$E2E_DIR/reexport-bundles-before.txt" "$E2E_DIR/reexport-bundles-after.txt")" \
+		"no new bundle: $(grep -c . "$E2E_DIR/reexport-bundles-after.txt") stored, as before; the export stored $(jq -r '.bundles // [] | map(.[0:12]) | join(", ")' "$res")"
+
+	log "#30: a second pipeline on A over the same alpine"
+	alpine="$(head -n 1 "$E2E_DIR/layers-a.txt")"
+	line="$(log_lines "$E2E_DIR/cacheservice.log")"
+	start_trace
+	run_query a reexport-run-a2 <<<'{ container { from(address: "alpine:3.22") {
+		withExec(args: ["sh", "-c", "head -c 2097152 /dev/urandom > /other.bin && sha256sum /other.bin | cut -c1-16 > /other"]) {
+			file(path: "/other") { contents } } } } }' >/dev/null
+	wait_for "$E2E_TIMEOUT" "the second pipeline's export" \
+		sh -c "tail -n +$((line + 1)) '$E2E_DIR/cacheservice.log' | grep 'msg=\"export stored\"' | grep -qF 'cacheID=$(cache_of main "$conn_a") '"
+	wait_for "$E2E_TIMEOUT" "all of A's retained entries to be stored" \
+		sh -c "curl -fsS '$debug_url/debug/engines/$conn_a/entries' | jq -e '[.[] | select(.retained)] | all(.stored)'"
+	stop_trace reexport-trace-a2.log
+	log_since "$E2E_DIR/cacheservice.log" "$line" | grep 'msg="export stored"' >"$E2E_DIR/reexport-exports-a2.log"
+	uploaded="$(grep -o 'uploaded=[0-9]*' "$E2E_DIR/reexport-exports-a2.log" | cut -d= -f2 | awk '{ n += $1 } END { print n + 0 }')"
+	present="$(grep -o 'present=[0-9]*' "$E2E_DIR/reexport-exports-a2.log" | cut -d= -f2 | awk '{ n += $1 } END { print n + 0 }')"
+	new_bundles="$(grep -o 'bundle=[0-9a-f]*' "$E2E_DIR/reexport-exports-a2.log" | cut -d= -f2)"
+	grep 'PutObject' "$E2E_DIR/reexport-trace-a2.log" | grep '/blobs/' >"$E2E_DIR/reexport-puts-a2.log" || true
+	puts="$(grep -c . "$E2E_DIR/reexport-puts-a2.log" || true)"
+	local in_bundle=0
+	for b in $new_bundles; do
+		bundle_json "$b" | jq -e --arg d "$alpine" '[.outputs[]?.chain.layers[]?.Descriptor.digest] | index($d)' >/dev/null && in_bundle=1
+	done
+
+	echo "#30, a second pipeline sharing alpine's layer:"
+	check "$(ok_if test "${uploaded:-0}" -gt 0 -a "$puts" = "${uploaded:-0}")" \
+		"it uploaded only its own layers: ${uploaded:-0} blobs, ${puts} PUTs in MinIO's trace"
+	check "$(ok_if test "${present:-0}" -gt 0 -a "$in_bundle" = 1)" \
+		"alpine's layer is in its bundle, and was present (${present:-0} blobs present)"
+	check "$(ok_if bash -c "! grep -qF '/blobs/${alpine/://}' '$E2E_DIR/reexport-puts-a2.log'")" \
+		"alpine's layer (${alpine:7:12}...) was not uploaded again"
+}
+
+# ---------------------------------------------------------------------------
+# #31: a pull survives presigned GET expiry through renew; a missing layer
+# degrades to a cache miss.
+renew_started=0
+scenario_renew() {
+	start_replica
+	log "#31: starting engines C and D on the replica, each with an empty cache"
+	conn_c="$(start_engine c replica)"
+	conn_d="$(start_engine d replica)"
+	local roots merged_at expires_in line t_c t_d out_c out_d top
+	roots="$(jq -c '.roots | keys | map(tonumber)' "$E2E_DIR/index-after-a.json")"
+	for e in c d; do
+		local conn
+		conn="$([[ $e == c ]] && echo "$conn_c" || echo "$conn_d")"
+		wait_for "$E2E_TIMEOUT" "the replica to merge A's entries into ${e^^}" \
+			sh -c "curl -fsS '$replica_debug_url/debug/engines/$conn/imports' | jq -e --argjson r '$roots' '[.merged[].roots[]] as \$m | \$r - \$m | length == 0'"
+		curl -fsS "$replica_debug_url/debug/engines/$conn/imports" >"$E2E_DIR/renew-imports-$e-merged.json"
+	done
+	merged_at="$(date +%s)"
+	renew_started=1
+	expires_in=$((E2E_GET_EXPIRY + 2))
+	log "#31: waiting ${expires_in}s for the merged GETs to expire"
+	sleep "$expires_in"
+
+	log "#31: reading the layers on C, after the GETs expired"
+	line="$(log_lines "$E2E_DIR/replica.log")"
+	start_trace
+	t_c="$(run_query c renew-verify-c replica < <(verify "$(date +%s%N)"))"
+	stop_trace renew-trace-c.log
+	log_since "$E2E_DIR/replica.log" "$line" | grep -E "conn=$conn_c dir=(in|out) type=renew" >"$E2E_DIR/renew-envelopes-c.log" || true
+	out_c="$(verify_output renew-verify-c)"
+	printf 'took %ss, %ss after the merge. Output:\n%s\n' "$t_c" "$(($(date +%s) - merged_at))" "$out_c" >&2
+	grep 'GetObject' "$E2E_DIR/renew-trace-c.log" | grep '/blobs/' >"$E2E_DIR/renew-gets-c.log" || true
+	local missing=()
+	while read -r d; do
+		grep -F "/blobs/${d/://}" "$E2E_DIR/renew-gets-c.log" | grep -q '20[06]' || missing+=("${d:7:12}")
+	done <"$E2E_DIR/layers-a.txt"
+
+	echo "#31, C reads after the GETs expired (${E2E_GET_EXPIRY}s):"
+	check "$(ok_if grep -q 'type=renew ' "$E2E_DIR/renew-envelopes-c.log")" \
+		"C sent renew: $(grep -c 'type=renew ' "$E2E_DIR/renew-envelopes-c.log" || true) renew, for $(grep -o 'layers=[0-9]*' "$E2E_DIR/renew-envelopes-c.log" | paste -sd, -) layers"
+	check "$(ok_if bash -c "grep 'type=renewed' '$E2E_DIR/renew-envelopes-c.log' | grep -q 'unavailable=false' && ! grep -q 'unavailable=true' '$E2E_DIR/renew-envelopes-c.log'")" \
+		"the replica answered with fresh GETs: $(grep 'type=renewed' "$E2E_DIR/renew-envelopes-c.log" | grep -o 'addresses=[0-9]*' | paste -sd, -)"
+	check "$(ok_if test "${#missing[@]}" = 0 -a -s "$E2E_DIR/renew-gets-c.log")" \
+		"MinIO served C every layer of A's chain: $(grep -c . "$E2E_DIR/renew-gets-c.log" || true) blob GETs${missing:+, missing ${missing[*]}}"
+	# The engine renews an expired address without trying it: no blob GET
+	# before the renew, and none refused. The service's log and MinIO's trace
+	# share the host's clock, both in UTC to the millisecond.
+	local renewed_at first_get refused
+	renewed_at="$(grep -m 1 'type=renew ' "$E2E_DIR/renew-envelopes-c.log" | grep -o 'time=[^ ]*' | cut -c6-28)"
+	first_get="$(head -n 1 "$E2E_DIR/renew-gets-c.log" | cut -c1-23)"
+	refused="$(grep -c '\[403 ' "$E2E_DIR/renew-gets-c.log" || true)"
+	check "$(ok_if test -n "$renewed_at" -a -n "$first_get" -a "$refused" = 0 -a ! "$first_get" \< "$renewed_at")" \
+		"no GET before the renew, and none refused: renew at ${renewed_at#*T}, first blob GET at ${first_get#*T}, ${refused} refused (403)"
+	check "$(ok_if test "$out_c" = "$(printf '%s\n%s' "$stamp_a" "$sums_a")")" \
+		"the files C read are A's: its stamps and checksums"
+
+	# C's verify exec is exported next, and its upload would put back a
+	# layer deleted before it: the service asks only for the blobs the store
+	# lacks, and C has them all on disk now.
+	wait_for "$E2E_TIMEOUT" "C's verify exec to be stored" \
+		sh -c "curl -fsS '$replica_debug_url/debug/engines/$conn_c/entries' | jq -e '[.[] | select(.retained)] | length > 0 and all(.stored)'"
+	log "#31: deleting the last exec's layer from MinIO, and reading the layers on D"
+	top="$(tail -n 1 "$E2E_DIR/layers-a.txt")"
+	mc_minio "mc rm local/${CACHESERVICE_S3_BUCKET}/${CACHESERVICE_S3_PREFIX:+${CACHESERVICE_S3_PREFIX}/}blobs/${top/://}" >&2
+	if mc_minio "mc stat local/${CACHESERVICE_S3_BUCKET}/${CACHESERVICE_S3_PREFIX:+${CACHESERVICE_S3_PREFIX}/}blobs/${top/://}" >/dev/null 2>&1; then
+		die "exec2's layer ${top} is still in MinIO after mc rm"
+	fi
+	line="$(log_lines "$E2E_DIR/replica.log")"
+	start_trace
+	t_d="$(run_query d renew-verify-d replica < <(verify "$(date +%s%N)"))"
+	stop_trace renew-trace-d.log
+	log_since "$E2E_DIR/replica.log" "$line" | grep -E "conn=$conn_d dir=(in|out) type=renew|renew of a missing layer" >"$E2E_DIR/renew-envelopes-d.log" || true
+	out_d="$(verify_output renew-verify-d)"
+	printf 'took %ss. Output:\n%s\n' "$t_d" "$out_d" >&2
+	local stamps_d sums_d
+	stamps_d="$(head -n 2 <<<"$out_d")"
+	sums_d="$(tail -n 2 <<<"$out_d")"
+
+	echo "#31, D reads with a layer missing from MinIO:"
+	check "$(ok_if bash -c "grep 'type=renewed' '$E2E_DIR/renew-envelopes-d.log' | grep -q 'unavailable=true' && grep -qF 'digest=$top' '$E2E_DIR/renew-envelopes-d.log'")" \
+		"renew of the chain with the deleted layer answered unavailable ($(grep -c 'type=renew ' "$E2E_DIR/renew-envelopes-d.log" || true) renew, $(grep 'type=renewed' "$E2E_DIR/renew-envelopes-d.log" | grep -o 'unavailable=[a-z]*' | paste -sd, -))"
+	check "$(ok_if test "$(head -n 1 <<<"$stamps_d")" = "$(head -n 1 <<<"$stamp_a")" -a "$(head -n 1 <<<"$sums_d")" = "$(head -n 1 <<<"$sums_a")")" \
+		"exec1's files on D are A's"
+	check "$(ok_if test "$(tail -n 1 <<<"$stamps_d")" != "$(tail -n 1 <<<"$stamp_a")" -a "$(tail -n 1 <<<"$sums_d")" != "$(tail -n 1 <<<"$sums_a")")" \
+		"exec2 ran again on D, as for a cache miss: new stamp and checksum, and the query succeeded"
+	echo "timings:     C ${t_c}s (layers through renewed GETs), D ${t_d}s (exec2 recomputed)"
+}
+
+# ---------------------------------------------------------------------------
+# #32: entries an engine prunes are not merged back into it until it
+# restarts.
+scenario_prune() {
+	local before after forced cache_c gen_c line merges new_conn polls wait_s
+	if [[ -z "${conn_c:-}" ]]; then
+		start_replica
+		log "#32: starting engine C on the replica"
+		conn_c="$(start_engine c replica)"
+		local roots
+		roots="$(jq -c '.roots | keys | map(tonumber)' "$E2E_DIR/index-after-a.json")"
+		wait_for "$E2E_TIMEOUT" "the replica to merge A's entries into C" \
+			sh -c "curl -fsS '$replica_debug_url/debug/engines/$conn_c/imports' | jq -e --argjson r '$roots' '[.merged[].roots[]] as \$m | \$r - \$m | length == 0'"
+	fi
+	cache_c="$(cache_of replica "$conn_c")"
+	gen_c="$(engine_field replica "$conn_c" generation)"
+	# Earlier scenarios' exports may still be on their way to C: wait until
+	# every engine's entries are stored, and C's merges stop changing for
+	# three polls, so that what is merged after the prune can only be the
+	# pruned entries coming back.
+	for conn in $(curl -fsS "$replica_debug_url/debug/engines" | jq -r '.[].conn'); do
+		wait_for "$E2E_TIMEOUT" "the replica's exports of connection $conn" \
+			sh -c "curl -fsS '$replica_debug_url/debug/engines/$conn/entries' | jq -e '[.[] | select(.retained)] | all(.stored)'"
+	done
+	local settled=0 prev cur
+	prev="$(curl -fsS "$replica_debug_url/debug/engines/$conn_c/imports" | jq -c '[.merged[].bundle] | sort')"
+	while ((settled < 3)); do
+		sleep "$E2E_IMPORT_POLL"
+		cur="$(curl -fsS "$replica_debug_url/debug/engines/$conn_c/imports" | jq -c '[.merged[].bundle] | sort')"
+		if [[ "$cur" == "$prev" ]]; then settled=$((settled + 1)); else settled=0; prev="$cur"; fi
+	done
+	curl -fsS "$replica_debug_url/debug/engines/$conn_c/imports" >"$E2E_DIR/prune-imports-before.json"
+	before="$(jq '.values | length' "$E2E_DIR/prune-imports-before.json")"
+	merges="$(jq '.merged | length' "$E2E_DIR/prune-imports-before.json")"
+
+	log "#32: pruning C's cache ({ engine { localCache { prune } } })"
+	run_query c prune-entries-before replica <<<'{ engine { localCache { entrySet { entryCount diskSpaceBytes } } } }' >/dev/null
+	line="$(log_lines "$E2E_DIR/replica.log")"
+	run_query c prune-run replica <<<'{ engine { localCache { prune } } }' >/dev/null
+	wait_for 60 "C's engine.prune event" \
+		sh -c "tail -n +$((line + 1)) '$E2E_DIR/replica.log' | grep 'kind=engine.prune' | grep -qF 'cache=$cache_c/'"
+	wait_for 30 "the importer to forget C's pruned entries" \
+		sh -c "curl -fsS '$replica_debug_url/debug/engines/$conn_c/imports' | jq -e '.values | length < $before'"
+	log_since "$E2E_DIR/replica.log" "$line" | grep 'kind=engine.prune' | grep -F "cache=$cache_c/" >"$E2E_DIR/prune-event.log"
+	curl -fsS "$replica_debug_url/debug/engines/$conn_c/imports" >"$E2E_DIR/prune-imports-pruned.json"
+	after="$(jq '.values | length' "$E2E_DIR/prune-imports-pruned.json")"
+	run_query c prune-entries-after replica <<<'{ engine { localCache { entrySet { entryCount diskSpaceBytes } } } }' >/dev/null
+
+	polls=5
+	wait_s=$((E2E_IMPORT_POLL * polls + 1))
+	log "#32: waiting ${wait_s}s (${polls} import polls), then syncing C 3 times by hand"
+	sleep "$wait_s"
+	for i in 1 2 3; do
+		curl -fsS -XPOST "$replica_debug_url/debug/engines/$conn_c/import" >"$E2E_DIR/prune-sync-$i.json"
+	done
+	forced="$(jq -s '[.[].merged // [] | length] | add' "$E2E_DIR"/prune-sync-*.json)"
+	curl -fsS "$replica_debug_url/debug/engines/$conn_c/imports" >"$E2E_DIR/prune-imports-polled.json"
+	log_since "$E2E_DIR/replica.log" "$line" | grep -E "conn=$conn_c dir=out type=(merge|offer) " >"$E2E_DIR/prune-merges-after.log" || true
+	# Bundles merged into C after the prune that it had merged before.
+	local remerged
+	remerged="$(log_since "$E2E_DIR/replica.log" "$line" | grep 'msg="import: merged"' | grep -F "cacheID=$cache_c " |
+		grep -o 'bundle=[0-9a-f]*' | cut -d= -f2 | while read -r b; do
+			if jq -e --arg b "$b" '[.merged[].bundle] | index($b)' "$E2E_DIR/prune-imports-before.json" >/dev/null; then echo "${b:0:12}"; fi
+		done | paste -sd, -)" || true
+
+	log "#32: restarting C"
+	docker restart "$(container c)" >/dev/null
+	new_conn="$(wait_conn c replica "$conn_c")"
+	wait_for "$E2E_TIMEOUT" "the replica to merge into C again" \
+		sh -c "curl -fsS '$replica_debug_url/debug/engines/$new_conn/imports' | jq -e '.merged | length >= $merges'"
+	sleep 1
+	curl -fsS "$replica_debug_url/debug/engines/$new_conn/imports" >"$E2E_DIR/prune-imports-restarted.json"
+
+	echo "#32, pruned entries aren't merged back (engine.localCache.prune on C; import poll ${E2E_IMPORT_POLL}s):"
+	check "$(ok_if test "$after" -lt "$before")" \
+		"C pruned imported entries: its engine.prune event named $(grep -o 'resultId' "$E2E_DIR/prune-event.log" | wc -l) entries; the importer holds ${after} of its ${before} imported values; disk $(jq '.engine.localCache.entrySet.diskSpaceBytes' "$E2E_DIR/prune-entries-before.json") -> $(jq '.engine.localCache.entrySet.diskSpaceBytes' "$E2E_DIR/prune-entries-after.json") bytes"
+	check "$(ok_if test -z "$remerged" -a ! -s "$E2E_DIR/prune-merges-after.log" -a "$forced" = 0)" \
+		"no merge or offer to C over ${polls} polls and 3 syncs by hand ($(grep -c . "$E2E_DIR/prune-merges-after.log" || true) sent, ${forced} merged by the syncs${remerged:+, merged again: $remerged})"
+	check "$(ok_if jq -e -n --slurpfile p "$E2E_DIR/prune-imports-pruned.json" --slurpfile q "$E2E_DIR/prune-imports-polled.json" \
+		'($p[0].values | length) == ($q[0].values | length) and ($p[0].merged | length) == ($q[0].merged | length)')" \
+		"the importer's state for C is as the prune left it"
+	check "$(ok_if jq -e --argjson g "$gen_c" --argjson n "$before" '.generation > $g and (.values | length) >= $n' "$E2E_DIR/prune-imports-restarted.json")" \
+		"after C restarted (generation $(jq '.generation' "$E2E_DIR/prune-imports-restarted.json")), the replica merged $(jq '.merged | length' "$E2E_DIR/prune-imports-restarted.json") bundles into it again, $(jq '.values | length' "$E2E_DIR/prune-imports-restarted.json") values"
+}
+
+# ---------------------------------------------------------------------------
+# #32 (#27): which record of a replaced value a new engine ends up with.
+scenario_superseded() {
+	local mod="$E2E_DIR/ttlmod" version cache_a line n1 n2 s1 s2 e1 b1 b2 l1 l2 conn_f cache_f t_f read_f wait_s
+	version="$(engine_field main "$conn_a" engineVersion)"
+	cache_a="$(cache_of main "$conn_a")"
+	mkdir -p "$mod"
+	cat >"$mod/dagger.json" <<-EOF
+		{"name": "ttlmod", "engineVersion": "${version}", "sdk": "dang"}
+	EOF
+	# Nothing depends on stamp2's result in A's cache, so when it has expired
+	# the engine replaces its value in place (same entry, one more
+	# replacement) rather than computing it into a new entry.
+	cat >"$mod/main.dang" <<-EOF
+		type Ttlmod {
+		  pub stamp2(): Container! @cache(ttl: "${E2E_TTL}s") {
+		    container.from("alpine:3.22").withExec(["sh", "-c", "cat /proc/sys/kernel/random/uuid > /stamp2"])
+		  }
+		}
+	EOF
+
+	# superseded_export N OUT: waits for A's entry N to be stored, and
+	# prints its service number, bundle and fs layer as the index has it.
+	superseded_export() {
+		wait_for "$E2E_TIMEOUT" "A's entry $1 to be stored" \
+			sh -c "curl -fsS '$debug_url/debug/engines/$conn_a/entries' | jq -e '.[] | select(.number == $1) | .stored'"
+		index_json >"$E2E_DIR/$2-index.json"
+		local s b o
+		s="$(jq -r --arg c "$cache_a" --arg n "$1" '.caches[$c].numbers[$n].number' "$E2E_DIR/$2-index.json")"
+		b="$(jq -r --arg s "$s" '.entries[$s].bundle' "$E2E_DIR/$2-index.json")"
+		o="$(jq -r --arg s "$s" '.entries[$s].ordinal' "$E2E_DIR/$2-index.json")"
+		bundle_json "$b" >"$E2E_DIR/$2-bundle.json"
+		echo "$s $b $(jq -r --argjson o "$o" '[.outputs[] | select(.ordinal == $o and .address.part == "fs") | .chain.layers[-1].Descriptor.digest][0]' "$E2E_DIR/$2-bundle.json") $(jq -r --arg s "$s" '.entries[$s].expiresAtUnix // 0' "$E2E_DIR/$2-index.json") $(jq -r --arg s "$s" '.entries[$s].replacements // 0' "$E2E_DIR/$2-index.json")"
+	}
+	# stamp2_entry FROM-LINE CACHE: the engine entry of the latest
+	# Ttlmod.stamp2 span of a cache, and its outcome.
+	stamp2_span() {
+		log_since "$E2E_DIR/cacheservice.log" "$1" | grep 'msg="cache span"' | grep -F "cache=$2/" | grep 'name=Ttlmod.stamp2 ' | tail -n 1
+	}
+
+	log "#32/#27: running a Dang function with a ${E2E_TTL}s cache TTL on A"
+	line="$(log_lines "$E2E_DIR/cacheservice.log")"
+	run_cli a superseded-run-1 main -m "$mod" call stamp-2 sync >/dev/null
+	wait_for 30 "A's Ttlmod.stamp2 span" sh -c "tail -n +$((line + 1)) '$E2E_DIR/cacheservice.log' | grep 'name=Ttlmod.stamp2 ' | grep -qF 'cache=$cache_a/'"
+	n1="$(stamp2_span "$line" "$cache_a" | grep -o 'result=[0-9]*' | cut -d= -f2)"
+	read -r s1 b1 l1 e1 _ < <(superseded_export "$n1" superseded-1)
+	echo "first value: engine entry ${n1}, service number ${s1}, bundle ${b1:0:12}, layer ${l1:7:12}, expires $(date -u -d "@$e1" +%T)" >&2
+
+	wait_s=$((e1 - $(date +%s) + 2))
+	log "#32/#27: waiting ${wait_s}s for it to expire, then running it again on A"
+	((wait_s > 0)) && sleep "$wait_s"
+	line="$(log_lines "$E2E_DIR/cacheservice.log")"
+	run_cli a superseded-run-2 main -m "$mod" call stamp-2 sync >/dev/null
+	wait_for 30 "A's Ttlmod.stamp2 span" sh -c "tail -n +$((line + 1)) '$E2E_DIR/cacheservice.log' | grep 'name=Ttlmod.stamp2 ' | grep -qF 'cache=$cache_a/'"
+	n2="$(stamp2_span "$line" "$cache_a" | grep -o 'result=[0-9]*' | cut -d= -f2)"
+	wait_for "$E2E_TIMEOUT" "the replaced value to be stored" \
+		sh -c "curl -fsS '$debug_url/debug/engines/$conn_a/entries' | jq -e '.[] | select(.number == $n2) | .stored and (.replacements // 0) > 0'"
+	local r2
+	read -r s2 b2 l2 _ r2 < <(superseded_export "$n2" superseded-2)
+	echo "second value: engine entry ${n2}, service number ${s2}, bundle ${b2:0:12}, layer ${l2:7:12}, replacements ${r2}" >&2
+
+	log "#32/#27: starting engine F, with an empty cache, and reading the value on it"
+	conn_f="$(start_engine f)"
+	cache_f="$(cache_of main "$conn_f")"
+	# Both bundles, before F reads: the importer records each merge as it
+	# goes, and merges the newer bundle first when its lowest root is lower,
+	# so the newer one alone doesn't mean F has the older record's bundle yet.
+	wait_for "$E2E_TIMEOUT" "merges of both bundles into F (${b1:0:12} and ${b2:0:12})" \
+		sh -c "curl -fsS '$debug_url/debug/engines/$conn_f/imports' | jq -e --arg b1 '$b1' --arg b2 '$b2' '[.merged[].bundle] | index(\$b1) and index(\$b2)'"
+	curl -fsS "$debug_url/debug/engines/$conn_f/imports" >"$E2E_DIR/superseded-imports-f.json"
+	jq -c --arg b1 "$b1" --arg b2 "$b2" '.merged[] | select(.bundle == $b1 or .bundle == $b2) | {bundle: .bundle[0:12], roots, retained, expired}' "$E2E_DIR/superseded-imports-f.json" >&2
+	line="$(log_lines "$E2E_DIR/cacheservice.log")"
+	start_trace
+	t_f="$(run_cli f superseded-read-f main -m "$mod" call stamp-2 file --path /stamp2 contents)"
+	stop_trace superseded-trace-f.log
+	wait_for 30 "F's Ttlmod.stamp2 span" sh -c "tail -n +$((line + 1)) '$E2E_DIR/cacheservice.log' | grep 'name=Ttlmod.stamp2 ' | grep -qF 'cache=$cache_f/'"
+	read_f="$(stamp2_span "$line" "$cache_f")"
+	echo "$read_f" >"$E2E_DIR/superseded-span-f.log"
+	grep 'GetObject' "$E2E_DIR/superseded-trace-f.log" | grep '/blobs/' >"$E2E_DIR/superseded-gets-f.log" || true
+
+	echo "#32 (#27), a value replaced after it expired (TTL ${E2E_TTL}s), then imported into an empty engine:"
+	check "$(ok_if test "$n1" = "$n2" -a "${r2:-0}" -gt 0)" \
+		"A replaced the value in place: engine entry ${n1}, then ${n2}, ${r2:-0} replacement(s)"
+	check "$(ok_if test "$s1" = "$s2" -a "$b1" != "$b2" -a "$l1" != "$l2")" \
+		"the index kept service number ${s1} and moved it to the newer bundle (${b1:0:12} -> ${b2:0:12}); the older bundle still holds the first record"
+	# A function with an explicit cache TTL is evaluated again on every call
+	# (core/sdk/dang/v2/entrypoint.go), so the hit is its body's exec, which
+	# resolves to the imported entry.
+	local imported_f exec_f
+	imported_f="$(jq -r --arg s "$s2" '.values[$s].number // empty' "$E2E_DIR/superseded-imports-f.json")"
+	exec_f="$(log_since "$E2E_DIR/cacheservice.log" "$line" | grep 'msg="cache span"' | grep -F "cache=$cache_f/" | grep 'name=Container.withExec ' | grep -F "result=${imported_f:-none} " | tail -n 1)"
+	check "$(ok_if bash -c "grep -q 'outcome=hit' <<<'$exec_f' && grep -qF 'result=${imported_f:-none} ' <<<'$read_f'")" \
+		"F hit the imported value: stamp2's exec hit F's entry ${imported_f:-?} (service number ${s2}), and stamp2 returned it ($(grep -o 'outcome=[a-z]*' <<<"$read_f") as a TTL function)"
+	if grep -qF "/blobs/${l2/://}" "$E2E_DIR/superseded-gets-f.log" && ! grep -qF "/blobs/${l1/://}" "$E2E_DIR/superseded-gets-f.log"; then
+		check 1 "F has the newer record: it read the second value's layer (${l2:7:12}...) from MinIO, not the first's (in ${t_f}s)"
+	elif grep -qF "/blobs/${l1/://}" "$E2E_DIR/superseded-gets-f.log"; then
+		# The outcome #27 is about; expected to fail until it is fixed.
+		printf '  GAP   F has the older record: it read the first value'"'"'s layer (%s...), from a superseded record (known gap #27)\n' "${l1:7:12}"
+	else
+		check 0 "F read neither value's layer from MinIO: $E2E_DIR/superseded-gets-f.log"
+	fi
+}
+
+for sc in "${all_scenarios[@]}"; do
+	if wanted "$sc"; then
+		echo
+		"scenario_$sc"
+	fi
+done
+
+echo
+if ((failures > 0)); then
+	echo "e2e: ${failures} check(s) failed. Files: $E2E_DIR"
+	exit 1
+fi
+echo "e2e: all checks passed (scenarios: hit ${E2E_SCENARIOS}). Files: $E2E_DIR"

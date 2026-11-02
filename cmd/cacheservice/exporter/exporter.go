@@ -375,6 +375,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		return res, survivors, nil
 	}
 
+	stripVolatile(exported.Bundle)
 	rec, err := x.cfg.Meta.Record(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation())
 	if err != nil {
 		if ctx.Err() != nil {
@@ -500,6 +501,61 @@ func replyError(env protocol.Envelope) error {
 		return errTooLarge
 	}
 	return errors.New(e.Message)
+}
+
+// volatileLayerAnnotations are layer descriptor annotations an engine reports
+// for some exports of a chain and not others.
+//
+// buildkit/createdat is the layer's creation time, which ExportLayer.CreatedAt
+// carries too. The engine reads it from the snapshot's metadata when it builds
+// the descriptor, and a layer it has just compressed for the export has none
+// yet: a real engine's first export of an exec's layers leaves it out, and
+// every later export has it (seen on the real-engine run, #30). It is internal
+// to the engine, which strips it from the images it exports too.
+var volatileLayerAnnotations = []string{"buildkit/createdat"}
+
+// stripVolatile removes from an exported bundle what belongs to one export,
+// or one engine's session, rather than to the values, before it is stored:
+//
+//   - the download addresses of every chain. An engine that merged a bundle
+//     from this service holds the merge's offers, with presigned GETs, in its
+//     records' pending offers until it pulls them, and exports them as they
+//     are. Stored, they would be handed to every engine that merges the
+//     bundle, as GETs that work until they expire but that this service never
+//     renewed, and that read the store under whatever scope signed them (seen
+//     on the real-engine run, #31). Without them, an engine that wants such a
+//     part renews it through its own session, with the chain's renewal key,
+//     and the service signs GETs for the blobs it still has. The Cloud's own
+//     merge drops the pending offers altogether; they are kept here, without
+//     addresses, as they may name the values an offer's owner needs.
+//   - volatileLayerAnnotations.
+//
+// Either would also make each export of the same values a different bundle,
+// which moves them in the index and is merged again into every engine.
+func stripVolatile(bundle *dagql.ValueBundle) {
+	strip := func(c *dagql.OfferedChain) {
+		c.Addresses = nil
+		for i := range c.Layers {
+			ann := c.Layers[i].Descriptor.Annotations
+			for _, k := range volatileLayerAnnotations {
+				delete(ann, k)
+			}
+			if ann != nil && len(ann) == 0 {
+				c.Layers[i].Descriptor.Annotations = nil
+			}
+		}
+	}
+	for i := range bundle.Values {
+		offers := bundle.Values[i].Record.Envelope.PendingOffers
+		for j := range offers {
+			strip(&offers[j].Chain)
+		}
+	}
+	for _, o := range bundle.Outputs {
+		if o.Chain != nil {
+			strip(o.Chain)
+		}
+	}
 }
 
 // neededBlobs are the layer blobs a bundle's outputs need, each once.
