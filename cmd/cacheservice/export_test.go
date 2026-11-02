@@ -24,6 +24,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/engine/remotecache"
@@ -43,6 +44,8 @@ type exportHarness struct {
 	blobs  blobstore.Store
 	meta   *metastore.Store
 	engine *engineConn
+	// ctx ends the harness's engines.
+	ctx context.Context
 }
 
 func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*exportConfig)) *exportHarness {
@@ -61,6 +64,10 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The import path too: it syncs on hello and after each stored export.
+	if err := svc.enableImport(ctx, importConfig{Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: testScope}}); err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(svc.handler())
 	debug := httptest.NewServer(svc.debugHandler())
 	cache := fakeengine.New("cache-a", 4)
@@ -72,10 +79,11 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 		cancel()
 		<-done
 		svc.waitExports()
+		svc.waitImports()
 		srv.Close()
 		debug.Close()
 	})
-	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: blobs, meta: meta}
+	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: blobs, meta: meta, ctx: ctx}
 	h.engine = waitEngines(t, svc, 1)[0]
 	return h
 }
