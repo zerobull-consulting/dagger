@@ -267,9 +267,9 @@ e2e-down` removes the engines and volumes later.
 | `E2E_CA_FILE` | unset | A CA bundle to add to the engine image, for hosts behind a TLS-intercepting proxy |
 | `E2E_TIMEOUT` | `180` | Seconds to wait for each export, and each merge |
 | `E2E_SCENARIOS` | all | The scenarios to run after the first part, which always runs |
-| `E2E_GET_EXPIRY` | `30` | Seconds the replica's presigned GETs last (`renew`) |
-| `E2E_IMPORT_POLL` | `2` | Seconds between the replica's import polls (`prune`) |
-| `E2E_TTL` | `30` | The cache TTL of the `superseded` scenario's function, in seconds |
+| `E2E_GET_EXPIRY` | `5` | Seconds the replica's presigned GETs last (`renew`) |
+| `E2E_IMPORT_POLL` | `1` | Seconds between the replica's import polls (`prune`) |
+| `E2E_TTL` | `10` | The cache TTL of the `superseded` scenario's function, in seconds. The value has to reach engine F and be read there before it expires; the scenario fails asking for a longer one if it doesn't |
 | `E2E_KEEP` | unset | `1` leaves the engines and the run's objects in the bucket |
 
 Notes:

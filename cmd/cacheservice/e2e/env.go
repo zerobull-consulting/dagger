@@ -83,9 +83,9 @@ func SettingsFromEnv(t *testing.T) Settings {
 		SkipBuild:  os.Getenv("E2E_SKIP_BUILD") == "1",
 		CAFile:     os.Getenv("E2E_CA_FILE"),
 		Timeout:    secs("E2E_TIMEOUT", 180),
-		GetExpiry:  secs("E2E_GET_EXPIRY", 30),
-		ImportPoll: secs("E2E_IMPORT_POLL", 2),
-		TTL:        secs("E2E_TTL", 30),
+		GetExpiry:  secs("E2E_GET_EXPIRY", 5),
+		ImportPoll: secs("E2E_IMPORT_POLL", 1),
+		TTL:        secs("E2E_TTL", 10),
 		Keep:       os.Getenv("E2E_KEEP") == "1",
 	}
 }

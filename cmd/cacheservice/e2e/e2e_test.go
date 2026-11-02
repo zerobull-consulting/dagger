@@ -746,6 +746,22 @@ func (s *state) superseded(t *testing.T) {
 	})
 	importsF := s.imports(s.main, f)
 	env.Save("superseded-imports-f", importsF)
+	// The second value has to reach F, and F has to read it, before its
+	// TTL runs out; otherwise the checks below would fail for the wrong
+	// reason.
+	tooShort := func(what string) {
+		t.Fatalf("the second value expired at %s, %s: the TTL (%s) is too short for this host; raise E2E_TTL",
+			r2.expiresAt.UTC().Format(time.TimeOnly), what, env.Settings.TTL)
+	}
+	for _, m := range importsF.Merged {
+		if m.Bundle == r2.bundle && slices.Contains(m.Expired, r2.serviceNum) {
+			tooShort("before it was merged into F")
+		}
+	}
+	if !r2.expiresAt.IsZero() && time.Until(r2.expiresAt) < time.Second {
+		tooShort("before F read it")
+	}
+	t.Logf("F reads the value %s before it expires", time.Until(r2.expiresAt).Round(100*time.Millisecond))
 	mark, s3Mark := s.main.Logs.Mark(), env.Proxy.Mark()
 	_, timeF := f.CLI(nil, "superseded-read-f", "", "-m", mod, "call", "stamp-2", "file", "--path", "/stamp2", "contents")
 	readF := lastSpan(mark, cacheF)
