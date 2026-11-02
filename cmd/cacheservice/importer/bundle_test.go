@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -65,11 +66,40 @@ func chainBundle(first uint64, recipes ...string) *dagql.ValueBundle {
 
 func record(t *testing.T, idx *metastore.Index, id string, b *dagql.ValueBundle, cacheID string) map[dagql.TransferOrdinal]uint64 {
 	t.Helper()
-	numbers, err := idx.Record(id, b, cacheID, 1)
+	numbers, res, err := idx.RecordResolved(id, b, cacheID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	keepResolution(t, res)
 	return numbers
+}
+
+// testResolutions are the resolutions record made, by ID: what Store.Record
+// would have stored.
+var testResolutions sync.Map
+
+func keepResolution(t *testing.T, res *metastore.Resolution) {
+	t.Helper()
+	rid, _, err := metastore.ResolutionID(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testResolutions.Store(rid, res)
+}
+
+// resolutionOf returns the resolution root's record names, as the importer
+// reads it for a merge: nil when the root isn't stored or names none.
+func resolutionOf(t *testing.T, idx *metastore.Index, root uint64) *metastore.Resolution {
+	t.Helper()
+	e := idx.Entries[root]
+	if e == nil || e.Resolution == "" {
+		return nil
+	}
+	res, ok := testResolutions.Load(e.Resolution)
+	if !ok {
+		t.Fatalf("root %d names resolution %s, which no record made", root, e.Resolution)
+	}
+	return res.(*metastore.Resolution)
 }
 
 func testSigner(_ context.Context, d digest.Digest) (dagql.BlobAddress, error) {
@@ -84,7 +114,10 @@ func TestPlan(t *testing.T) {
 	record(t, idx, b1, chainBundle(30, "mine"), "cache-b")
 
 	got := Plan(idx, "cache-b", 100)
-	want := []Candidate{{Bundle: a1, Source: "cache-a", Roots: []uint64{2}}, {Bundle: a2, Source: "cache-a", Roots: []uint64{3}}}
+	want := []Candidate{
+		{Bundle: a1, Source: "cache-a", Resolution: idx.Entries[2].Resolution, Roots: []uint64{2}},
+		{Bundle: a2, Source: "cache-a", Resolution: idx.Entries[3].Resolution, Roots: []uint64{3}},
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan for cache-b: %+v, want %+v", got, want)
 	}
@@ -114,7 +147,7 @@ func TestPlanFollowsCurrentRecord(t *testing.T) {
 	got := Plan(idx, "cache-b", 0)
 	// Both of the second bundle's roots-so-far: exec stays a root, and
 	// test is one too; both records are now in the second bundle.
-	want := []Candidate{{Bundle: second, Source: "cache-a", Roots: []uint64{2, 3}}}
+	want := []Candidate{{Bundle: second, Source: "cache-a", Resolution: idx.Entries[3].Resolution, Roots: []uint64{2, 3}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan: %+v, want %+v", got, want)
 	}
@@ -130,8 +163,11 @@ func TestPlanSharedBundle(t *testing.T) {
 	nb := record(t, idx, id, stored, "cache-b")
 	got := Plan(idx, "cache-c", 0)
 	want := []Candidate{
-		{Bundle: id, Source: "cache-a", Roots: []uint64{na[1]}},
-		{Bundle: id, Source: "cache-b", Roots: []uint64{nb[1]}},
+		{Bundle: id, Source: "cache-a", Resolution: idx.Entries[na[1]].Resolution, Roots: []uint64{na[1]}},
+		{Bundle: id, Source: "cache-b", Resolution: idx.Entries[nb[1]].Resolution, Roots: []uint64{nb[1]}},
+	}
+	if want[0].Resolution == "" || want[0].Resolution == want[1].Resolution {
+		t.Fatalf("the two caches' records name resolutions %q and %q, want one each", want[0].Resolution, want[1].Resolution)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan: %+v, want %+v", got, want)
@@ -140,7 +176,7 @@ func TestPlanSharedBundle(t *testing.T) {
 		t.Fatal("candidates share a key")
 	}
 	for _, c := range got {
-		mb, err := BuildMerge(context.Background(), idx, c.Bundle, stored, c.Roots, testSigner, "team")
+		mb, err := BuildMerge(context.Background(), idx, c.Bundle, stored, resolutionOf(t, idx, c.Roots[0]), c.Roots, testSigner, "team")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -161,7 +197,7 @@ func TestBuildMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mb, err := BuildMerge(context.Background(), idx, id, stored, []uint64{numbers[2]}, testSigner, "team")
+	mb, err := BuildMerge(context.Background(), idx, id, stored, resolutionOf(t, idx, numbers[2]), []uint64{numbers[2]}, testSigner, "team")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +249,7 @@ func TestBuildMergeDroppedValues(t *testing.T) {
 	if dropped := idx.DropExpired(20); !slices.Equal(dropped, []uint64{numbers[3]}) {
 		t.Fatalf("dropped %v", dropped)
 	}
-	mb, err := BuildMerge(context.Background(), idx, id, stored, []uint64{numbers[2]}, testSigner, "team")
+	mb, err := BuildMerge(context.Background(), idx, id, stored, resolutionOf(t, idx, numbers[2]), []uint64{numbers[2]}, testSigner, "team")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,9 +269,15 @@ func TestBuildMergeDroppedValues(t *testing.T) {
 		t.Fatal("a dropped value has a service number")
 	}
 
-	// Drop base's mapping by hand: exec needs it.
-	delete(idx.Caches["cache-a"].Numbers, 10)
-	if _, err := BuildMerge(context.Background(), idx, id, stored, []uint64{numbers[2]}, testSigner, "team"); err == nil || !strings.Contains(err.Error(), "no longer stored") {
+	// Drop base's entry by hand, as DropExpired would if it had expired:
+	// exec needs it. The resolution still names it, but a merge sends only
+	// what the index holds.
+	res := resolutionOf(t, idx, numbers[2])
+	if n, _ := res.Number(1); n != numbers[1] {
+		t.Fatalf("resolution gives base %d, want %d", n, numbers[1])
+	}
+	delete(idx.Entries, numbers[1])
+	if _, err := BuildMerge(context.Background(), idx, id, stored, resolutionOf(t, idx, numbers[2]), []uint64{numbers[2]}, testSigner, "team"); err == nil || !strings.Contains(err.Error(), "no longer stored") {
 		t.Fatalf("err %v", err)
 	}
 }
@@ -247,17 +289,21 @@ func TestBuildMergeRefuses(t *testing.T) {
 	na := record(t, idx, a, sa, "cache-a")
 	nb := record(t, idx, b, sb, "cache-b")
 	ctx := context.Background()
+	ra, rb := resolutionOf(t, idx, na[1]), resolutionOf(t, idx, nb[1])
 	for name, tc := range map[string]struct {
 		roots []uint64
+		res   *metastore.Resolution
 		want  string
 	}{
-		"no roots":       {nil, "no roots"},
-		"unknown root":   {[]uint64{99}, "not stored"},
-		"another bundle": {[]uint64{nb[1]}, "is in bundle"},
-		"ok":             {[]uint64{na[1]}, ""},
+		"no roots":           {nil, ra, "no roots"},
+		"unknown root":       {[]uint64{99}, ra, "not stored"},
+		"another bundle":     {[]uint64{nb[1]}, ra, "is in bundle"},
+		"another resolution": {[]uint64{na[1]}, rb, "names resolution"},
+		"no resolution":      {[]uint64{na[1]}, nil, "none was given"},
+		"ok":                 {[]uint64{na[1]}, ra, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := BuildMerge(ctx, idx, a, sa, tc.roots, testSigner, "team")
+			_, err := BuildMerge(ctx, idx, a, sa, tc.res, tc.roots, testSigner, "team")
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -272,7 +318,7 @@ func TestBuildMergeRefuses(t *testing.T) {
 	failing := func(context.Context, digest.Digest) (dagql.BlobAddress, error) {
 		return dagql.BlobAddress{}, fmt.Errorf("no credentials")
 	}
-	if _, err := BuildMerge(ctx, idx, a, sa, []uint64{na[1]}, failing, "team"); err == nil || !strings.Contains(err.Error(), "no credentials") {
+	if _, err := BuildMerge(ctx, idx, a, sa, ra, []uint64{na[1]}, failing, "team"); err == nil || !strings.Contains(err.Error(), "no credentials") {
 		t.Fatalf("err %v", err)
 	}
 }
@@ -293,39 +339,150 @@ func TestPlanSkipsRootWithExpiredDependency(t *testing.T) {
 	}
 }
 
-// KNOWN GAP (https://github.com/zerobull-consulting/dagger/issues/47), found
-// by the real-engine run (#12): a stored bundle names an imported value by
-// the engine number it was imported on, and BuildMerge resolves it through
-// the cache's current imported mapping. When the import moves to another
-// engine entry (the engine pruned it, restarted, and had it merged again)
-// the old number no longer resolves, and the bundle can't be merged into any
-// engine again. This test fails once the gap is fixed: then make it check
-// that the bundle merges, with the values on A's numbers.
-func TestKnownGapBundleOfMovedImportsUnmergeable(t *testing.T) {
-	idx := metastore.NewIndex()
-	// A exports base (10) and exec (11).
-	aID := testBundleID("a")
-	aNumbers := record(t, idx, aID, chainBundle(10, "base", "exec"), "cache-a")
+// movedImportsFixture is #47's case: A exports base and exec; C has them
+// merged, on its engine entries 6 and 7, and exports test (8) on them. C's
+// bundle names base and exec by 6 and 7, which resolved to A's numbers when
+// it was recorded.
+func movedImportsFixture(t *testing.T) (idx *metastore.Index, cID string, cBundle *dagql.ValueBundle, want map[dagql.TransferOrdinal]uint64) {
+	t.Helper()
+	idx = metastore.NewIndex()
+	aNumbers := record(t, idx, testBundleID("a"), chainBundle(10, "base", "exec"), "cache-a")
 	baseN, execN := aNumbers[1], aNumbers[2]
-
-	// C has them merged, on its entries 6 and 7, and builds test (8) on
-	// them: its bundle names them by 6 and 7, which resolve to A's numbers.
 	idx.RecordImports("cache-c", 1, []metastore.Import{{Number: baseN, Engine: 6}, {Number: execN, Engine: 7}})
-	cID := testBundleID("c")
-	cBundle := chainBundle(6, "base", "exec", "test")
+	cID = testBundleID("c")
+	cBundle = chainBundle(6, "base", "exec", "test")
 	cNumbers := record(t, idx, cID, cBundle, "cache-c")
 	if cNumbers[1] != baseN || cNumbers[2] != execN {
 		t.Fatalf("C's bundle recorded base and exec as %d and %d, want A's %d and %d", cNumbers[1], cNumbers[2], baseN, execN)
 	}
-	testN := cNumbers[3]
-	if _, err := BuildMerge(context.Background(), idx, cID, cBundle, []uint64{testN}, testSigner, "team"); err != nil {
-		t.Fatalf("before the imports move: %v", err)
+	return idx, cID, cBundle, cNumbers
+}
+
+// checkMerges checks that C's bundle merges test, with every value on the
+// service number Record gave it: base and exec on A's.
+func checkMerges(t *testing.T, idx *metastore.Index, cID string, cBundle *dagql.ValueBundle, want map[dagql.TransferOrdinal]uint64, when string) {
+	t.Helper()
+	testN := want[3]
+	plan := Plan(idx, "cache-fresh", 0)
+	i := slices.IndexFunc(plan, func(c Candidate) bool { return c.Bundle == cID })
+	if i < 0 || !slices.Equal(plan[i].Roots, []uint64{testN}) || plan[i].Source != "cache-c" {
+		t.Fatalf("%s: plan %+v, want C's bundle %s with root %d", when, plan, cID, testN)
 	}
+	mb, err := BuildMerge(context.Background(), idx, cID, cBundle, resolutionOf(t, idx, testN), plan[i].Roots, testSigner, "team")
+	if err != nil {
+		t.Fatalf("%s: C's bundle doesn't merge: %v", when, err)
+	}
+	for _, v := range mb.Bundle.Values {
+		if v.SenderNumber != want[v.Ordinal] || mb.Numbers[v.Ordinal] != want[v.Ordinal] {
+			t.Fatalf("%s: value %d sent as %d (numbers %v), want %d", when, v.Ordinal, v.SenderNumber, mb.Numbers, want[v.Ordinal])
+		}
+	}
+}
+
+// #47, found by the real-engine run (#12): a stored bundle names an imported
+// value by the engine number it was imported on. Once the import moved to
+// another engine entry (the engine pruned it, restarted, and had it merged
+// again), the old number no longer resolved through the cache's imported
+// mapping, and the bundle couldn't be merged into any engine again. The
+// bundle's resolution, stored when Record recorded it, still gives A's
+// numbers.
+func TestBundleOfMovedImportsMerges(t *testing.T) {
+	idx, cID, cBundle, want := movedImportsFixture(t)
+	checkMerges(t, idx, cID, cBundle, want, "before the imports move")
 
 	// C prunes them, restarts, and has them merged again, on 20 and 21.
-	idx.RecordImports("cache-c", 2, []metastore.Import{{Number: baseN, Engine: 20}, {Number: execN, Engine: 21}})
-	_, err := BuildMerge(context.Background(), idx, cID, cBundle, []uint64{testN}, testSigner, "team")
-	if err == nil || !strings.Contains(err.Error(), "no longer stored") {
-		t.Fatalf("after the imports moved: %v; the gap (#47) may be fixed: update this test, the README and the issue", err)
+	idx.RecordImports("cache-c", 2, []metastore.Import{{Number: want[1], Engine: 20}, {Number: want[2], Engine: 21}})
+	if _, ok := idx.Caches["cache-c"].Imported[6]; ok {
+		t.Fatal("the import didn't move")
+	}
+	checkMerges(t, idx, cID, cBundle, want, "after the imports moved")
+}
+
+// The same after a wipe, which drops the cache's imports altogether.
+func TestBundleOfWipedImportsMerges(t *testing.T) {
+	idx, cID, cBundle, want := movedImportsFixture(t)
+	idx.ForgetImports("cache-c")
+	if c := idx.Caches["cache-c"]; c == nil || len(c.Imported) != 0 {
+		t.Fatalf("cache-c after the wipe: %+v", c)
+	}
+	checkMerges(t, idx, cID, cBundle, want, "after the wipe")
+}
+
+// A record stored before resolutions names none, and its bundle resolves
+// through the source cache's current mappings, as all bundles did before #47
+// was fixed: it merges while the imports stay, and not once they move.
+//
+// Intended: there is no resolution to read, and the index no longer knows
+// where a moved import was, so a backfill at startup could only write what
+// the mappings say then: it would save the records whose imports hadn't
+// moved yet, at the cost of a pass over every entry and bundle at startup.
+// Such a record gets a resolution when its value is exported again, and goes
+// when it expires; no deployment held stored bundles outside test runs
+// before resolutions were added.
+func TestLegacyBundleResolvesThroughCurrentMappings(t *testing.T) {
+	idx, cID, cBundle, want := movedImportsFixture(t)
+	for _, e := range idx.Entries {
+		e.Resolution = ""
+	}
+	testN := want[3]
+	if c := Plan(idx, "cache-fresh", 0); len(c) != 2 || c[1].Bundle != cID || c[1].Resolution != "" {
+		t.Fatalf("plan %+v", c)
+	}
+	mb, err := BuildMerge(context.Background(), idx, cID, cBundle, nil, []uint64{testN}, testSigner, "team")
+	if err != nil {
+		t.Fatalf("before the imports move: %v", err)
+	}
+	if mb.Numbers[1] != want[1] || mb.Numbers[2] != want[2] {
+		t.Fatalf("numbers %v, want %v", mb.Numbers, want)
+	}
+	idx.RecordImports("cache-c", 2, []metastore.Import{{Number: want[1], Engine: 20}, {Number: want[2], Engine: 21}})
+	if _, err := BuildMerge(context.Background(), idx, cID, cBundle, nil, []uint64{testN}, testSigner, "team"); err == nil || !strings.Contains(err.Error(), "no longer stored") {
+		t.Fatalf("after the imports moved: %v, want the pre-resolution failure", err)
+	}
+}
+
+// A bundle one cache recorded twice, resolved differently, plans a candidate
+// per resolution: each root merges with the resolution its record names.
+// Here the second record (an older generation's export, arriving late) keeps
+// the newer records of exec, and adds lone, dropped since the first.
+func TestPlanSplitsByResolution(t *testing.T) {
+	idx := metastore.NewIndex()
+	id := testBundleID("a")
+	stored := chainBundle(10, "base", "exec")
+	stored.Values = append(stored.Values, dagql.TransferredValue{
+		Ordinal: 3, SenderNumber: 50,
+		Record: dagql.PersistedRecord{ResultID: 3, Call: &dagql.ResultCall{Field: "lone"}},
+	})
+	stored.Roots = append(stored.Roots, dagql.TransferredRoot{Ordinal: 3, ExpiresAtUnix: 10})
+	first, res1, err := idx.RecordResolved(id, stored, "cache-a", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keepResolution(t, res1)
+	idx.DropExpired(20)
+	stored.Roots[1].ExpiresAtUnix = 0
+	second, res2, err := idx.RecordResolved(id, stored, "cache-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keepResolution(t, res2)
+	if second[3] == first[3] || second[2] != first[2] {
+		t.Fatalf("first %v, second %v", first, second)
+	}
+	plan := Plan(idx, "cache-b", 30)
+	if len(plan) != 2 || plan[0].Resolution == plan[1].Resolution || plan[0].Key() == plan[1].Key() {
+		t.Fatalf("plan %+v, want a candidate per resolution", plan)
+	}
+	for _, c := range plan {
+		mb, err := BuildMerge(context.Background(), idx, c.Bundle, stored, resolutionOf(t, idx, c.Roots[0]), c.Roots, testSigner, "team")
+		if err != nil {
+			t.Fatalf("candidate %+v: %v", c, err)
+		}
+		for _, r := range c.Roots {
+			o := idx.Entries[r].Ordinal
+			if mb.Numbers[o] != r {
+				t.Fatalf("candidate %+v: root ordinal %d sent as %d", c, o, mb.Numbers[o])
+			}
+		}
 	}
 }

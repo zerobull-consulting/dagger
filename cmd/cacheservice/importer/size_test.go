@@ -60,7 +60,7 @@ func TestMergeSizeBoundsBuildMerge(t *testing.T) {
 				idx.Roots[n] = metastore.Root{ExpiresAtUnix: 4000000000}
 				roots = append(roots, n)
 			}
-			mb, err := BuildMerge(context.Background(), idx, id, stored, roots, testSigner, "team")
+			mb, err := BuildMerge(context.Background(), idx, id, stored, resolutionOf(t, idx, roots[0]), roots, testSigner, "team")
 			if err != nil {
 				t.Fatal(err)
 			}

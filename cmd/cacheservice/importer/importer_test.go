@@ -339,7 +339,7 @@ func TestSyncMergeFailures(t *testing.T) {
 		t.Fatalf("%d merges, want %d", merges, DefaultMergeAttempts)
 	}
 	st, _ := f.im.State("cache-b")
-	if st.Failures[rec.BundleID+"/cache-a"] != DefaultMergeAttempts {
+	if st.Failures[rec.BundleID+"/cache-a/"+rec.ResolutionID] != DefaultMergeAttempts {
 		t.Fatalf("failures %+v", st.Failures)
 	}
 }
