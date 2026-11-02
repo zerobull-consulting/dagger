@@ -52,10 +52,13 @@ func newMinIOExportHarness(t *testing.T) (*exportHarness, *minioTestEnv) {
 }
 
 // After a build on engine A, its layers and bundle exist in S3. A repeated
-// export uploads nothing new.
+// export uploads nothing new, and stores the same bundle even though the
+// engine annotates the layers with buildkit/createdat only from the second
+// export on, as a real engine does (#30).
 func TestMinIOExportBuild(t *testing.T) {
 	h, env := newMinIOExportHarness(t)
 	ctx := context.Background()
+	h.cache.CreatedAtAnnotation = true
 	layers := h.build()
 
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
