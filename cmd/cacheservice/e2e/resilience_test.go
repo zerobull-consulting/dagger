@@ -188,6 +188,17 @@ func (s *state) engineRestart(t *testing.T) {
 	cacheA, genA := a.CacheID(), a.Generation()
 	stall, query, want, stalled, logMark := s.midUpload(t, "engine-restart-run-a")
 	idxBefore, bundlesBefore := env.Index(), env.BundleIDs()
+	// The entries the cut export carries, by A's engine numbers.
+	var pending []uint64
+	entries, err := s.main.Entries(a.Conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Retained && !e.Stored {
+			pending = append(pending, e.Number)
+		}
+	}
 
 	old := a.Conn
 	t.Logf("restarting A with the upload of %v in flight", shorts(digestStrings(stalled)))
@@ -219,6 +230,14 @@ func (s *state) engineRestart(t *testing.T) {
 			newGen++
 		}
 	}
+	// Each engine number the cut export carried is stored under it, as
+	// generation 2's: the numbers held across the restart.
+	var renumbered []uint64
+	for _, n := range pending {
+		if m, ok := idx.Caches[cacheA].Numbers[n]; !ok || m.Generation != a.Generation() {
+			renumbered = append(renumbered, n)
+		}
+	}
 
 	Check(t, a.CacheID() == cacheA && a.Generation() == genA+1,
 		"A restarted cleanly in %s: same cache %s, generation %d (was %d)", restart.Round(100*time.Millisecond), Short(a.CacheID()), a.Generation(), genA)
@@ -226,6 +245,8 @@ func (s *state) engineRestart(t *testing.T) {
 		"the export on the old generation's connection was interrupted, not failed")
 	Check(t, len(stalled) > 0 && idxMid.NextNumber == idxBefore.NextNumber && len(idxMid.Entries) == len(idxBefore.Entries) && slices.Equal(bundlesMid, bundlesBefore),
 		"nothing of the cut export was published: the index (%d entries) and the %d bundles are as before it", len(idxMid.Entries), len(bundlesMid))
+	Check(t, len(pending) > 0 && len(renumbered) == 0,
+		"the cut export's engine entries %v are each recorded under the same number as generation %d's (not: %v)", pending, a.Generation(), renumbered)
 	Check(t, len(holding) > 0 && newGen > 0,
 		"the export ran again on generation %d, under the same entry numbers, and was stored with the layer that was in flight (%d index entries of generation %d in bundles %v)",
 		a.Generation(), newGen, a.Generation(), shorts(holding))

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/opencontainers/go-digest"
+
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
@@ -22,10 +24,14 @@ func TestMergeSizeBoundsBuildMerge(t *testing.T) {
 		// merged is how many of the chain's entries are merged roots; the
 		// rest are sent expired.
 		merged int
+		// sha512 gives every layer a sha512 digest, whose address is longer
+		// than the sha256 one AddressBytes measures.
+		sha512 bool
 	}{
 		{name: "one value", values: 1, merged: 1},
 		{name: "a deep chain, every entry a root", values: 40, merged: 40},
 		{name: "a deep chain, its top merged", values: 40, merged: 1},
+		{name: "a deep chain of sha512 layers", values: 40, merged: 40, sha512: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			recipes := make([]string, tc.values)
@@ -33,6 +39,14 @@ func TestMergeSizeBoundsBuildMerge(t *testing.T) {
 				recipes[i] = fmt.Sprintf("step-%d", i)
 			}
 			stored := chainBundle(10, recipes...)
+			if tc.sha512 {
+				for _, o := range stored.Outputs {
+					for i := range o.Chain.Layers {
+						l := &o.Chain.Layers[i].Descriptor
+						l.Digest = digest.SHA512.FromString(l.Digest.String())
+					}
+				}
+			}
 			stored.Roots = nil
 			for i := range tc.values {
 				stored.Roots = append(stored.Roots, dagql.TransferredRoot{Ordinal: stored.Values[i].Ordinal})

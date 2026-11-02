@@ -47,17 +47,27 @@ func MergeSize(bundle *dagql.ValueBundle, storedBytes, addressBytes int, renewal
 		}
 		n += chainOverheadBytes + keyBytes
 		for _, l := range o.Chain.Layers {
-			// "<digest>":<address>,
-			n += len(l.Descriptor.Digest.String()) + 4 + addressBytes
+			d := l.Descriptor.Digest
+			// "<digest>":<address>, where the address names the blob's key,
+			// which holds the digest's hex once: longer for a longer
+			// digest than AddressBytes measured.
+			n += len(d.String()) + 4 + addressBytes + max(0, len(d.Encoded())-canonicalHexBytes)
 		}
 	}
 	return n
 }
 
+// canonicalHexBytes is the hex length of a digest of the algorithm
+// AddressBytes signs for.
+var canonicalHexBytes = digest.Canonical.Size() * 2
+
 // AddressBytes returns the size of one download address from sign, as it is
-// encoded in a merge. Every address the signer makes for a blob of the
-// default algorithm has the same size, up to its expiry's digits, which it
-// counts at their most.
+// encoded in a merge, for a blob of the canonical algorithm (sha256). Every
+// address the signer makes for such a blob has the same size, up to its
+// expiry's digits, which it counts at their most. A blob's address names its
+// key, which holds the algorithm's name and the digest's hex once
+// (blobstore's blobKey): MergeSize adds the extra hex of a longer digest,
+// such as sha512's, per layer.
 func AddressBytes(ctx context.Context, sign Signer) (int, error) {
 	addr, err := sign(ctx, digest.Canonical.FromString(""))
 	if err != nil {
