@@ -7,8 +7,8 @@
 #   dev.sh status  show the containers
 #   dev.sh env     print the settings as shell exports
 #   dev.sh test    run the Go tests against it (starts it first)
-#   dev.sh e2e     run the remote cache with two real engines (e2e.sh)
-#   dev.sh e2e-down  stop what dev.sh e2e left running
+#   dev.sh e2e     run the remote cache with real engines (cmd/cacheservice/e2e)
+#   dev.sh e2e-down  remove the engines a run with E2E_KEEP=1 left
 #
 # Address, ports, credentials and bucket come from MINIO_BIND_ADDR,
 # MINIO_API_PORT, MINIO_CONSOLE_PORT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
@@ -81,8 +81,33 @@ test)
 	cd "$repo"
 	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/...
 	;;
-e2e) exec "$here/e2e.sh" run ;;
-e2e-down) exec "$here/e2e.sh" down ;;
+e2e)
+	# Extra arguments go to go test, such as -run 'TestRealEngines/^renew$'.
+	# E2E_SCENARIOS picks the scenarios after the first, which always runs.
+	scenarios="${E2E_SCENARIOS:-}"
+	for sc in $scenarios; do
+		case "$sc" in
+		reexport | renew | prune | superseded) ;;
+		*)
+			echo "dev.sh e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: reexport renew prune superseded)" >&2
+			exit 2
+			;;
+		esac
+	done
+	run=TestRealEngines
+	if [[ -n "${scenarios// /}" ]]; then
+		run="TestRealEngines/^($(tr -s ' ' '|' <<<"$scenarios" | sed 's/^|//; s/|$//'))\$"
+	fi
+	up >/dev/null
+	eval "$(print_env)"
+	cd "$repo"
+	CACHESERVICE_E2E=1 go test -count=1 -v -timeout 60m -run "$run" ./cmd/cacheservice/e2e/ "${@:2}"
+	;;
+e2e-down)
+	label=dagger-remote-cache-e2e
+	docker ps -aq --filter "label=$label" | xargs -r docker rm -f >/dev/null
+	docker volume ls -q --filter "label=$label" | xargs -r docker volume rm -f >/dev/null
+	;;
 *)
 	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2

@@ -487,7 +487,9 @@ empty cache, runs the same pipeline and gets cache hits whose layers come
 from MinIO. Then it runs the [scenarios](#the-scenarios) that check what a
 first hit doesn't: a repeated export, renewal after the GETs expired, a
 pruned import, and a replaced value. One command builds and starts
-everything from empty and checks the outcome. See
+everything from empty and checks the outcome. It is a Go test,
+[`e2e`](e2e/), that runs the service in-process, and CI runs it on every
+pull request. See
 [`hack/remote-cache/README.md`](../../hack/remote-cache/README.md#real-engines-devsh-e2e)
 for what it does and its settings.
 

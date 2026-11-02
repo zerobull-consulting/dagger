@@ -111,3 +111,59 @@ jobs:
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+  e2e:
+    name: real engines (e2e)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        id: setup-go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # setup-go's own cache uses one key for every job, so only the first
+          # job to finish saves it; each job caches its own build below.
+          cache: false
+      # Module and build caches, per job: this one builds the engine and the
+      # CLI. Every run restores the newest cache saved by a push to
+      # feature/remote-cache; only those pushes save one.
+      - name: Restore Go cache
+        id: go-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      # Starts MinIO, builds the engine image from this commit, and runs
+      # TestRealEngines in cmd/cacheservice/e2e: the service in-process,
+      # engines in Docker. See hack/remote-cache/README.md, "Real engines".
+      - name: Real engines
+        env:
+          E2E_DIR: ${{ runner.temp }}/e2e
+        run: ./hack/remote-cache/dev.sh e2e
+      # Each run's service logs, CLI output, index and importer state, and
+      # the engines' logs when it failed.
+      - name: Upload the run's files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-runs
+          path: ${{ runner.temp }}/e2e/runs
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: ./hack/remote-cache/dev.sh reset
+      - name: Save Go cache
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
