@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -980,4 +981,118 @@ func TestEnableRefusesStoreWithoutNamespaces(t *testing.T) {
 		t.Fatal("the import path took a store without namespaces")
 	}
 	svc.Wait()
+}
+
+// A revoked connection gets nothing more of its namespace while its close
+// handshake runs (up to 5s with an engine that doesn't answer it): it is
+// marked revoked and its import loop stops, cancelling a merge in flight,
+// before the reload returns, and its renewals are refused.
+func TestRevocationStopsImportsAtOnce(t *testing.T) {
+	h := newAuthHarness(t)
+	a := fakeengine.New("cache-a", 1)
+	layersA := authBuild(a, "a")
+	h.connect(a, "tok-a")
+	h.export(a, "tok-a")
+	nsA := h.ns("team-a")
+
+	// An engine of team A that takes the merge of A's entries and then
+	// reads nothing more: neither the merge's reply nor the close frame
+	// ever comes back.
+	raw, code := dialAs(t, h.srv, "tok-a2")
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade: %d", code)
+	}
+	raw.helloAs("cache-r")
+	if env := raw.next(); env.Type != protocol.TypeMerge {
+		t.Fatalf("got %s, want the merge of A's entries", env.Type)
+	}
+	c := h.svc.engineFor(nsA, "cache-r")
+	if c == nil {
+		t.Fatal("not connected")
+	}
+	looping := func() bool {
+		p := h.svc.imports
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		_, ok := p.triggers[c]
+		return ok
+	}
+	if !looping() {
+		t.Fatal("no import loop")
+	}
+
+	h.reload("tok-a team-a\ntok-b team-b\n")
+	if !c.revoked.Load() {
+		t.Fatal("not marked revoked when the reload returned")
+	}
+	waitUntil(t, time.Second, "the import loop to stop, well before the close handshake times out", func() bool { return !looping() })
+	renewed := h.svc.renew(t.Context(), c, protocol.Renew{RenewalKey: "team-a", Layers: exportLayers(layersA...)})
+	if !renewed.Unavailable || len(renewed.Addresses) != 0 {
+		t.Fatalf("a revoked connection renewed: %+v", renewed)
+	}
+	if res := h.svc.syncImports(t.Context(), c); len(res.Merged) != 0 {
+		t.Fatalf("a revoked connection synced: %+v", res)
+	}
+}
+
+// blockingTokens holds the first lookup of one token until released, to
+// interleave token reloads.
+type blockingTokens struct {
+	Tokens
+	token   string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingTokens) Lookup(token string) (string, bool) {
+	if token == b.token {
+		b.once.Do(func() {
+			close(b.entered)
+			<-b.release
+		})
+	}
+	return b.Tokens.Lookup(token)
+}
+
+// Token reloads run one at a time: one that replaces the tokens while
+// another is still revoking waits for it, so no connection is revoked by a
+// set of tokens another reload has already replaced.
+func TestTokenReloadsSerialized(t *testing.T) {
+	h := newAuthHarness(t)
+	raw, _ := dialAs(t, h.srv, "tok-b")
+	raw.helloAs("cache-b")
+
+	without, err := ParseTokens([]byte("tok-a team-a\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	with, err := ParseTokens([]byte(testTokens))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &blockingTokens{Tokens: without, token: "tok-b", entered: make(chan struct{}), release: make(chan struct{})}
+	doneFirst, doneSecond := make(chan int, 1), make(chan int, 1)
+	go func() { doneFirst <- h.svc.SetTokens(first) }()
+	<-first.entered // the first is checking tok-b's connection
+	go func() { doneSecond <- h.svc.SetTokens(with) }()
+	select {
+	case <-doneSecond:
+		t.Fatal("a second SetTokens ran while the first was revoking")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(first.release)
+	if n := <-doneFirst; n != 1 {
+		t.Fatalf("the first SetTokens revoked %d connections, want 1", n)
+	}
+	if n := <-doneSecond; n != 0 {
+		t.Fatalf("the second SetTokens revoked %d connections, want 0", n)
+	}
+	if got := raw.closed(); got != protocol.CloseTokenRevoked {
+		t.Fatalf("closed with %d", got)
+	}
+	// The tokens in effect are the second set's, which has tok-b.
+	if _, code := dialAs(t, h.srv, "tok-b"); code != http.StatusSwitchingProtocols {
+		t.Fatalf("tok-b refused after the second set: %d", code)
+	}
 }

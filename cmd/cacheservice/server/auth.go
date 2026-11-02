@@ -22,6 +22,8 @@ const (
 // tokens file, the service takes any token, and every engine is in the
 // default namespace.
 func (s *Service) UseTokensFile(path string) error {
+	s.tokensMu.Lock()
+	defer s.tokensMu.Unlock()
 	tf, err := LoadTokenFile(path)
 	if err != nil {
 		return err
@@ -29,7 +31,7 @@ func (s *Service) UseTokensFile(path string) error {
 	s.mu.Lock()
 	s.tokensFile = path
 	s.mu.Unlock()
-	s.SetTokens(tf)
+	s.setTokensLocked(tf)
 	s.logger.Info("tokens loaded", "file", path, "tokens", tf.Len(), "namespaces", tf.Namespaces())
 	return nil
 }
@@ -37,7 +39,10 @@ func (s *Service) UseTokensFile(path string) error {
 // ReloadTokens reads the tokens file again, as on SIGHUP, and closes the
 // connections whose token it no longer maps to their namespace. A file that
 // can't be read or parsed changes nothing: the tokens loaded before stay.
+// Reloads run one at a time, so the file read last is the one in effect.
 func (s *Service) ReloadTokens() error {
+	s.tokensMu.Lock()
+	defer s.tokensMu.Unlock()
 	s.mu.Lock()
 	path := s.tokensFile
 	s.mu.Unlock()
@@ -49,7 +54,7 @@ func (s *Service) ReloadTokens() error {
 		s.logger.Error("tokens not reloaded; the tokens loaded before stay", "file", path, "error", err)
 		return err
 	}
-	revoked := s.SetTokens(tf)
+	revoked := s.setTokensLocked(tf)
 	s.logger.Info("tokens reloaded", "file", path, "tokens", tf.Len(), "namespaces", tf.Namespaces(), "revokedConnections", revoked)
 	return nil
 }
@@ -59,7 +64,18 @@ func (s *Service) ReloadTokens() error {
 // to the namespace it connected in: a removed token, or one moved to another
 // namespace. Nil makes the service unauthenticated. It returns how many
 // connections it closed.
+//
+// Calls run one at a time, with ReloadTokens and UseTokensFile: each
+// revocation is decided by the tokens in effect, never by a set another call
+// has already replaced.
 func (s *Service) SetTokens(tokens Tokens) int {
+	s.tokensMu.Lock()
+	defer s.tokensMu.Unlock()
+	return s.setTokensLocked(tokens)
+}
+
+// setTokensLocked is SetTokens; it requires s.tokensMu.
+func (s *Service) setTokensLocked(tokens Tokens) int {
 	s.mu.Lock()
 	s.tokens = tokens
 	s.tokensGen++
@@ -73,15 +89,18 @@ func (s *Service) SetTokens(tokens Tokens) int {
 		if s.tokenMaps(tokens, c.secret, c.ns.name) {
 			continue
 		}
-		// Gone from the list at once, so no export or import picks it
-		// while its close handshake runs.
+		// Revoked at once, before its close handshake: gone from the
+		// list, so no export picks it; its import loop stopped, and its
+		// renewals refused, so nothing more of the namespace reaches it.
 		s.mu.Lock()
 		if s.conns[c.id] == c {
 			delete(s.conns, c.id)
 		}
 		s.mu.Unlock()
-		revoked++
-		go c.revoke()
+		if c.markRevoked() {
+			revoked++
+			go c.closeRevoked()
+		}
 	}
 	return revoked
 }
@@ -147,14 +166,27 @@ func (s *Service) register(c *engineConn) bool {
 	}
 }
 
-// revoke closes the connection with protocol.CloseTokenRevoked, and waits
-// for the close handshake (at most 5s, then it drops the connection).
-func (c *engineConn) revoke() {
+// markRevoked marks the connection revoked, and stops its import loop,
+// cancelling a sync in flight. It reports false when it was already.
+func (c *engineConn) markRevoked() bool {
 	if !c.revoked.CompareAndSwap(false, true) {
-		return
+		return false
+	}
+	c.mu.Lock()
+	stop := c.stopImports
+	c.mu.Unlock()
+	if stop != nil {
+		stop()
 	}
 	c.logger.Info("closing the engine's connection: its token was revoked", "token", c.token)
 	c.svc.metrics.TokenRevoked(c.ns.name)
+	return true
+}
+
+// closeRevoked closes a revoked connection with protocol.CloseTokenRevoked,
+// and waits for the close handshake (at most 5s, then it drops the
+// connection).
+func (c *engineConn) closeRevoked() {
 	_ = c.conn.Close(websocket.StatusCode(protocol.CloseTokenRevoked), "token revoked")
 }
 

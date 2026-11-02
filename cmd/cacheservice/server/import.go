@@ -121,6 +121,9 @@ func (s *Service) startImports(connCtx context.Context, c *engineConn) {
 
 // syncImports syncs one engine and logs what it did.
 func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Result {
+	if c.revoked.Load() {
+		return importer.Result{}
+	}
 	res, err := s.syncMeasured(ctx, c)
 	if err != nil && ctx.Err() == nil && s.connected(c) {
 		c.logger.Warn("import sync failed", "error", err)
@@ -153,7 +156,7 @@ func (s *Service) triggerImports(ns *namespace, except string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for c, trigger := range p.triggers {
-		if c.ns != ns || c.CacheID() == except {
+		if c.ns != ns || c.CacheID() == except || c.revoked.Load() {
 			continue
 		}
 		select {
@@ -203,7 +206,7 @@ func (s *Service) forgetWiped(ns *namespace, cacheID string) {
 // namespace, a token could have those blobs merged into its engine anyway.
 // TestRenewNotLimitedToOfferedDigests pins it.
 func (s *Service) renew(ctx context.Context, c *engineConn, req protocol.Renew) protocol.Renewed {
-	if s.imports == nil {
+	if s.imports == nil || c.revoked.Load() {
 		return protocol.Renewed{Unavailable: true}
 	}
 	return c.ns.importer.Renew(ctx, req)

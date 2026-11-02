@@ -45,6 +45,8 @@ type Service struct {
 	// one set of tokens isn't welcomed after another replaced it.
 	tokens    Tokens
 	tokensGen uint64
+	// tokensMu serializes SetTokens, ReloadTokens and UseTokensFile.
+	tokensMu sync.Mutex
 	// tokensFile is where ReloadTokens reads tokens from.
 	tokensFile string
 
@@ -122,7 +124,9 @@ type engineConn struct {
 	secret string
 	key    tokenKey
 	// ns is the namespace of the token.
-	ns          *namespace
+	ns *namespace
+	// revoked is set once the token no longer maps to ns: the connection
+	// gets nothing more of the namespace while its close handshake runs.
 	revoked     atomic.Bool
 	remote      string
 	connectedAt time.Time
@@ -134,6 +138,8 @@ type engineConn struct {
 	hello  protocol.Hello
 
 	mu sync.Mutex
+	// stopImports ends the import sync loop; set once it starts.
+	stopImports context.CancelFunc
 	// pending are the service's requests waiting for their replies, by ID.
 	pending map[uint64]chan protocol.Envelope
 }
@@ -213,7 +219,8 @@ func (c *engineConn) serve(ctx context.Context) error {
 		return err
 	}
 	if !c.svc.register(c) {
-		c.revoke()
+		c.markRevoked()
+		c.closeRevoked()
 		return errors.New("token revoked before welcome")
 	}
 	if err := c.reply(ctx, env, protocol.TypeWelcome, protocol.Welcome{}); err != nil {
@@ -222,6 +229,13 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// The import sync loop ends with the connection.
 	importCtx, stopImports := context.WithCancel(ctx)
 	defer stopImports()
+	c.mu.Lock()
+	c.stopImports = stopImports
+	c.mu.Unlock()
+	// A revocation since register found no loop to stop.
+	if c.revoked.Load() {
+		stopImports()
+	}
 	c.svc.startImports(importCtx, c)
 	for {
 		env, err := c.read(ctx)
