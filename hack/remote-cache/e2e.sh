@@ -10,7 +10,8 @@
 #      repo, and an engine image that copies them over a release image;
 #   2. starts MinIO, published on the Docker bridge gateway so the engine
 #      containers reach it at the address the service signs URLs for;
-#   3. starts cacheservice on the host, with the S3 settings from `dev.sh env`;
+#   3. starts cacheservice on the host, on the bridge gateway only (it takes
+#      any token), with the S3 settings from `dev.sh env`;
 #   4. starts engines A and B, each pointed at the service;
 #   5. runs the pipeline on A, waits until the index in MinIO holds its
 #      entries and the service has merged them into B, then runs the same
@@ -137,12 +138,12 @@ start_minio() {
 }
 
 start_service() {
-	log "Starting cacheservice on :${CACHESERVICE_PORT}"
+	log "Starting cacheservice on ${gateway}:${CACHESERVICE_PORT}"
 	if curl -fsS -o /dev/null "$debug_url/debug/engines" 2>/dev/null; then
 		die "a cacheservice already answers on ${debug_url}: stop it first (dev.sh e2e-down, with the E2E_DIR it was started with)"
 	fi
 	"$E2E_DIR/bin/cacheservice" -v \
-		-listen ":${CACHESERVICE_PORT}" \
+		-listen "${gateway}:${CACHESERVICE_PORT}" \
 		-debug-listen "127.0.0.1:${CACHESERVICE_DEBUG_PORT}" \
 		-scope "$E2E_SCOPE" \
 		>"$E2E_DIR/cacheservice.log" 2>&1 &

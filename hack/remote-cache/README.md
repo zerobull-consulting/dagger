@@ -191,7 +191,9 @@ engines A and B new, empty cache volumes. Then it:
 2. starts MinIO on the Docker bridge gateway (see
    [above](#pointing-an-engine-at-the-service-and-minio)), and
    `cacheservice` on the host with `dev.sh env`'s settings, listening on
-   `:8090`, with its debug API on `127.0.0.1:8091`;
+   the gateway's port 8090 only (it accepts any engine token and any OTLP
+   request, so it isn't exposed beyond this host), with its debug API on
+   `127.0.0.1:8091`;
 3. starts engines A and B in containers, each with
    `_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL`, `DAGGER_CLOUD_TOKEN` and
    `DAGGER_CLOUD_URL` pointing at the service on the gateway;
