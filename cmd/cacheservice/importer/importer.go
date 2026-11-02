@@ -197,6 +197,29 @@ type Value struct {
 	// Complete and Offered are the entry's parts, by address key.
 	Complete []dagql.PersistedPartAddress `json:"complete,omitempty"`
 	Offered  []dagql.PersistedPartAddress `json:"offered,omitempty"`
+	// imported is set when the index recorded the value as the engine
+	// entry's import.
+	imported bool
+}
+
+// importedCopies copies the values the index recorded as imports, of those
+// numbers (nil: all), for Config.Imported. Requires mu, when values is a
+// state's.
+func importedCopies(values map[uint64]*Value, numbers map[uint64]bool) map[uint64]Value {
+	out := map[uint64]Value{}
+	for n, v := range values {
+		if v.imported && (numbers == nil || numbers[n]) {
+			out[n] = v.clone()
+		}
+	}
+	return out
+}
+
+// notifyImported passes values to Config.Imported, if set.
+func (im *Importer) notifyImported(eng Engine, values map[uint64]Value) {
+	if im.cfg.Imported != nil && len(values) > 0 {
+		im.cfg.Imported(eng.CacheID(), eng.Generation(), values)
+	}
 }
 
 func (v *Value) clone() Value {
@@ -644,16 +667,35 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 	for _, n := range slices.Sorted(maps.Keys(values)) {
 		imports = append(imports, metastore.Import{Number: n, Engine: values[n].Number})
 	}
-	if _, err := im.cfg.Meta.RecordImports(ctx, im.cfg.Scope, eng.CacheID(), eng.Generation(), imports); err != nil {
+	recorded, err := im.cfg.Meta.RecordImports(ctx, im.cfg.Scope, eng.CacheID(), eng.Generation(), imports)
+	if err != nil {
 		if ctx.Err() != nil {
 			return MergedBundle{}, nil, &connectionError{context.Cause(ctx)}
 		}
 		return MergedBundle{}, nil, err
 	}
+	// Only the imports the index took are the stored values: one the index
+	// skipped landed on an entry the cache exported itself.
+	for _, r := range recorded {
+		if v := values[r.Number]; v != nil && v.Number == r.Engine {
+			v.imported = true
+		}
+	}
 
 	im.mu.Lock()
 	if !im.currentLocked(eng, st) {
+		// A wipe forgets the cache here before it drops the cache's
+		// imports from the index. If it did so while the imports were
+		// being written, they may have landed after the drop: drop them
+		// again. A new generation of the same cache keeps them, as its
+		// entries are the same.
+		wiped := im.caches[eng.CacheID()] == nil
 		im.mu.Unlock()
+		if wiped {
+			if err := im.cfg.Meta.ForgetImports(ctx, im.cfg.Scope, eng.CacheID()); err != nil {
+				im.log.Warn("import: forgetting a wiped cache's imports failed", "cacheID", eng.CacheID(), "error", err)
+			}
+		}
 		return MergedBundle{}, nil, errStateReset
 	}
 	st.merged[c.Key()] = &out
@@ -661,17 +703,9 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 	for n, v := range values {
 		st.values[n] = v
 	}
-	var copies map[uint64]Value
-	if im.cfg.Imported != nil {
-		copies = make(map[uint64]Value, len(values))
-		for n, v := range values {
-			copies[n] = v.clone()
-		}
-	}
+	copies := importedCopies(values, nil)
 	im.mu.Unlock()
-	if im.cfg.Imported != nil {
-		im.cfg.Imported(eng.CacheID(), eng.Generation(), copies)
-	}
+	im.notifyImported(eng, copies)
 	im.log.Info("import: merged", "cacheID", eng.CacheID(), "bundle", c.Bundle,
 		"roots", len(c.Roots), "values", len(reply.Values), "retained", len(out.Retained),
 		"expired", len(out.Expired), "offers", len(offers))
@@ -816,6 +850,8 @@ func (im *Importer) sendOffers(ctx context.Context, eng Engine, st *cacheState, 
 	}
 
 	var retry []pendingOffer
+	// touched are the values the answers changed, by service number.
+	touched := map[uint64]bool{}
 	im.mu.Lock()
 	live := im.currentLocked(eng, st)
 	for i, answer := range offered.Items {
@@ -848,11 +884,13 @@ func (im *Importer) sendOffers(ctx context.Context, eng Engine, st *cacheState, 
 				counts.Accepted++
 				if live && target != nil && target.Number == n {
 					target.Offered = addAddress(target.Offered, p.part.Offer.Address)
+					touched[p.part.CloudNumber] = true
 				}
 			case protocol.OfferAlreadyComplete:
 				counts.AlreadyComplete++
 				if live && target != nil && target.Number == n {
 					target.Complete = addAddress(target.Complete, p.part.Offer.Address)
+					touched[p.part.CloudNumber] = true
 				}
 			case protocol.OfferExecutionStarted:
 				counts.ExecutionStarted++
@@ -866,8 +904,11 @@ func (im *Importer) sendOffers(ctx context.Context, eng Engine, st *cacheState, 
 			}
 		}
 		if live && answer.Replacements != 0 {
-			for _, v := range st.values {
+			for s, v := range st.values {
 				if v.Number == n && answer.Replacements >= v.Replacements {
+					if answer.Replacements != v.Replacements {
+						touched[s] = true
+					}
 					v.Replacements = answer.Replacements
 					if answer.Deps != nil {
 						v.Deps = slices.Clone(answer.Deps)
@@ -876,10 +917,15 @@ func (im *Importer) sendOffers(ctx context.Context, eng Engine, st *cacheState, 
 			}
 		}
 	}
+	var changed map[uint64]Value
 	if live {
 		st.offers.add(counts)
+		// The export path learns the parts the offers placed, so a
+		// span naming one doesn't make the import look changed.
+		changed = importedCopies(st.values, touched)
 	}
 	im.mu.Unlock()
+	im.notifyImported(eng, changed)
 	requeue(bumpAttempts(retry, im.cfg.OfferAttempts))
 	im.log.Info("import: offered", "cacheID", eng.CacheID(), "items", len(req.Items),
 		"accepted", counts.Accepted, "alreadyComplete", counts.AlreadyComplete,

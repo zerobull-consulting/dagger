@@ -465,3 +465,21 @@ func TestTrackerImportedNotExported(t *testing.T) {
 		t.Fatalf("after prune: %v", got)
 	}
 }
+
+// Intentional: an unchanged import whose spans report a later expiry is not
+// exported, as a stored entry isn't (exportedValue compares replacements and
+// parts only). An export couldn't change the expiry anyway: the index keeps
+// an imported value's record, whose expiry the entry has, unless the export
+// holds more parts (see metastore's TestRecordImportKeepsRecordExpiry).
+func TestTrackerImportedIgnoresExpiry(t *testing.T) {
+	tr := newTestTracker()
+	tr.Imported("c", 1, []ImportedValue{{Number: 1, Parts: []dagql.PersistedPartAddress{{Part: "fs"}}}})
+	o := state(1, 10, fsPart)
+	o.Expires = t0.Add(time.Hour).Unix()
+	o.RetentionExp = t0.Add(2 * time.Hour).Unix()
+	tr.Observe(o, t0)
+	tr.SessionEnded("c", 1, "s1", 1, t0)
+	if got := roots(tr.Due(t0)); len(got) != 0 {
+		t.Fatalf("exported %v", got)
+	}
+}

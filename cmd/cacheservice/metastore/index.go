@@ -498,17 +498,17 @@ type Import struct {
 
 // RecordImports records that stored entries were merged into the engine
 // cache cacheID at generation, and landed on the given engine entries, and
-// returns how many it recorded. It skips an import of an entry no longer
+// returns the imports it recorded. It skips an import of an entry no longer
 // stored, of an entry the cache exported itself, and onto an engine entry
 // the cache exported: that entry is the cache's own, and keeps its own
 // service number. A stored entry imported onto another engine entry than
 // before, as when the engine replaced the one it landed on, moves there.
-func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Import) int {
+func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Import) []Import {
 	if cacheID == "" {
-		return 0
+		return nil
 	}
 	cache := idx.Caches[cacheID]
-	recorded := 0
+	var recorded []Import
 	for _, im := range imports {
 		e, ok := idx.Entries[im.Number]
 		if !ok || im.Engine == 0 || e.Source.CacheID == cacheID {
@@ -535,7 +535,7 @@ func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Imp
 		}
 		cache.Imported[im.Engine] = Mapping{Number: im.Number, Generation: gen}
 		cache.Generation = max(cache.Generation, generation)
-		recorded++
+		recorded = append(recorded, im)
 	}
 	return recorded
 }
@@ -714,24 +714,24 @@ func (s *Store) DropExpired(ctx context.Context, scope string, nowUnix int64) ([
 }
 
 // RecordImports records stored entries merged into an engine cache, as
-// Index.RecordImports does, in one atomic index update, and returns how many
-// it recorded.
-func (s *Store) RecordImports(ctx context.Context, scope, cacheID string, generation uint64, imports []Import) (int, error) {
+// Index.RecordImports does, in one atomic index update, and returns the
+// imports it recorded.
+func (s *Store) RecordImports(ctx context.Context, scope, cacheID string, generation uint64, imports []Import) ([]Import, error) {
 	if cacheID == "" {
-		return 0, errors.New("record imports: no cacheID")
+		return nil, errors.New("record imports: no cacheID")
 	}
 	if len(imports) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-	var n int
+	var recorded []Import
 	_, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
-		n = idx.RecordImports(cacheID, generation, imports)
+		recorded = idx.RecordImports(cacheID, generation, imports)
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("record imports into %q: %w", cacheID, err)
+		return nil, fmt.Errorf("record imports into %q: %w", cacheID, err)
 	}
-	return n, nil
+	return recorded, nil
 }
 
 // ForgetImports drops an engine cache's imported mappings from the scope's

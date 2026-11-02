@@ -30,7 +30,7 @@ func importChain(t *testing.T) *Index {
 	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1); err != nil {
 		t.Fatal(err)
 	}
-	n := idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 100}, {Number: 2, Engine: 101}, {Number: 3, Engine: 102}})
+	n := len(idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 100}, {Number: 2, Engine: 101}, {Number: 3, Engine: 102}}))
 	if n != 3 {
 		t.Fatalf("recorded %d imports, want 3", n)
 	}
@@ -144,15 +144,15 @@ func TestRecordImportsSkips(t *testing.T) {
 	if _, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 200}}, root(1, 0)), "cache-b", 1); err != nil {
 		t.Fatal(err)
 	}
-	n := idx.RecordImports("cache-b", 1, []Import{{Number: 99, Engine: 300}, {Number: 4, Engine: 301}, {Number: 1, Engine: 200}})
+	n := len(idx.RecordImports("cache-b", 1, []Import{{Number: 99, Engine: 300}, {Number: 4, Engine: 301}, {Number: 1, Engine: 200}}))
 	if n != 0 {
 		t.Fatalf("recorded %d", n)
 	}
-	if n := idx.RecordImports("cache-a", 1, []Import{{Number: 1, Engine: 10}}); n != 0 {
+	if n := len(idx.RecordImports("cache-a", 1, []Import{{Number: 1, Engine: 10}})); n != 0 {
 		t.Fatalf("recorded an import of cache-a's own entry")
 	}
 	// An import that landed elsewhere moves.
-	if n := idx.RecordImports("cache-b", 2, []Import{{Number: 1, Engine: 150}}); n != 1 {
+	if n := len(idx.RecordImports("cache-b", 2, []Import{{Number: 1, Engine: 150}})); n != 1 {
 		t.Fatalf("recorded %d", n)
 	}
 	c := idx.Caches["cache-b"]
@@ -221,9 +221,9 @@ func TestStoreRecordImports(t *testing.T) {
 	if _, err := s.Record(ctx, "s1", chain(10), "cache-a", 1); err != nil {
 		t.Fatal(err)
 	}
-	n, err := s.RecordImports(ctx, "s1", "cache-b", 1, []Import{{Number: 3, Engine: 7}})
-	if err != nil || n != 1 {
-		t.Fatalf("%d, %v", n, err)
+	rec, err := s.RecordImports(ctx, "s1", "cache-b", 1, []Import{{Number: 3, Engine: 7}})
+	if err != nil || len(rec) != 1 || rec[0] != (Import{Number: 3, Engine: 7}) {
+		t.Fatalf("%v, %v", rec, err)
 	}
 	if m := mustIndex(t, s, "s1").Caches["cache-b"].Imported[7]; m.Number != 3 {
 		t.Fatalf("mapping %+v", m)
@@ -236,5 +236,65 @@ func TestStoreRecordImports(t *testing.T) {
 	}
 	if _, err := s.RecordImports(ctx, "s1", "", 1, []Import{{Number: 3, Engine: 7}}); err == nil {
 		t.Fatal("no cacheID: no error")
+	}
+}
+
+// Known gap: an importing cache's record of an imported value that holds a
+// part the stored record lacks, but lacks one the stored record holds, is
+// not recorded. The stored record stays, so its parts aren't lost (an entry
+// names one record, and records of two bundles can't be merged), and the new
+// part never reaches the index. The engine still has it; only other engines
+// don't get it. See "Imported entries" in README.md.
+func TestRecordKnownGapImportWithOtherParts(t *testing.T) {
+	idx := importChain(t) // stored records hold "fs"
+	b := withParts(testBundle([]val{{sender: 100}}, root(1, 0)), 1, "execMeta")
+	before := *idx.Entries[1]
+	nums, err := idx.Record(strings.Repeat("b", 64), b, "cache-b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nums[1] != 1 || idx.NextNumber != 4 {
+		t.Fatalf("numbers %v, next %d", nums, idx.NextNumber)
+	}
+	e := idx.Entries[1]
+	if e.Bundle != before.Bundle || e.Source != before.Source || !slices.Equal(e.Parts, []string{`{"part":"fs"}`}) {
+		t.Fatalf("entry 1 %+v: the stored record was replaced", e)
+	}
+}
+
+// Intentional: re-exporting an imported value doesn't change its entry's
+// expiry, even when the importing cache's record says it expires later. An
+// entry's expiry is its record's: merges send the record, with the expiry it
+// holds, so an index expiry later than the record's would offer engines an
+// entry whose record they then treat as expired. The importing cache's
+// retention is kept where it belongs, on the root, which takes the later
+// expiry. A record that replaces the stored one (more parts) brings its own
+// expiry with it.
+func TestRecordImportKeepsRecordExpiry(t *testing.T) {
+	idx := NewIndex()
+	b := withParts(testBundle([]val{{sender: 10, expires: 100}}, root(1, 150)), 1, "fs")
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1); err != nil {
+		t.Fatal(err)
+	}
+	idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 100}})
+
+	later := withParts(testBundle([]val{{sender: 100, expires: 200}}, root(1, 300)), 1, "fs")
+	if _, err := idx.Record(strings.Repeat("b", 64), later, "cache-b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if e := idx.Entries[1]; e.ExpiresAtUnix != 100 || e.Source.CacheID != "cache-a" {
+		t.Fatalf("entry 1 %+v: want the stored record's expiry, 100", e)
+	}
+	if r := idx.Roots[1]; r.ExpiresAtUnix != 300 {
+		t.Fatalf("root 1 %+v: want the later retention, 300", r)
+	}
+
+	// With more parts, the record replaces the stored one, expiry and all.
+	more := withParts(testBundle([]val{{sender: 100, expires: 200}}, root(1, 300)), 1, "fs", "execMeta")
+	if _, err := idx.Record(strings.Repeat("c", 64), more, "cache-b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if e := idx.Entries[1]; e.ExpiresAtUnix != 200 || e.Source.CacheID != "cache-b" {
+		t.Fatalf("entry 1 %+v: want cache-b's record, expiring at 200", e)
 	}
 }

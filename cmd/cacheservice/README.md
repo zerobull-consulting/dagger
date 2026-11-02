@@ -174,6 +174,20 @@ stored entry landed on as the cache's import (`Index.RecordImports`):
   export may still name it in a closure. Dropping its import then would
   store it again under a new number, or leave that bundle unmergeable. Engine
   numbers are never reused within a cache, so a stale import names nothing.
+- An imported entry keeps its record's expiry when the importing cache
+  exports it again, even if that cache's record says it expires later
+  (`TestRecordImportKeepsRecordExpiry`). This is intentional: merges send the
+  record with the expiry it holds, so a later expiry in the index would offer
+  engines an entry whose record they treat as expired. The importing cache's
+  retention goes on the root, which takes the later expiry. The tracker
+  likewise doesn't export an unchanged import for a later expiry, as it
+  doesn't for a stored entry (`TestTrackerImportedIgnoresExpiry`).
+- **Known gap:** a record of an imported value that holds a part the stored
+  record lacks, but lacks one the stored record holds, is not recorded
+  (`TestRecordKnownGapImportWithOtherParts`). Replacing the stored record
+  would lose its part, and an entry names one record, so two bundles' parts
+  can't be combined. The new part stays in that engine and doesn't reach
+  others. Recording it would need entries that name a record per part.
 - Indexes written before imports have entries with no parts. A record of an
   imported value with any part replaces such an entry once.
 
@@ -306,15 +320,20 @@ again whenever another engine's export is stored, and every `-import-poll`
    offered parts, and which roots it retained or skipped as expired. The
    importer keeps that, by service number (`GET
    /debug/engines/{conn}/imports`), records each landed entry in the index as
-   the cache's import, and tells the export path's tracker. If the index
-   can't be updated, the merge counts as failed and is sent again later.
+   the cache's import, and tells the export path's tracker the ones the index
+   took (not those that landed on an entry the cache exported itself). If
+   the index can't be updated, the merge counts as failed and is sent again
+   later. If the cache was wiped while the imports were written, they are
+   dropped again.
 3. **Offer.** A stored part a merged entry has neither complete nor offered
    is offered to that entry, by the engine's number, with fresh GETs and the
    owner's dependencies and the value's services mapped to the engine's
    numbers. `accepted` and `alreadyComplete` are recorded. `executionStarted`
    and `unavailable` are tried again at the next sync, up to 3 times, unless
    the stored entry has expired by then, or its engine entry has moved or
-   been forgotten. `invalid` is not tried again.
+   been forgotten. `invalid` is not tried again. Parts that offers place on
+   imported entries are passed to the tracker too, so a span naming one
+   doesn't count as a change.
    An entry the engine answers `gone` for is forgotten. An offer over the
    message limit is split in two until each fits.
 
