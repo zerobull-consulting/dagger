@@ -15,6 +15,7 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
@@ -46,6 +47,9 @@ type ExportConfig struct {
 func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	if cfg.Exporter.Logger == nil {
 		cfg.Exporter.Logger = s.logger.With("component", "export")
+	}
+	if cfg.Exporter.Meta != nil && cfg.Exporter.Meta.Metrics() == nil {
+		cfg.Exporter.Meta = cfg.Exporter.Meta.WithMetrics(s.metrics)
 	}
 	x, err := exporter.New(cfg.Exporter)
 	if err != nil {
@@ -104,27 +108,52 @@ func (s *Service) runBatch(ctx context.Context, b exporter.Batch) {
 		p.tracker.Requeue(b, p.now().Add(p.noEngineWait))
 		return
 	}
-	res, err := p.exporter.Export(ctx, eng, b.Request)
-	s.recordExport(ctx, eng, b, res, err)
+	_, _ = s.exportBatch(ctx, eng, b)
+}
+
+// exportBatch exports b on eng, records its result in the tracker, and
+// measures it.
+func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.Batch) (exporter.Result, error) {
+	start := time.Now()
+	res, err := s.export.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
+	outcome := s.recordExport(ctx, eng, b, res, err)
+	s.metrics.ExportBatch(metrics.ExportBatch{
+		Outcome:  outcome,
+		Duration: time.Since(start),
+		Roots:    len(b.Request.Roots),
+		Stored:   len(res.Stored),
+		Gone:     len(res.Gone),
+		Busy:     len(res.Busy),
+		Refused:  len(res.Refused),
+		Failed:   len(res.Failed),
+		Uploaded: len(res.Uploaded),
+		Present:  len(res.Present),
+		Bundles:  len(res.Bundles),
+	})
+	return res, err
 }
 
 // recordExport records an export's result in the tracker. An export cut
 // short because its engine went away, or ctx ended, is not a failure of its
-// roots: they wait for the engine and are tried again.
-func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.Batch, res exporter.Result, err error) {
+// roots: they wait for the engine and are tried again. It returns the
+// batch's outcome, for the metrics.
+func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.Batch, res exporter.Result, err error) string {
 	p := s.export
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
 		p.tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
-		return
+		return metrics.ExportInterrupted
 	}
+	outcome := metrics.OutcomeOK
 	if err != nil {
 		eng.logger.Warn("export failed", "roots", len(b.Request.Roots), "error", err)
+		outcome = metrics.OutcomeError
 	}
 	p.tracker.Done(b, res, p.now())
 	if len(res.Bundles) > 0 {
 		s.triggerImports(eng.CacheID())
 	}
+	return outcome
 }
 
 // connected reports whether c is still a welcomed connection.
