@@ -259,9 +259,11 @@ func TestIndexBeforeResolutions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The same index, as written before resolutions: no "resolution".
+	// The same index, as written before resolutions: version 1, and no
+	// "resolution".
 	legacy := strings.ReplaceAll(mustJSON(t, rec.Index), `,"resolution":"`+rec.ResolutionID+`"`, "")
-	if strings.Contains(legacy, "resolution") {
+	legacy = strings.Replace(legacy, `{"version":2,`, `{"version":1,`, 1)
+	if strings.Contains(legacy, "resolution") || !strings.HasPrefix(legacy, `{"version":1,`) {
 		t.Fatalf("legacy index %s", legacy)
 	}
 	if _, err := objects.Put(ctx, "team/s1/index.json", []byte(legacy), Condition{}); err != nil {
@@ -279,6 +281,15 @@ func TestIndexBeforeResolutions(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkResolution(t, s, "s1", rec2, "cache-a")
+	// And it was written back as version 2, which a service that reads only
+	// version 1 refuses rather than rewrite without the resolutions.
+	raw, _, err := objects.Get(ctx, "team/s1/index.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(raw), `{"version":2,`) {
+		t.Fatalf("written back as %.40s...", raw)
+	}
 
 	idx.Entries[1].Resolution = "not-an-id"
 	if err := idx.Validate(); err == nil || !strings.Contains(err.Error(), "resolution") {

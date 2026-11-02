@@ -287,6 +287,12 @@ doesn't either: `Store.Record` stores it, and merges use it.
   backfill from once an import has moved, a backfill at startup would cost a
   pass over every entry and bundle, and no deployment held such bundles. A
   record gets a resolution when its value is exported again.
+- **Index version 2.** Resolutions bumped the index format to version 2. A
+  version 1 index reads as one whose records name no resolution, and is
+  written back as version 2. A service that reads only version 1 refuses a
+  version 2 index rather than rewrite it without the field, so during a
+  rolling upgrade older replicas stop updating the scope instead of erasing
+  the resolutions newer ones recorded.
 
 `DropExpired` drops expired roots, expired entries and, transitively, the
 entries that depend on them, then every entry no remaining root depends on,

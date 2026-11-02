@@ -13,7 +13,17 @@ import (
 
 // IndexVersion is the index format this package writes. It refuses to read a
 // later one, rather than drop fields it doesn't know.
-const IndexVersion = 1
+//
+// Version 2 added Entry.Resolution (#47). A version 1 index reads as one
+// whose records name no resolution, and is written back as version 2. A
+// service that reads only version 1 refuses a version 2 index, rather than
+// rewrite it without the resolutions: so during a rolling upgrade the older
+// replicas stop updating the scope instead of erasing what the newer ones
+// recorded.
+const IndexVersion = 2
+
+// oldestIndexVersion is the oldest index format this package reads.
+const oldestIndexVersion = 1
 
 // Index is everything a scope stores, apart from the bundles' contents.
 //
@@ -167,9 +177,11 @@ func decodeIndex(body []byte) (*Index, error) {
 	if err := json.Unmarshal(body, &idx); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	if idx.Version != IndexVersion {
-		return nil, fmt.Errorf("index version %d, this service reads %d", idx.Version, IndexVersion)
+	if idx.Version < oldestIndexVersion || idx.Version > IndexVersion {
+		return nil, fmt.Errorf("index version %d, this service reads %d to %d", idx.Version, oldestIndexVersion, IndexVersion)
 	}
+	// Version 1 has no resolutions; its records read as naming none.
+	idx.Version = IndexVersion
 	if idx.Entries == nil {
 		idx.Entries = map[uint64]*Entry{}
 	}
