@@ -1,4 +1,4 @@
-package main
+package server
 
 // Tests against a real S3-compatible store: the MinIO dev environment in
 // hack/remote-cache. They check, through the raw SDK, what the blob store

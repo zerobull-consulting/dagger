@@ -1,4 +1,4 @@
-package main
+package server
 
 // #35: an engine that had entries merged into it, and hits them, must not
 // export them back as new entries, nor record them again through the

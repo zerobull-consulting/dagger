@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -72,11 +72,11 @@ func (h *logRecorder) find(msg string) []map[string]string {
 	return found
 }
 
-func newTestService(t *testing.T, dumpDir string) (*service, *logRecorder, *httptest.Server) {
+func newTestService(t *testing.T, dumpDir string) (*Service, *logRecorder, *httptest.Server) {
 	t.Helper()
 	rec := &logRecorder{}
-	svc := newService(slog.New(rec), dumpDir)
-	srv := httptest.NewServer(svc.handler())
+	svc := New(slog.New(rec), dumpDir)
+	srv := httptest.NewServer(svc.Handler())
 	t.Cleanup(srv.Close)
 	return svc, rec, srv
 }
@@ -388,7 +388,7 @@ func TestCloseAll(t *testing.T) {
 	a.hello()
 	b.hello()
 	waitEngines(t, svc, 2)
-	svc.closeAll()
+	svc.CloseEngines()
 	for _, e := range []*rawEngine{a, b} {
 		if status := e.closed(); status != websocket.StatusGoingAway {
 			t.Fatalf("closed with %d", status)
@@ -505,8 +505,8 @@ func TestSummarize(t *testing.T) {
 }
 
 func TestDebugAPIErrors(t *testing.T) {
-	svc := newService(slog.New(slog.DiscardHandler), "")
-	debug := httptest.NewServer(svc.debugHandler())
+	svc := New(slog.New(slog.DiscardHandler), "")
+	debug := httptest.NewServer(svc.DebugHandler())
 	defer debug.Close()
 
 	post := func(path, body string) int {
@@ -557,7 +557,7 @@ func TestDebugAPIErrors(t *testing.T) {
 // The debug API lists engines in connection order, with their hellos.
 func TestDebugListsEnginesInOrder(t *testing.T) {
 	svc, _, srv := newTestService(t, "")
-	debug := httptest.NewServer(svc.debugHandler())
+	debug := httptest.NewServer(svc.DebugHandler())
 	defer debug.Close()
 	for range 3 {
 		dialRaw(t, srv, "tok").hello()
@@ -590,7 +590,7 @@ func TestDebugListsEnginesInOrder(t *testing.T) {
 // The debug API relays the engine's error reply as the reply.
 func TestDebugRelaysEngineError(t *testing.T) {
 	svc, _, srv := newTestService(t, "")
-	debug := httptest.NewServer(svc.debugHandler())
+	debug := httptest.NewServer(svc.DebugHandler())
 	defer debug.Close()
 	e := dialRaw(t, srv, "tok")
 	e.hello()

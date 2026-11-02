@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"compress/gzip"
@@ -20,7 +20,7 @@ import (
 // otlpRoutes receives OTLP/HTTP at the paths the engine's Cloud exporters
 // post to under DAGGER_CLOUD_URL. The engine's cache events arrive as log
 // records; session spans carry the cache entries their calls touched.
-func (s *service) otlpRoutes(mux *http.ServeMux) {
+func (s *Service) otlpRoutes(mux *http.ServeMux) {
 	// Before taking over a session's telemetry, the engine probes the Cloud
 	// URL with HEAD /v1/traces; any answer will do.
 	mux.HandleFunc("HEAD /v1/traces", func(w http.ResponseWriter, r *http.Request) {
@@ -59,7 +59,7 @@ func (s *service) otlpRoutes(mux *http.ServeMux) {
 	})
 }
 
-func (s *service) logRecords(req *collogspb.ExportLogsServiceRequest) {
+func (s *Service) logRecords(req *collogspb.ExportLogsServiceRequest) {
 	other := 0
 	for _, rl := range req.ResourceLogs {
 		instance := stringAttr(rl.GetResource().GetAttributes(), "service.instance.id")
@@ -86,7 +86,7 @@ func (s *service) logRecords(req *collogspb.ExportLogsServiceRequest) {
 	}
 }
 
-func (s *service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
+func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 	spans, cacheSpans := 0, 0
 	for _, rs := range req.ResourceSpans {
 		cache := stringAttr(rs.GetResource().GetAttributes(), telemetryattrs.EngineCacheAttr)
@@ -113,7 +113,7 @@ func (s *service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 
 // decodeOTLP reads an OTLP/HTTP request body, protobuf or JSON, gzipped or
 // not.
-func (s *service) decodeOTLP(w http.ResponseWriter, r *http.Request, msg proto.Message) bool {
+func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, msg proto.Message) bool {
 	s.logger.Debug("otlp request", "path", r.URL.Path, "userAgent", r.UserAgent(),
 		"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
 		"contentLength", r.ContentLength)

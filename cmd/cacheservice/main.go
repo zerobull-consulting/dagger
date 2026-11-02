@@ -2,7 +2,8 @@
 // spike that stored nothing; with CACHESERVICE_S3_BUCKET set, it stores
 // engines' cache entries in S3 and hands them to other engines.
 //
-// It serves:
+// The service itself is package server; this command parses flags, reads
+// the CACHESERVICE_S3_* settings and listens. It serves:
 //
 //   - a WebSocket at protocol.EnginePath that takes the HTTP Basic username
 //     as the engine token (any token), answers hello with welcome, answers
@@ -56,8 +57,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
-	"github.com/dagger/dagger/cmd/cacheservice/importer"
-	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
 func main() {
@@ -80,7 +80,7 @@ func main() {
 	flag.DurationVar(&quiet, "export-quiet", exporter.DefaultQuietPeriod, "export a session's entries after this long without a cache span from it, if its end isn't seen")
 	flag.DurationVar(&endGrace, "export-end-grace", exporter.DefaultEndGrace, "after a session ends, wait this long for the cache spans it said were coming")
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
-	flag.DurationVar(&importPoll, "import-poll", DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
+	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -99,13 +99,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	svc := newService(logger, dumpDir)
+	svc := server.New(logger, dumpDir)
 	if os.Getenv(blobstore.EnvBucket) != "" {
-		poll := time.Duration(-1)
-		if imports {
-			poll = importPoll
+		cfg, err := blobstore.S3ConfigFromEnv()
+		if err == nil {
+			err = svc.EnableS3(ctx, cfg, server.S3Options{
+				Scope:      scope,
+				Tracker:    exporter.TrackerConfig{QuietPeriod: quiet, EndGrace: endGrace},
+				NoImport:   !imports,
+				ImportPoll: importPoll,
+			})
 		}
-		if err := enableS3(ctx, svc, scope, exporter.TrackerConfig{QuietPeriod: quiet, EndGrace: endGrace}, poll); err != nil {
+		if err != nil {
 			logger.Error("export path", "error", err)
 			os.Exit(1)
 		}
@@ -113,9 +118,9 @@ func main() {
 		logger.Info("export path off: set " + blobstore.EnvBucket + " to store exports in S3")
 	}
 
-	servers := []*http.Server{{Addr: listen, Handler: svc.handler()}}
+	servers := []*http.Server{{Addr: listen, Handler: svc.Handler()}}
 	if debugListen != "" {
-		servers = append(servers, &http.Server{Addr: debugListen, Handler: svc.debugHandler()})
+		servers = append(servers, &http.Server{Addr: debugListen, Handler: svc.DebugHandler()})
 	}
 	errs := make(chan error, len(servers))
 	for _, srv := range servers {
@@ -134,50 +139,11 @@ func main() {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	svc.closeAll()
+	svc.CloseEngines()
 	for _, srv := range servers {
 		_ = srv.Shutdown(shutdownCtx)
 	}
 	// End the exports in flight, and wait for them.
 	stop()
-	svc.waitExports()
-	svc.waitImports()
-}
-
-// enableS3 turns on the export path, and the import path unless importPoll
-// is negative, with the S3 blob and metadata stores from the
-// CACHESERVICE_S3_* settings. It refuses a store that ignores conditional
-// writes, which would let index updates overwrite each other.
-func enableS3(ctx context.Context, svc *service, scope string, tracker exporter.TrackerConfig, importPoll time.Duration) error {
-	cfg, err := blobstore.S3ConfigFromEnv()
-	if err != nil {
-		return err
-	}
-	blobs, err := blobstore.NewS3(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	meta, err := metastore.NewS3(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	if err := meta.VerifyConditionalWrites(ctx, scope); err != nil {
-		return err
-	}
-	svc.logger.Info("export path on", "bucket", cfg.Bucket, "prefix", cfg.Prefix, "scope", scope)
-	if err := svc.enableExport(ctx, exportConfig{
-		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: scope},
-		Tracker:  tracker,
-	}); err != nil {
-		return err
-	}
-	if importPoll < 0 {
-		svc.logger.Info("import path off")
-		return nil
-	}
-	svc.logger.Info("import path on", "scope", scope, "poll", importPoll)
-	return svc.enableImport(ctx, importConfig{
-		Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: scope},
-		Poll:     importPoll,
-	})
+	svc.Wait()
 }
