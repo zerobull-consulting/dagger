@@ -13,6 +13,7 @@ import (
 
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
+	"github.com/dagger/dagger/engine/snapshots"
 )
 
 // The import side of the fake: Merge and OfferParts as the engine answers
@@ -318,6 +319,42 @@ func get(ctx context.Context, client *http.Client, url string) ([]byte, error) {
 		return nil, fmt.Errorf("GET: status %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// RenewLayers asks the service, through the engine's session, for addresses
+// of any layers under any renewal key, as an engine that guessed or learned
+// digests could. It returns the addresses, and false when the service
+// answered unavailable.
+func (c *Cache) RenewLayers(ctx context.Context, renewalKey string, layers []snapshots.ExportLayer) (map[digest.Digest]dagql.BlobAddress, bool, error) {
+	if len(layers) == 0 {
+		return nil, false, errors.New("no layers")
+	}
+	c.mu.Lock()
+	c.renewSeq++
+	req := &dagql.RenewalRequest{
+		ID:         dagql.RenewalRequestID{Sequence: c.renewSeq},
+		RenewalKey: renewalKey,
+		Layers:     slices.Clone(layers),
+		NeededBlob: layers[0].Descriptor.Digest,
+		Deadline:   time.Now().Add(time.Minute),
+	}
+	reply := make(chan dagql.RenewalReply, 1)
+	c.renewed[req.ID] = reply
+	c.mu.Unlock()
+	done := make(chan struct{})
+	defer close(done)
+	req.Done = done
+	select {
+	case c.renewals <- req:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	select {
+	case r := <-reply:
+		return r.Addresses, !r.Unavailable, nil
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
 }
 
 // Renew asks the service, through the engine's session, for fresh addresses

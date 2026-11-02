@@ -56,7 +56,7 @@ func (h *exportHarness) connectEngine(cache *fakeengine.Cache) *engineConn {
 	})
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if c := h.svc.engineFor(cache.ID); c != nil {
+		if c := h.svc.engineFor(h.ns(), cache.ID); c != nil {
 			return c
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -285,10 +285,11 @@ func TestImportRenew(t *testing.T) {
 // Without a store, renew is unavailable, and the import hooks are off.
 func TestImportOff(t *testing.T) {
 	svc := New(slog.New(slog.DiscardHandler), "")
-	if got := svc.renew(context.Background(), protocol.Renew{RenewalKey: testScope}); !got.Unavailable {
+	ns := mustNamespace(t, svc, DefaultNamespace)
+	if got := svc.renew(context.Background(), &engineConn{ns: ns}, protocol.Renew{RenewalKey: testScope}); !got.Unavailable {
 		t.Fatalf("renewed %+v", got)
 	}
-	svc.triggerImports("")
+	svc.triggerImports(ns, "")
 	svc.waitImports()
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -20,11 +21,14 @@ import (
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
-// exportPath pushes engines' cache entries to the store: the tracker learns
-// entries from OTLP, and the scheduler exports them when they are due.
+// exportPath pushes engines' cache entries to the store: each namespace's
+// tracker learns entries from OTLP, and the scheduler exports them, with the
+// namespace's exporter, when they are due.
 type exportPath struct {
-	tracker  *exporter.Tracker
-	exporter *exporter.Exporter
+	// cfg and trackerCfg configure each namespace's exporter and tracker;
+	// cfg.Scope is replaced by the namespace.
+	cfg        exporter.Config
+	trackerCfg exporter.TrackerConfig
 	// tick is how often the scheduler looks for due exports, and
 	// noEngineWait how long a batch whose engine isn't connected waits.
 	tick         time.Duration
@@ -43,7 +47,11 @@ type ExportConfig struct {
 }
 
 // EnableExport turns on the export path, and runs its scheduler until ctx
-// ends. Without it, the service exports nothing on its own.
+// ends. Without it, the service exports nothing on its own. Each namespace
+// gets an exporter of cfg.Exporter, with the namespace as its scope and its
+// own view of the blob store (see blobstore.Namespacer); cfg.Exporter.Scope
+// is the namespace of a service without tokens. Call it before the service
+// serves engines.
 func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	if cfg.Exporter.Logger == nil {
 		cfg.Exporter.Logger = s.logger.With("component", "export")
@@ -51,8 +59,14 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	if cfg.Exporter.Meta != nil && cfg.Exporter.Meta.Metrics() == nil {
 		cfg.Exporter.Meta = cfg.Exporter.Meta.WithMetrics(s.metrics)
 	}
-	x, err := exporter.New(cfg.Exporter)
-	if err != nil {
+	// Checked now, so a bad config fails here rather than on a connection.
+	if _, err := exporter.New(cfg.Exporter); err != nil {
+		return err
+	}
+	if _, err := namespaceBlobs(cfg.Exporter.Blobs, cfg.Exporter.Scope); err != nil {
+		return fmt.Errorf("exporter: %w", err)
+	}
+	if err := s.setDefaultNamespace(cfg.Exporter.Scope); err != nil {
 		return err
 	}
 	if cfg.Tick <= 0 {
@@ -62,8 +76,8 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 		cfg.NoEngineWait = 10 * time.Second
 	}
 	p := &exportPath{
-		tracker:      exporter.NewTracker(cfg.Tracker),
-		exporter:     x,
+		cfg:          cfg.Exporter,
+		trackerCfg:   cfg.Tracker,
 		tick:         cfg.Tick,
 		noEngineWait: cfg.NoEngineWait,
 		now:          time.Now,
@@ -89,23 +103,26 @@ func (s *Service) scheduleExports(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		for _, b := range p.tracker.Due(p.now()) {
-			p.wg.Add(1)
-			go func() {
-				defer p.wg.Done()
-				s.runBatch(ctx, b)
-			}()
+		for _, ns := range s.namespacesNow() {
+			for _, b := range ns.tracker.Due(p.now()) {
+				p.wg.Add(1)
+				go func() {
+					defer p.wg.Done()
+					s.runBatch(ctx, ns, b)
+				}()
+			}
 		}
 	}
 }
 
-// runBatch exports one batch on the engine connected with its cache.
-func (s *Service) runBatch(ctx context.Context, b exporter.Batch) {
+// runBatch exports one batch of a namespace on the engine connected there
+// with its cache.
+func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch) {
 	p := s.export
-	eng := s.engineFor(b.CacheID)
+	eng := s.engineFor(ns, b.CacheID)
 	if eng == nil {
-		s.logger.Debug("export: engine not connected; waiting", "cacheID", b.CacheID, "roots", len(b.Request.Roots))
-		p.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+		s.logger.Debug("export: engine not connected; waiting", "namespace", ns.name, "cacheID", b.CacheID, "roots", len(b.Request.Roots))
+		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
 		return
 	}
 	_, _ = s.exportBatch(ctx, eng, b)
@@ -115,9 +132,10 @@ func (s *Service) runBatch(ctx context.Context, b exporter.Batch) {
 // measures it.
 func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.Batch) (exporter.Result, error) {
 	start := time.Now()
-	res, err := s.export.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
+	res, err := eng.ns.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
 	outcome := s.recordExport(ctx, eng, b, res, err)
 	s.metrics.ExportBatch(metrics.ExportBatch{
+		Scope:    eng.ns.name,
 		Outcome:  outcome,
 		Duration: time.Since(start),
 		Roots:    len(b.Request.Roots),
@@ -139,9 +157,10 @@ func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.B
 // batch's outcome, for the metrics.
 func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.Batch, res exporter.Result, err error) string {
 	p := s.export
+	tracker := eng.ns.tracker
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
-		p.tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
+		tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
 		return metrics.ExportInterrupted
 	}
 	outcome := metrics.OutcomeOK
@@ -149,9 +168,9 @@ func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.
 		eng.logger.Warn("export failed", "roots", len(b.Request.Roots), "error", err)
 		outcome = metrics.OutcomeError
 	}
-	p.tracker.Done(b, res, p.now())
+	tracker.Done(b, res, p.now())
 	if len(res.Bundles) > 0 {
-		s.triggerImports(eng.CacheID())
+		s.triggerImports(eng.ns, eng.CacheID())
 	}
 	return outcome
 }
@@ -163,13 +182,16 @@ func (s *Service) connected(c *engineConn) bool {
 	return s.conns[c.id] == c
 }
 
-// engineFor returns the latest welcomed connection of an engine cache.
-func (s *Service) engineFor(cacheID string) *engineConn {
+// engineFor returns the latest welcomed connection of an engine cache in a
+// namespace. A connection of another namespace that says hello with the same
+// cache ID is never chosen: its token gives it no say over this namespace's
+// exports.
+func (s *Service) engineFor(ns *namespace, cacheID string) *engineConn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var latest *engineConn
 	for _, c := range s.conns {
-		if c.hello.CacheID == cacheID && (latest == nil || c.id > latest.id) {
+		if c.ns == ns && c.hello.CacheID == cacheID && (latest == nil || c.id > latest.id) {
 			latest = c
 		}
 	}
@@ -186,12 +208,16 @@ func (c *engineConn) Request(ctx context.Context, typ protocol.Type, body json.R
 	return c.request(ctx, typ, body)
 }
 
-// trackSpans feeds the tracker the cache spans of a trace request.
-func (s *Service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
+// trackSpans feeds a namespace's tracker the cache spans of a trace request
+// authenticated for it. Spans reach the service under the token of the
+// client that ran the session, not the engine's, so any token of the
+// namespace is taken (see the README, "Auth and namespaces").
+func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRequest) {
 	p := s.export
 	if p == nil {
 		return
 	}
+	tracker := ns.tracker
 	now := p.now()
 	for _, rs := range req.ResourceSpans {
 		res := rs.GetResource().GetAttributes()
@@ -206,7 +232,7 @@ func (s *Service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
 				if n, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr); ok {
 					count, err := strconv.Atoi(n.GetStringValue())
 					if err == nil {
-						p.tracker.SessionEnded(cacheID, generation, session, count, now)
+						tracker.SessionEnded(cacheID, generation, session, count, now)
 					}
 				}
 				number, err := strconv.ParseUint(stringAttr(attrs, telemetryattrs.CacheResultIDAttr), 10, 64)
@@ -235,20 +261,34 @@ func (s *Service) trackSpans(req *coltracepb.ExportTraceServiceRequest) {
 						}
 					}
 				}
-				p.tracker.Observe(o, now)
+				tracker.Observe(o, now)
 			}
 		}
 	}
 }
 
-// trackEvent feeds the tracker one engine cache event.
-func (s *Service) trackEvent(kind, cache, body string) {
+// trackEvent feeds a namespace's tracker and importer one engine cache
+// event, from a request authenticated with token key. With tokens, an event
+// about a cache whose latest connection had another token is dropped, as is
+// a start that reports wiping such a cache: only an engine's own token
+// speaks for it.
+func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body string) {
 	p := s.export
 	if p == nil && s.imports == nil {
 		return
 	}
+	// Only the kinds acted on below go further: kind comes from the
+	// request, and names a metric label when the event is dropped.
+	if kind != telemetryattrs.EngineEventStart && kind != telemetryattrs.EngineEventPrune {
+		return
+	}
 	cacheID, generation, ok := parseEngineCache(cache)
 	if !ok {
+		return
+	}
+	authenticated := s.authenticated()
+	if authenticated && !ns.ownerAccepts(cacheID, key) {
+		s.ignoredEvent(ns, kind, cacheID)
 		return
 	}
 	switch kind {
@@ -258,11 +298,19 @@ func (s *Service) trackEvent(kind, cache, body string) {
 			s.logger.Warn("undecodable engine event", "kind", kind, "error", err)
 			return
 		}
-		if p != nil {
-			p.tracker.Started(cacheID, generation, ev.WipedCache)
+		wiped := ev.WipedCache
+		if wiped != "" && authenticated && !ns.ownerAccepts(wiped, key) {
+			s.ignoredEvent(ns, kind+" (wiped cache)", wiped)
+			wiped = ""
 		}
-		if s.imports != nil && ev.WipedCache != "" {
-			s.forgetWiped(ev.WipedCache)
+		if wiped != "" && wiped != cacheID {
+			ns.disown(wiped)
+		}
+		if p != nil {
+			ns.tracker.Started(cacheID, generation, wiped)
+		}
+		if s.imports != nil && wiped != "" {
+			s.forgetWiped(ns, wiped)
 		}
 	case telemetryattrs.EngineEventPrune:
 		var ev telemetryattrs.EnginePruneEvent
@@ -277,10 +325,10 @@ func (s *Service) trackEvent(kind, cache, body string) {
 			numbers = append(numbers, d.ResultID)
 		}
 		if p != nil {
-			p.tracker.Pruned(cacheID, generation, drops)
+			ns.tracker.Pruned(cacheID, generation, drops)
 		}
 		if s.imports != nil {
-			s.imports.importer.Pruned(cacheID, generation, numbers)
+			ns.importer.Pruned(cacheID, generation, numbers)
 		}
 	}
 }
@@ -367,6 +415,14 @@ func (s *Service) serveEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, entries)
+}
+
+// ignoredEvent logs an engine event dropped because it came with a token
+// other than the engine's.
+func (s *Service) ignoredEvent(ns *namespace, kind, cacheID string) {
+	s.metrics.IgnoredEvent(ns.name, kind)
+	s.logger.Warn("engine event ignored: it came with a token other than the engine's",
+		"namespace", ns.name, "kind", kind, "cacheID", cacheID)
 }
 
 // waitExports waits for the exports in flight, after the context that runs

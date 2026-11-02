@@ -25,8 +25,12 @@ spike, and only logs what the engine does on the wire.
 
 On the engine WebSocket, the service:
 
-- takes the HTTP Basic username as the engine token. It accepts any non-empty
-  token and logs only a short SHA-256 fingerprint of it.
+- takes the HTTP Basic username as the engine token. With `-tokens-file`, it
+  refuses an unknown token with 401 before the upgrade, and the token's
+  namespace decides everything the connection exports, imports, is offered
+  and renews (see [Auth and namespaces](#auth-and-namespaces)). Without it,
+  it accepts any non-empty token, in the `-scope` namespace. It logs only a
+  short SHA-256 fingerprint of a token.
 - reads `hello`, replies `welcome`, and records the engine's cache identity.
 - answers WebSocket pings (the library does this; `-v` logs each one).
 - answers `renew` with fresh presigned GETs when the import path is on and
@@ -38,7 +42,8 @@ On the engine WebSocket, the service:
 `-dump-dir DIR` also writes every envelope body and engine event body to a
 numbered file in `DIR`.
 
-The debug API has no authentication. It listens on localhost only by default.
+The debug API has no authentication, and sees and drives every namespace. It
+listens on localhost only by default; keep it there.
 
 ## Code layout
 
@@ -73,8 +78,12 @@ measures is in [`metrics`](metrics/).
 uses it. Blobs never pass through the service: it hands the
 engine presigned URLs, so the engine never holds S3 credentials.
 
-- Keys are content-addressed: `<prefix>/blobs/<algorithm>/<hex>`, such as
-  `team/blobs/sha256/4f1e...`.
+- Keys are content-addressed: `<prefix>/blobs/<algorithm>/<hex>`. The service
+  uses each namespace's view of the store (`Namespace`), whose keys are
+  `<prefix>/<namespace>/blobs/<algorithm>/<hex>`, such as
+  `cache/team-a/blobs/sha256/4f1e...`: next to the namespace's metadata, and
+  apart from every other namespace's blobs (see
+  [Auth and namespaces](#auth-and-namespaces)).
 - `Has` checks a blob with `HeadObject`. A 404 means missing; any other error
   is an error.
 - `PresignPut` signs a PUT for an exact size: `Content-Length` is a signed
@@ -130,8 +139,10 @@ records into it. Each scope (a team, a tenant) has:
   the entries the cache exported (`numbers`), and the stored entries merged
   into it (`imported`, see [Imported entries](#imported-entries)).
 
-The scope `blobs` is refused, since it would clash with the blob store's keys
-under the same prefix.
+A scope is a namespace (see [Auth and namespaces](#auth-and-namespaces)), and
+its blobs are under it too, at `<prefix>/<scope>/blobs/`. The scope `blobs` is
+refused, since it would clash with the blob store's own keys under the same
+prefix (`<prefix>/blobs/`, where blobs were kept before namespaces).
 
 **Index updates are atomic.** `UpdateIndex` reads the index and its ETag,
 applies a change, and writes it back with `If-Match` on that ETag, or
@@ -311,9 +322,10 @@ don't contend.
 `CACHESERVICE_S3_BUCKET` is set; the other `CACHESERVICE_S3_*` settings are as
 for the blob store. At startup the service checks the bucket's conditional
 writes (`VerifyConditionalWrites`) and refuses to start if they fail.
-Exported entries go into one scope, `-scope` (`default`), until auth and
-namespacing ([#10](https://github.com/zerobull-consulting/dagger/issues/10))
-picks one per engine.
+Exported entries go into the scope of the engine's namespace: its token's,
+with `-tokens-file`, or `-scope` (`default`) without (see
+[Auth and namespaces](#auth-and-namespaces)). Each namespace has its own
+tracker and exporter, and its blobs, bundles and index under its own prefix.
 
 **Triggers and roots.** The tracker follows
 [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md). It learns entries from session
@@ -415,12 +427,13 @@ reuses. An export that fails as a whole (S3 down) counts a failure of its
 roots, which are tried again with backoff (2s doubling), up to 5 times per
 value.
 
-**Known gaps.** Nothing is authenticated yet
-([#10](https://github.com/zerobull-consulting/dagger/issues/10)): the
-WebSocket takes any token, and the OTLP receivers take any request. Anyone who
-can reach the service can forge spans, which make it export (or stop
+**Known gaps.** Without `-tokens-file`, nothing is authenticated: the
+WebSocket takes any token, and the OTLP receivers take any request, so anyone
+who can reach the service can forge spans, which make it export (or stop
 exporting) a connected engine's entries, or connect as an engine and offer it
-bundles of its own. Run the export path only on a trusted network until then.
+bundles of its own. Run it that way only on a trusted network. With tokens,
+the same holds within a namespace (see
+[Auth and namespaces](#auth-and-namespaces)).
 Uploaded content isn't verified against its digest
 ([#23](https://github.com/zerobull-consulting/dagger/issues/23)). Sessions whose
 clients send no spans to the service are invisible (see
@@ -436,7 +449,9 @@ later session names its entries
 
 [`importer`](importer) makes engines reuse what other engines exported
 ([#8](https://github.com/zerobull-consulting/dagger/issues/8)). It is on with
-the export path, reads the same scope, and is turned off with `-import=false`.
+the export path, reads the same namespace's scope, and is turned off with
+`-import=false`. An engine is merged and offered only its own namespace's
+bundles, with presigned GETs of its own namespace's blobs.
 
 **When.** Each welcomed connection gets a sync loop. It syncs on `hello`,
 again whenever another engine's export is stored, and every `-import-poll`
@@ -502,8 +517,13 @@ reply that arrives after its cache's state was reset is discarded.
 
 **Renew.** Presigned GETs last `CACHESERVICE_S3_GET_EXPIRY` (1h). When the
 engine reads an offered part after they expired, it sends `renew` with the
-chain's layers; the service checks each is stored and answers with fresh GETs,
-or `unavailable` when one is missing or the renewal key isn't its scope.
+chain's layers; the service checks each is stored in the connection's
+namespace and answers with fresh GETs of that namespace's keys, or
+`unavailable` when one is missing there or the renewal key isn't the
+namespace. Renewals aren't limited to the digests offered to the connection:
+an engine renews offers merged before a reconnect or a service restart, which
+this process never offered it, and within its namespace a token could have
+those blobs merged anyway (`TestRenewNotLimitedToOfferedDigests`).
 The engine checks an address's expiry itself, and renews without trying an
 expired GET; it renews a whole chain at once, and only once per read. When
 renewal answers `unavailable`, the read fails and the engine computes the part
@@ -529,6 +549,173 @@ them. Entries an engine prunes, or answers
 `gone` for, are not merged into it again until it restarts: merging them back
 on the next poll would undo its garbage collection, which prunes them again.
 
+## Auth and namespaces
+
+[#10](https://github.com/zerobull-consulting/dagger/issues/10). A **token**
+authenticates an engine, and maps it to a **namespace**: a team, a tenant.
+The namespace is the trust boundary. Everything a connection does is in its
+namespace's scope:
+
+- **exports:** what it records, in the namespace's index, and where its
+  blobs and bundles go, under `<prefix>/<namespace>/`;
+- **imports:** the index and bundles the importer plans and merges into it;
+- **offers:** of the namespace's stored parts, with GETs of its blobs;
+- **renew:** only blobs stored in the namespace, under the namespace's
+  renewal key.
+
+One service serves many namespaces at once. Each has its own tracker,
+exporter, importer, in-memory caches and blob store view, created on its
+first connection; the metrics' `scope` label is the namespace.
+
+### The tokens file
+
+`-tokens-file FILE` turns authentication on. One token and its namespace per
+line, separated by white space; blank lines and `#` comments are ignored:
+
+```text
+# team A's engines and CI
+3f9c0e2a7d...   team-a
+b72d41c09e...   team-a
+# team B
+5e01aa83f4...   team-b
+```
+
+A token may not contain white space or `:` (HTTP Basic ends the username at
+the first colon), and may appear once. A namespace is what
+a scope may be: 1-128 letters, digits, `.`, `_` or `-`, starting with a letter
+or digit, and not `blobs`. Many tokens may share a namespace. Generate tokens
+long and random (`openssl rand -hex 32`), and keep the file readable by the
+service only. The service keeps only the tokens' SHA-256 hashes, compares
+them in constant time, and logs only a short fingerprint (the hash's first 4
+bytes).
+
+An engine sends its token as the HTTP Basic username, from
+`DAGGER_CLOUD_TOKEN`
+([#13](https://github.com/zerobull-consulting/dagger/issues/13) will let its
+config set it). On the WebSocket, an unknown or missing token is refused with
+401 before the upgrade, so it never gets a protocol message. A token is
+checked again when its connection says `hello`, against the tokens of that
+moment.
+
+**The OTLP receivers** take the same tokens, as HTTP Basic usernames, and
+refuse others with 401 (`HEAD /v1/traces`, the engine's credential-less probe,
+is still answered). Each request feeds only its token's namespace. The engine
+sends two kinds, under different tokens:
+
+- **Engine events** (`engine.start`, `engine.prune`, on `/v1/logs`) come from
+  the engine's own log exporter, under the engine's `DAGGER_CLOUD_TOKEN`
+  (`cmd/engine/telemetry.go`), the token of its WebSocket. The service takes
+  an event about an engine cache only from the token of that cache's latest
+  connection, or about a cache no connection has named yet (an engine's
+  `engine.start` can arrive before its `hello`). An `engine.start` that
+  reports wiping a cache whose connection had another token is taken without
+  the wipe. The others are dropped, logged (`engine event ignored`) and
+  counted (`engine_events_ignored_total`). A cache's owner is kept while it
+  is connected and for an hour after, and at most 4096 owners of
+  disconnected caches are kept per namespace, so cache IDs that never come
+  back don't pile up.
+- **Session spans** (`/v1/traces`) come under the token of the client that
+  ran the session: the CLI forwards them, or the engine publishes them for it
+  with the client's credential (`engine/server/session_cloud_telemetry.go`).
+  So spans are taken from any token of the namespace: a CI client's token
+  must be in the file, in its engines' namespace, for its sessions to be
+  exported. A token that doesn't belong to the engine's namespace reaches
+  only its own namespace, where that cache is a stranger.
+
+A request with another namespace's token, or none, can't change what the
+importer or tracker knows of an engine (`TestForgedTelemetryIgnored`). Within
+a namespace, tokens trust each other further: a connection may say `hello`
+with another engine's cache ID, and then takes over its exports and its
+engine events. That is a known gap
+([#51](https://github.com/zerobull-consulting/dagger/issues/51),
+`TestKnownGapSameNamespaceTokenClaimsCacheID`); give engines you don't trust
+with each other different namespaces.
+
+### Reloading and revocation
+
+`SIGHUP` reloads the file. (A file watcher would also fire on half-written
+files and editors' temporary renames; a signal is explicit, and works the
+same with a file mounted from a secret.) A file that can't be read or parsed
+changes nothing: the tokens loaded before stay, and the service logs an
+error. After a reload, every connection whose token is gone, or now maps to
+another namespace, is closed with WebSocket status 4001
+(`protocol.CloseTokenRevoked`), and is no longer listed, so no export or merge
+picks it while its close handshake runs.
+
+The engine treats 4001 as any other close: it logs it and reconnects with its
+backoff (1s, doubling to 30s). The reconnection is refused with 401, as is
+every later one. Those refusals are logged at warning level once per token a
+minute, and at most 10 times a minute in all, then at debug level, never at
+error level; `auth_rejected_total` counts them all.
+
+Nothing stored is deleted or changed when a token goes: its namespace's data
+stays, for its other tokens, and for the token if it comes back.
+
+### Blobs are kept per namespace
+
+Each namespace's blobs are stored under its own prefix,
+`<prefix>/<namespace>/blobs/<algorithm>/<hex>`, even when two namespaces
+store the same layer. The service checks, presigns PUTs and GETs for, and
+renews only the connection's namespace's keys (`EnableExport` and
+`EnableImport` refuse a blob store that can't keep namespaces apart), so one namespace can never get
+a GET for another's blob, nor have its uploads skipped because another
+namespace has the blob (`TestNamespacesKeepExportsApart`,
+`TestRenewAcrossNamespacesRefused`, `TestMinIONamespaceKeys`).
+
+The trade-off is storage: a base image layer every team uses is stored once
+per namespace. Sharing a prefix would store it once, but until uploads are
+verified ([#23](https://github.com/zerobull-consulting/dagger/issues/23)), a
+blob is whatever its first uploader sent: one tenant's bad or malicious
+same-size upload would then break that layer for every tenant, and `Has`
+would keep the others from ever uploading the right one. It would also tell a
+tenant which digests the others hold. Once #23 promotes only verified blobs,
+sharing could be offered per group of namespaces that accept each other's
+uploads.
+
+Without a tokens file, the one namespace is `-scope`, so blobs are at
+`<prefix>/<scope>/blobs/`. Blobs stored by earlier versions, at
+`<prefix>/blobs/`, are no longer read: their entries' layers are uploaded
+again on the next export, and an import of an entry whose layers are only at
+the old keys finds them missing, as for a deleted blob.
+
+### Unauthenticated mode
+
+Without `-tokens-file`, the service takes any non-empty token on the
+WebSocket and any OTLP request, and puts every engine in the `-scope`
+namespace, as before namespaces existed. It logs a warning at startup:
+
+```text
+level=WARN msg="UNAUTHENTICATED: no -tokens-file, so the service takes any token, and every engine that reaches it shares namespace default: ..."
+```
+
+Anyone who can reach it can read everything stored, add to it, and steer
+exports with forged telemetry. Use it only on a trusted network, as the
+real-engine run does on the Docker bridge.
+
+### TLS
+
+Engines send their token in the clear over `http://`. Serve the engine
+address over TLS, one of two ways:
+
+- **Behind a TLS-terminating proxy** (a load balancer, nginx, Envoy): point
+  engines at `https://<host>` (the WebSocket becomes `wss://`), and proxy to
+  `-listen`. The proxy must pass WebSocket upgrades (`Upgrade` and
+  `Connection` headers, HTTP/1.1 to the service), keep idle connections open
+  longer than the engine's 15s ping interval, and pass `Authorization`
+  through. Keep `-listen` reachable only from the proxy.
+- **`-tls-cert` and `-tls-key`**: the engine address serves HTTPS with that
+  certificate and key (PEM). They are read at startup; restart the service to
+  rotate them. Engines must trust the certificate's CA.
+
+Either way, `DAGGER_CLOUD_URL` should be the same `https://` URL, so the OTLP
+requests, which carry the token too, are encrypted. The debug and metrics
+addresses are never served over TLS: they are for local use.
+
+The debug API (`-debug-listen`) is **not authenticated**, and lists, exports
+and imports for every namespace's engines. It listens on `127.0.0.1` by
+default; never expose it. `-metrics-listen` serves only `/metrics`, whose
+`scope` labels name the namespaces.
+
 ## Metrics
 
 [`metrics`](metrics/) measures the storage costs that decide when the index
@@ -553,12 +740,18 @@ paths record into them through their metadata store. All are prefixed
 | `resolution_reads_total`, `resolution_read_bytes_total` | `scope` | Resolutions read from the store |
 | `import_bundle_cache_total` | `result` | Bundles a merge needed: `hit` (in memory) or `miss` |
 | `import_resolution_cache_total` | `result` | Resolutions a merge needed: `hit` (in memory) or `miss` |
-| `import_syncs_total`, `import_sync_duration_seconds` | `outcome` | Import syncs of one engine |
-| `export_batches_total` | `outcome` | Export batches: `ok`, `error` or `interrupted` |
+| `import_syncs_total` | `scope`, `outcome` | Import syncs of one engine |
+| `import_sync_duration_seconds` | | Time per import sync |
+| `export_batches_total` | `scope`, `outcome` | Export batches: `ok`, `error` or `interrupted` |
 | `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
 | `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
 | `export_blobs_total` | `result` | Layer blobs: `uploaded`, or `present` (the store had them) |
 | `export_bundles_total` | | Bundles published |
+| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket) or `otlp` |
+| `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
+| `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
+
+`scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
 
 `caller` is `export` or `import` for the path that read or updated the index,
 whether its scheduler, its sync loop or the debug API ran it, and `other` for
@@ -589,6 +782,11 @@ For a local S3-compatible store (MinIO), see
    go run ./cmd/cacheservice -v -dump-dir /tmp/cacheservice-dump
    ```
 
+   That is unauthenticated, with any token in the `default` namespace. To
+   check tokens, add `-tokens-file tokens.txt`, with a line
+   `<token> <namespace>` for the engine's token, and for the CLI's if it
+   sends spans (see [Auth and namespaces](#auth-and-namespaces)).
+
 2. Build and start a dev engine (see `hack/dev`). Then restart its container
    with these variables set:
 
@@ -600,7 +798,7 @@ For a local S3-compatible store (MinIO), see
 
    The remote cache connection turns on only when both the URL and
    `DAGGER_CLOUD_TOKEN` are set. `DAGGER_CLOUD_TOKEN=oidc` keeps it off. Any
-   other string works as the token.
+   other string works as the token, unless the service has a tokens file.
 
    Set `DAGGER_CLOUD_URL` too. Turning on the remote cache also turns on the
    engine's cache-event export (`cmd/engine/remotecache.go`), and those events
@@ -847,6 +1045,20 @@ Two more things about the module path:
   its body's `withExec` was the hit, on the imported entry.
 - The module's own loading (sources, type definitions) is exported too: the
   first call's bundle held 50 values.
+
+**`namespaces`
+([#10](https://github.com/zerobull-consulting/dagger/issues/10)).** Its own
+service, with a tokens file, and engines NA and NB on tokens of `team-a` and
+`team-b`. NA's pipeline (alpine, one exec) was stored in team A's index; a
+sync of NB right after merged nothing, and NB ran the exec itself (0 hits, its
+own stamp). Neither index mapped the other team's engine; NA's exec layer was
+under `team-a/blobs/` only, and alpine's layer under both namespaces. NC, on
+NA's token, had NA's bundle merged and hit NA's exec with NA's stamp. After
+team B's token was removed and the file reloaded, NB's engine logged
+`received close frame: status = StatusCode(4001) and reason = "token
+revoked"`, its reconnection was refused with 401, and the service logged
+nothing at error level. It adds about 12s to the run (the whole run took
+2m06s with the binaries built).
 
 ### Resilience
 

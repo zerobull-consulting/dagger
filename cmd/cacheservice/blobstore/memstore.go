@@ -19,25 +19,55 @@ import (
 // it that server's URL with SetBaseURL. Like a presigned S3 PUT, a PUT must carry exactly the
 // size it was signed for; unlike S3, it also checks the body against the
 // digest.
+//
+// Namespace returns a view of one namespace's blobs: it shares the store's
+// memory and server, and keeps its blobs apart from every other namespace's,
+// as the S3 store's keys do.
 type MemStore struct {
-	baseURL string
+	// ns is the view's namespace; "" for the store itself.
+	ns string
+	*memState
+}
 
-	mu    sync.Mutex
-	blobs map[digest.Digest][]byte
-	puts  int
-	// failPuts are PUTs still to fail, by digest.
+type memState struct {
+	mu      sync.Mutex
+	baseURL string
+	blobs   map[memKey][]byte
+	puts    int
+	// failPuts are PUTs still to fail, by digest, in any namespace.
 	failPuts map[digest.Digest]int
 }
 
-var _ Store = (*MemStore)(nil)
+type memKey struct {
+	ns   string
+	dgst digest.Digest
+}
+
+var (
+	_ Store      = (*MemStore)(nil)
+	_ Namespacer = (*MemStore)(nil)
+)
 
 // NewMemStore returns an empty MemStore whose addresses start with baseURL.
 func NewMemStore(baseURL string) *MemStore {
-	return &MemStore{
+	return &MemStore{memState: &memState{
 		baseURL:  strings.TrimSuffix(baseURL, "/"),
-		blobs:    map[digest.Digest][]byte{},
+		blobs:    map[memKey][]byte{},
 		failPuts: map[digest.Digest]int{},
+	}}
+}
+
+// Namespace returns the view of one namespace's blobs.
+func (m *MemStore) Namespace(ns string) (Store, error) {
+	return m.In(ns)
+}
+
+// In is Namespace, typed: the view of one namespace's blobs.
+func (m *MemStore) In(ns string) (*MemStore, error) {
+	if err := ValidateNamespace(ns); err != nil {
+		return nil, err
 	}
+	return &MemStore{ns: ns, memState: m.memState}, nil
 }
 
 // SetBaseURL changes where the store's addresses point, for a store created
@@ -48,6 +78,17 @@ func (m *MemStore) SetBaseURL(baseURL string) {
 	m.baseURL = strings.TrimSuffix(baseURL, "/")
 }
 
+func (m *MemStore) key(dgst digest.Digest) memKey { return memKey{ns: m.ns, dgst: dgst} }
+
+// path is the address path of a blob of the view: /mem/<digest>, or
+// /mem/<ns>/<digest> in a namespace.
+func (m *MemStore) path(dgst digest.Digest) string {
+	if m.ns == "" {
+		return "/mem/" + dgst.String()
+	}
+	return "/mem/" + m.ns + "/" + dgst.String()
+}
+
 // Has reports whether the blob is stored.
 func (m *MemStore) Has(_ context.Context, dgst digest.Digest) (bool, error) {
 	if err := dgst.Validate(); err != nil {
@@ -55,7 +96,7 @@ func (m *MemStore) Has(_ context.Context, dgst digest.Digest) (bool, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.blobs[dgst]
+	_, ok := m.blobs[m.key(dgst)]
 	return ok, nil
 }
 
@@ -70,7 +111,7 @@ func (m *MemStore) PresignPut(_ context.Context, dgst digest.Digest, size int64)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Address{
-		URL:       fmt.Sprintf("%s/mem/%s?size=%d", m.baseURL, dgst, size),
+		URL:       fmt.Sprintf("%s%s?size=%d", m.baseURL, m.path(dgst), size),
 		ExpiresAt: time.Now().Add(DefaultPutExpiry),
 	}, nil
 }
@@ -83,7 +124,7 @@ func (m *MemStore) PresignGet(_ context.Context, dgst digest.Digest) (Address, e
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Address{
-		URL:       fmt.Sprintf("%s/mem/%s", m.baseURL, dgst),
+		URL:       m.baseURL + m.path(dgst),
 		ExpiresAt: time.Now().Add(DefaultGetExpiry),
 	}, nil
 }
@@ -93,7 +134,7 @@ func (m *MemStore) Put(data []byte) digest.Digest {
 	dgst := digest.FromBytes(data)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.blobs[dgst] = bytes.Clone(data)
+	m.blobs[m.key(dgst)] = bytes.Clone(data)
 	return dgst
 }
 
@@ -101,7 +142,7 @@ func (m *MemStore) Put(data []byte) digest.Digest {
 func (m *MemStore) Get(dgst digest.Digest) ([]byte, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	data, ok := m.blobs[dgst]
+	data, ok := m.blobs[m.key(dgst)]
 	return bytes.Clone(data), ok
 }
 
@@ -109,17 +150,23 @@ func (m *MemStore) Get(dgst digest.Digest) ([]byte, bool) {
 func (m *MemStore) Delete(dgst digest.Digest) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.blobs, dgst)
+	delete(m.blobs, m.key(dgst))
 }
 
-// Len returns how many blobs are stored.
+// Len returns how many blobs the view stores.
 func (m *MemStore) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.blobs)
+	n := 0
+	for k := range m.blobs {
+		if k.ns == m.ns {
+			n++
+		}
+	}
+	return n
 }
 
-// Puts returns how many PUTs the store has accepted.
+// Puts returns how many PUTs the store has accepted, in every namespace.
 func (m *MemStore) Puts() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -133,12 +180,20 @@ func (m *MemStore) FailPuts(dgst digest.Digest, n int) {
 	m.failPuts[dgst] = n
 }
 
-// ServeHTTP serves the store's addresses.
+// ServeHTTP serves the addresses of the store and of every namespace view.
 func (m *MemStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name, ok := strings.CutPrefix(r.URL.Path, "/mem/")
 	if !ok {
 		http.NotFound(w, r)
 		return
+	}
+	view := &MemStore{memState: m.memState}
+	if ns, rest, found := strings.Cut(name, "/"); found {
+		if ValidateNamespace(ns) != nil {
+			http.Error(w, "bad namespace", http.StatusBadRequest)
+			return
+		}
+		view.ns, name = ns, rest
 	}
 	dgst, err := digest.Parse(name)
 	if err != nil {
@@ -147,7 +202,7 @@ func (m *MemStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		data, ok := m.Get(dgst)
+		data, ok := view.Get(dgst)
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -175,7 +230,7 @@ func (m *MemStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "injected failure", http.StatusServiceUnavailable)
 			return
 		}
-		m.blobs[dgst] = data
+		m.blobs[view.key(dgst)] = data
 		m.puts++
 		m.mu.Unlock()
 	default:

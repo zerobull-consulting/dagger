@@ -127,7 +127,10 @@ type S3Store struct {
 	now       func() time.Time
 }
 
-var _ Store = (*S3Store)(nil)
+var (
+	_ Store      = (*S3Store)(nil)
+	_ Namespacer = (*S3Store)(nil)
+)
 
 // NewS3 returns an S3Store for cfg. It makes no requests.
 func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
@@ -197,6 +200,21 @@ func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 		opts.BaseEndpoint = aws.String(cfg.Endpoint)
 	}
 	return s3.New(opts), nil
+}
+
+// Namespace returns the store of one namespace's blobs: the same bucket and
+// expiries, with keys under <prefix>/<ns>, so its blobs are at
+// <prefix>/<ns>/blobs/<algorithm>/<hex>, next to the namespace's metadata.
+func (s *S3Store) Namespace(ns string) (Store, error) {
+	if err := ValidateNamespace(ns); err != nil {
+		return nil, err
+	}
+	c := *s
+	c.prefix = ns
+	if s.prefix != "" {
+		c.prefix = s.prefix + "/" + ns
+	}
+	return &c, nil
 }
 
 // Key returns the object key of a blob: <prefix>/blobs/<algorithm>/<hex>.

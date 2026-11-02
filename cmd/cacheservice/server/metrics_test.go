@@ -85,7 +85,7 @@ func TestMetricsOfExportAndImport(t *testing.T) {
 		t.Fatalf("GET /metrics: %d %s", resp.StatusCode, body)
 	}
 	for _, want := range []string{
-		`cacheservice_export_batches_total{outcome="ok"}`,
+		`cacheservice_export_batches_total{outcome="ok",scope="team"}`,
 		`cacheservice_index_size_bytes{scope="team"}`,
 		"go_goroutines",
 	} {

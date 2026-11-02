@@ -70,6 +70,52 @@ func TestBlobKey(t *testing.T) {
 	}
 }
 
+// A namespace's store keeps its blobs under <prefix>/<ns>/blobs, next to the
+// namespace's metadata (<prefix>/<ns>/index.json and the rest), and signs
+// URLs for those keys only.
+func TestNamespaceKeys(t *testing.T) {
+	hex := testDigest.Encoded()
+	for _, tc := range []struct {
+		prefix string
+		want   string
+	}{
+		{"", "team-a/blobs/sha256/" + hex},
+		{"cache", "cache/team-a/blobs/sha256/" + hex},
+		{"/cache/x/", "cache/x/team-a/blobs/sha256/" + hex},
+	} {
+		cfg := testConfig()
+		cfg.Prefix = tc.prefix
+		root := newTestStore(t, cfg)
+		ns, err := root.Namespace("team-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ns.(*S3Store).Key(testDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("prefix %q: key %q, want %q", tc.prefix, got, tc.want)
+		}
+		get, err := ns.PresignGet(context.Background(), testDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(get.URL, "/"+tc.want+"?") {
+			t.Errorf("prefix %q: GET %s is not of %s", tc.prefix, get.URL, tc.want)
+		}
+		// The store itself is unchanged.
+		if k, _ := root.Key(testDigest); strings.Contains(k, "team-a") {
+			t.Errorf("prefix %q: the store's own key moved to %s", tc.prefix, k)
+		}
+	}
+	for _, bad := range []string{"", "a/b", "..", `a\b`} {
+		if _, err := newTestStore(t, testConfig()).Namespace(bad); err == nil {
+			t.Errorf("namespace %q accepted", bad)
+		}
+	}
+}
+
 func TestBlobKeyRejectsBadDigests(t *testing.T) {
 	for _, d := range []digest.Digest{
 		"",

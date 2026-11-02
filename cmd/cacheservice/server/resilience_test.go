@@ -133,7 +133,7 @@ func TestConnectionLostMidUpload(t *testing.T) {
 	if n := indexEntries(t, meta); n != 0 {
 		t.Fatalf("the index has %d entries from an export whose upload never finished", n)
 	}
-	for _, e := range h.svc.export.tracker.Entries(h.cache.ID) {
+	for _, e := range h.ns().tracker.Entries(h.cache.ID) {
 		if e.Failures != 0 {
 			t.Fatalf("an export cut short by the connection counted as a failure: %+v", e)
 		}
@@ -143,16 +143,16 @@ func TestConnectionLostMidUpload(t *testing.T) {
 	// new connection once the store answers.
 	var second *engineConn
 	waitUntil(t, 10*time.Second, "the engine to reconnect", func() bool {
-		second = h.svc.engineFor(h.cache.ID)
+		second = h.svc.engineFor(h.ns(), h.cache.ID)
 		return second != nil && second.id != first
 	})
 	release()
 	h.waitIndex(10, 11)
-	if !hasAll(t, blobs, digests) {
+	if !hasAll(t, scoped(t, blobs), digests) {
 		t.Fatal("the blobs of the stored export aren't all stored")
 	}
 	waitUntil(t, 5*time.Second, "the export's chains to be released", func() bool { return h.cache.InFlight() == 0 })
-	for _, e := range h.svc.export.tracker.Entries(h.cache.ID) {
+	for _, e := range h.ns().tracker.Entries(h.cache.ID) {
 		if !e.Stored || e.Failures != 0 {
 			t.Fatalf("after the retry: %+v", e)
 		}
@@ -177,7 +177,7 @@ func TestExportUploadTimeout(t *testing.T) {
 	defer release()
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
 	waitUntil(t, 10*time.Second, "an export to fail on its stalled upload", func() bool {
-		for _, e := range h.svc.export.tracker.Entries(h.cache.ID) {
+		for _, e := range h.ns().tracker.Entries(h.cache.ID) {
 			if e.Failures > 0 {
 				return true
 			}
@@ -189,7 +189,7 @@ func TestExportUploadTimeout(t *testing.T) {
 	}
 	release()
 	h.waitIndex(10, 11)
-	if !hasAll(t, blobs, digests) {
+	if !hasAll(t, scoped(t, blobs), digests) {
 		t.Fatal("the blobs of the stored export aren't all stored")
 	}
 }
@@ -288,7 +288,7 @@ func waitConn(t *testing.T, svc *Service, cacheID string) *engineConn {
 	t.Helper()
 	var c *engineConn
 	waitUntil(t, 10*time.Second, "engine "+cacheID+" to connect", func() bool {
-		c = svc.engineFor(cacheID)
+		c = svc.engineFor(mustNamespace(t, svc, testScope), cacheID)
 		return c != nil
 	})
 	return c
@@ -473,7 +473,7 @@ func testImportBundleNearMergeLimit(t *testing.T, blobs blobstore.Store, meta *m
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, err := importer.AddressBytes(context.Background(), importer.StoreSigner(blobs))
+	addr, err := importer.AddressBytes(context.Background(), importer.StoreSigner(scoped(t, blobs)))
 	if err != nil {
 		t.Fatal(err)
 	}

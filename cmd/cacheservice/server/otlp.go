@@ -19,31 +19,46 @@ import (
 
 // otlpRoutes receives OTLP/HTTP at the paths the engine's Cloud exporters
 // post to under DAGGER_CLOUD_URL. The engine's cache events arrive as log
-// records; session spans carry the cache entries their calls touched.
+// records, under the engine's own token; session spans carry the cache
+// entries their calls touched, under the token of the session's client.
+// With tokens, each POST must carry a known token as its HTTP Basic
+// username, and feeds only its namespace's paths (see otlpAuth).
 func (s *Service) otlpRoutes(mux *http.ServeMux) {
 	// Before taking over a session's telemetry, the engine probes the Cloud
-	// URL with HEAD /v1/traces; any answer will do.
+	// URL with HEAD /v1/traces, with no credentials; any answer will do.
+	// It carries nothing, so it isn't authenticated.
 	mux.HandleFunc("HEAD /v1/traces", func(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("otlp probe", "method", r.Method, "path", r.URL.Path, "userAgent", r.UserAgent())
 	})
 	mux.HandleFunc("POST /v1/logs", func(w http.ResponseWriter, r *http.Request) {
+		ns, key, ok := s.otlpAuth(w, r)
+		if !ok {
+			return
+		}
 		var req collogspb.ExportLogsServiceRequest
 		if !s.decodeOTLP(w, r, &req) {
 			return
 		}
-		s.logRecords(&req)
+		s.logRecords(ns, key, &req)
 		writeOTLP(w, r, &collogspb.ExportLogsServiceResponse{})
 	})
 	mux.HandleFunc("POST /v1/traces", func(w http.ResponseWriter, r *http.Request) {
+		ns, _, ok := s.otlpAuth(w, r)
+		if !ok {
+			return
+		}
 		var req coltracepb.ExportTraceServiceRequest
 		if !s.decodeOTLP(w, r, &req) {
 			return
 		}
 		s.logSpans(&req)
-		s.trackSpans(&req)
+		s.trackSpans(ns, &req)
 		writeOTLP(w, r, &coltracepb.ExportTraceServiceResponse{})
 	})
 	mux.HandleFunc("POST /v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if _, _, ok := s.otlpAuth(w, r); !ok {
+			return
+		}
 		var req colmetricspb.ExportMetricsServiceRequest
 		if !s.decodeOTLP(w, r, &req) {
 			return
@@ -59,7 +74,7 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 	})
 }
 
-func (s *Service) logRecords(req *collogspb.ExportLogsServiceRequest) {
+func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportLogsServiceRequest) {
 	other := 0
 	for _, rl := range req.ResourceLogs {
 		instance := stringAttr(rl.GetResource().GetAttributes(), "service.instance.id")
@@ -72,12 +87,12 @@ func (s *Service) logRecords(req *collogspb.ExportLogsServiceRequest) {
 				}
 				body := rec.GetBody().GetStringValue()
 				cache := stringAttr(rec.Attributes, telemetryattrs.EngineCacheAttr)
-				s.logger.Info("engine event", "kind", kind, "cache", cache, "instance", instance,
+				s.logger.Info("engine event", "namespace", ns.name, "kind", kind, "cache", cache, "instance", instance,
 					"scope", sl.GetScope().GetName(), "bodyBytes", len(body), "body", truncate(body, 512))
 				if s.dumpDir != "" {
 					s.dump(fmt.Sprintf("%06d-event-%s.json", s.dumpSeq.Add(1), kind), []byte(body))
 				}
-				s.trackEvent(kind, cache, body)
+				s.trackEvent(ns, key, kind, cache, body)
 			}
 		}
 	}

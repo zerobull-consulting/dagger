@@ -38,8 +38,14 @@ type Engine struct {
 	// connection number there.
 	Service *Service
 	Conn    uint64
+	// Token is the engine's DAGGER_CLOUD_TOKEN, which it authenticates
+	// with: its host name, unless the engine was started with a token. An
+	// engine started with one runs its CLI with the same token too, since
+	// session spans reach the service under the CLI's token.
+	Token string
 
-	env *Env
+	cliToken string
+	env      *Env
 }
 
 // Hostname is the engine's host name, which it sends as its engine name.
@@ -48,6 +54,14 @@ func (en *Engine) Hostname() string { return "e2e-engine-" + en.Name }
 // StartEngines starts engines with the given names, pointed at svc, and
 // waits until each has connected. They boot at once.
 func (e *Env) StartEngines(svc *Service, names ...string) []*Engine {
+	e.T.Helper()
+	return e.StartEnginesWithTokens(svc, nil, names...)
+}
+
+// StartEnginesWithTokens is StartEngines, with the token of each engine
+// named in tokens; the others use their host name. An engine with a token
+// runs its CLI with it too.
+func (e *Env) StartEnginesWithTokens(svc *Service, tokens map[string]string, names ...string) []*Engine {
 	t := e.T
 	t.Helper()
 	before := svc.maxConn()
@@ -58,7 +72,12 @@ func (e *Env) StartEngines(svc *Service, names ...string) []*Engine {
 			Container: "dagger-remote-cache-e2e-" + e.RunID + "-" + name,
 			Volume:    "dagger-remote-cache-e2e-" + e.RunID + "-" + name,
 			Service:   svc,
+			cliToken:  "e2e-cli",
 			env:       e,
+		}
+		en.Token = en.Hostname()
+		if tok, ok := tokens[name]; ok {
+			en.Token, en.cliToken = tok, tok
 		}
 		ctx, cancel := e.ctx()
 		_, err := Docker(ctx, "volume", "create", "--label", Label+"="+e.RunID, en.Volume)
@@ -69,7 +88,7 @@ func (e *Env) StartEngines(svc *Service, names ...string) []*Engine {
 				"--label", Label+"="+e.RunID,
 				"-v", en.Volume+":/var/lib/dagger",
 				"-e", "_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="+svc.URL,
-				"-e", "DAGGER_CLOUD_TOKEN="+en.Hostname(),
+				"-e", "DAGGER_CLOUD_TOKEN="+en.Token,
 				"-e", "DAGGER_CLOUD_URL="+svc.URL,
 				e.Settings.Image, "--debug")
 		}
@@ -153,6 +172,18 @@ func (en *Engine) Attach(svc *Service) {
 	en.waitConn(0)
 }
 
+// Logs returns the engine container's log.
+func (en *Engine) Logs() string {
+	en.env.T.Helper()
+	ctx, cancel := en.env.ctx()
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "logs", en.Container).CombinedOutput()
+	if err != nil {
+		en.env.T.Fatalf("logs of engine %s: %v", en.Name, err)
+	}
+	return string(out)
+}
+
 func (en *Engine) remove() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -195,7 +226,7 @@ func (en *Engine) CLI(svc *Service, out, stdin string, args ...string) ([]byte, 
 	}
 	env = append(env,
 		"_EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://"+en.Container,
-		"DAGGER_CLOUD_TOKEN=e2e-cli",
+		"DAGGER_CLOUD_TOKEN="+en.cliToken,
 		"DAGGER_CLOUD_URL="+svc.URL,
 		"DAGGER_NO_NAG=1",
 	)
