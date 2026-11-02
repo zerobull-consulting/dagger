@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/opencontainers/go-digest"
+
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -73,9 +75,10 @@ func TestMinIOExportBuild(t *testing.T) {
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
 	idx := h.waitIndex(10, 11)
 
-	// The layers, at their content-addressed keys, with their sizes.
+	// The layers, at their content-addressed keys under the scope (the
+	// namespace of a service without tokens), with their sizes.
 	for i, d := range layers {
-		ok, size := env.exists(ctx, t, env.key("blobs/sha256/"+d.Encoded()))
+		ok, size := env.exists(ctx, t, env.key(testScope+"/blobs/sha256/"+d.Encoded()))
 		want := int64(len(testLayer([]string{"base", "exec"}[i])))
 		if !ok || size != want {
 			t.Fatalf("layer %s: exists %v, size %d, want %d", d, ok, size, want)
@@ -178,5 +181,56 @@ func TestMinIOEnableS3(t *testing.T) {
 	bad.Bucket = "no-such-bucket-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
 	if err := New(slog.New(slog.DiscardHandler), "").EnableS3(ctx, bad, S3Options{Scope: testScope}); err == nil {
 		t.Fatal("EnableS3 accepted a missing bucket")
+	}
+}
+
+// On MinIO, two namespaces exporting the same build store everything under
+// their own prefix: <prefix>/<ns>/blobs/sha256/<hex> for every blob, the
+// shared base layer once in each, and their bundles and indexes under
+// <prefix>/<ns>/; nothing lands at <prefix>/blobs. Team B's engine can't
+// renew team A's layers, and an address of team B's for A's exec layer
+// finds nothing.
+func TestMinIONamespaceKeys(t *testing.T) {
+	blobs, meta, env := newMinIOStores(t)
+	h := newAuthHarnessOn(t, blobs, meta)
+	a, b := fakeengine.New("cache-a", 1), fakeengine.New("cache-b", 1)
+	layersA, layersB := authBuild(a, "a"), authBuild(b, "b")
+	h.connect(a, "tok-a")
+	h.connect(b, "tok-b")
+	h.export(a, "tok-a")
+	h.export(b, "tok-b")
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{
+		{"team-a/blobs/sha256/" + digest.FromBytes(layersA[0]).Encoded(), true},
+		{"team-b/blobs/sha256/" + digest.FromBytes(layersB[0]).Encoded(), true},
+		{"team-a/blobs/sha256/" + digest.FromBytes(layersA[1]).Encoded(), true},
+		{"team-b/blobs/sha256/" + digest.FromBytes(layersB[1]).Encoded(), true},
+		{"team-b/blobs/sha256/" + digest.FromBytes(layersA[1]).Encoded(), false},
+		{"team-a/blobs/sha256/" + digest.FromBytes(layersB[1]).Encoded(), false},
+		{"blobs/sha256/" + digest.FromBytes(layersA[0]).Encoded(), false},
+		{"team-a/index.json", true},
+		{"team-b/index.json", true},
+	} {
+		if ok, _ := env.exists(ctx, t, env.key(tc.key)); ok != tc.want {
+			t.Errorf("%s: exists %v, want %v", tc.key, ok, tc.want)
+		}
+	}
+	if addrs, ok, err := b.RenewLayers(ctx, "team-a", exportLayers(layersA...)); err != nil || ok || len(addrs) != 0 {
+		t.Fatalf("B renewed A's layers: %v, %v, %v", addrs, ok, err)
+	}
+	inB, err := namespaceBlobs(blobs, "team-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	get, err := inB.PresignGet(ctx, digest.FromBytes(layersA[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _, err := httpGet(ctx, get.URL); err != nil || code != http.StatusNotFound {
+		t.Fatalf("team B's GET of A's exec layer: %d, %v", code, err)
 	}
 }

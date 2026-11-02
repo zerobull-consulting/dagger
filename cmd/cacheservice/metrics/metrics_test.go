@@ -27,7 +27,7 @@ func TestNilRecordsNothing(t *testing.T) {
 	m.BundleWrite("s", metrics.BundleWritten, 1)
 	m.BundleRead("s", 1)
 	m.ImportBundleCache(true)
-	m.ImportSync(false, time.Millisecond)
+	m.ImportSync("team", false, time.Millisecond)
 	m.ExportBatch(metrics.ExportBatch{Outcome: metrics.OutcomeOK})
 	if m.Collectors() != nil {
 		t.Fatal("nil metrics has collectors")
@@ -130,8 +130,8 @@ func TestBundlesAndImports(t *testing.T) {
 	m.ImportBundleCache(true)
 	m.ImportBundleCache(false)
 	m.ImportBundleCache(false)
-	m.ImportSync(false, time.Millisecond)
-	m.ImportSync(true, time.Millisecond)
+	m.ImportSync("team", false, time.Millisecond)
+	m.ImportSync("team", true, time.Millisecond)
 	for _, c := range []struct {
 		name   string
 		labels map[string]string

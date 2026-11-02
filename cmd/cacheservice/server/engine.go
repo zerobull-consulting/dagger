@@ -39,6 +39,26 @@ type Service struct {
 
 	mu    sync.Mutex
 	conns map[uint64]*engineConn
+	// tokens maps tokens to namespaces; nil means the service is
+	// unauthenticated: any token, all in the default namespace.
+	// tokensGen counts SetTokens calls, so a connection checked against
+	// one set of tokens isn't welcomed after another replaced it.
+	tokens    Tokens
+	tokensGen uint64
+	// tokensFile is where ReloadTokens reads tokens from.
+	tokensFile string
+
+	// rejections rate-limits the logs of refused tokens, by fingerprint.
+	rejections rejectionLog
+
+	// nsMu guards the namespaces and the default namespace.
+	nsMu       sync.Mutex
+	namespaces map[string]*namespace
+	// defaultNS is the namespace of every engine when there are no tokens:
+	// the scope EnableExport and EnableImport name. scopeSet is set once
+	// one of them named it.
+	defaultNS string
+	scopeSet  bool
 
 	// export is the export path, nil when it is off.
 	export *exportPath
@@ -57,11 +77,13 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return &Service{
-		logger:   logger,
-		dumpDir:  dumpDir,
-		conns:    map[uint64]*engineConn{},
-		registry: reg,
-		metrics:  metrics.New(reg),
+		logger:     logger,
+		dumpDir:    dumpDir,
+		conns:      map[uint64]*engineConn{},
+		namespaces: map[string]*namespace{},
+		defaultNS:  DefaultNamespace,
+		registry:   reg,
+		metrics:    metrics.New(reg),
 	}
 }
 
@@ -92,8 +114,16 @@ func (s *Service) Handler() http.Handler {
 // engineConn is one engine's connection. The service numbers its own
 // messages, as the engine does, from 1.
 type engineConn struct {
-	id          uint64
-	token       string
+	id uint64
+	// token is the token's fingerprint, for logs; secret is the token
+	// itself, to check it again when the tokens change, and key its hash.
+	// Neither is ever logged.
+	token  string
+	secret string
+	key    tokenKey
+	// ns is the namespace of the token.
+	ns          *namespace
+	revoked     atomic.Bool
 	remote      string
 	connectedAt time.Time
 	conn        *websocket.Conn
@@ -111,20 +141,27 @@ type engineConn struct {
 func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
 	token, _, ok := r.BasicAuth()
 	if !ok || token == "" {
-		s.logger.Warn("engine rejected: no token", "remote", r.RemoteAddr)
-		w.Header().Set("WWW-Authenticate", `Basic realm="dagger-cache"`)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		s.reject(w, r, endpointEngine, "")
+		return
+	}
+	// Before the upgrade: an unknown token gets 401, and never a protocol
+	// message.
+	ns, ok := s.authenticate(w, r, endpointEngine, token)
+	if !ok {
 		return
 	}
 	c := &engineConn{
 		id:          s.lastConn.Add(1),
 		token:       tokenFingerprint(token),
+		secret:      token,
+		key:         keyOf(token),
+		ns:          ns,
 		remote:      r.RemoteAddr,
 		connectedAt: time.Now(),
 		svc:         s,
 		pending:     map[uint64]chan protocol.Envelope{},
 	}
-	c.logger = s.logger.With("conn", c.id)
+	c.logger = s.logger.With("conn", c.id, "namespace", ns.name)
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionNoContextTakeover,
 		OnPingReceived: func(context.Context, []byte) bool {
@@ -143,16 +180,19 @@ func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
 
 	err = c.serve(r.Context())
 	s.mu.Lock()
-	delete(s.conns, c.id)
+	if s.conns[c.id] == c {
+		delete(s.conns, c.id)
+	}
 	s.mu.Unlock()
 	c.failPending()
-	if s.export != nil {
-		s.export.exporter.Forget(c)
+	if c.ns.exporter != nil {
+		c.ns.exporter.Forget(c)
 	}
 	_ = conn.CloseNow()
 	c.logger.Info("engine disconnected",
 		"after", time.Since(c.connectedAt).Round(time.Millisecond),
 		"closeStatus", int(websocket.CloseStatus(err)),
+		"revoked", c.revoked.Load(),
 		"error", err)
 }
 
@@ -172,9 +212,10 @@ func (c *engineConn) serve(ctx context.Context) error {
 		_ = c.replyError(ctx, env, err.Error())
 		return err
 	}
-	c.svc.mu.Lock()
-	c.svc.conns[c.id] = c
-	c.svc.mu.Unlock()
+	if !c.svc.register(c) {
+		c.revoke()
+		return errors.New("token revoked before welcome")
+	}
 	if err := c.reply(ctx, env, protocol.TypeWelcome, protocol.Welcome{}); err != nil {
 		return err
 	}
@@ -235,7 +276,7 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 				_ = c.replyError(ctx, env, err.Error())
 				return
 			}
-			_ = c.reply(ctx, env, protocol.TypeRenewed, c.svc.renew(ctx, req))
+			_ = c.reply(ctx, env, protocol.TypeRenewed, c.svc.renew(ctx, c, req))
 		}()
 	default:
 		go func() { _ = c.replyError(ctx, env, fmt.Sprintf("unexpected request %q", env.Type)) }()
@@ -439,11 +480,13 @@ func (s *Service) DebugHandler() http.Handler {
 	return mux
 }
 
-// EngineInfo is a welcomed engine connection, as Engines lists it.
+// EngineInfo is a welcomed engine connection, as Engines lists it. Token is
+// the token's fingerprint, not the token.
 type EngineInfo struct {
 	Conn          uint64    `json:"conn"`
 	Remote        string    `json:"remote"`
 	Token         string    `json:"token"`
+	Namespace     string    `json:"namespace"`
 	ConnectedAt   time.Time `json:"connectedAt"`
 	CacheID       string    `json:"cacheID"`
 	Generation    uint64    `json:"generation"`
