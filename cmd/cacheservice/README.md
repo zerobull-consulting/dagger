@@ -543,7 +543,10 @@ paths record into them through their metadata store. All are prefixed
 | `bundle_writes_total` | `scope`, `outcome` | Bundles stored: `written`, or `existing` (already stored) |
 | `bundle_write_size_bytes` | `scope` | Size of each bundle stored |
 | `bundle_reads_total`, `bundle_read_bytes_total` | `scope` | Bundles read from the store |
+| `resolution_writes_total`, `resolution_write_size_bytes` | `scope`, `outcome` (writes) | Bundle resolutions stored, one per recorded export plus one per lost index write that changed the numbers: `written`, or `existing` (see [Imported entries](#imported-entries)) |
+| `resolution_reads_total`, `resolution_read_bytes_total` | `scope` | Resolutions read from the store |
 | `import_bundle_cache_total` | `result` | Bundles a merge needed: `hit` (in memory) or `miss` |
+| `import_resolution_cache_total` | `result` | Resolutions a merge needed: `hit` (in memory) or `miss` |
 | `import_syncs_total`, `import_sync_duration_seconds` | `outcome` | Import syncs of one engine |
 | `export_batches_total` | `outcome` | Export batches: `ok`, `error` or `interrupted` |
 | `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
@@ -555,7 +558,8 @@ paths record into them through their metadata store. All are prefixed
 whether its scheduler, its sync loop or the debug API ran it, and `other` for
 the rest (a wiped cache's imports leaving the index). Debug-triggered exports
 and imports count in the export and import metrics too. `bundle_reads_total`
-counts the read `PutBundle` makes when the bundle is already stored. The Go runtime and process collectors are served too.
+counts the read `PutBundle` makes when the bundle is already stored, and
+`resolution_reads_total` the same for resolutions. The Go runtime and process collectors are served too.
 
 What to watch:
 

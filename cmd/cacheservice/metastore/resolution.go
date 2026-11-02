@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"
 )
 
@@ -155,9 +156,18 @@ func (s *Store) PutResolution(ctx context.Context, scope string, r *Resolution) 
 	if err != nil {
 		return "", err
 	}
-	if err := s.putImmutable(ctx, key, body); err != nil {
+	existed, read, err := s.putImmutable(ctx, key, body)
+	if read > 0 {
+		s.metrics.ResolutionRead(scope, read)
+	}
+	if err != nil {
 		return "", fmt.Errorf("put resolution %s: %w", id, err)
 	}
+	outcome := metrics.BundleWritten
+	if existed {
+		outcome = metrics.BundleExisting
+	}
+	s.metrics.ResolutionWrite(scope, outcome, len(body))
 	return id, nil
 }
 
@@ -172,6 +182,7 @@ func (s *Store) GetResolution(ctx context.Context, scope, id string) (*Resolutio
 	if err != nil {
 		return nil, fmt.Errorf("get resolution: %w", err)
 	}
+	s.metrics.ResolutionRead(scope, len(body))
 	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != id {
 		return nil, fmt.Errorf("get resolution %s: %w", id, ErrCorruptBundle)
 	}
@@ -186,32 +197,35 @@ func (s *Store) GetResolution(ctx context.Context, scope, id string) (*Resolutio
 }
 
 // putImmutable writes a content-addressed object once: If-None-Match: *,
-// and, when the key exists, a check that what is there is body.
-func (s *Store) putImmutable(ctx context.Context, key string, body []byte) error {
+// and, when the key exists, a check that what is there is body. It reports
+// whether the object was already stored, and how many bytes it read
+// checking.
+func (s *Store) putImmutable(ctx context.Context, key string, body []byte) (existed bool, read int, err error) {
 	for attempt := 1; ; attempt++ {
 		_, err := s.objects.Put(ctx, key, body, Condition{IfNoneMatch: true})
 		if err == nil {
-			return nil
+			return false, read, nil
 		}
 		if !errors.Is(err, ErrPreconditionFailed) {
-			return err
+			return false, read, err
 		}
 		// The key exists, or a write of it is in flight (S3's 409).
 		stored, _, err := s.objects.Get(ctx, key)
 		if err == nil {
+			read += len(stored)
 			if !bytes.Equal(stored, body) {
-				return ErrCorruptBundle
+				return true, read, ErrCorruptBundle
 			}
-			return nil
+			return true, read, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
-			return err
+			return false, read, err
 		}
 		if attempt >= s.maxAttempts {
-			return ErrContention
+			return false, read, ErrContention
 		}
 		if err := s.sleep(ctx, backoff(attempt)); err != nil {
-			return err
+			return false, read, err
 		}
 	}
 }

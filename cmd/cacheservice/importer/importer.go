@@ -567,6 +567,7 @@ func (im *Importer) resolution(ctx context.Context, id string) (*metastore.Resol
 	im.mu.Lock()
 	r := im.resolutions[id]
 	im.mu.Unlock()
+	im.cfg.Metrics.ImportResolutionCache(r != nil)
 	if r != nil {
 		return r, nil
 	}

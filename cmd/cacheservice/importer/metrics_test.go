@@ -39,4 +39,13 @@ func TestMetricsBundleCache(t *testing.T) {
 	if got := metricstest.Value(t, reg, "cacheservice_bundle_reads_total", map[string]string{"scope": scope}); got != 1 {
 		t.Fatalf("bundle reads %v, want 1", got)
 	}
+	// Its resolution likewise.
+	for result, want := range map[string]float64{"miss": 1, "hit": 1} {
+		if got := metricstest.Value(t, reg, "cacheservice_import_resolution_cache_total", map[string]string{"result": result}); got != want {
+			t.Errorf("resolution %s %v, want %v", result, got, want)
+		}
+	}
+	if got := metricstest.Value(t, reg, "cacheservice_resolution_reads_total", map[string]string{"scope": scope}); got != 1 {
+		t.Fatalf("resolution reads %v, want 1", got)
+	}
 }

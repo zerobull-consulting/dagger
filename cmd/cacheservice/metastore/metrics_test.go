@@ -188,3 +188,35 @@ func TestWithMetrics(t *testing.T) {
 		t.Fatal("WithMetrics changed the original, or didn't set them")
 	}
 }
+
+// Each recorded export stores its resolution: written once, existing when
+// the same export is recorded again; reading it back is counted.
+func TestMetricsResolutions(t *testing.T) {
+	s, reg := newMetricsStore(t, NewMemObjects(), 0)
+	ctx := context.Background()
+	rec, err := s.Record(ctx, "s1", chain(10), "cache-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Record(ctx, "s1", chain(10), "cache-a", 2); err != nil {
+		t.Fatal(err)
+	}
+	for outcome, want := range map[string]float64{metrics.BundleWritten: 1, metrics.BundleExisting: 1} {
+		if got := metricstest.Value(t, reg, "cacheservice_resolution_writes_total", map[string]string{"scope": "s1", "outcome": outcome}); got != want {
+			t.Errorf("resolution writes %s %v, want %v", outcome, got, want)
+		}
+	}
+	// The existing one was read to check it.
+	if got := metricstest.Value(t, reg, "cacheservice_resolution_reads_total", map[string]string{"scope": "s1"}); got != 1 {
+		t.Fatalf("resolution reads %v, want 1", got)
+	}
+	if _, err := s.GetResolution(ctx, "s1", rec.ResolutionID); err != nil {
+		t.Fatal(err)
+	}
+	if got := metricstest.Value(t, reg, "cacheservice_resolution_reads_total", map[string]string{"scope": "s1"}); got != 2 {
+		t.Fatalf("resolution reads %v, want 2", got)
+	}
+	if got := metricstest.Value(t, reg, "cacheservice_resolution_read_bytes_total", map[string]string{"scope": "s1"}); got <= 0 {
+		t.Fatalf("resolution read bytes %v", got)
+	}
+}
