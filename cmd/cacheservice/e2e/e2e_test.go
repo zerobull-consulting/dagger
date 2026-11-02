@@ -83,6 +83,12 @@ func TestRealEngines(t *testing.T) {
 	env.Run("renew", st.renew)
 	env.Run("prune", st.prune)
 	env.Run("superseded", st.superseded)
+	// The resilience scenarios (#12), last: they break things on purpose,
+	// and service-restart replaces the main service.
+	env.Run("disconnect", st.disconnect)
+	env.Run("engine-restart", st.engineRestart)
+	env.Run("s3-faults", st.s3Faults)
+	env.Run("service-restart", st.serviceRestart)
 }
 
 // retainedStored reports whether every retained entry the service tracks

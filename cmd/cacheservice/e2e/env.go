@@ -117,6 +117,8 @@ type Env struct {
 	Proxy *S3Proxy
 
 	bin string
+	// deleted are the blobs scenarios deleted from MinIO on purpose.
+	deleted map[digest.Digest]bool
 	// root is the run's own test: what the run starts is cleaned up when it
 	// ends, not when a scenario does, since later scenarios reuse it.
 	root *testing.T
@@ -142,6 +144,7 @@ func New(t *testing.T) *Env {
 		RunID:    time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(suffix),
 		Scope:    "e2e",
 		bin:      filepath.Join(settings.Dir, "bin"),
+		deleted:  map[digest.Digest]bool{},
 	}
 	e.RunDir = filepath.Join(settings.Dir, "runs", e.RunID)
 	if err := os.MkdirAll(e.RunDir, 0o755); err != nil {
@@ -359,12 +362,76 @@ func (e *Env) DeleteBlob(d digest.Digest) {
 	ctx, cancel := e.ctx()
 	defer cancel()
 	key := e.BlobKey(d)
+	e.deleted[d] = true
 	if _, err := e.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(e.S3Config.Bucket), Key: aws.String(key)}); err != nil {
 		e.T.Fatalf("delete %s: %v", key, err)
 	}
 	if _, err := e.S3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(e.S3Config.Bucket), Key: aws.String(key)}); err == nil {
 		e.T.Fatalf("%s is still in MinIO after its delete", key)
 	}
+}
+
+// CheckConsistent checks, reading MinIO directly, that what the store
+// publishes is whole (#12): the index names no bundle that isn't stored, and
+// no stored bundle names a layer blob that isn't, besides those a scenario
+// deleted on purpose (DeleteBlob). Each failure says what is missing.
+func (e *Env) CheckConsistent(t *testing.T, when string) {
+	t.Helper()
+	idx := e.Index()
+	stored := map[string]bool{}
+	ids := e.BundleIDs()
+	for _, id := range ids {
+		stored[id] = true
+	}
+	var missingBundles []string
+	for n, entry := range idx.Entries {
+		if !stored[entry.Bundle] {
+			missingBundles = append(missingBundles, fmt.Sprintf("entry %d's bundle %s", n, Short(entry.Bundle)))
+		}
+	}
+	slices.Sort(missingBundles)
+	blobs := map[string]bool{}
+	for _, key := range e.listKeys(e.S3Config.Prefix + "/blobs/") {
+		blobs[key] = true
+	}
+	named := map[digest.Digest]bool{}
+	var missingBlobs []string
+	deleted := 0
+	for _, id := range ids {
+		b := e.Bundle(id)
+		var chains []*dagql.OfferedChain
+		for _, o := range b.Outputs {
+			chains = append(chains, o.Chain)
+		}
+		for _, v := range b.Values {
+			for i := range v.Record.Envelope.PendingOffers {
+				chains = append(chains, &v.Record.Envelope.PendingOffers[i].Chain)
+			}
+		}
+		for _, c := range chains {
+			if c == nil {
+				continue
+			}
+			for _, l := range c.Layers {
+				d := l.Descriptor.Digest
+				if named[d] {
+					continue
+				}
+				named[d] = true
+				switch {
+				case blobs[e.BlobKey(d)]:
+				case e.deleted[d]:
+					deleted++
+				default:
+					missingBlobs = append(missingBlobs, fmt.Sprintf("%s (in bundle %s)", Short(d.String()), Short(id)))
+				}
+			}
+		}
+	}
+	Check(t, len(missingBundles) == 0, "S3 consistent %s: the index's %d entries are all in its stored bundles (%d stored; missing: %v)",
+		when, len(idx.Entries), len(ids), missingBundles)
+	Check(t, len(missingBlobs) == 0, "S3 consistent %s: the %d stored bundles name %d layer blobs, all stored (missing: %v; %d deleted on purpose)",
+		when, len(ids), len(named), missingBlobs, deleted)
 }
 
 func (e *Env) deletePrefix() {

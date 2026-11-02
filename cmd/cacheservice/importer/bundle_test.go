@@ -292,3 +292,40 @@ func TestPlanSkipsRootWithExpiredDependency(t *testing.T) {
 		t.Fatalf("after the dependency expired: %+v", got)
 	}
 }
+
+// KNOWN GAP (https://github.com/zerobull-consulting/dagger/issues/47), found
+// by the real-engine run (#12): a stored bundle names an imported value by
+// the engine number it was imported on, and BuildMerge resolves it through
+// the cache's current imported mapping. When the import moves to another
+// engine entry (the engine pruned it, restarted, and had it merged again)
+// the old number no longer resolves, and the bundle can't be merged into any
+// engine again. This test fails once the gap is fixed: then make it check
+// that the bundle merges, with the values on A's numbers.
+func TestKnownGapBundleOfMovedImportsUnmergeable(t *testing.T) {
+	idx := metastore.NewIndex()
+	// A exports base (10) and exec (11).
+	aID := testBundleID("a")
+	aNumbers := record(t, idx, aID, chainBundle(10, "base", "exec"), "cache-a")
+	baseN, execN := aNumbers[1], aNumbers[2]
+
+	// C has them merged, on its entries 6 and 7, and builds test (8) on
+	// them: its bundle names them by 6 and 7, which resolve to A's numbers.
+	idx.RecordImports("cache-c", 1, []metastore.Import{{Number: baseN, Engine: 6}, {Number: execN, Engine: 7}})
+	cID := testBundleID("c")
+	cBundle := chainBundle(6, "base", "exec", "test")
+	cNumbers := record(t, idx, cID, cBundle, "cache-c")
+	if cNumbers[1] != baseN || cNumbers[2] != execN {
+		t.Fatalf("C's bundle recorded base and exec as %d and %d, want A's %d and %d", cNumbers[1], cNumbers[2], baseN, execN)
+	}
+	testN := cNumbers[3]
+	if _, err := BuildMerge(context.Background(), idx, cID, cBundle, []uint64{testN}, testSigner, "team"); err != nil {
+		t.Fatalf("before the imports move: %v", err)
+	}
+
+	// C prunes them, restarts, and has them merged again, on 20 and 21.
+	idx.RecordImports("cache-c", 2, []metastore.Import{{Number: baseN, Engine: 20}, {Number: execN, Engine: 21}})
+	_, err := BuildMerge(context.Background(), idx, cID, cBundle, []uint64{testN}, testSigner, "team")
+	if err == nil || !strings.Contains(err.Error(), "no longer stored") {
+		t.Fatalf("after the imports moved: %v; the gap (#47) may be fixed: update this test, the README and the issue", err)
+	}
+}

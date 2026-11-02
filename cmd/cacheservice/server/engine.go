@@ -381,6 +381,19 @@ func (s *Service) CloseEngines() {
 	}
 }
 
+// CloseEngine drops one engine's connection at once, with no close frame,
+// as a network failure would. The engine reconnects with backoff; requests
+// in flight on the connection fail, and exports cut short by it are tried
+// again on the engine's next connection.
+func (s *Service) CloseEngine(conn uint64) error {
+	c, err := s.conn(conn)
+	if err != nil {
+		return err
+	}
+	c.logger.Info("closing the engine's connection")
+	return c.conn.CloseNow()
+}
+
 // tokenFingerprint names a token in logs without revealing it.
 func tokenFingerprint(token string) string {
 	sum := sha256.Sum256([]byte(token))
