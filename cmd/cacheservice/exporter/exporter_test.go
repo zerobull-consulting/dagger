@@ -44,6 +44,8 @@ type fakeEngine struct {
 	hold chan struct{}
 	// mangle, when set, changes each capture before it is sent.
 	mangle func(*fakeengine.Capture)
+	// noPut lists blobs the engine reports done without uploading them.
+	noPut map[digest.Digest]bool
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -109,7 +111,14 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 		}
 		reply := protocol.Uploaded{Done: []digest.Digest{}}
 		for d, url := range req.URLs {
-			if err := put(ctx, url, capt.Blobs[d]); err != nil {
+			e.mu.Lock()
+			skip := e.noPut[d]
+			e.mu.Unlock()
+			if skip {
+				reply.Done = append(reply.Done, d)
+				continue
+			}
+			if err := put(ctx, url, e.cache.UploadBody(d, capt.Blobs[d])); err != nil {
 				reply.Failed = append(reply.Failed, protocol.UploadFailure{Digest: d, Message: err.Error()})
 				continue
 			}

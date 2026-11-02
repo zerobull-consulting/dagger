@@ -88,6 +88,8 @@ func TestRealEngines(t *testing.T) {
 	env.Run("superseded", st.superseded)
 	// Auth and namespaces (#10): its own service, with tokens, and engines.
 	env.Run("namespaces", st.namespaces)
+	// Upload verification (#23): A's uploads corrupted on their way to S3.
+	env.Run("verify", st.verify)
 	// The resilience scenarios (#12), last: they break things on purpose,
 	// and service-restart replaces the main service.
 	env.Run("disconnect", st.disconnect)

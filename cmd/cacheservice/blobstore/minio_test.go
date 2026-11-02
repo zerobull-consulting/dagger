@@ -110,6 +110,53 @@ func randomBlob(t *testing.T, size int) ([]byte, digest.Digest) {
 	return data, digest.FromBytes(data)
 }
 
+// stageAndPromote uploads body as the engine would to a fresh stage's PUT
+// for d, and promotes it.
+func stageAndPromote(t *testing.T, s *S3Store, d digest.Digest, size int64, body []byte) Promotion {
+	t.Helper()
+	ctx := context.Background()
+	stage := NewStage()
+	put, err := s.PresignPut(ctx, stage, d, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := enginePut(t, put.URL, body); status != http.StatusOK {
+		t.Fatalf("presigned PUT: status %d", status)
+	}
+	p, err := s.Promote(ctx, stage, d, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// objectExists reports whether key is in the bucket.
+func objectExists(t *testing.T, s *S3Store, key string) bool {
+	t.Helper()
+	_, err := s.client.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.bucket, Key: &key})
+	if err != nil && !isNotFound(err) {
+		t.Fatal(err)
+	}
+	return err == nil
+}
+
+// listKeys lists the keys under prefix.
+func listKeys(t *testing.T, s *S3Store, prefix string) []string {
+	t.Helper()
+	var keys []string
+	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range page.Contents {
+			keys = append(keys, aws.ToString(o.Key))
+		}
+	}
+	return keys
+}
+
 func mustHas(t *testing.T, s *S3Store, d digest.Digest) bool {
 	t.Helper()
 	ok, err := s.Has(context.Background(), d)
@@ -119,7 +166,9 @@ func mustHas(t *testing.T, s *S3Store, d digest.Digest) bool {
 	return ok
 }
 
-// A blob uploaded with a presigned PUT can be fetched with a presigned GET.
+// A blob uploaded with a presigned PUT is staged, not stored, until it is
+// promoted; then it can be fetched with a presigned GET, and the staged
+// object is gone.
 func TestMinIOStorePutGet(t *testing.T) {
 	s := newMinIOStore(t, nil)
 	ctx := context.Background()
@@ -128,15 +177,24 @@ func TestMinIOStorePutGet(t *testing.T) {
 	if mustHas(t, s, d) {
 		t.Fatalf("%s is stored before its upload", d)
 	}
-	put, err := s.PresignPut(ctx, d, int64(len(blob)))
+	stage := NewStage()
+	put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status := enginePut(t, put.URL, blob); status != http.StatusOK {
 		t.Fatalf("presigned PUT: status %d", status)
 	}
-	if !mustHas(t, s, d) {
-		t.Fatalf("%s is not stored after its upload", d)
+	staged, _ := s.StagingKey(stage, d)
+	if mustHas(t, s, d) || !objectExists(t, s, staged) {
+		t.Fatalf("after the upload: stored %v, staged %v; want staged only", mustHas(t, s, d), objectExists(t, s, staged))
+	}
+	p, err := s.Promote(ctx, stage, d, int64(len(blob)))
+	if err != nil || p.Outcome != Promoted || p.HashedBy != HashedByStore || p.Bytes != int64(len(blob)) {
+		t.Fatalf("promote: %+v, %v", p, err)
+	}
+	if !mustHas(t, s, d) || objectExists(t, s, staged) {
+		t.Fatalf("after promotion: stored %v, staged %v; want stored only", mustHas(t, s, d), objectExists(t, s, staged))
 	}
 
 	key, _ := s.Key(d)
@@ -177,12 +235,24 @@ func TestMinIOStoreNamespaces(t *testing.T) {
 	}
 	a, b := nsA.(*S3Store), nsB.(*S3Store)
 	blob, d := randomBlob(t, 4096)
-	put, err := a.PresignPut(ctx, d, int64(len(blob)))
+	stage := NewStage()
+	put, err := a.PresignPut(ctx, stage, d, int64(len(blob)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status := enginePut(t, put.URL, blob); status != http.StatusOK {
 		t.Fatalf("presigned PUT: status %d", status)
+	}
+	staged, _ := a.StagingKey(stage, d)
+	if want := s.prefix + "/team-a/staging/" + string(stage) + "/sha256/" + d.Encoded(); staged != want {
+		t.Fatalf("staging key %s, want %s", staged, want)
+	}
+	// Promotion never crosses namespaces: team-b finds nothing staged.
+	if p, err := b.Promote(ctx, stage, d, int64(len(blob))); err != nil || p.Outcome != Missing {
+		t.Fatalf("team-b's promotion of team-a's upload: %+v, %v", p, err)
+	}
+	if p, err := a.Promote(ctx, stage, d, int64(len(blob))); err != nil || p.Outcome != Promoted {
+		t.Fatalf("promote: %+v, %v", p, err)
 	}
 	key, _ := a.Key(d)
 	if want := s.prefix + "/team-a/blobs/sha256/" + d.Encoded(); key != want {
@@ -198,14 +268,15 @@ func TestMinIOStoreNamespaces(t *testing.T) {
 	if status, _ := httpGet(t, get.URL); status != http.StatusNotFound {
 		t.Fatalf("team-b's GET: status %d", status)
 	}
-	urls, err := UploadURLs(ctx, b, []Blob{{Digest: d, Size: int64(len(blob))}})
+	urls, err := UploadURLs(ctx, b, NewStage(), []Blob{{Digest: d, Size: int64(len(blob))}})
 	if err != nil || len(urls) != 1 {
 		t.Fatalf("team-b's upload URLs %v, %v", urls, err)
 	}
 }
 
-// An existing blob is not requested again: once uploaded, UploadURLs leaves
-// it out of the next upload request.
+// An existing blob is not requested again: once uploaded and promoted,
+// UploadURLs leaves it out of the next upload request. An upload not yet
+// promoted is asked for again.
 func TestMinIOStoreUploadURLsSkipsExisting(t *testing.T) {
 	s := newMinIOStore(t, nil)
 	ctx := context.Background()
@@ -213,7 +284,8 @@ func TestMinIOStoreUploadURLsSkipsExisting(t *testing.T) {
 	second, d2 := randomBlob(t, 8192)
 	blobs := []Blob{{Digest: d1, Size: int64(len(first))}, {Digest: d2, Size: int64(len(second))}}
 
-	urls, err := UploadURLs(ctx, s, blobs)
+	stage := NewStage()
+	urls, err := UploadURLs(ctx, s, stage, blobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,8 +295,15 @@ func TestMinIOStoreUploadURLsSkipsExisting(t *testing.T) {
 	if status := enginePut(t, urls[d1], first); status != http.StatusOK {
 		t.Fatalf("PUT %s: status %d", d1, status)
 	}
+	if urls, _ := UploadURLs(ctx, s, NewStage(), blobs); len(urls) != 2 {
+		t.Fatalf("before promotion: %d URLs, want 2", len(urls))
+	}
+	if p, err := s.Promote(ctx, stage, d1, int64(len(first))); err != nil || p.Outcome != Promoted {
+		t.Fatalf("promote: %+v, %v", p, err)
+	}
 
-	urls, err = UploadURLs(ctx, s, blobs)
+	stage = NewStage()
+	urls, err = UploadURLs(ctx, s, stage, blobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,8 +313,11 @@ func TestMinIOStoreUploadURLsSkipsExisting(t *testing.T) {
 	if status := enginePut(t, urls[d2], second); status != http.StatusOK {
 		t.Fatalf("PUT %s: status %d", d2, status)
 	}
+	if p, err := s.Promote(ctx, stage, d2, int64(len(second))); err != nil || p.Outcome != Promoted {
+		t.Fatalf("promote: %+v, %v", p, err)
+	}
 
-	urls, err = UploadURLs(ctx, s, blobs)
+	urls, err = UploadURLs(ctx, s, NewStage(), blobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,19 +335,21 @@ func keys(m map[digest.Digest]string) []digest.Digest {
 }
 
 // The presigned PUT is bound to the size it was signed for: a longer or
-// shorter body is refused and nothing is stored.
+// shorter body is refused and nothing is staged or stored.
 func TestMinIOStorePutSizeBound(t *testing.T) {
 	s := newMinIOStore(t, nil)
 	blob, d := randomBlob(t, 4096)
-	put, err := s.PresignPut(context.Background(), d, int64(len(blob)))
+	stage := NewStage()
+	put, err := s.PresignPut(context.Background(), stage, d, int64(len(blob)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	staged, _ := s.StagingKey(stage, d)
 	for _, body := range [][]byte{append(append([]byte{}, blob...), 0), blob[:len(blob)-1]} {
 		if status := enginePut(t, put.URL, body); status/100 == 2 {
 			t.Fatalf("PUT of %d bytes, signed for %d: status %d", len(body), len(blob), status)
 		}
-		if mustHas(t, s, d) {
+		if mustHas(t, s, d) || objectExists(t, s, staged) {
 			t.Fatalf("PUT of %d bytes stored an object", len(body))
 		}
 	}
@@ -279,7 +363,8 @@ func TestMinIOStoreExpiry(t *testing.T) {
 	})
 	ctx := context.Background()
 	blob, d := randomBlob(t, 128)
-	put, err := s.PresignPut(ctx, d, int64(len(blob)))
+	stage := NewStage()
+	put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,6 +374,10 @@ func TestMinIOStoreExpiry(t *testing.T) {
 	}
 	if status := enginePut(t, put.URL, blob); status != http.StatusOK {
 		t.Fatalf("fresh PUT: status %d", status)
+	}
+	// The GET is of the digest key: promote what the PUT staged.
+	if p, err := s.Promote(ctx, stage, d, int64(len(blob))); err != nil || p.Outcome != Promoted {
+		t.Fatalf("promote: %+v, %v", p, err)
 	}
 	time.Sleep(time.Until(get.ExpiresAt) + 1500*time.Millisecond)
 	if status, _ := httpGet(t, get.URL); status != http.StatusForbidden {
@@ -310,46 +399,5 @@ func TestMinIOStoreHasBadCredentials(t *testing.T) {
 	})
 	if ok, err := s.Has(context.Background(), digest.FromString("x")); err == nil {
 		t.Fatalf("Has with bad credentials = %v, nil; want an error", ok)
-	}
-}
-
-// Known gap, pinned on purpose: S3 checks a presigned PUT's size, not its
-// content. A same-size body that doesn't hash to the digest is stored under
-// that digest's key, Has then reports it, and UploadURLs never asks for the
-// right blob again. Downloading engines refuse the blob (containerd checks the
-// digest), so builds stay correct, but the cache entry fails until the object
-// is deleted. When uploads are verified before they reach the digest key,
-// this test should fail: replace it with one that the bad upload is refused.
-func TestMinIOStoreKnownGapMisdeclaredDigest(t *testing.T) {
-	s := newMinIOStore(t, nil)
-	ctx := context.Background()
-	blob, d := randomBlob(t, 4096)
-	wrong := append([]byte{}, blob...)
-	wrong[0] ^= 0xff
-
-	put, err := s.PresignPut(ctx, d, int64(len(blob)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status := enginePut(t, put.URL, wrong); status != http.StatusOK {
-		t.Fatalf("PUT of the wrong content: status %d; the store now refuses it, so replace this test", status)
-	}
-	if !mustHas(t, s, d) {
-		t.Fatal("the wrong content isn't reported under the digest; replace this test")
-	}
-	urls, err := UploadURLs(ctx, s, []Blob{{Digest: d, Size: int64(len(blob))}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(urls) != 0 {
-		t.Fatal("UploadURLs asks for the blob again; replace this test")
-	}
-	get, err := s.PresignGet(ctx, d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	status, data := httpGet(t, get.URL)
-	if status != http.StatusOK || digest.FromBytes(data) == d {
-		t.Fatalf("GET: status %d, digest matches %v; want the wrong content served", status, digest.FromBytes(data) == d)
 	}
 }

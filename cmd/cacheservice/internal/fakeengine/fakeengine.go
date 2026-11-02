@@ -81,6 +81,8 @@ type Cache struct {
 
 	// compressed are the layers an export has compressed.
 	compressed map[digest.Digest]bool
+	// corrupt counts the uploads of each blob still to corrupt (-1: all).
+	corrupt map[digest.Digest]int
 
 	renewals chan *dagql.RenewalRequest
 	renewed  map[dagql.RenewalRequestID]chan dagql.RenewalReply
@@ -95,6 +97,7 @@ func New(id string, generation uint64) *Cache {
 		entries:    map[uint64]*Entry{},
 		next:       1000,
 		compressed: map[digest.Digest]bool{},
+		corrupt:    map[digest.Digest]int{},
 		renewals:   make(chan *dagql.RenewalRequest),
 		renewed:    map[dagql.RenewalRequestID]chan dagql.RenewalReply{},
 	}
@@ -318,7 +321,7 @@ func (a Adapter) Export(ctx context.Context, req protocol.Export, consume func(c
 		return err
 	}
 	defer done()
-	return consume(ctx, remotecache.Export{Bundle: capt.Bundle, Skipped: capt.Skipped, Blobs: blobSource(capt.Blobs)})
+	return consume(ctx, remotecache.Export{Bundle: capt.Bundle, Skipped: capt.Skipped, Blobs: blobSource{cache: a.Cache, blobs: capt.Blobs}})
 }
 
 func (a Adapter) Merge(_ context.Context, req protocol.Merge) (protocol.Merged, error) {
@@ -350,14 +353,46 @@ func (a Adapter) ReplyRenewal(reply dagql.RenewalReply) dagql.RenewalReplyDispos
 	return dagql.RenewalReplyAccepted
 }
 
-type blobSource map[digest.Digest][]byte
+type blobSource struct {
+	cache *Cache
+	blobs map[digest.Digest][]byte
+}
 
 func (b blobSource) ReadBlob(_ context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
-	data, ok := b[d]
+	data, ok := b.blobs[d]
 	if !ok {
 		return nil, 0, fmt.Errorf("blob %s is not in the export's chains", d)
 	}
+	data = b.cache.UploadBody(d, data)
 	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+}
+
+// CorruptUploads makes the next n uploads of blob d send a body of the
+// right size with other content, as a buggy or compromised engine could; n
+// < 0 corrupts every one from now on, and 0 none. The engine still reports
+// each upload done: S3 takes the body, since a presigned PUT bounds only its
+// size.
+func (c *Cache) CorruptUploads(d digest.Digest, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.corrupt[d] = n
+}
+
+// UploadBody is the body an upload of blob d sends: data, or a corrupted
+// copy of the same size (see CorruptUploads).
+func (c *Cache) UploadBody(d digest.Digest, data []byte) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.corrupt[d]
+	if n == 0 || len(data) == 0 {
+		return data
+	}
+	if n > 0 {
+		c.corrupt[d] = n - 1
+	}
+	out := bytes.Clone(data)
+	out[0] ^= 0xff
+	return out
 }
 
 // SortedDigests returns a capture's blob digests, sorted.

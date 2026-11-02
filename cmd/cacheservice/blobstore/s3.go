@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,6 +28,15 @@ const (
 	DefaultGetExpiry = time.Hour
 	// maxPresignExpiry is SigV4's limit on a presigned URL's lifetime.
 	maxPresignExpiry = 7 * 24 * time.Hour
+	// DefaultMaxPromotions bounds the promotions in flight per store,
+	// across its namespaces.
+	DefaultMaxPromotions = 8
+	// maxPartCopy is S3's largest UploadPartCopy: 5 GiB. A blob up to this
+	// size is promoted with one part, which the store hashes as it copies.
+	maxPartCopy = 5 << 30
+	// defaultCopyPartSize is the part size of a blob over maxPartCopy,
+	// which the service hashes itself. S3 allows 10,000 parts.
+	defaultCopyPartSize = 1 << 30
 )
 
 // S3Config configures an S3Store.
@@ -53,9 +63,17 @@ type S3Config struct {
 	// Credentials signs requests and presigned URLs. Nil means the AWS SDK's
 	// default chain (environment, shared config, instance role, ...).
 	Credentials aws.CredentialsProvider
-	// HTTPClient sends the store's own requests (HeadObject). Nil means the
-	// SDK's default.
+	// HTTPClient sends the store's own requests (HeadObject, the
+	// promotion's copies and reads). Nil means the SDK's default.
 	HTTPClient aws.HTTPClient
+	// MaxPromotions bounds the promotions in flight at once, across every
+	// namespace. Zero means DefaultMaxPromotions.
+	MaxPromotions int
+	// HashInService makes the service hash every staged blob by reading it,
+	// instead of having the store hash it as it copies. Use it for a store
+	// whose part copies return a SHA-256 checksum that can't be trusted.
+	// A store that returns none is detected, and hashed by the service.
+	HashInService bool
 }
 
 // Environment variables read by S3ConfigFromEnv. They match what
@@ -70,6 +88,8 @@ const (
 	EnvSecretAccessKey = "CACHESERVICE_S3_SECRET_ACCESS_KEY"
 	EnvPutExpiry       = "CACHESERVICE_S3_PUT_EXPIRY"
 	EnvGetExpiry       = "CACHESERVICE_S3_GET_EXPIRY"
+	EnvMaxPromotions   = "CACHESERVICE_S3_MAX_PROMOTIONS"
+	EnvHashInService   = "CACHESERVICE_S3_HASH_IN_SERVICE"
 )
 
 // S3ConfigFromEnv reads an S3Config from the CACHESERVICE_S3_* variables.
@@ -83,12 +103,24 @@ func S3ConfigFromEnv() (S3Config, error) {
 		Bucket:   os.Getenv(EnvBucket),
 		Prefix:   os.Getenv(EnvPrefix),
 	}
-	if v := os.Getenv(EnvPathStyle); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return S3Config{}, fmt.Errorf("%s: %w", EnvPathStyle, err)
+	for _, b := range []struct {
+		name string
+		dst  *bool
+	}{{EnvPathStyle, &cfg.PathStyle}, {EnvHashInService, &cfg.HashInService}} {
+		if v := os.Getenv(b.name); v != "" {
+			val, err := strconv.ParseBool(v)
+			if err != nil {
+				return S3Config{}, fmt.Errorf("%s: %w", b.name, err)
+			}
+			*b.dst = val
 		}
-		cfg.PathStyle = b
+	}
+	if v := os.Getenv(EnvMaxPromotions); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return S3Config{}, fmt.Errorf("%s: %q is not a positive number", EnvMaxPromotions, v)
+		}
+		cfg.MaxPromotions = n
 	}
 	for _, d := range []struct {
 		name string
@@ -125,6 +157,19 @@ type S3Store struct {
 	putExpiry time.Duration
 	getExpiry time.Duration
 	now       func() time.Time
+
+	// promotions bounds the promotions in flight, across every namespace
+	// view of the store, which share it.
+	promotions chan struct{}
+	// hashInService is S3Config.HashInService. noStoreHash is set, for
+	// every view, once a part copy returned no checksum: the store doesn't
+	// hash, and the service does from then on.
+	hashInService bool
+	noStoreHash   *atomic.Bool
+	// maxPartCopy and copyPartSize are maxPartCopy and defaultCopyPartSize;
+	// tests lower them to exercise many-part copies.
+	maxPartCopy  int64
+	copyPartSize int64
 }
 
 var (
@@ -145,6 +190,12 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	}
 	if cfg.GetExpiry == 0 {
 		cfg.GetExpiry = DefaultGetExpiry
+	}
+	if cfg.MaxPromotions < 0 {
+		return nil, fmt.Errorf("s3 blob store: max promotions %d is negative", cfg.MaxPromotions)
+	}
+	if cfg.MaxPromotions == 0 {
+		cfg.MaxPromotions = DefaultMaxPromotions
 	}
 	for _, e := range []struct {
 		name string
@@ -167,6 +218,12 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		putExpiry: cfg.PutExpiry,
 		getExpiry: cfg.GetExpiry,
 		now:       time.Now,
+
+		promotions:    make(chan struct{}, cfg.MaxPromotions),
+		hashInService: cfg.HashInService,
+		noStoreHash:   &atomic.Bool{},
+		maxPartCopy:   maxPartCopy,
+		copyPartSize:  defaultCopyPartSize,
 	}, nil
 }
 
@@ -222,6 +279,28 @@ func (s *S3Store) Key(dgst digest.Digest) (string, error) {
 	return blobKey(s.prefix, dgst)
 }
 
+// StagingKey returns the object key a blob is uploaded to under stage:
+// <prefix>/staging/<stage>/<algorithm>/<hex>.
+func (s *S3Store) StagingKey(stage Stage, dgst digest.Digest) (string, error) {
+	if err := stage.Validate(); err != nil {
+		return "", err
+	}
+	if err := dgst.Validate(); err != nil {
+		return "", fmt.Errorf("staging key: %w", err)
+	}
+	return s.StagingPrefix() + string(stage) + "/" + dgst.Algorithm().String() + "/" + dgst.Encoded(), nil
+}
+
+// StagingPrefix is the prefix of every staged upload of the store (or of
+// the namespace, for a namespace's view): <prefix>/staging/. The bucket's
+// lifecycle rule expires what is under it.
+func (s *S3Store) StagingPrefix() string {
+	if s.prefix == "" {
+		return "staging/"
+	}
+	return s.prefix + "/staging/"
+}
+
 func blobKey(prefix string, dgst digest.Digest) (string, error) {
 	if err := dgst.Validate(); err != nil {
 		return "", fmt.Errorf("blob key: %w", err)
@@ -252,22 +331,32 @@ func (s *S3Store) Has(ctx context.Context, dgst digest.Digest) (bool, error) {
 // isNotFound reports a 404 and nothing else: a HEAD response has no body, so
 // the status is all S3 says.
 func isNotFound(err error) bool {
-	var re *smithyhttp.ResponseError
-	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotFound
+	return hasStatus(err, http.StatusNotFound)
 }
 
-// PresignPut returns a presigned PUT of exactly size bytes. Content-Length is
-// signed, so S3 refuses a body of any other size. The store does not check
-// the body against dgst.
+// isConditionFailed reports a conditional write that lost: 412, or 409 for
+// one that raced another write of the same key.
+func isConditionFailed(err error) bool {
+	return hasStatus(err, http.StatusPreconditionFailed) || hasStatus(err, http.StatusConflict)
+}
+
+func hasStatus(err error, status int) bool {
+	var re *smithyhttp.ResponseError
+	return errors.As(err, &re) && re.HTTPStatusCode() == status
+}
+
+// PresignPut returns a presigned PUT of exactly size bytes to the blob's
+// staging key under stage. Content-Length is signed, so S3 refuses a body of
+// any other size. S3 doesn't check the body against dgst: Promote does.
 //
 // size must be positive: SigV4 never signs a Content-Length of 0, so a PUT
 // presigned for an empty blob would take a body of any size. Layer blobs are
 // compressed archives and never empty.
-func (s *S3Store) PresignPut(ctx context.Context, dgst digest.Digest, size int64) (Address, error) {
+func (s *S3Store) PresignPut(ctx context.Context, stage Stage, dgst digest.Digest, size int64) (Address, error) {
 	if size <= 0 {
 		return Address{}, fmt.Errorf("presign PUT %s: size %d: %w", dgst, size, ErrNotPositiveSize)
 	}
-	key, err := s.Key(dgst)
+	key, err := s.StagingKey(stage, dgst)
 	if err != nil {
 		return Address{}, err
 	}

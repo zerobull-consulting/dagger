@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -22,23 +23,43 @@ type S3Request struct {
 	Time   time.Time
 	Method string
 	// Path is the request path: /<bucket>/<key> (the services use
-	// path-style addressing).
-	Path string
+	// path-style addressing), and Query its query string.
+	Path  string
+	Query string
 	// Status is the store's answer (0: not answered yet), or the injected
 	// fault's.
 	Status int
 	// Fault names the fault the proxy answered with instead of the store
-	// ("" when the store answered), and Stalled is whether a stall held it.
-	Fault   string
-	Stalled bool
+	// ("" when the store answered), Stalled is whether a stall held it, and
+	// Rewritten whether a fault rewrote its body before the store got it.
+	Fault     string
+	Stalled   bool
+	Rewritten bool
 }
 
-// IsBlob reports whether the request is for a layer blob's object.
-func (r S3Request) IsBlob() bool { return strings.Contains(r.Path, "/blobs/") }
+// IsBlob reports whether the request is an engine's, for a layer blob: an
+// upload, which goes to a staging key (<ns>/staging/<stage>/<alg>/<hex>), or
+// a download, of a digest key (<ns>/blobs/<alg>/<hex>). The service's own
+// requests for blobs (HEADs, and a promotion's copies and reads) are not.
+func (r S3Request) IsBlob() bool {
+	switch r.Method {
+	case http.MethodPut:
+		// The service never PUTs to a staging key: its copies go to
+		// digest keys.
+		return r.IsStaging()
+	case http.MethodGet:
+		return strings.Contains(r.Path, "/blobs/")
+	}
+	return false
+}
 
-// IsBlobOf reports whether the request is for the blob of digest d.
+// IsStaging reports whether the request is for a staged upload's object.
+func (r S3Request) IsStaging() bool { return strings.Contains(r.Path, "/staging/") }
+
+// IsBlobOf reports whether the request is an engine's for the blob of digest
+// d (see IsBlob).
 func (r S3Request) IsBlobOf(d digest.Digest) bool {
-	return strings.HasSuffix(r.Path, "/blobs/"+d.Algorithm().String()+"/"+d.Encoded())
+	return r.IsBlob() && strings.HasSuffix(r.Path, "/"+d.Algorithm().String()+"/"+d.Encoded())
 }
 
 // S3Proxy sits between everything and the S3 store, and records each
@@ -59,8 +80,9 @@ type S3Proxy struct {
 
 // Fault makes the proxy answer some requests itself instead of passing them
 // to the store: with an S3 error (Status and Code), or by stalling them until
-// Release. It applies to requests that Match, up to Count of them (0: until
-// removed), from when it is injected until it is removed.
+// Release; or pass them on with their body rewritten (Rewrite). It applies to
+// requests that Match, up to Count of them (0: until removed), from when it
+// is injected until it is removed.
 type Fault struct {
 	// Name is how the requests it answered are recorded.
 	Name string
@@ -72,6 +94,10 @@ type Fault struct {
 	Code   string
 	// Count is how many requests it answers; 0 means every matching one.
 	Count int
+	// Rewrite, when set, replaces the request's body before it goes on to
+	// the store, which then answers it: as an engine that uploads other
+	// content would. Status is ignored.
+	Rewrite func(body []byte) []byte
 
 	hits    int
 	release chan struct{}
@@ -126,6 +152,20 @@ func (p *S3Proxy) faultLocked(method, path string) *Fault {
 	return nil
 }
 
+// maxRewriteBytes bounds the body a Rewrite fault holds in memory.
+const maxRewriteBytes = 256 << 20
+
+// SameSizeCorruption rewrites a body to other content of the same size: its
+// first byte flipped. A presigned PUT's signed Content-Length still matches,
+// so S3 takes it.
+func SameSizeCorruption(body []byte) []byte {
+	out := bytes.Clone(body)
+	if len(out) > 0 {
+		out[0] ^= 0xff
+	}
+	return out
+}
+
 // Methods matches requests with one of methods whose path contains part.
 func Methods(part string, methods ...string) func(method, path string) bool {
 	return func(method, path string) bool {
@@ -172,17 +212,30 @@ func StartS3Proxy(t *testing.T, host, target string) *S3Proxy {
 		// that got one always finds its request recorded.
 		p.mu.Lock()
 		i := len(p.reqs)
-		p.reqs = append(p.reqs, S3Request{Time: time.Now(), Method: r.Method, Path: r.URL.Path})
+		p.reqs = append(p.reqs, S3Request{Time: time.Now(), Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery})
 		f := p.faultLocked(r.Method, r.URL.Path)
 		if f != nil {
 			p.reqs[i].Fault = f.Name
-			if f.Status != 0 {
+			if f.Rewrite != nil {
+				p.reqs[i].Rewritten = true
+			} else if f.Status != 0 {
 				p.reqs[i].Status = f.Status
 			} else {
 				p.reqs[i].Stalled = true
 			}
 		}
 		p.mu.Unlock()
+		if f != nil && f.Rewrite != nil {
+			body, err := io.ReadAll(io.LimitReader(r.Body, maxRewriteBytes+1))
+			if err != nil || len(body) > maxRewriteBytes {
+				writeS3Error(w, http.StatusBadRequest, "IncompleteBody")
+				return
+			}
+			body = f.Rewrite(body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+			f = nil
+		}
 		if f != nil && f.Status != 0 {
 			// Drain the body, as a store answering an error would read it,
 			// so the client sees the answer rather than a reset.

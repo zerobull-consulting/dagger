@@ -75,41 +75,260 @@ measures is in [`metrics`](metrics/).
 
 [`blobstore`](blobstore) stores layer blobs in S3 for the service
 ([#5](https://github.com/zerobull-consulting/dagger/issues/5)). The export path
-uses it. Blobs never pass through the service: it hands the
-engine presigned URLs, so the engine never holds S3 credentials.
+uses it. Blobs never pass through the service on their way in or out: it
+hands the engine presigned URLs, so the engine never holds S3 credentials.
+An upload goes to a staging key, and reaches the blob's digest key only once
+the service has checked its content
+([#23](https://github.com/zerobull-consulting/dagger/issues/23)).
 
-- Keys are content-addressed: `<prefix>/blobs/<algorithm>/<hex>`. The service
-  uses each namespace's view of the store (`Namespace`), whose keys are
-  `<prefix>/<namespace>/blobs/<algorithm>/<hex>`, such as
-  `cache/team-a/blobs/sha256/4f1e...`: next to the namespace's metadata, and
-  apart from every other namespace's blobs (see
-  [Auth and namespaces](#auth-and-namespaces)).
-- `Has` checks a blob with `HeadObject`. A 404 means missing; any other error
-  is an error.
-- `PresignPut` signs a PUT for an exact size: `Content-Length` is a signed
-  header, so S3 refuses a body of any other size. It signs no other headers,
-  matching the engine's upload. It refuses size 0, because SigV4 doesn't sign
-  a zero `Content-Length` and the URL would take a body of any size.
-- `PresignGet` signs a GET. PUTs expire after 15 minutes and GETs after an hour
-  by default. A URL signed with temporary credentials (STS, an instance role)
-  stops working when they expire, so its `ExpiresAt` is capped at theirs.
+**Keys.** The service uses each namespace's view of the store (`Namespace`),
+next to the namespace's metadata and apart from every other namespace's blobs
+(see [Auth and namespaces](#auth-and-namespaces)):
+
+```
+<prefix>/<ns>/blobs/<alg>/<hex>                    a blob, verified: its digest key
+<prefix>/<ns>/staging/<stage>/<alg>/<hex>          an upload, not yet verified
+```
+
+such as `cache/team-a/blobs/sha256/4f1e...`. A **stage** is 128 random bits
+(32 hex digits), new for each try of each export: two exports of one blob
+never write the same staging key, and a staging key can't be guessed from a
+digest. Engine-supplied strings never name a key: digests are validated, and
+stages are the service's own.
+
+- `Has` checks a blob's **digest key** with `HeadObject`. A 404 means
+  missing; any other error is an error.
+- `PresignPut` signs a PUT of a **staging key**, for an exact size:
+  `Content-Length` is a signed header, so S3 refuses a body of any other
+  size. It signs no other headers, matching the engine's upload (a bare PUT
+  with `Content-Length`, unchanged by #23). It refuses size 0, because SigV4
+  doesn't sign a zero `Content-Length` and the URL would take a body of any
+  size.
+- `PresignGet` signs a GET of a **digest key**. PUTs expire after 15 minutes
+  and GETs after an hour by default. A URL signed with temporary credentials
+  (STS, an instance role) stops working when they expire, so its `ExpiresAt`
+  is capped at theirs.
 - `UploadURLs` builds an `upload` request's URL map: it checks each blob with
-  `Has` (16 at a time) and presigns PUTs only for the missing ones, so a blob
-  already stored is not requested again.
+  `Has` (16 at a time) and presigns PUTs, under the try's stage, only for the
+  missing ones, so a verified blob is not requested again, and a blob whose
+  upload failed verification is.
+- `Promote` verifies one staged upload and moves it to its digest key (below).
 
-**Known gap: content isn't verified.** S3 checks a PUT's size, not its
-content. An engine that uploads a same-size body that doesn't hash to the
-digest stores it under that digest. `Has` then reports the blob, and
-`UploadURLs` never asks for the right one again. Downloading engines refuse it
-(containerd checks the digest), so builds stay correct, but that cache entry
-fails until the object is deleted. `TestMinIOStoreKnownGapMisdeclaredDigest`
-pins this behavior. The planned fix needs no engine changes: uploads go to a
-per-session staging prefix, and the service verifies each blob after the
-engine's `uploaded` reply and only then promotes it to its digest key.
+`Has`, `UploadURLs`, and every presigned GET (the import path's merges and
+offers, and `renew`) look at digest keys alone. So "stored" means
+"verified", and a staged upload is never reported, offered, merged or renewed
+(`TestVerifyStagingNeverServed`).
+
+### Verification and promotion
+
+The engine's `uploaded` reply lists the blobs it uploaded. For each one the
+service asked for, the exporter calls `Promote`. It:
+
+1. checks the staged object (`HeadObject`): **missing** if the engine reported
+   a blob it never uploaded;
+2. checks the digest key: **existing** if the blob is already stored, by an
+   earlier upload or another export racing this one;
+3. hashes the staged object (below), and copies it to the digest key only if
+   the hash is the digest and the size the declared one, else **mismatch**;
+4. completes the copy with `If-None-Match: *`, so the digest key appears only
+   now, and a blob already there is never overwritten: when two exports race,
+   the first verified copy wins and the other is **existing**
+   (`TestMinIOConditionalPromotion`, `TestVerifyRacingExports`);
+5. deletes the staged object once it has decided (promoted, existing or
+   mismatch). After a store error it leaves the object to the
+   [lifecycle rule](#lifecycle-rule-for-staging).
+
+A blob that isn't promoted counts as failed: the export publishes nothing,
+tries again with backoff under a new stage, and asks for that blob again.
+The bundle and index are written only once every blob of the export is
+promoted, so no stored bundle names a blob that wasn't verified
+(`TestMinIOStoreMisdeclaredDigestNeverStored`, which replaced the known-gap
+test `TestMinIOStoreKnownGapMisdeclaredDigest`;
+`TestVerifyLyingUploadNotPublished`; the real-engine `verify` scenario).
+
+**Who hashes (open question 1).** Plain S3-compatible storage can: MinIO
+computes a full-object SHA-256 when it copies an object with
+`ChecksumAlgorithm=SHA256`, from an object uploaded with no checksum at all,
+and so does AWS S3 for objects up to 5 GB (`TestMinIOStoreHashesCopies`).
+
+- A SHA-256 blob of up to 5 GiB is promoted by a multipart upload of one
+  `UploadPartCopy`, created with `ChecksumAlgorithm=SHA256`. The store hashes
+  the bytes as it copies them and returns the part's checksum, which for one
+  part is the whole blob's, **before** the upload completes. A mismatch aborts
+  the upload, so nothing is written to the digest key. No byte passes through
+  the service.
+- A blob over 5 GiB needs several parts (`UploadPartCopy`'s limit), whose
+  checksums are per part and can't be combined into the blob's. The service
+  then reads the staged object and hashes it itself, and copies it in parts
+  of 1 GiB (larger when that would make over S3's 10,000 parts), each
+  conditioned on the ETag it read (`CopySourceIfMatch`), so a staged object
+  overwritten in between is not what gets promoted
+  (`TestMinIOPromoteManyParts`, with the limits lowered to 5 MiB).
+- So is every blob with `CACHESERVICE_S3_HASH_IN_SERVICE=true`, for a store
+  whose copy checksums can't be trusted, and every blob once a store returns
+  a part copy without a checksum: the service then hashes from that point
+  on (`TestMinIOPromoteStoreWithoutChecksums`).
+
+**Why a multipart copy.** MinIO ignores `If-None-Match` on `CopyObject` (a
+second conditional copy overwrote the key), but honors it on
+`CompleteMultipartUpload` (412), and honors `CopySourceIfMatch`
+(`TestMinIOConditionalPromotion`). AWS S3 documents both conditions on
+those calls too. Correctness doesn't
+rest on the condition: only verified copies are ever promoted, so a store
+that ignored it would overwrite a blob with identical bytes.
+
+**Bounds.** At most 8 promotions run at once per service, across every
+namespace (`CACHESERVICE_S3_MAX_PROMOTIONS`), and one export promotes at most
+8 at a time. A store-hashed promotion holds no blob data in the service; a
+service-hashed one streams the object through a 32 KiB buffer, so at most
+8 × 32 KiB in all.
+
+**Time to promotion.** A blob reaches the shared cache after the engine's
+`uploaded` reply (which waits for every upload of the export), plus its own
+promotion. Promotion costs a fixed ~13 ms (6 requests: a HEAD of each key, the
+multipart upload's create, copy and complete, and the staged object's
+delete) plus the copy, which grows with the size. Measured against the local MinIO
+(`TestMinIOPromoteLatency`, 2026-11-02; `CACHESERVICE_TEST_PROMOTE_MB=1024`
+adds the 1 GiB row, which takes about 50s and writes 4 GiB):
+
+| Blob size | Store-hashed | Service-hashed |
+| --- | --- | --- |
+| 64 KiB | 13 ms | 14 ms |
+| 1 MiB | 20 ms | 21 ms |
+| 16 MiB | 103 ms | 147 ms |
+| 64 MiB | 381 ms | 465 ms |
+| 1 GiB | 5.5 s | 6.9 s |
+
+So roughly `13 ms + size / 185 MiB/s` when the store hashes, and
+`13 ms + size / 150 MiB/s` when the service does, on one local disk. Store
+copies on AWS S3 run in the store, at its internal copy rate; a
+service-hashed promotion also reads the blob once over the service's network
+to S3. `blob_promotion_duration_seconds` measures it in production (see
+[Metrics](#metrics)).
+
+**A restart between `uploaded` and promotion** leaves the staged uploads
+where they are. The service doesn't scan staging on startup, or when a
+namespace is first used: a staged object belongs to an export whose state
+was lost with the restart
+([#45](https://github.com/zerobull-consulting/dagger/issues/45)), so nothing
+would publish a bundle for it. The next export of the entries asks for the
+blobs again, under a new stage, and promotes those; the orphans are never
+read, and the lifecycle rule expires them. The cost is the blobs' upload
+again (`TestVerifyRestartBetweenUploadedAndPromotion`).
+
+### Lifecycle rule for staging
+
+Abandoned staged uploads (an export cut short, an engine that uploaded and
+never answered, a store error during promotion) and incomplete multipart
+copies need a bucket lifecycle rule; the service never lists or sweeps
+staging. One day is safe: an export's uploads and promotions finish within
+its upload timeout (1h).
+
+S3 lifecycle filters match a key prefix, not a wildcard segment, so one rule
+can't match `<prefix>/*/staging/`. The options, and the choice:
+
+- **A tag set on staging objects** would need the engine to send
+  `x-amz-tagging` with its PUT: the presigned URL signs it as a header, and a
+  bare PUT then fails (tried against MinIO: 400). Ruled out, since the engine
+  doesn't change.
+- **Staging outside the namespace** (`<prefix>/staging/<ns>/...`) would take
+  one rule, but #23's comment from #52 settles staging under the namespace,
+  so that promotion never crosses a namespace's prefix.
+- **One rule per namespace**, on `<prefix>/<ns>/staging/`: the choice. A
+  namespace is added in the tokens file, so its rule can be generated from
+  the same file (below). A namespace without a rule leaks abandoned uploads,
+  which are never read; the GC of
+  [#11](https://github.com/zerobull-consulting/dagger/issues/11) is to cover
+  them. AWS allows 1,000 rules per bucket.
+
+Plus one rule for the whole prefix that aborts incomplete multipart uploads
+(a promotion aborts its own, but a service killed mid-copy leaves its parts).
+
+On AWS, with the service's prefix `cache` and namespaces `team-a` and
+`team-b`:
+
+```json
+{
+  "Rules": [
+    {"ID": "cacheservice-staging-team-a", "Status": "Enabled",
+     "Filter": {"Prefix": "cache/team-a/staging/"}, "Expiration": {"Days": 1}},
+    {"ID": "cacheservice-staging-team-b", "Status": "Enabled",
+     "Filter": {"Prefix": "cache/team-b/staging/"}, "Expiration": {"Days": 1}},
+    {"ID": "cacheservice-incomplete-copies", "Status": "Enabled",
+     "Filter": {"Prefix": "cache/"}, "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket dagger-cache --lifecycle-configuration file://lifecycle.json
+```
+
+That call replaces the bucket's whole lifecycle configuration: merge these
+rules into any the bucket has. The rules can be generated from the tokens
+file (a namespace's rule is the same whichever of its tokens names it):
+
+```bash
+awk '!/^#/ && NF >= 2 {print $2}' tokens | sort -u |
+  jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
+    Filter: {Prefix: ($p + "/" + . + "/staging/")}, Expiration: {Days: 1}}' |
+  jq -s --arg p cache '{Rules: (. + [{ID: "cacheservice-incomplete-copies", Status: "Enabled",
+    Filter: {Prefix: ($p + "/")}, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}}])}' > lifecycle.json
+```
+
+Without a tokens file, the one namespace is `-scope` (`default`):
+`cache/default/staging/`.
+
+On MinIO, with `mc` (the alias `local` and bucket `dagger-cache` of
+`hack/remote-cache`):
+
+```bash
+mc ilm rule add --prefix cache/team-a/staging/ --expire-days 1 local/dagger-cache
+```
+
+once per namespace. MinIO drops incomplete multipart uploads on its own
+(after 24 hours, its `api stale_uploads_expiry`).
+
+### Repairing blobs stored before verification
+
+Blobs stored at digest keys before verification shipped were never checked
+(#23's open question 3). The service trusts them: `Has` reports them, and a
+correct upload's promotion finds the key taken. It never re-verifies, deletes
+or rewrites a digest key on its own, and never because an engine reported a
+failure (a `renew`, or an offer that failed): that is one engine's say-so
+([#23](https://github.com/zerobull-consulting/dagger/issues/23#issuecomment-6561085241)).
+This gap is pinned by `TestMinIOStoreKnownGapUnverifiedOldObjects`, and doing
+it in the service is
+[#53](https://github.com/zerobull-consulting/dagger/issues/53).
+
+To repair a bucket once, after upgrading: hash every object at a digest key
+and compare it with its key. This reads every blob once:
+
+```bash
+# Lists the digest keys whose content doesn't match; deletes nothing.
+mc find local/dagger-cache/cache --path '*/blobs/sha256/*' | while read -r obj; do
+  want="${obj##*/}"
+  got="$(mc cat "$obj" | sha256sum | cut -d' ' -f1)"
+  [ "$got" = "$want" ] || echo "MISMATCH $obj ($got)"
+done
+```
+
+(With the AWS CLI: `aws s3 ls --recursive s3://dagger-cache/cache/` and
+`aws s3 cp s3://dagger-cache/<key> - | sha256sum`.) Delete the keys it
+reports. The next export that needs such a blob uploads it again, and this
+time it is verified; until then, an import of an entry naming it finds the
+layer missing, as for any deleted blob.
+
+### Configuration
 
 `S3ConfigFromEnv` reads endpoint, region, bucket, prefix, path-style
-addressing, expiries and static credentials from `CACHESERVICE_S3_*`. Without
-static credentials it uses the AWS SDK's default chain.
+addressing, expiries, static credentials,
+`CACHESERVICE_S3_MAX_PROMOTIONS` (8) and `CACHESERVICE_S3_HASH_IN_SERVICE`
+(false) from `CACHESERVICE_S3_*`. Without static credentials it uses the AWS
+SDK's default chain. The service's credentials need `s3:GetObject` and
+`s3:DeleteObject` on staging keys (a copy reads its source), `s3:PutObject`
+and `s3:AbortMultipartUpload` on digest keys (the multipart copy), besides
+what the metadata store needs.
 
 ## Metadata store
 
@@ -355,15 +574,21 @@ session's cache ID. If none is, the export waits and is tried again.
    doubling to 5m), and `refused` ones are not tried again until their value
    changes.
 2. The layer blobs the bundle's outputs need, each once, less those S3
-   already has (`UploadURLs`), go in `upload` as presigned PUTs. When S3 has
-   them all, the map is empty, and the engine releases the chains.
-3. `uploaded`: if any blob failed, or wasn't answered, nothing is published.
-   The engine released the chains with its answer, so the export is tried
-   again from step 1 after a backoff (1s, doubling). Blobs stored by the
-   earlier try aren't asked for again. After 3 tries the roots count as
-   failed. The tracker tries them again later, up to 5 times per value.
-4. Once every blob is stored, the bundle is published and recorded in the
-   index (`metastore.Record`).
+   already has at their digest keys (`UploadURLs`), go in `upload` as
+   presigned PUTs to staging keys, under a stage of this try's own. When S3
+   has them all, the map is empty, and the engine releases the chains.
+3. `uploaded`: the service verifies each blob the engine reports done, and
+   promotes it to its digest key only if its content hashes to the digest
+   (see [Verification and promotion](#verification-and-promotion)). A blob
+   that failed, wasn't answered, or failed verification (a mismatch, or
+   nothing uploaded) is not stored, and nothing is published. The engine
+   released the chains with its answer, so the export is tried again from
+   step 1 after a backoff (1s, doubling), under a new stage. Blobs stored by
+   the earlier try aren't asked for again; those that failed are. After 3
+   tries the roots count as failed. The tracker tries them again later, up to
+   5 times per value.
+4. Once every blob is stored (promoted, so verified), the bundle is published
+   and recorded in the index (`metastore.Record`).
 
 A repeated export of stored entries uploads no blob again, and keeps the
 entries' service numbers. An unchanged bundle is not written again. Before a
@@ -417,13 +642,14 @@ and entry numbers, so this holds across one too, on the new generation.
 
 **S3 errors.** The service's own requests (`HeadObject` for which blobs to
 ask for, bundle and index writes) go through the AWS SDK's standard retryer,
-which retries throttling (503 `SlowDown`) and 5xx answers with backoff. The
-engine doesn't retry a failed blob PUT itself; it reports it in `uploaded`,
-and the export is tried again as above. Nothing is published until every blob
-is stored, and the index is written last, so a failure at any step leaves no
-index entry naming a missing bundle, and no stored bundle naming a missing
-blob; at worst, blobs or a bundle nothing names yet, which the next export
-reuses. An export that fails as a whole (S3 down) counts a failure of its
+which retries throttling (503 `SlowDown`) and 5xx answers with backoff, and
+so do a promotion's copies. The engine doesn't retry a failed blob PUT
+itself; it reports it in `uploaded`, and the export is tried again as above.
+Nothing is published until every blob is stored, verified, and the index is
+written last, so a failure at any step leaves no index entry naming a
+missing bundle, and no stored bundle naming a missing or unverified blob; at
+worst, blobs or a bundle nothing names yet, which the next export reuses,
+and staged uploads, which the lifecycle rule expires. An export that fails as a whole (S3 down) counts a failure of its
 roots, which are tried again with backoff (2s doubling), up to 5 times per
 value.
 
@@ -434,8 +660,10 @@ exporting) a connected engine's entries, or connect as an engine and offer it
 bundles of its own. Run it that way only on a trusted network. With tokens,
 the same holds within a namespace (see
 [Auth and namespaces](#auth-and-namespaces)).
-Uploaded content isn't verified against its digest
-([#23](https://github.com/zerobull-consulting/dagger/issues/23)). Sessions whose
+Blobs stored before uploads were verified are trusted as they are
+([#53](https://github.com/zerobull-consulting/dagger/issues/53); see
+[Repairing blobs stored before verification](#repairing-blobs-stored-before-verification)).
+Sessions whose
 clients send no spans to the service are invisible (see
 [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#gaps-and-options)). The tracker's state
 is in memory, so after a service restart entries are learned again from new
@@ -663,14 +891,22 @@ namespace has the blob (`TestNamespacesKeepExportsApart`,
 `TestRenewAcrossNamespacesRefused`, `TestMinIONamespaceKeys`).
 
 The trade-off is storage: a base image layer every team uses is stored once
-per namespace. Sharing a prefix would store it once, but until uploads are
-verified ([#23](https://github.com/zerobull-consulting/dagger/issues/23)), a
-blob is whatever its first uploader sent: one tenant's bad or malicious
-same-size upload would then break that layer for every tenant, and `Has`
-would keep the others from ever uploading the right one. It would also tell a
-tenant which digests the others hold. Once #23 promotes only verified blobs,
-sharing could be offered per group of namespaces that accept each other's
-uploads.
+per namespace. Staging keys are per namespace too
+(`<prefix>/<ns>/staging/<stage>/...`), and a promotion copies within one
+namespace's prefix, so verification never crosses tenants
+(`TestVerifyNamespacesApart`).
+
+Before #23, sharing a prefix would have let one tenant's bad or malicious
+same-size upload break a layer for every tenant, with `Has` keeping the
+others from ever uploading the right one. Now that only verified blobs are
+promoted ([#23](https://github.com/zerobull-consulting/dagger/issues/23)),
+that no longer holds, so blobs could be shared per group of namespaces that
+accept each other's uploads: the promotion target would be a group's prefix
+outside `<prefix>/<ns>/` (say `<prefix>/shared/<group>/blobs/`), and `Has`,
+GETs and `renew` would read it. Not built: sharing would still tell a tenant
+which digests the others in its group hold (an upload skipped is a blob
+someone stored), and GC would have to count references across the group's
+namespaces (#11).
 
 Without a tokens file, the one namespace is `-scope`, so blobs are at
 `<prefix>/<scope>/blobs/`. Blobs stored by earlier versions, at
@@ -745,13 +981,19 @@ paths record into them through their metadata store. All are prefixed
 | `export_batches_total` | `scope`, `outcome` | Export batches: `ok`, `error` or `interrupted` |
 | `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
 | `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
-| `export_blobs_total` | `result` | Layer blobs: `uploaded`, or `present` (the store had them) |
+| `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
 | `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket) or `otlp` |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
+| `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
+| `blob_hashed_bytes_total` | `scope`, `by` | Bytes hashed to verify uploads: `store` (as it copied them) or `service` (read through the service) |
+| `blob_promotion_duration_seconds` | `scope` | Time to verify and promote one blob, slot wait included: it grows with the blob's size (see [Verification and promotion](#verification-and-promotion)) |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
+No label comes from an engine-supplied string: `scope` is a validated
+namespace from the tokens file or `-scope`, and the others are the service's
+constants.
 
 `caller` is `export` or `import` for the path that read or updated the index,
 whether its scheduler, its sync loop or the debug API ran it, and `other` for
@@ -770,6 +1012,13 @@ What to watch:
 - **Bytes per import sync:** `rate(index_read_bytes_total{caller="import"})`
   over `rate(import_syncs_total)`.
 - **Bundle cache:** `import_bundle_cache_total{result="hit"}` against `miss`.
+- **Bad uploads:** any `blob_promotions_total{outcome="mismatch"}` is an
+  engine that uploaded content that isn't the blob it named (a bug, or a
+  compromised engine), in that namespace; the export logs its cache ID and
+  the digest. `missing` is one that reported an upload it didn't make.
+- **Promotion cost:** `blob_promotion_duration_seconds` against the blobs'
+  sizes, and `blob_hashed_bytes_total{by="service"}`, which is read through
+  the service (blobs over 5 GiB, or a store that doesn't hash).
 
 ## Running it against a local engine
 
@@ -1059,6 +1308,21 @@ team B's token was removed and the file reloaded, NB's engine logged
 revoked"`, its reconnection was refused with 401, and the service logged
 nothing at error level. It adds about 12s to the run (the whole run took
 2m06s with the binaries built).
+
+**`verify` ([#23](https://github.com/zerobull-consulting/dagger/issues/23)).**
+From a run on 2026-11-02 (7.9s on top of the run, which took 5m58s with the
+build). The S3 proxy rewrote every blob A uploaded to other content of the
+same length while A ran a new pipeline: 6 PUTs of 2 blobs (the exec's layer,
+1.2 MB, and a small one), over the export's 3 tries. MinIO took each (200),
+at its staging key. The service rejected all 6 as mismatches, hashed by the
+store (`hashedBy=store`: MinIO's checksum of the part copy); neither blob
+reached its digest key, the export failed once, and nothing of A's was
+published. Once the rewrite was lifted, the tracker's retry asked for both
+blobs again, under a new stage; both were uploaded and promoted, and read
+back from MinIO they hash to their digests. The export was stored, S3 was
+consistent, no staged upload was left in the scope, and B got the pipeline's
+exec as a cache hit with A's output in 350ms. The engine is unchanged: it
+PUT to the staging URLs as to any other.
 
 ### Resilience
 

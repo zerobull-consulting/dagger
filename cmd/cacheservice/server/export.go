@@ -56,6 +56,9 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	if cfg.Exporter.Logger == nil {
 		cfg.Exporter.Logger = s.logger.With("component", "export")
 	}
+	if cfg.Exporter.Metrics == nil {
+		cfg.Exporter.Metrics = s.metrics
+	}
 	if cfg.Exporter.Meta != nil && cfg.Exporter.Meta.Metrics() == nil {
 		cfg.Exporter.Meta = cfg.Exporter.Meta.WithMetrics(s.metrics)
 	}
@@ -146,6 +149,7 @@ func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.B
 		Failed:   len(res.Failed),
 		Uploaded: len(res.Uploaded),
 		Present:  len(res.Present),
+		Rejected: len(res.Rejected),
 		Bundles:  len(res.Bundles),
 	})
 	return res, err
