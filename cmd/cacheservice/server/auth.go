@@ -282,7 +282,7 @@ func (l *rejectionLog) allow(fp string, now time.Time) bool {
 	if now.Sub(l.windowStart) >= rejectionWindow {
 		l.windowStart, l.inWindow = now, 0
 	}
-	if l.last == nil || len(l.last) >= maxRejectionKeys {
+	if l.last == nil {
 		l.last = map[string]time.Time{}
 	}
 	if t, ok := l.last[fp]; ok && now.Sub(t) < rejectionWindow {
@@ -290,6 +290,19 @@ func (l *rejectionLog) allow(fp string, now time.Time) bool {
 	}
 	if l.inWindow >= rejectionWarnings {
 		return false
+	}
+	// Full: forget only the fingerprints warned about before the window.
+	// If none has, warn about no new one until some has, rather than
+	// forget when a token was last warned about.
+	if len(l.last) >= maxRejectionKeys {
+		for k, t := range l.last {
+			if now.Sub(t) >= rejectionWindow {
+				delete(l.last, k)
+			}
+		}
+		if len(l.last) >= maxRejectionKeys {
+			return false
+		}
 	}
 	l.last[fp] = now
 	l.inWindow++

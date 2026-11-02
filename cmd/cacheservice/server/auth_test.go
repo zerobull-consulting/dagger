@@ -1285,3 +1285,39 @@ func TestRevocationRacingRegistration(t *testing.T) {
 		})
 	}
 }
+
+// When the fingerprints remembered reach maxRejectionKeys, only those warned
+// about before the window are forgotten: a token warned about within the
+// last minute is not warned about again, however many other tokens were
+// refused since.
+func TestRejectionLogFullKeepsWindow(t *testing.T) {
+	var l rejectionLog
+	clock := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	// Fill the log over many windows, rejectionWarnings new tokens each.
+	for n := 0; n < maxRejectionKeys-1; {
+		for range rejectionWarnings - 1 {
+			if n == maxRejectionKeys-1 {
+				break
+			}
+			l.allow("spray-"+strconv.Itoa(n), clock)
+			n++
+		}
+		clock = clock.Add(rejectionWindow)
+	}
+	if !l.allow("revoked", clock) {
+		t.Fatal("the revoked token's first refusal")
+	}
+	// The log is full now; another token's refusal in the same window
+	// must not make the revoked token's next refusal a warning.
+	l.allow("other", clock.Add(time.Second))
+	if l.allow("revoked", clock.Add(2*time.Second)) {
+		t.Fatal("warned again within the window after the log filled up")
+	}
+	if len(l.last) > maxRejectionKeys {
+		t.Fatalf("%d fingerprints kept", len(l.last))
+	}
+	// A minute on, it may warn again.
+	if !l.allow("revoked", clock.Add(rejectionWindow+time.Second)) {
+		t.Fatal("not warned again a minute later")
+	}
+}
