@@ -22,6 +22,8 @@ the settings. Data persists in the `dagger-remote-cache_minio-data` volume.
 | `dev.sh status` | Show the containers. |
 | `dev.sh env` | Print the settings as `export` lines: `eval "$(./hack/remote-cache/dev.sh env)"`. |
 | `dev.sh test` | Start MinIO and run the Go tests against it. |
+| `dev.sh e2e` | Run the remote cache with two real engines, from empty. **Deletes MinIO's data first.** See [Real engines](#real-engines-devsh-e2e). |
+| `dev.sh e2e-down` | Stop the service and engines `dev.sh e2e` left running. |
 
 It needs Docker with Compose v2.
 
@@ -165,8 +167,75 @@ container can't reach the host's loopback, so either:
 
 Both were checked from a container on 2026-10-31.
 
-The service doesn't use the blob store yet: its `PUT /blobs/{digest}`
-stand-in stores nothing. The blob store (`cmd/cacheservice/blobstore`) reads
-the `CACHESERVICE_S3_*` variables that `dev.sh env` prints. To run the service
-against a dev engine today, see
-[`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md).
+The service reads the `CACHESERVICE_S3_*` variables that `dev.sh env`
+prints. To run it against a dev engine by hand, see
+[`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#running-it-against-a-local-engine);
+`dev.sh e2e` below does it all in one command.
+
+## Real engines: `dev.sh e2e`
+
+```bash
+./hack/remote-cache/dev.sh e2e
+```
+
+One command runs the remote cache end to end with two engines built from this
+repo ([#29](https://github.com/zerobull-consulting/dagger/issues/29)). It
+starts from nothing: it **deletes MinIO's data** (`dev.sh reset`), and gives
+engines A and B new, empty cache volumes. Then it:
+
+1. builds `dagger-engine`, `dagger-init-session`, the `dagger` CLI and
+   `cacheservice` from this repo, and an engine image that copies them over
+   the release image `E2E_BASE_IMAGE` (`registry.dagger.io/engine:v1.0.0-beta.22`),
+   with `{"gc":{"enabled":false}}` and a `mirror.gcr.io` mirror for
+   `docker.io` in `/etc/dagger/engine.json`;
+2. starts MinIO on the Docker bridge gateway (see
+   [above](#pointing-an-engine-at-the-service-and-minio)), and
+   `cacheservice` on the host with `dev.sh env`'s settings, listening on
+   the gateway's port 8090 only (it accepts any engine token and any OTLP
+   request, so it isn't exposed beyond this host), with its debug API on
+   `127.0.0.1:8091`;
+3. starts engines A and B in containers, each with
+   `_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL`, `DAGGER_CLOUD_TOKEN` and
+   `DAGGER_CLOUD_URL` pointing at the service on the gateway;
+4. runs a pipeline on A with the CLI (whose `DAGGER_CLOUD_URL` and token point
+   at the service too): `alpine`, then two `withExec`s that each write 4MB of
+   random data and a random stamp, then reads the stamps;
+5. waits until the service has stored A's entries (`GET
+   /debug/engines/{conn}/entries`, and `index.json` in MinIO), and merged
+   them into B (`GET /debug/engines/{conn}/imports`);
+6. runs the same pipeline on B, then one more exec on B that checksums both
+   layer files, while tracing MinIO's requests (`mc admin trace`).
+
+It passes when B's stamps are A's (the execs didn't run again), B's
+`withExec` spans are hits, the layer files on B have A's checksums, and MinIO
+served B's engine the layer blobs. It prints the wall-clock time of each run.
+What a run showed is in
+[`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#real-engine-run).
+
+Everything stays up afterwards for poking at (`curl
+localhost:8091/debug/engines`, the MinIO console); `dev.sh e2e-down` stops
+the engines and the service, and `dev.sh down` stops MinIO. Logs, query
+results, the index before and after, the importer's state and MinIO's trace
+are in `E2E_DIR`.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | Binaries, logs and results |
+| `E2E_SKIP_BUILD` | unset | `1` reuses the binaries in `E2E_DIR/bin` |
+| `E2E_BASE_IMAGE` | `registry.dagger.io/engine:v1.0.0-beta.22` | The release image the engine binaries are copied over |
+| `E2E_CA_FILE` | unset | A CA bundle to add to the engine image, for hosts behind a TLS-intercepting proxy |
+| `E2E_TIMEOUT` | `180` | Seconds to wait for the export, and for the merge |
+| `CACHESERVICE_PORT`, `CACHESERVICE_DEBUG_PORT` | `8090`, `8091` | The service's ports |
+
+Notes:
+
+- It needs Go, Docker with Compose v2, `jq` and `curl`. The engines run
+  `--privileged`.
+- The CLI runs with `TRACEPARENT` (and the `OTEL_EXPORTER_OTLP_*` endpoints)
+  unset. Some CI runners and sandboxes export an unsampled `TRACEPARENT`; the
+  CLI then continues that unsampled trace, the engine records no session
+  spans, and the service never hears of any entry. Watch for this when
+  pointing your own CLI at the service.
+- Where Docker Hub rate-limits pulls, pull the MinIO image through
+  `mirror.gcr.io` and tag it as the name in `compose.yaml`. The engines pull
+  `alpine` through `mirror.gcr.io` already.

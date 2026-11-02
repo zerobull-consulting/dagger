@@ -358,7 +358,96 @@ For a local S3-compatible store (MinIO), see
    Take entry numbers from the `result` fields of the `cache span` log lines.
    Cache spans arrive only when the CLI itself has Cloud telemetry configured,
    through `DAGGER_CLOUD_TOKEN` or `dagger login`, and has `DAGGER_CLOUD_URL`
-   pointing at the service.
+   pointing at the service. They don't arrive either when the CLI inherits an
+   unsampled `TRACEPARENT` (see [Real-engine run](#real-engine-run)).
+
+## Real-engine run
+
+`./hack/remote-cache/dev.sh e2e` runs both paths with two real engines built
+from this repo
+([#29](https://github.com/zerobull-consulting/dagger/issues/29)): engine A
+builds a pipeline and the service exports it to MinIO; engine B, with an
+empty cache, runs the same pipeline and gets cache hits whose layers come
+from MinIO. One command builds and starts everything from empty and checks
+the outcome. See
+[`hack/remote-cache/README.md`](../../hack/remote-cache/README.md#real-engines-devsh-e2e)
+for what it does and its settings.
+
+The pipeline is `container.from(alpine:3.22)`, then two `withExec`s that each
+write 4MB of random data and a random stamp to `/stamp`, then
+`file("/stamp").contents`. After it, B runs one more exec over the same
+container that prints the stamps and the checksums of both data files.
+
+### What it showed
+
+From a run on 2026-11-02, in a cloud container (4 CPUs), with the engines'
+binaries copied into `registry.dagger.io/engine:v1.0.0-beta.22`, MinIO and the
+service on the same host:
+
+| Run | Engine cache | Wall clock |
+| --- | --- | --- |
+| A: the pipeline | empty; pulls `alpine` from `mirror.gcr.io`, runs both execs | 2.36s |
+| B: the same pipeline | empty, plus the 6 entries the service merged from S3 | 0.98s |
+| B: one new exec over the pipeline's container | as above | 0.71s |
+
+The pipeline is small, so the times are mostly session setup; the speedup
+says little yet about large builds. An earlier run gave 2.33s and 0.92s for
+the two pipeline runs.
+
+- **Export.** A's session ended, and within a second the service had
+  exported 4 roots and 6 values in one bundle, with 5 blobs uploaded through
+  presigned PUTs, and recorded them in the index.
+- **Merge.** The service merged that bundle into B right after the export
+  was stored (B was already connected): 4 roots retained, none skipped, no
+  merge refused. B's cache then had the entries, each with its `fs` and
+  `execMeta` parts offered (presigned GETs), not yet on disk.
+- **Cache hit.** On B, both `withExec` spans had outcome `hit`, none
+  `executed`, and B returned A's stamps byte for byte. The execs did not run
+  again.
+- **Layers come only when needed.** The pipeline on B was cached down to its
+  result string, so it read no layers at all: MinIO saw no blob GET. The extra
+  exec needed the container's filesystem. B's engine then fetched the three
+  layer blobs (alpine's and both execs') from MinIO through the merged
+  presigned GETs, as ranged `GetObject`s (206), and the data files it read had
+  A's checksums. B never pulled `alpine` from a registry.
+- **No offers, no renew.** Every part was already in the merge, so the
+  service sent no `offer`. The GETs had not expired, so B sent no `renew`
+  ([#31](https://github.com/zerobull-consulting/dagger/issues/31) covers it).
+- Nothing in the service broke, and it logged no warning.
+
+### What the fake engine did not show
+
+- **B re-exports what it imported.** B's session spans name the entries it
+  hit, which are the imported rows, and they are retained. So the service
+  exports them again, from B: a new bundle with no blobs to upload, whose
+  values are recorded as new entries under B's cache ID, with new service
+  numbers. That bundle is then merged back into A, which already has every
+  value (the engine keeps what it has, as the same recipe is
+  interchangeable). The extra exec's bundle carries the imported values in
+  its closure too, and records them again. After the run, the index held 13
+  entries: A's 6, and 7 under B, of which only 2 (the new exec and its
+  output) were new. Nothing is wrong in what engines get, but the index and
+  the bundles grow by a copy of every imported value per importing engine,
+  and the copies have their own service numbers. The importer knows which of
+  an engine's entries are imports (`GET /debug/engines/{conn}/imports`), but
+  the exporter doesn't consult it, and the index can map an engine entry
+  only to an entry that engine exported. A fix means letting the index map an
+  importing engine's entries to the stored entries they came from
+  ([#35](https://github.com/zerobull-consulting/dagger/issues/35)).
+- **The expired-roots path did not run.** Each merged bundle's roots were
+  all planned, so none was sent already expired (`ExpiresAtUnix: 1`), and
+  `planValueMergeLocked` skipping them is still seen only in the code. It
+  needs a bundle with a superseded or expired root
+  ([#32](https://github.com/zerobull-consulting/dagger/issues/32)).
+- **An unsampled `TRACEPARENT` hides every entry.** This container exports
+  `TRACEPARENT=00-…-00` to every process. The CLI continued that unsampled
+  trace, so neither it nor the engine recorded any span: the engine logged
+  "session telemetry published to Cloud" and its session span queue counted 0
+  spans, and the service saw `/v1/logs` and `/v1/metrics` but never
+  `/v1/traces`. The service never learned of an entry, so it exported
+  nothing. `dev.sh e2e` unsets `TRACEPARENT` for the CLI. A client in CI that
+  inherits one has the same silent miss as a client with no Cloud
+  credential (see [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#gaps-and-options)).
 
 ## Expected behavior, read from the code
 
