@@ -664,6 +664,15 @@ scenario_renew() {
 		"the replica answered with fresh GETs: $(grep 'type=renewed' "$E2E_DIR/renew-envelopes-c.log" | grep -o 'addresses=[0-9]*' | paste -sd, -)"
 	check "$(ok_if test "${#missing[@]}" = 0 -a -s "$E2E_DIR/renew-gets-c.log")" \
 		"MinIO served C every layer of A's chain: $(grep -c . "$E2E_DIR/renew-gets-c.log" || true) blob GETs${missing:+, missing ${missing[*]}}"
+	# The engine renews an expired address without trying it: no blob GET
+	# before the renew, and none refused. The service's log and MinIO's trace
+	# share the host's clock, both in UTC to the millisecond.
+	local renewed_at first_get refused
+	renewed_at="$(grep -m 1 'type=renew ' "$E2E_DIR/renew-envelopes-c.log" | grep -o 'time=[^ ]*' | cut -c6-28)"
+	first_get="$(head -n 1 "$E2E_DIR/renew-gets-c.log" | cut -c1-23)"
+	refused="$(grep -c '\[403 ' "$E2E_DIR/renew-gets-c.log" || true)"
+	check "$(ok_if test -n "$renewed_at" -a -n "$first_get" -a "$refused" = 0 -a ! "$first_get" \< "$renewed_at")" \
+		"no GET before the renew, and none refused: renew at ${renewed_at#*T}, first blob GET at ${first_get#*T}, ${refused} refused (403)"
 	check "$(ok_if test "$out_c" = "$(printf '%s\n%s' "$stamp_a" "$sums_a")")" \
 		"the files C read are A's: its stamps and checksums"
 
@@ -848,8 +857,11 @@ scenario_superseded() {
 	log "#32/#27: starting engine F, with an empty cache, and reading the value on it"
 	conn_f="$(start_engine f)"
 	cache_f="$(cache_of main "$conn_f")"
-	wait_for "$E2E_TIMEOUT" "a merge of the newer bundle into F" \
-		sh -c "curl -fsS '$debug_url/debug/engines/$conn_f/imports' | jq -e --arg b '$b2' '[.merged[].bundle] | index(\$b)'"
+	# Both bundles, before F reads: the importer records each merge as it
+	# goes, and merges the newer bundle first when its lowest root is lower,
+	# so the newer one alone doesn't mean F has the older record's bundle yet.
+	wait_for "$E2E_TIMEOUT" "merges of both bundles into F (${b1:0:12} and ${b2:0:12})" \
+		sh -c "curl -fsS '$debug_url/debug/engines/$conn_f/imports' | jq -e --arg b1 '$b1' --arg b2 '$b2' '[.merged[].bundle] | index(\$b1) and index(\$b2)'"
 	curl -fsS "$debug_url/debug/engines/$conn_f/imports" >"$E2E_DIR/superseded-imports-f.json"
 	jq -c --arg b1 "$b1" --arg b2 "$b2" '.merged[] | select(.bundle == $b1 or .bundle == $b2) | {bundle: .bundle[0:12], roots, retained, expired}' "$E2E_DIR/superseded-imports-f.json" >&2
 	line="$(log_lines "$E2E_DIR/cacheservice.log")"
