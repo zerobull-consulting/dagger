@@ -184,10 +184,11 @@ func (o *failIndexPuts) Put(ctx context.Context, key string, body []byte, cond m
 	return o.Objects.Put(ctx, key, body, cond)
 }
 
-// A merge whose imports can't be recorded isn't committed, and is sent again
-// at the next sync, however many times the index fails: the bundle isn't at
-// fault, and giving up would leave the engine's values unrecorded as imports.
-func TestSyncIndexFailureDoesNotCountAgainstMerge(t *testing.T) {
+// A merge whose imports can't be recorded stays committed, since the engine
+// has it, and is not sent again: only the index write is retried, at each
+// sync, however many times it fails, and the export path is told once it
+// lands.
+func TestSyncRetriesImportsNotMerge(t *testing.T) {
 	objects := &failIndexPuts{Objects: metastore.NewMemObjects()}
 	f, calls := newImportsFixture(t, objects)
 	f.store(chainBundle(10, "base"), "cache-a")
@@ -196,16 +197,21 @@ func TestSyncIndexFailureDoesNotCountAgainstMerge(t *testing.T) {
 	ctx := context.Background()
 	for i := range DefaultMergeAttempts + 1 {
 		res, err := f.im.Sync(ctx, eng)
-		if err != nil || len(res.Failed) != 1 || len(res.Merged) != 0 {
+		if err != nil || len(res.Failed) != 0 {
 			t.Fatalf("sync %d: %+v, %v", i, res, err)
 		}
+		if i == 0 && len(res.Merged) != 1 {
+			t.Fatalf("sync 0: %+v", res)
+		}
+		if len(calls.all()) != 0 {
+			t.Fatalf("sync %d: export path told before the imports were recorded", i)
+		}
 	}
-	if st, _ := f.im.State("cache-b"); len(st.Merged) != 0 || len(st.Failures) != 0 {
-		t.Fatalf("state %+v", st)
+	if merges, _ := eng.counts(); merges != 1 {
+		t.Fatalf("%d merges: the merge was sent again", merges)
 	}
-	res, err := f.im.Sync(ctx, eng)
-	if err != nil || len(res.Merged) != 1 {
-		t.Fatalf("after the index recovered: %+v, %v", res, err)
+	if _, err := f.im.Sync(ctx, eng); err != nil {
+		t.Fatal(err)
 	}
 	idx, err := f.meta.Index(ctx, scope)
 	if err != nil {
@@ -214,10 +220,13 @@ func TestSyncIndexFailureDoesNotCountAgainstMerge(t *testing.T) {
 	if c := idx.Caches["cache-b"]; c == nil || len(c.Imported) != 1 {
 		t.Fatalf("imports %+v", c)
 	}
-	if merges, _ := eng.counts(); merges != DefaultMergeAttempts+2 {
+	if got := calls.all(); len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("export path told %+v", got)
+	}
+	if merges, _ := eng.counts(); merges != 1 {
 		t.Fatalf("%d merges", merges)
 	}
-	if len(calls.all()) != 1 {
-		t.Fatalf("export path told %d times", len(calls.all()))
+	if st, _ := f.im.State("cache-b"); len(st.Merged) != 1 || len(st.Failures) != 0 {
+		t.Fatalf("state %+v", st)
 	}
 }

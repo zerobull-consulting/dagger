@@ -96,10 +96,11 @@ type Config struct {
 	Now func() time.Time
 	// Imported, when set, is called with the engine cache's imports, by
 	// service number: the engine entry each stored entry landed on, with
-	// its replacement count and parts. It is called after each committed
-	// merge, with the values the index recorded as imports, and after each
-	// offer round that changed an import's parts or replacement count,
-	// with those values. The export path uses it to know an unchanged
+	// its replacement count and parts. It is called when the index records
+	// a merge's imports, with the values it took (right after the merge, or
+	// at a later sync if that write failed), and after each offer round
+	// that changed an import's parts or replacement count, with those
+	// values. The export path uses it to know an unchanged
 	// import is already stored.
 	Imported func(cacheID string, generation uint64, values map[uint64]Value)
 }
@@ -167,6 +168,9 @@ type cacheState struct {
 	values map[uint64]*Value
 	// pending are offers to try again.
 	pending []pendingOffer
+	// pendingImports are imports of committed merges that the index
+	// didn't take yet, written again at each sync.
+	pendingImports []metastore.Import
 	// offers counts the offers' outcomes.
 	offers OfferCounts
 }
@@ -324,6 +328,7 @@ func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 		st.failures = map[string]int{}
 		st.values = map[uint64]*Value{}
 		st.pending = nil
+		st.pendingImports = nil
 		st.offers = OfferCounts{}
 	}
 	return st
@@ -392,6 +397,28 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		return res, errStateReset
 	}
 
+	// Imports of earlier merges that the index didn't take yet.
+	im.mu.Lock()
+	pendingImports := st.pendingImports
+	st.pendingImports = nil
+	im.mu.Unlock()
+	if len(pendingImports) > 0 {
+		if err := im.recordImports(ctx, eng, st, pendingImports); err != nil {
+			if errors.Is(err, errStateReset) {
+				return res, err
+			}
+			im.mu.Lock()
+			if im.currentLocked(eng, st) {
+				st.pendingImports = append(pendingImports, st.pendingImports...)
+			}
+			im.mu.Unlock()
+			if ctx.Err() != nil {
+				return res, context.Cause(ctx)
+			}
+			im.log.Warn("import: recording imports failed; trying again at the next sync", "cacheID", cacheID, "imports", len(pendingImports), "error", err)
+		}
+	}
+
 	idx, err := im.cfg.Meta.Index(ctx, im.cfg.Scope)
 	if err != nil {
 		return res, fmt.Errorf("read index: %w", err)
@@ -422,10 +449,6 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 			}
 			im.log.Warn("import: merge failed", "cacheID", cacheID, "bundle", c.Bundle, "roots", len(c.Roots), "error", err)
 			res.Failed = append(res.Failed, FailedBundle{Bundle: c.Bundle, Error: err.Error()})
-			var idxErr *indexError
-			if errors.As(err, &idxErr) {
-				continue
-			}
 			im.mu.Lock()
 			st.failures[c.Key()]++
 			im.mu.Unlock()
@@ -465,15 +488,42 @@ func (im *Importer) currentLocked(eng Engine, st *cacheState) bool {
 	return im.caches[eng.CacheID()] == st && st.generation == eng.Generation()
 }
 
-// indexError is a merge the engine committed whose imports could not be
-// recorded in the index. The bundle isn't at fault, so it doesn't count
-// against MergeAttempts: giving up on it would leave the engine holding
-// values the index doesn't know are imports, which it would then export
-// back. The merge is sent again at the next sync.
-type indexError struct{ err error }
-
-func (e *indexError) Error() string { return "record imports: " + e.err.Error() }
-func (e *indexError) Unwrap() error { return e.err }
+// recordImports records where merged values landed as the cache's imports
+// in the index, and tells the export path about those the index took. It
+// returns errStateReset if the state was reset meanwhile; if the cache was
+// wiped, the imports may have landed after the wipe dropped them, so they
+// are dropped again. A new generation of the same cache keeps them, as its
+// entries are the same.
+func (im *Importer) recordImports(ctx context.Context, eng Engine, st *cacheState, imports []metastore.Import) error {
+	recorded, err := im.cfg.Meta.RecordImports(ctx, im.cfg.Scope, eng.CacheID(), eng.Generation(), imports)
+	if err != nil {
+		return err
+	}
+	im.mu.Lock()
+	if !im.currentLocked(eng, st) {
+		wiped := im.caches[eng.CacheID()] == nil
+		im.mu.Unlock()
+		if wiped {
+			if err := im.cfg.Meta.ForgetImports(ctx, im.cfg.Scope, eng.CacheID()); err != nil {
+				im.log.Warn("import: forgetting a wiped cache's imports failed", "cacheID", eng.CacheID(), "error", err)
+			}
+		}
+		return errStateReset
+	}
+	// Only the imports the index took are the stored values: one the index
+	// skipped landed on an entry the cache exported itself.
+	touched := map[uint64]bool{}
+	for _, r := range recorded {
+		if v := st.values[r.Number]; v != nil && v.Number == r.Engine {
+			v.imported = true
+			touched[r.Number] = true
+		}
+	}
+	copies := importedCopies(st.values, touched)
+	im.mu.Unlock()
+	im.notifyImported(eng, copies)
+	return nil
+}
 
 // connectionError is a request that failed for the connection, not the
 // request: the sync stops.
@@ -546,11 +596,10 @@ func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *
 // replaced is discarded with errStateReset, so it can't repopulate the state
 // of a wiped cache or of another generation.
 //
-// The engine entries the values landed on are recorded in the index as the
-// cache's imports first. If that fails, the merge isn't committed, and is
-// sent again at the next sync, which the engine keeps as it is. The failure
-// is the index's, not the bundle's, so it doesn't count against
-// MergeAttempts (see indexError).
+// Then the engine entries the values landed on are recorded in the index as
+// the cache's imports (recordImports). If that fails, the merge stays
+// committed, since the engine has it, and only the index write is tried
+// again, at each sync, until it lands.
 func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState, c Candidate, mb MergeBundle, reply protocol.Merged) (MergedBundle, []pendingOffer, error) {
 	byOrdinal := make(map[dagql.TransferOrdinal]*protocol.MergedValue, len(reply.Values))
 	for i := range reply.Values {
@@ -675,45 +724,14 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 		})
 	}
 
-	im.mu.Lock()
-	current := im.currentLocked(eng, st)
-	im.mu.Unlock()
-	if !current {
-		return MergedBundle{}, nil, errStateReset
-	}
 	imports := make([]metastore.Import, 0, len(values))
 	for _, n := range slices.Sorted(maps.Keys(values)) {
 		imports = append(imports, metastore.Import{Number: n, Engine: values[n].Number})
 	}
-	recorded, err := im.cfg.Meta.RecordImports(ctx, im.cfg.Scope, eng.CacheID(), eng.Generation(), imports)
-	if err != nil {
-		if ctx.Err() != nil {
-			return MergedBundle{}, nil, &connectionError{context.Cause(ctx)}
-		}
-		return MergedBundle{}, nil, &indexError{err}
-	}
-	// Only the imports the index took are the stored values: one the index
-	// skipped landed on an entry the cache exported itself.
-	for _, r := range recorded {
-		if v := values[r.Number]; v != nil && v.Number == r.Engine {
-			v.imported = true
-		}
-	}
 
 	im.mu.Lock()
 	if !im.currentLocked(eng, st) {
-		// A wipe forgets the cache here before it drops the cache's
-		// imports from the index. If it did so while the imports were
-		// being written, they may have landed after the drop: drop them
-		// again. A new generation of the same cache keeps them, as its
-		// entries are the same.
-		wiped := im.caches[eng.CacheID()] == nil
 		im.mu.Unlock()
-		if wiped {
-			if err := im.cfg.Meta.ForgetImports(ctx, im.cfg.Scope, eng.CacheID()); err != nil {
-				im.log.Warn("import: forgetting a wiped cache's imports failed", "cacheID", eng.CacheID(), "error", err)
-			}
-		}
 		return MergedBundle{}, nil, errStateReset
 	}
 	st.merged[c.Key()] = &out
@@ -721,9 +739,22 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 	for n, v := range values {
 		st.values[n] = v
 	}
-	copies := importedCopies(values, nil)
 	im.mu.Unlock()
-	im.notifyImported(eng, copies)
+
+	// The engine committed the merge, so it isn't sent again if the
+	// imports can't be recorded: only the index write is retried, at each
+	// sync, until it lands.
+	if err := im.recordImports(ctx, eng, st, imports); err != nil {
+		if errors.Is(err, errStateReset) {
+			return MergedBundle{}, nil, err
+		}
+		im.log.Warn("import: recording imports failed; trying again at the next sync", "cacheID", eng.CacheID(), "bundle", c.Bundle, "error", err)
+		im.mu.Lock()
+		if im.currentLocked(eng, st) {
+			st.pendingImports = append(st.pendingImports, imports...)
+		}
+		im.mu.Unlock()
+	}
 	im.log.Info("import: merged", "cacheID", eng.CacheID(), "bundle", c.Bundle,
 		"roots", len(c.Roots), "values", len(reply.Values), "retained", len(out.Retained),
 		"expired", len(out.Expired), "offers", len(offers))

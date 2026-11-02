@@ -326,9 +326,9 @@ again whenever another engine's export is stored, and every `-import-poll`
    /debug/engines/{conn}/imports`), records each landed entry in the index as
    the cache's import, and tells the export path's tracker the ones the index
    took (not those that landed on an entry the cache exported itself). If
-   the index can't be updated, the merge isn't committed, and is sent again
-   at the next sync; this doesn't count against the merge's attempts, since
-   the bundle isn't at fault. If the cache was wiped while the imports were
+   the index can't be updated, the merge stays committed, since the engine
+   has it, and only the index write is tried again, at each sync, until it
+   lands; the tracker is told then. If the cache was wiped while the imports were
    written, they are dropped again.
 3. **Offer.** A stored part a merged entry has neither complete nor offered
    is offered to that entry, by the engine's number, with fresh GETs and the
