@@ -473,7 +473,11 @@ the two pipeline runs.
   unchanged import, and a bundle that names one, as a root or in its closure,
   reuses the stored entry. `dev.sh e2e` now checks that the index ends with
   A's entries and only the verify exec's new ones, each once, and that
-  nothing of A's is merged back into A.
+  nothing of A's is merged back into A. A run on 2026-11-02 with the fix
+  stored two exports, A's build and B's verify exec (5 values, of which 4
+  resolved to A's numbers as B's imports), and ended with 7 entries: A's 6
+  and the verify exec's container, which depends on A's last exec by its
+  original number.
 - **The expired-roots path did not run.** Each merged bundle's roots were
   all planned, so none was sent already expired (`ExpiresAtUnix: 1`), and
   `planValueMergeLocked` skipping them is still seen only in the code. It
