@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 )
 
 // S3Request is one request through the S3 proxy.
@@ -65,7 +67,9 @@ func (r S3Request) IsBlobOf(d digest.Digest) bool {
 // S3Proxy sits between everything and the S3 store, and records each
 // request: the services are configured with its address as their S3
 // endpoint, so the presigned URLs they hand engines point at it too. It
-// keeps the Host header, which presigned URLs are signed for.
+// keeps the Host header, which presigned URLs are signed for, or, for a store
+// that routes on its own name, checks the signature and signs again
+// (Upstream).
 //
 // It replaces tracing the store: which blobs an engine read or uploaded,
 // when, and what the store answered.
@@ -76,6 +80,16 @@ type S3Proxy struct {
 	mu     sync.Mutex
 	reqs   []S3Request
 	faults []*Fault
+	guard  *s3test.Guard
+}
+
+// ProxyOptions configure a proxy beyond its plain forwarding.
+type ProxyOptions struct {
+	// Upstream, when set, signs requests again for the store; see Upstream.
+	Upstream *Upstream
+	// Guard, when set, answers 403 to requests it refuses, which don't reach
+	// the store. Guard.Refused and Guard.Touched say what it saw.
+	Guard *s3test.Guard
 }
 
 // Fault makes the proxy answer some requests itself instead of passing them
@@ -187,6 +201,12 @@ func writeS3Error(w http.ResponseWriter, status int, code string) {
 // (an address engine containers reach) on a free port, until the test ends.
 func StartS3Proxy(t *testing.T, host, target string) *S3Proxy {
 	t.Helper()
+	return StartS3ProxyWith(t, host, target, ProxyOptions{})
+}
+
+// StartS3ProxyWith is StartS3Proxy with options.
+func StartS3ProxyWith(t *testing.T, host, target string, opts ProxyOptions) *S3Proxy {
+	t.Helper()
 	to, err := url.Parse(target)
 	if err != nil {
 		t.Fatalf("S3 endpoint %q: %v", target, err)
@@ -195,9 +215,14 @@ func StartS3Proxy(t *testing.T, host, target string) *S3Proxy {
 	if err != nil {
 		t.Fatalf("S3 proxy: %v", err)
 	}
-	p := &S3Proxy{URL: "http://" + ln.Addr().String()}
+	p := &S3Proxy{URL: "http://" + ln.Addr().String(), guard: opts.Guard}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
+			if opts.Upstream != nil {
+				// Upstream.forward made the request the store's.
+				r.Out.URL, r.Out.Host = r.In.URL, r.In.Host
+				return
+			}
 			r.SetURL(to)
 			// Presigned URLs are signed for the proxy's host: the store
 			// checks the signature against the Host it receives.
@@ -206,6 +231,9 @@ func StartS3Proxy(t *testing.T, host, target string) *S3Proxy {
 		// Stream bodies as they come: layer blobs are large.
 		FlushInterval: -1,
 	}
+	if opts.Upstream != nil && opts.Upstream.Transport != nil {
+		rp.Transport = opts.Upstream.Transport
+	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Recorded as it arrives, with its status set as the response
 		// starts: before the client can see the response, so a client
@@ -213,6 +241,14 @@ func StartS3Proxy(t *testing.T, host, target string) *S3Proxy {
 		p.mu.Lock()
 		i := len(p.reqs)
 		p.reqs = append(p.reqs, S3Request{Time: time.Now(), Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery})
+		if p.guard != nil {
+			if err := p.guard.CheckRecord(r); err != nil {
+				p.reqs[i].Status = http.StatusForbidden
+				p.mu.Unlock()
+				writeS3Error(w, http.StatusForbidden, "AccessDenied")
+				return
+			}
+		}
 		f := p.faultLocked(r.Method, r.URL.Path)
 		if f != nil {
 			p.reqs[i].Fault = f.Name
@@ -255,6 +291,15 @@ func StartS3Proxy(t *testing.T, host, target string) *S3Proxy {
 			p.reqs[i].Status = code
 			p.mu.Unlock()
 		}}
+		if opts.Upstream != nil {
+			// After the faults: a Rewrite changes the body, which the
+			// signature doesn't cover, but its length must be final.
+			if err := opts.Upstream.forward(r, to); err != nil {
+				t.Logf("S3 proxy: %s %s: %v", r.Method, r.URL.Path, err)
+				writeS3Error(sw, http.StatusForbidden, "SignatureDoesNotMatch")
+				return
+			}
+		}
 		rp.ServeHTTP(sw, r)
 		sw.WriteHeader(http.StatusOK) // no-op unless nothing was written
 	})}

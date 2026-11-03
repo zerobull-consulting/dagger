@@ -160,6 +160,32 @@ func TestKnownGapPromoteSameMD5Overwrite(t *testing.T) {
 	}
 }
 
+// Known gap, pinned on purpose: a store whose ETags aren't MD5s can't have its
+// copies checked, so only CopySourceIfMatch protects them. One that also
+// ignored that condition would have an overwritten staged object promoted,
+// unverified. No store is known to do both: Spaces ignores the condition, but
+// its ETags are MD5s. When promotion stops relying on either, this test fails:
+// replace it with one of the fix.
+func TestKnownGapPromoteNonMD5ETagsIgnoredCondition(t *testing.T) {
+	good := []byte(strings.Repeat("0123456789", 3))
+	bad := append([]byte(nil), good...)
+	bad[0] ^= 0xff
+	f := &copyStore{body: good, overwrite: bad, etag: func(data []byte) string { return fmt.Sprintf("kms-%x", md5.Sum(data)) }} //nolint:gosec // see the import
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	cfg.HashInService = true
+	s := newTestStore(t, cfg)
+	p, err := s.Promote(context.Background(), NewStage(), digest.FromBytes(good), int64(len(good)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Outcome != Promoted || f.completed != 1 {
+		t.Fatalf("promote: %+v, %d completed; the gap is closed, so replace this test", p, f.completed)
+	}
+}
+
 func TestPartMD5s(t *testing.T) {
 	sum := func(s string) string {
 		b := md5.Sum([]byte(s)) //nolint:gosec // see the import
