@@ -1205,6 +1205,14 @@ serialized with exports on the index:
    checked the object before it was deleted
    (`TestRecordFenced`, `TestExportRacesSweep`).
 
+The epoch object only goes up (a conditional write), and each run
+republishes the index's epoch if the object lags it, such as after a failed
+publish (`TestWriteEpochMonotonic`, `TestEpochRepublished`). A lagging epoch
+is safe anyway: it only makes exports refuse more. A marker pruned while it
+lagged can't let an export through either: the deletion finished over 4h
+before, and an export that may still record started under 3h ago, so its
+checks came after the deletion (`TestStaleEpochAfterPruneIsSafe`).
+
 A refused export is tried again from the start: it finds what is gone, has
 the engine upload it again, and is recorded (`export_collected_total`). So
 the index never names an object that isn't stored, whatever GC does at the
@@ -1287,7 +1295,8 @@ Per namespace and run:
 | Expire | 1 index GET; 1 conditional PUT when something changed |
 | List | 1 `ListObjectsV2` per 1,000 objects |
 | Mark | 1 GET per live bundle not read before (kept in memory) |
-| Claim, finish | 1 index read and conditional PUT each, only when there is something to delete; 1 PUT of the epoch |
+| Claim, finish | 1 index read and conditional PUT each, only when there is something to delete; 1 GET and conditional PUT of the epoch |
+| Epoch | 1 GET of the epoch object, once the namespace has deleted anything |
 | Delete | 1 `DeleteObjects` per 1,000 objects |
 | Staging | none beyond the listing; 1 `DeleteObjects` per 1,000 deleted |
 

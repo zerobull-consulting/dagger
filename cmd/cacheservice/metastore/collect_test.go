@@ -349,3 +349,51 @@ func jsonMarshal(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// The published epoch only goes up: a replica that publishes late doesn't
+// lower it.
+func TestWriteEpochMonotonic(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, NewMemObjects())
+	for _, e := range []uint64{2, 3, 1, 3, 2} {
+		if err := s.WriteEpoch(ctx, "s1", e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if e, _ := s.ReadEpoch(ctx, "s1"); e != 3 {
+		t.Fatalf("epoch %d, want 3", e)
+	}
+}
+
+// A stale published epoch is safe once a deletion's marker is pruned: the
+// deletion finished more than DeletionRetention ago, and an export that may
+// still record started less than MaxFenceAge ago, so its checks came after
+// the deletion and saw the object missing. Recording with the stale epoch is
+// allowed, which is right: the export uploaded (or found re-uploaded) what
+// it names.
+func TestStaleEpochAfterPruneIsSafe(t *testing.T) {
+	ctx := context.Background()
+	s, clock := newClockedStore(t, NewMemObjects())
+	blob := digest.FromString("layer")
+	claim(t, s, "s1", 5, BlobRelKey(blob))
+	if _, err := s.RecordFenced(ctx, "s1", layered(5, blob), "c", 1, Fence{Epoch: 1, Started: clock.now()}); !errors.Is(err, ErrCollected) {
+		t.Fatalf("with the marker: %v", err)
+	}
+	// The marker is pruned (GC does so after DeletionRetention); an export
+	// started since, fencing at the stale epoch 1, records.
+	if _, err := s.UpdateIndex(ctx, "s1", func(idx *Index) error {
+		idx.GC.Deletions = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.add(DeletionRetention)
+	if _, err := s.RecordFenced(ctx, "s1", layered(5, blob), "c", 1, Fence{Epoch: 1, Started: clock.now()}); err != nil {
+		t.Fatal(err)
+	}
+	// And one that started before the deletion's retention ran out is
+	// refused by its age instead.
+	if _, err := s.RecordFenced(ctx, "s1", layered(6, blob), "c", 1, Fence{Epoch: 1, Started: clock.now().Add(-MaxFenceAge - time.Minute)}); !errors.Is(err, ErrCollected) {
+		t.Fatalf("an export older than MaxFenceAge: %v", err)
+	}
+}

@@ -507,6 +507,12 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 		return rep
 	}
 
+	// The published epoch must not lag the index's: a finish whose publish
+	// failed, or a replica that published late, is caught up here.
+	if !c.cfg.DryRun {
+		c.publishEpoch(ctx, ns, idx, &rep)
+	}
+
 	// 2. List what is stored.
 	l, err := c.list(ctx, ns)
 	if err != nil {
@@ -568,6 +574,22 @@ func (c *Collector) expire(ctx context.Context, ns string, lim Limits, now time.
 	}
 	c.cfg.Metrics.GCExpired(ns, metrics.ExpiredByExpiry, rep.Expired)
 	return snap, idx, nil
+}
+
+// publishEpoch publishes the index's epoch when the epoch object lags it.
+// A lagging epoch is safe, but refuses exports that name an object deleted
+// in the epochs it lags, until their markers are pruned.
+func (c *Collector) publishEpoch(ctx context.Context, ns string, idx *metastore.Index, rep *Report) {
+	if idx.GC == nil || idx.GC.Epoch == 0 {
+		return
+	}
+	published, err := c.cfg.Meta.ReadEpoch(ctx, ns)
+	if err == nil && published >= idx.GC.Epoch {
+		return
+	}
+	if err := c.cfg.Meta.WriteEpoch(ctx, ns, idx.GC.Epoch); err != nil {
+		rep.fail(fmt.Errorf("publish epoch %d: %w", idx.GC.Epoch, err))
+	}
 }
 
 // pruneDeletions drops finished deletions older than DeletionRetention.

@@ -280,18 +280,45 @@ func (s *Store) ReadEpoch(ctx context.Context, scope string) (uint64, error) {
 }
 
 // WriteEpoch publishes the scope's epoch, after the index update that
-// reached it. A replica that publishes an older epoch than another's only
-// makes exports refuse more until the next publish.
+// reached it. It only ever raises the published epoch: a conditional write
+// (If-Match the epoch object read, or If-None-Match: * when there is none),
+// so a replica that publishes late never lowers what another published.
+// An epoch that lags the index's only makes exports refuse more, never
+// less; GC republishes the index's epoch at each run when it lags.
 func (s *Store) WriteEpoch(ctx context.Context, scope string, epoch uint64) error {
 	key, err := s.epochKey(scope)
 	if err != nil {
 		return err
 	}
 	body, _ := json.Marshal(epochObject{Epoch: epoch})
-	if _, err := s.objects.Put(ctx, key, body, Condition{}); err != nil {
-		return fmt.Errorf("write gc epoch: %w", err)
+	for attempt := 1; ; attempt++ {
+		cur, etag, err := s.objects.Get(ctx, key)
+		cond := Condition{IfNoneMatch: true}
+		switch {
+		case errors.Is(err, ErrNotFound):
+		case err != nil:
+			return fmt.Errorf("write gc epoch: %w", err)
+		default:
+			var e epochObject
+			if json.Unmarshal(cur, &e) == nil && e.Epoch >= epoch {
+				return nil
+			}
+			cond = Condition{IfMatch: etag}
+		}
+		_, err = s.objects.Put(ctx, key, body, cond)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrPreconditionFailed) {
+			return fmt.Errorf("write gc epoch: %w", err)
+		}
+		if attempt >= s.maxAttempts {
+			return fmt.Errorf("write gc epoch: %w", ErrContention)
+		}
+		if err := s.sleep(ctx, backoff(attempt)); err != nil {
+			return err
+		}
 	}
-	return nil
 }
 
 // ScopePrefix returns the prefix of every key of a scope:

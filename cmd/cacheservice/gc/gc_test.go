@@ -904,3 +904,24 @@ func TestStaleClaimsBoundedByMaxDeletes(t *testing.T) {
 		}
 	}
 }
+
+// A published epoch that lags the index's (a finish whose publish failed,
+// or a replica that published late) is caught up by the next run.
+func TestEpochRepublished(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.export("team", "a", buildX("x"), 2)
+	if _, err := e.meta.UpdateIndex(ctx, "team", func(idx *metastore.Index) error {
+		idx.GC = &metastore.Collection{Epoch: 3}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.meta.WriteEpoch(ctx, "team", 1); err != nil {
+		t.Fatal(err)
+	}
+	e.run(e.collector(nil))
+	if ep, _ := e.meta.ReadEpoch(ctx, "team"); ep != 3 {
+		t.Fatalf("published epoch %d, want 3", ep)
+	}
+}
