@@ -39,6 +39,8 @@ const (
 	// EnvPrefix is blobstore.EnvPrefix, which this package can't import: the
 	// blob store's own tests import this package.
 	EnvPrefix = "CACHESERVICE_S3_PREFIX"
+	// EnvEndpoint is blobstore.EnvEndpoint, for the same reason.
+	EnvEndpoint = "CACHESERVICE_S3_ENDPOINT"
 	// EnvDisposableBucket, set to 1, marks the bucket as one whose lifecycle
 	// configuration a test may replace. Leave it unset on a shared bucket.
 	EnvDisposableBucket = "CACHESERVICE_TEST_DISPOSABLE_BUCKET"
@@ -137,7 +139,7 @@ type Scope struct {
 func NewScope(t testing.TB, bucket string) *Scope {
 	t.Helper()
 	root := RunRoot(t)
-	g := NewGuard(bucket, root, Disposable())
+	g := NewGuard(bucket, root, Disposable()).WithEndpoint(os.Getenv(EnvEndpoint))
 	t.Cleanup(func() {
 		for _, r := range g.Refused() {
 			t.Errorf("s3test: a request was refused: %s", r)
@@ -172,7 +174,7 @@ func CheckURL(t testing.TB, method, rawURL, bucket string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := NewGuard(bucket, RunRoot(t), Disposable())
+	g := NewGuard(bucket, RunRoot(t), Disposable()).WithEndpoint(os.Getenv(EnvEndpoint))
 	if err := g.Check(&http.Request{Method: method, URL: u, Host: u.Host}); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +190,8 @@ type Guard struct {
 	// lifecycle allows replacing the bucket's lifecycle configuration.
 	lifecycle bool
 	inner     aws.HTTPClient
+	// host is the endpoint's host; see WithEndpoint.
+	host string
 
 	mu      sync.Mutex
 	touched []string
@@ -208,6 +212,18 @@ func NewGuard(bucket, root string, lifecycle bool) *Guard {
 // WithClient makes the guard send what it allows with inner.
 func (g *Guard) WithClient(inner aws.HTTPClient) *Guard {
 	g.inner = inner
+	return g
+}
+
+// WithEndpoint binds the guard to an endpoint: only its host (path-style) and
+// the bucket's name under it (virtual-hosted) are the bucket. Otherwise a
+// request for another bucket's host can pass as this bucket's, when its key
+// starts with this bucket's name. An empty endpoint leaves it unbound.
+func (g *Guard) WithEndpoint(endpoint string) *Guard {
+	g.host = ""
+	if u, err := url.Parse(endpoint); err == nil {
+		g.host = u.Host
+	}
 	return g
 }
 
@@ -302,6 +318,9 @@ func (g *Guard) key(r *http.Request) (key string, ok bool) {
 		host = r.URL.Host
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/")
+	if g.host != "" && host != g.host && host != g.bucket+"."+g.host {
+		return "", false
+	}
 	if strings.HasPrefix(host, g.bucket+".") {
 		return path, true
 	}

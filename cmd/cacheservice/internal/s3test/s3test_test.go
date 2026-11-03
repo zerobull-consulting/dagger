@@ -289,9 +289,36 @@ func TestGuardOtherBucketAndReads(t *testing.T) {
 	}
 }
 
+// Bound to its endpoint, the guard takes only that host and the bucket's name
+// under it. A request for another bucket's host is refused even when its key
+// starts with this bucket's name, which would otherwise look path-style.
+func TestGuardBoundToTheEndpoint(t *testing.T) {
+	g := NewGuard(testBucket, testRoot, false).WithEndpoint("https://s3.example.test")
+	for _, tc := range []struct {
+		url string
+		ok  bool
+	}{
+		{"https://s3.example.test/bkt/" + testRoot + "/k", true},
+		{"https://bkt.s3.example.test/" + testRoot + "/k", true},
+		{"https://other.s3.example.test/bkt/" + testRoot + "/k", false},
+		{"https://elsewhere.test/bkt/" + testRoot + "/k", false},
+		{"https://bkt.elsewhere.test/" + testRoot + "/k", false},
+		{"https://bkt.s3.example.test.evil.test/" + testRoot + "/k", false},
+	} {
+		req, err := http.NewRequest(http.MethodPut, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Check(req); (err == nil) != tc.ok {
+			t.Errorf("PUT %s: %v, want allowed %v", tc.url, err, tc.ok)
+		}
+	}
+}
+
 // CheckURL looks at presigned URLs, which don't go through a Guard.
 func TestCheckURLRefusesOutsideTheRoot(t *testing.T) {
 	t.Setenv(EnvPrefix, "test")
+	t.Setenv(EnvEndpoint, "https://s3.example.test")
 	root := RunRoot(t)
 	CheckURL(t, http.MethodPut, "https://s3.example.test/bkt/"+root+"/k?X-Amz-Signature=x", "bkt")
 	CheckURL(t, http.MethodPut, "https://bkt.s3.example.test/"+root+"/k?X-Amz-Signature=x", "bkt")
@@ -302,6 +329,14 @@ func TestCheckURLRefusesOutsideTheRoot(t *testing.T) {
 	}()
 	if !fatal.failed {
 		t.Fatal("CheckURL took a key outside the root")
+	}
+	fatal = &recordingTB{TB: t}
+	func() {
+		defer func() { _ = recover() }()
+		CheckURL(fatal, http.MethodPut, "https://other.s3.example.test/bkt/"+root+"/k", "bkt")
+	}()
+	if !fatal.failed {
+		t.Fatal("CheckURL took another host")
 	}
 }
 

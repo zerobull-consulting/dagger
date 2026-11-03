@@ -133,6 +133,33 @@ func TestPromoteChecksCopiedParts(t *testing.T) {
 	}
 }
 
+// Known gap, pinned on purpose: MD5 isn't collision resistant. On a store that
+// ignores CopySourceIfMatch, someone holding the presigned PUT who prepared
+// two bodies with one MD5, and overwrote the staged object between the hash
+// and the copy, gets the second body promoted, unverified. Simulated here with
+// a store whose ETags are all the first body's MD5. When promotion stops
+// relying on MD5 there, this test fails: replace it with one of the fix.
+func TestKnownGapPromoteSameMD5Overwrite(t *testing.T) {
+	good := []byte(strings.Repeat("0123456789", 3))
+	bad := append([]byte(nil), good...)
+	bad[0] ^= 0xff
+	sum := md5.Sum(good) //nolint:gosec // see the import
+	f := &copyStore{body: good, overwrite: bad, etag: func([]byte) string { return hex.EncodeToString(sum[:]) }}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	cfg.HashInService = true
+	s := newTestStore(t, cfg)
+	p, err := s.Promote(context.Background(), NewStage(), digest.FromBytes(good), int64(len(good)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Outcome != Promoted || f.completed != 1 {
+		t.Fatalf("promote: %+v, %d completed; the gap is closed, so replace this test", p, f.completed)
+	}
+}
+
 func TestPartMD5s(t *testing.T) {
 	sum := func(s string) string {
 		b := md5.Sum([]byte(s)) //nolint:gosec // see the import
