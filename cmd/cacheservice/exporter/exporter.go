@@ -413,6 +413,10 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	// Each try uploads under a stage of its own: a blob it stages is never
 	// at the same key as another try's or another export's.
 	stage := blobstore.NewStage()
+	// GC's epoch, read before any check of the store, fences this try's
+	// index write against objects GC deletes after the checks (see
+	// metastore.Collection).
+	fence := x.fence(ctx)
 	var urls map[digest.Digest]string
 	if err == nil {
 		urls, err = blobstore.UploadURLs(ctx, x.cfg.Blobs, stage, blobs)
@@ -466,10 +470,18 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		return res, survivors, nil
 	}
 
-	rec, err := x.cfg.Meta.Record(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation())
+	rec, err := x.cfg.Meta.RecordFenced(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation(), fence)
 	if err != nil {
 		if ctx.Err() != nil {
 			return res, nil, context.Cause(ctx)
+		}
+		if errors.Is(err, metastore.ErrCollected) {
+			// GC deleted, or is deleting, an object this try found
+			// stored. Try again from the start: its checks will see
+			// what is stored then, and ask for what is gone.
+			x.cfg.Metrics.ExportCollected(x.cfg.Scope)
+			x.log.Info("export: garbage collection raced it; trying again", "cacheID", eng.CacheID(), "roots", len(survivors), "error", err)
+			return res, survivors, nil
 		}
 		res.fail(survivors, fmt.Errorf("publish: %w", err))
 		return res, nil, nil
@@ -480,6 +492,19 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, nil
+}
+
+// fence reads GC's epoch for the scope, now. A failed read fences at epoch
+// 0, which refuses every object GC deleted lately: an export that names one
+// is tried again.
+func (x *Exporter) fence(ctx context.Context) metastore.Fence {
+	started := x.cfg.Meta.Now()
+	epoch, err := x.cfg.Meta.ReadEpoch(ctx, x.cfg.Scope)
+	if err != nil {
+		x.log.Warn("export: reading GC's epoch failed; fencing at 0", "error", err)
+		epoch = 0
+	}
+	return metastore.Fence{Epoch: epoch, Started: started}
 }
 
 // promote verifies and promotes the blobs the engine reported done, of those

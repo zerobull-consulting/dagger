@@ -44,6 +44,11 @@ type memState struct {
 	// beforePromote, when set, runs before each promotion, outside the
 	// lock; an error fails the promotion.
 	beforePromote func(ctx context.Context, ns string, dgst digest.Digest) error
+	// modified is when each blob and staged blob was last written, by the
+	// clock now, as a bucket listing reports it.
+	modified       map[memKey]time.Time
+	stagedModified map[stagedKey]time.Time
+	now            func() time.Time
 }
 
 type memKey struct {
@@ -69,6 +74,10 @@ func NewMemStore(baseURL string) *MemStore {
 		blobs:    map[memKey][]byte{},
 		staged:   map[stagedKey][]byte{},
 		failPuts: map[digest.Digest]int{},
+
+		modified:       map[memKey]time.Time{},
+		stagedModified: map[stagedKey]time.Time{},
+		now:            time.Now,
 	}}
 }
 
@@ -186,6 +195,7 @@ func (m *MemStore) Promote(ctx context.Context, stage Stage, dgst digest.Digest,
 		return Promotion{Outcome: Missing, Duration: time.Since(start)}, nil
 	}
 	delete(m.staged, sk)
+	delete(m.stagedModified, sk)
 	if _, ok := m.blobs[m.key(dgst)]; ok {
 		return Promotion{Outcome: Existing, Duration: time.Since(start)}, nil
 	}
@@ -194,6 +204,7 @@ func (m *MemStore) Promote(ctx context.Context, stage Stage, dgst digest.Digest,
 		p.Outcome = Mismatch
 	} else {
 		m.blobs[m.key(dgst)] = data
+		m.modified[m.key(dgst)] = m.now()
 		p.Outcome = Promoted
 	}
 	p.Duration = time.Since(start)
@@ -214,6 +225,7 @@ func (m *MemStore) PutUnverified(dgst digest.Digest, data []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.blobs[m.key(dgst)] = bytes.Clone(data)
+	m.modified[m.key(dgst)] = m.now()
 }
 
 // Get returns a stored blob.
@@ -229,6 +241,70 @@ func (m *MemStore) Delete(dgst digest.Digest) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.blobs, m.key(dgst))
+	delete(m.modified, m.key(dgst))
+}
+
+// SetClock sets the clock that stamps when blobs are written, as a bucket
+// listing reports it (MemObject.Modified). Nil is time.Now.
+func (m *MemStore) SetClock(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now == nil {
+		now = time.Now
+	}
+	m.now = now
+}
+
+// MemObject is a blob of a MemStore, as a bucket listing would show it:
+// at its digest key, or staged when Stage is set.
+type MemObject struct {
+	NS       string
+	Stage    Stage
+	Digest   digest.Digest
+	Size     int64
+	Modified time.Time
+}
+
+// Objects returns every blob of every namespace, promoted and staged, in no
+// order.
+func (m *MemStore) Objects() []MemObject {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]MemObject, 0, len(m.blobs)+len(m.staged))
+	for k, data := range m.blobs {
+		out = append(out, MemObject{NS: k.ns, Digest: k.dgst, Size: int64(len(data)), Modified: m.modified[k]})
+	}
+	for k, data := range m.staged {
+		out = append(out, MemObject{NS: k.ns, Stage: k.stage, Digest: k.dgst, Size: int64(len(data)), Modified: m.stagedModified[k]})
+	}
+	return out
+}
+
+// PutStaged stages data under stage in the view's namespace, as an engine's
+// upload that was never promoted leaves it.
+func (m *MemStore) PutStaged(stage Stage, data []byte) digest.Digest {
+	dgst := digest.FromBytes(data)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sk := stagedKey{ns: m.ns, stage: stage, dgst: dgst}
+	m.staged[sk] = bytes.Clone(data)
+	m.stagedModified[sk] = m.now()
+	return dgst
+}
+
+// DeleteObject deletes one blob of a namespace: staged under stage, or at
+// its digest key when stage is empty. Deleting a missing one does nothing.
+func (m *MemStore) DeleteObject(ns string, stage Stage, dgst digest.Digest) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if stage == "" {
+		delete(m.blobs, memKey{ns: ns, dgst: dgst})
+		delete(m.modified, memKey{ns: ns, dgst: dgst})
+		return
+	}
+	sk := stagedKey{ns: ns, stage: stage, dgst: dgst}
+	delete(m.staged, sk)
+	delete(m.stagedModified, sk)
 }
 
 // Len returns how many blobs the view stores, staged ones left out.
@@ -332,6 +408,7 @@ func (m *MemStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m.staged[stagedKey{ns: view.ns, stage: stage, dgst: dgst}] = data
+		m.stagedModified[stagedKey{ns: view.ns, stage: stage, dgst: dgst}] = m.now()
 		m.puts++
 		m.mu.Unlock()
 	default:

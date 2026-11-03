@@ -66,6 +66,10 @@ type Service struct {
 	export *exportPath
 	// imports is the import path, nil when it is off.
 	imports *importPath
+	// gc is garbage collection, nil when it is off; limits are every
+	// namespace's retention limits (UseLimits).
+	gc     *gcPath
+	limits limitsState
 
 	// registry holds metrics, which records the storage costs.
 	registry *prometheus.Registry
@@ -518,6 +522,7 @@ func (s *Service) DebugHandler() http.Handler {
 	mux.HandleFunc("GET /debug/engines/{conn}/entries", s.serveEntries)
 	mux.HandleFunc("POST /debug/engines/{conn}/import", s.serveImport)
 	mux.HandleFunc("GET /debug/engines/{conn}/imports", s.serveImports)
+	mux.HandleFunc("POST /debug/gc", s.serveGC)
 	mux.Handle("GET /metrics", s.MetricsHandler())
 	return mux
 }

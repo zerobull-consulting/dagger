@@ -48,7 +48,15 @@
 //     GET  /metrics                                    (Prometheus metrics)
 //
 //   - with -metrics-listen set, /metrics alone on that address, for a
-//     scraper that shouldn't reach the debug API.
+//     scraper that shouldn't reach the debug API;
+//
+//   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
+//     -gc-interval: per namespace in the bucket, it expires entries past
+//     their expiry, -max-age or -max-bytes (per namespace with
+//     -namespaces-file, which SIGHUP reloads too), and deletes what no live
+//     entry names, staged uploads older than an export's upload timeout,
+//     and stale multipart uploads. POST /debug/gc runs it now. See
+//     README.md, "Retention and garbage collection".
 //
 // With -tls-cert and -tls-key, the engine address serves HTTPS (wss:// for
 // the WebSocket); otherwise run it behind a TLS-terminating proxy. See
@@ -65,6 +73,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -74,6 +83,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
@@ -92,6 +102,14 @@ func main() {
 		tokensFile    string
 		tlsCert       string
 		tlsKey        string
+		nsFile        string
+		maxAge        string
+		maxBytes      string
+		gcInterval    time.Duration
+		gcDryRun      bool
+		gcGrace       time.Duration
+		gcStagingAge  time.Duration
+		gcMaxDeletes  int
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
 	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the unauthenticated debug API (empty: off)")
@@ -106,6 +124,14 @@ func main() {
 	flag.DurationVar(&endGrace, "export-end-grace", exporter.DefaultEndGrace, "after a session ends, wait this long for the cache spans it said were coming")
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
+	flag.StringVar(&nsFile, "namespaces-file", "", "file of per-namespace limits, one '<namespace> max-age=<duration> max-bytes=<size>' per line, '*' for the defaults; SIGHUP reloads it (empty: -max-age and -max-bytes for every namespace)")
+	flag.StringVar(&maxAge, "max-age", "0", "default max age of a namespace's roots, from when an export last recorded them, such as 720h (0: no limit)")
+	flag.StringVar(&maxBytes, "max-bytes", "0", "default max size of what a namespace keeps, such as 500GiB (0: no limit)")
+	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25% (0: only POST /debug/gc; needs "+blobstore.EnvBucket+")")
+	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
+	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
+	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
+	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -135,20 +161,36 @@ func main() {
 		logger.Error("scope", "error", err)
 		os.Exit(2)
 	}
+	defaults, err := parseLimits(maxAge, maxBytes)
+	if err != nil {
+		logger.Error("limits", "error", err)
+		os.Exit(2)
+	}
+	if err := svc.UseLimits(nsFile, defaults); err != nil {
+		logger.Error("namespaces file", "error", err)
+		os.Exit(1)
+	}
+	if tokensFile != "" || nsFile != "" {
+		// SIGHUP reloads the files; one that doesn't parse leaves what it
+		// set as it was.
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				if tokensFile != "" {
+					_ = svc.ReloadTokens()
+				}
+				if nsFile != "" {
+					_ = svc.ReloadLimits()
+				}
+			}
+		}()
+	}
 	if tokensFile != "" {
 		if err := svc.UseTokensFile(tokensFile); err != nil {
 			logger.Error("tokens", "error", err)
 			os.Exit(1)
 		}
-		// SIGHUP reloads the file; a file that doesn't parse leaves the
-		// tokens as they were.
-		hup := make(chan os.Signal, 1)
-		signal.Notify(hup, syscall.SIGHUP)
-		go func() {
-			for range hup {
-				_ = svc.ReloadTokens()
-			}
-		}()
 	} else {
 		logger.Warn("UNAUTHENTICATED: no -tokens-file, so the service takes any token, and every engine that reaches it " +
 			"shares namespace " + scope + ": it can read everything stored there and add to it. " +
@@ -162,6 +204,15 @@ func main() {
 				Tracker:    exporter.TrackerConfig{QuietPeriod: quiet, EndGrace: endGrace},
 				NoImport:   !imports,
 				ImportPoll: importPoll,
+				GC: &server.GCConfig{
+					Interval: gcInterval,
+					Collector: gc.Config{
+						DryRun:     gcDryRun,
+						Grace:      gcGrace,
+						StagingAge: gcStagingAge,
+						MaxDeletes: gcMaxDeletes,
+					},
+				},
 			})
 		}
 		if err != nil {
@@ -214,4 +265,17 @@ func main() {
 	// End the exports in flight, and wait for them.
 	stop()
 	svc.Wait()
+}
+
+// parseLimits reads -max-age and -max-bytes.
+func parseLimits(maxAge, maxBytes string) (gc.Limits, error) {
+	age, err := gc.ParseAge(maxAge)
+	if err != nil {
+		return gc.Limits{}, fmt.Errorf("-max-age: %w", err)
+	}
+	size, err := gc.ParseSize(maxBytes)
+	if err != nil {
+		return gc.Limits{}, fmt.Errorf("-max-bytes: %w", err)
+	}
+	return gc.Limits{MaxAge: age, MaxBytes: size}, nil
 }

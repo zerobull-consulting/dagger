@@ -104,6 +104,12 @@ type Config struct {
 	// values. The export path uses it to know an unchanged
 	// import is already stored.
 	Imported func(cacheID string, generation uint64, values map[uint64]Value)
+	// MaxAge returns the namespace's max age (0: none), read at each sync,
+	// so a reload of the limits applies at the next one. A root is merged
+	// only until its max age after it was recorded, and its expiry in a
+	// merge is capped there, so engines release imported roots on their
+	// own (see metastore.Index.ApplyMaxAge). Nil is no max age.
+	MaxAge func() time.Duration
 	// Metrics records whether the bundles a merge needs were in memory.
 	// Nil records nothing.
 	Metrics *metrics.Metrics
@@ -428,6 +434,11 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	idx, err := im.cfg.Meta.Index(ctx, im.cfg.Scope)
 	if err != nil {
 		return res, fmt.Errorf("read index: %w", err)
+	}
+	// This snapshot is only read: Plan leaves out roots past their max age,
+	// and BuildMerge sends the capped expiry.
+	if im.cfg.MaxAge != nil {
+		idx.ApplyMaxAge(im.cfg.MaxAge())
 	}
 	for _, c := range Plan(idx, cacheID, im.cfg.Now().Unix()) {
 		im.mu.Lock()
