@@ -7,8 +7,6 @@ package metastore
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 )
 
 // minioConfig returns the MinIO settings with a prefix of this test's own,
@@ -39,10 +38,14 @@ func minioConfig(t *testing.T) blobstore.S3Config {
 	if cfg.Bucket == "" {
 		cfg.Bucket = "dagger-cache"
 	}
-	suffix := make([]byte, 6)
-	_, _ = rand.Read(suffix)
-	cfg.Prefix = fmt.Sprintf("test/%s-%s", t.Name(), hex.EncodeToString(suffix))
-	t.Cleanup(func() { deletePrefix(t, cfg) })
+	scope := s3test.NewScope(t, cfg.Bucket)
+	cfg.Prefix = scope.Prefix
+	cfg.HTTPClient = scope.Guard
+	client, err := blobstore.NewS3Client(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope.DeleteOnCleanup(t, client)
 	return cfg
 }
 
@@ -55,28 +58,6 @@ func newMinIOStore(t *testing.T, cfg blobstore.S3Config) *Store {
 		t.Fatal(err)
 	}
 	return s
-}
-
-func deletePrefix(t *testing.T, cfg blobstore.S3Config) {
-	ctx := context.Background()
-	client, err := blobstore.NewS3Client(ctx, cfg)
-	if err != nil {
-		t.Logf("clean up: %v", err)
-		return
-	}
-	pages := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: &cfg.Bucket,
-		Prefix: aws.String(cfg.Prefix + "/"),
-	})
-	for pages.HasMorePages() {
-		page, err := pages.NextPage(ctx)
-		if err != nil {
-			return
-		}
-		for _, obj := range page.Contents {
-			_, _ = client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &cfg.Bucket, Key: obj.Key})
-		}
-	}
 }
 
 // MinIO honors the conditional writes the index relies on, and the check

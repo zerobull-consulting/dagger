@@ -14,6 +14,10 @@
 # MINIO_API_PORT, MINIO_CONSOLE_PORT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
 # MINIO_REGION and MINIO_BUCKET. MinIO listens on loopback unless
 # MINIO_BIND_ADDR says otherwise.
+#
+# With CACHESERVICE_TEST_EXTERNAL=1, `test` uses the bucket in the
+# CACHESERVICE_S3_* variables instead of starting MinIO; see README.md,
+# "Testing against a real bucket". `e2e` refuses it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +73,19 @@ up() {
 	print_env
 }
 
+# Starts MinIO and points the tests at it, or leaves them on the bucket in
+# the environment. MinIO's bucket is this repo's own, so tests may replace its
+# lifecycle configuration.
+use_store() {
+	if [[ "${CACHESERVICE_TEST_EXTERNAL:-}" == "1" ]]; then
+		return
+	fi
+	up >/dev/null
+	eval "$(print_env)"
+	export CACHESERVICE_S3_PREFIX=test
+	export CACHESERVICE_TEST_DISPOSABLE_BUCKET=1
+}
+
 case "${1:-}" in
 up) up ;;
 down) compose down ;;
@@ -76,12 +93,15 @@ reset) compose down --volumes ;;
 status) compose ps -a ;;
 env) print_env ;;
 test)
-	up >/dev/null
-	eval "$(print_env)"
+	use_store
 	cd "$repo"
 	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/...
 	;;
 e2e)
+	if [[ "${CACHESERVICE_TEST_EXTERNAL:-}" == "1" ]]; then
+		echo "dev.sh e2e: CACHESERVICE_TEST_EXTERNAL=1 isn't supported yet: the e2e isn't kept to its prefix on a real bucket" >&2
+		exit 2
+	fi
 	# Extra arguments go to go test, such as -run 'TestRealEngines/^renew$'.
 	# E2E_SCENARIOS picks the scenarios after the first, which always runs.
 	scenarios="${E2E_SCENARIOS:-}"
@@ -98,8 +118,7 @@ e2e)
 	if [[ -n "${scenarios// /}" ]]; then
 		run="TestRealEngines/^($(tr -s ' ' '|' <<<"$scenarios" | sed 's/^|//; s/|$//'))\$"
 	fi
-	up >/dev/null
-	eval "$(print_env)"
+	use_store
 	cd "$repo"
 	CACHESERVICE_E2E=1 go test -count=1 -v -timeout 60m -run "$run" ./cmd/cacheservice/e2e/ "${@:2}"
 	;;
@@ -109,7 +128,7 @@ e2e-down)
 	docker volume ls -q --filter "label=$label" | xargs -r docker volume rm -f >/dev/null
 	;;
 *)
-	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

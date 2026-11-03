@@ -50,8 +50,8 @@ var (
 )
 
 // S3Objects is Objects in an S3 bucket. Conditional writes need a store that
-// honors If-Match and If-None-Match on PutObject: AWS S3 (since 2024), MinIO
-// and others. VerifyConditionalWrites checks one.
+// honors If-Match and If-None-Match on PutObject: AWS S3 (since 2024), MinIO,
+// DigitalOcean Spaces and others. VerifyConditionalWrites checks one.
 type S3Objects struct {
 	Client *s3.Client
 	Bucket string
@@ -94,7 +94,9 @@ func (o *S3Objects) Put(ctx context.Context, key string, body []byte, cond Condi
 		in.IfNoneMatch = aws.String("*")
 	}
 	if cond.IfMatch != "" {
-		in.IfMatch = aws.String(cond.IfMatch)
+		// Unquoted: Spaces answers 412 to the quoted ETag it returned itself,
+		// even when it is current, and MinIO takes either.
+		in.IfMatch = aws.String(strings.Trim(cond.IfMatch, `"`))
 	}
 	out, err := o.Client.PutObject(ctx, in)
 	if err != nil {
@@ -198,7 +200,7 @@ func (m *MemObjects) Put(_ context.Context, key string, body []byte, cond Condit
 	if cond.IfNoneMatch && exists {
 		return "", fmt.Errorf("put %s: %w", key, ErrPreconditionFailed)
 	}
-	if cond.IfMatch != "" && (!exists || obj.etag != cond.IfMatch) {
+	if cond.IfMatch != "" && (!exists || strings.Trim(obj.etag, `"`) != strings.Trim(cond.IfMatch, `"`)) {
 		return "", fmt.Errorf("put %s: %w", key, ErrPreconditionFailed)
 	}
 	m.version++

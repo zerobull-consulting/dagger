@@ -137,8 +137,8 @@ func TestS3ObjectsErrors(t *testing.T) {
 	want := []string{
 		`none="*" match=""`,
 		`none="*" match=""`,
-		fmt.Sprintf(`none="" match=%q`, etag),
-		fmt.Sprintf(`none="" match=%q`, etag),
+		fmt.Sprintf(`none="" match=%q`, strings.Trim(etag, `"`)),
+		fmt.Sprintf(`none="" match=%q`, strings.Trim(etag, `"`)),
 	}
 	if strings.Join(sent, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("headers sent:\n%s\nwant:\n%s", strings.Join(sent, "\n"), strings.Join(want, "\n"))

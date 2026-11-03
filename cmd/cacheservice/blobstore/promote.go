@@ -3,9 +3,11 @@ package blobstore
 import (
 	"bytes"
 	"context"
+	"crypto/md5" //nolint:gosec // compared with the store's ETags, which are MD5s
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"net/url"
 	"strings"
@@ -50,7 +52,12 @@ const (
 //     part copy without a checksum. The service reads the staged object and
 //     hashes it, then copies it, each part conditioned on the ETag it read
 //     (CopySourceIfMatch), so a staged object overwritten in between is not
-//     what gets promoted.
+//     what gets promoted. A store may ignore that condition (DigitalOcean
+//     Spaces does), so the service also takes each part's MD5 as it reads,
+//     and compares it with the ETag the store returns for the part's copy:
+//     a difference is a Mismatch, and the upload never completes. A store
+//     whose ETags aren't MD5s (AWS S3 with SSE-KMS, say) shows it in the
+//     staged object's own ETag, and only the condition applies there.
 func (s *S3Store) Promote(ctx context.Context, stage Stage, dgst digest.Digest, size int64) (Promotion, error) {
 	start := time.Now()
 	p, err := s.promote(ctx, stage, dgst, size)
@@ -183,8 +190,16 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 	if err != nil {
 		return Promotion{}, fmt.Errorf("read %s: %w", src, err)
 	}
+	partSize := s.copyPartSize
+	if size <= s.maxPartCopy {
+		partSize = size
+	} else if least := (size + maxCopyParts - 1) / maxCopyParts; partSize < least {
+		partSize = least
+	}
 	h := dgst.Algorithm().Hash()
-	n, err := io.Copy(h, obj.Body)
+	whole := md5.New() //nolint:gosec // see the import
+	partSums := &partMD5s{size: partSize}
+	n, err := io.Copy(io.MultiWriter(h, whole, partSums), obj.Body)
 	_ = obj.Body.Close()
 	p := Promotion{HashedBy: HashedByService, Bytes: n}
 	if err != nil {
@@ -200,12 +215,8 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 		return p, fmt.Errorf("start copy to %s: %w", dst, err)
 	}
 	abort := s.aborter(ctx, dst, up.UploadId)
-	partSize := s.copyPartSize
-	if size <= s.maxPartCopy {
-		partSize = size
-	} else if least := (size + maxCopyParts - 1) / maxCopyParts; partSize < least {
-		partSize = least
-	}
+	etagsAreMD5 := unquoteETag(etag) == hex.EncodeToString(whole.Sum(nil))
+	wantParts := partSums.sums()
 	var parts []types.CompletedPart
 	for off, num := int64(0), int32(1); off < size; off, num = off+partSize, num+1 {
 		in := &s3.UploadPartCopyInput{
@@ -225,11 +236,56 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 			abort()
 			return p, fmt.Errorf("copy %s, part %d: %w", src, num, err)
 		}
+		if etagsAreMD5 && unquoteETag(aws.ToString(part.CopyPartResult.ETag)) != wantParts[num-1] {
+			// What the store copied isn't what the service hashed.
+			abort()
+			p.Outcome = Mismatch
+			return p, nil
+		}
 		parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(num), ETag: part.CopyPartResult.ETag})
 	}
 	p.Outcome, err = s.complete(ctx, dst, up.UploadId, parts, dgst)
 	return p, err
 }
+
+// partMD5s is a writer that takes the MD5 of each size bytes written.
+type partMD5s struct {
+	size int64
+	cur  hash.Hash
+	left int64
+	done []string
+}
+
+func (w *partMD5s) Write(b []byte) (int, error) {
+	n := len(b)
+	for len(b) > 0 {
+		if w.cur == nil {
+			w.cur = md5.New() //nolint:gosec // see the import
+			w.left = w.size
+		}
+		chunk := b[:min(int64(len(b)), w.left)]
+		_, _ = w.cur.Write(chunk)
+		b = b[len(chunk):]
+		w.left -= int64(len(chunk))
+		if w.left == 0 {
+			w.done = append(w.done, hex.EncodeToString(w.cur.Sum(nil)))
+			w.cur = nil
+		}
+	}
+	return n, nil
+}
+
+// sums are the parts' MD5s in hex, the last one possibly short.
+func (w *partMD5s) sums() []string {
+	if w.cur != nil {
+		w.done = append(w.done, hex.EncodeToString(w.cur.Sum(nil)))
+		w.cur = nil
+	}
+	return w.done
+}
+
+// unquoteETag is an ETag without the quotes around it.
+func unquoteETag(etag string) string { return strings.Trim(etag, `"`) }
 
 // complete completes a copy to dst without overwriting a blob already there:
 // Promoted, or Existing when another copy completed first. Any failure
