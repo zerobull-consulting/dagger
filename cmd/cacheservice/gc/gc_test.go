@@ -852,3 +852,55 @@ func TestClaimRechecksIndex(t *testing.T) {
 	}
 	e.checkConsistent("team")
 }
+
+// A namespace whose only leftover is an incomplete multipart upload (a
+// promotion cut short, its staged source since expired) has no object to
+// list it by: GC finds it by its upload, and aborts it.
+func TestNamespaceOfOnlyAnUpload(t *testing.T) {
+	e := newEnv(t)
+	e.bucket.AddUpload(Upload{Key: prefix + "/lonely/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
+	e.bucket.AddUpload(Upload{Key: prefix + "/blobs/sha256/" + strings.Repeat("1", 64), ID: "2", Initiated: e.clock.Now()})
+	e.clock.Add(2 * time.Hour)
+	reps := e.run(e.collector(nil))
+	if r := reportOf(reps, "lonely"); r.Deleted["upload"] != 1 {
+		t.Fatalf("lonely: %+v", r)
+	}
+	// The pre-namespace layout's isn't a namespace's: left alone.
+	if u := e.bucket.Uploads(); len(u) != 1 || u[0].ID != "2" {
+		t.Fatalf("uploads %v", u)
+	}
+}
+
+// Claims taken over from stopped runs count against MaxDeletes, with new
+// candidates: one run never deletes more, however many stopped runs left
+// claims. The rest stay claimed for later runs.
+func TestStaleClaimsBoundedByMaxDeletes(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.export("team", "a", buildX("x"), 2)
+	var keys []string
+	for i := range 5 {
+		keys = append(keys, metastore.BlobRelKey(e.view("team").Put(layer(fmt.Sprintf("stale%d", i), 100))))
+	}
+	if _, err := e.meta.UpdateIndex(ctx, "team", func(idx *metastore.Index) error {
+		idx.GC = &metastore.Collection{Deletions: map[string]metastore.Deletion{}}
+		for _, k := range keys {
+			idx.GC.Deletions[k] = metastore.Deletion{Run: "gone", StartedUnix: e.clock.Now().Unix()}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Add(time.Hour)
+	c := e.collector(func(cfg *Config) { cfg.MaxDeletes = 2 })
+	for run, want := range []int{2, 2, 1} {
+		if rep := reportOf(e.run(c), "team"); rep.Deleted["blob"] != want {
+			t.Fatalf("run %d deleted %v, want %d blobs", run, rep.Deleted, want)
+		}
+	}
+	for _, k := range keys {
+		if d := e.index("team").GC.Deletions[k]; d.InProgress() {
+			t.Fatalf("%s still claimed", k)
+		}
+	}
+}

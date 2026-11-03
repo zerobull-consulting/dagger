@@ -424,3 +424,38 @@ func TestGCIgnoresEngineSignals(t *testing.T) {
 		t.Fatalf("keys %v, then %v", before, after)
 	}
 }
+
+// POST /debug/gc refuses a dry-run value it can't read, rather than run for
+// real, and answers 500 when a run failed.
+func TestDebugGC(t *testing.T) {
+	st := newGCStores(t, nil)
+	h := newExportHarness(t, st.blobs, st.meta, nil)
+	enableGC(t, h.svc, st, nil)
+	h.buildRecipes()
+	h.exportBuild()
+	post := func(query string) int {
+		t.Helper()
+		resp, err := http.Post(h.debug.URL+"/debug/gc"+query, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := post("?dry-run=yes"); code != http.StatusBadRequest {
+		t.Fatalf("dry-run=yes: %d", code)
+	}
+	if code := post("?dry-run=1"); code != http.StatusOK {
+		t.Fatalf("dry-run=1: %d", code)
+	}
+	// A bundle the index names, gone: the run fails.
+	idx := h.waitIndex(10, 11)
+	for _, e := range idx.Entries {
+		if err := st.objs.Delete(context.Background(), testScope+"/bundles/"+e.Bundle+".json"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code := post(""); code != http.StatusInternalServerError {
+		t.Fatalf("failed run: %d", code)
+	}
+}

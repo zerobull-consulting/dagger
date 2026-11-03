@@ -1065,13 +1065,17 @@ that were never recorded or were superseded, and staged uploads. So an
 upgrade applies no age or size limit until one is configured.
 `-gc-dry-run`, or `POST /debug/gc?dry-run=1`, logs (`gc dry run: would
 delete`) and reports what a run would expire and delete, and changes
-nothing (`TestDryRunDeletesNothing`).
+nothing (`TestDryRunDeletesNothing`). `POST /debug/gc` refuses a `dry-run`
+value that isn't a boolean (400) rather than run for real, and answers 500,
+with the reports, when a run failed somewhere (`TestDebugGC`).
 
 ### One run, per namespace
 
-GC lists the top level of `<prefix>/`: every valid namespace name with
-objects is collected, including namespaces whose tokens were all removed
-and namespaces in no file. `<prefix>/blobs/` (where blobs were kept before
+GC lists the top level of `<prefix>/`, and the incomplete multipart
+uploads under it: every valid namespace name with objects or uploads is
+collected, including namespaces whose tokens were all removed, namespaces
+in no file, and a namespace whose only leftover is an upload
+(`TestNamespaceOfOnlyAnUpload`). `<prefix>/blobs/` (where blobs were kept before
 namespaces) and anything that isn't a valid namespace name are skipped. In
 each namespace, in order:
 
@@ -1101,7 +1105,8 @@ each namespace, in order:
    The next run deletes it (`TestNamespacesApart`).
 6. **Staging**, below.
 7. **Incomplete multipart uploads** under `<prefix>/<ns>/` older than the
-   staging age are aborted: promotions a stopped service left.
+   staging age are aborted: promotions a stopped service left. They are
+   listed once per run, for every namespace.
 
 Keys GC doesn't know (`conditional-write-check/`, anything else) are
 counted as `other` and never deleted. A run of one namespace never deletes
@@ -1224,7 +1229,9 @@ delete, so any number of replicas may run GC at once, with no election
 deletes only what it claimed. A run that stops between its claim and its
 finish leaves its claims in progress (exports naming them are refused);
 once they are 15 minutes old, a later run of any replica takes them over,
-deletes and finishes (`TestStaleClaimTakenOver`). Clocks of replicas only
+deletes and finishes (`TestStaleClaimTakenOver`). Claims taken over count
+against `-gc-max-deletes` with new ones, stale first, so one run never
+deletes more however many runs stopped (`TestStaleClaimsBoundedByMaxDeletes`). Clocks of replicas only
 need to agree within minutes.
 
 **Rolling upgrade.** Index version 3 holds the claims; a replica that reads
@@ -1283,10 +1290,11 @@ Per namespace and run:
 | Claim, finish | 1 index read and conditional PUT each, only when there is something to delete; 1 PUT of the epoch |
 | Delete | 1 `DeleteObjects` per 1,000 objects |
 | Staging | none beyond the listing; 1 `DeleteObjects` per 1,000 deleted |
-| Uploads | 1 `ListMultipartUploads` (2 when the store lists none by prefix, as MinIO) |
 
-and one `ListObjectsV2` of the top level and one
-`GetBucketLifecycleConfiguration` per run. Each index update adds about 100
+and, per run: one `ListObjectsV2` of the top level, one
+`ListMultipartUploads` per 1,000 uploads under the prefix (plus one more of
+the bucket's when the store lists none by prefix, as MinIO), and one
+`GetBucketLifecycleConfiguration`. Each index update adds about 100
 bytes per claimed object, at most `-gc-max-deletes` (5,000, so about 500 KB)
 while a run deletes, and the finished ones stay 4h. Memory: the listing is
 held for the namespace's run, about 150 bytes per object.

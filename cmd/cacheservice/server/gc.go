@@ -38,9 +38,11 @@ type limitsState struct {
 	defaults gc.Limits
 }
 
-// UseLimits sets every namespace's retention limits: defaults, and, with
-// path, the namespaces file's lines over them (see gc.LimitsFile).
-// ReloadLimits reads the file again. Without it, no namespace has limits.
+// UseLimits sets every namespace's retention limits: defaults, and, when
+// path isn't empty, the namespaces file's lines over them (see
+// gc.LimitsFile); with an empty path, every namespace has the defaults.
+// ReloadLimits reads the file again. A service that never calls UseLimits
+// has no limits at all.
 // Call it before engines connect. The import path caps the root expiry of
 // its merges at the namespace's max age even with GC off.
 func (s *Service) UseLimits(path string, defaults gc.Limits) error {
@@ -150,9 +152,18 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 	return c.Run(ctx)
 }
 
-// serveGC is POST /debug/gc[?dry-run=1]: run GC now.
+// serveGC is POST /debug/gc[?dry-run=1]: run GC now. A dry-run value that
+// isn't a boolean is refused (400), rather than taken as false and run for
+// real. A run with errors answers 500, with its reports.
 func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
-	dry, _ := strconv.ParseBool(r.URL.Query().Get("dry-run"))
+	dry := false
+	if v := r.URL.Query().Get("dry-run"); v != "" {
+		var err error
+		if dry, err = strconv.ParseBool(v); err != nil {
+			http.Error(w, "dry-run: want true or false (1 or 0)", http.StatusBadRequest)
+			return
+		}
+	}
 	reports, err := s.CollectGarbage(r.Context(), dry)
 	if errors.Is(err, ErrGCOff) {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -162,10 +173,11 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 		Reports []gc.Report `json:"reports"`
 		Error   string      `json:"error,omitempty"`
 	}{Reports: reports}
+	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		out.Error = err.Error()
+		w.WriteHeader(http.StatusInternalServerError)
 	}
-	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }
 

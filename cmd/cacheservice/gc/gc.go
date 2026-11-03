@@ -252,6 +252,26 @@ func (c *Collector) Namespaces(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// uploadsByNamespace lists the incomplete multipart uploads under the
+// store's prefix, by the namespace their key is under; keys under no valid
+// namespace name (such as the pre-namespace blobs/) are left out.
+func (c *Collector) uploadsByNamespace(ctx context.Context) (map[string][]Upload, error) {
+	top := c.top()
+	uploads, err := c.cfg.Bucket.ListUploads(ctx, top)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]Upload{}
+	for _, u := range uploads {
+		ns, _, found := strings.Cut(strings.TrimPrefix(u.Key, top), "/")
+		if !found || metastore.ValidateScope(ns) != nil {
+			continue
+		}
+		out[ns] = append(out[ns], u)
+	}
+	return out, nil
+}
+
 func (c *Collector) top() string {
 	if p := c.cfg.Meta.Prefix(); p != "" {
 		return p + "/"
@@ -269,6 +289,17 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gc: list namespaces: %w", err)
 	}
+	// Incomplete multipart uploads, listed once for every namespace. A
+	// namespace whose only leftover is one (a promotion cut short, whose
+	// staged source has since expired) has no object to list it by, so
+	// their namespaces join the set.
+	byNS, uerr := c.uploadsByNamespace(ctx)
+	for ns := range byNS {
+		if !slices.Contains(names, ns) {
+			names = append(names, ns)
+		}
+	}
+	slices.Sort(names)
 	rules, rerr := c.cfg.Bucket.ExpirationPrefixes(ctx)
 	if rerr != nil {
 		c.log.Info("gc: can't read the bucket's lifecycle rules, so it expires every namespace's staged uploads itself", "error", rerr)
@@ -280,7 +311,7 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 		if ctx.Err() != nil {
 			return reports, context.Cause(ctx)
 		}
-		rep := c.collect(ctx, ns, rules, rerr == nil)
+		rep := c.collect(ctx, ns, rules, rerr == nil, byNS[ns], uerr)
 		reports = append(reports, rep)
 		if len(rep.Errors) > 0 {
 			errs = append(errs, fmt.Errorf("namespace %s: %s", ns, strings.Join(rep.Errors, "; ")))
@@ -297,7 +328,9 @@ func (c *Collector) RunNamespace(ctx context.Context, ns string) (Report, error)
 	c.run.Lock()
 	defer c.run.Unlock()
 	rules, rerr := c.cfg.Bucket.ExpirationPrefixes(ctx)
-	rep := c.collect(ctx, ns, rules, rerr == nil)
+	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
+	uploads, uerr := c.cfg.Bucket.ListUploads(ctx, prefix)
+	rep := c.collect(ctx, ns, rules, rerr == nil, uploads, uerr)
 	if len(rep.Errors) > 0 {
 		return rep, errors.New(strings.Join(rep.Errors, "; "))
 	}
@@ -446,7 +479,7 @@ func (c *Collector) bundleBlobs(ctx context.Context, ns, id string) ([]string, e
 }
 
 // collect runs one namespace: expire, list, size, sweep, staging, uploads.
-func (c *Collector) collect(ctx context.Context, ns string, rules []string, rulesKnown bool) Report {
+func (c *Collector) collect(ctx context.Context, ns string, rules []string, rulesKnown bool, uploads []Upload, uploadsErr error) Report {
 	start := time.Now()
 	ctx = metrics.WithCaller(ctx, metrics.CallerGC)
 	rep := Report{Namespace: ns, DryRun: c.cfg.DryRun}
@@ -495,7 +528,7 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 	// 4. Staged uploads, unless a lifecycle rule expires them.
 	c.sweepStaging(ctx, ns, l, rules, rulesKnown, now, &rep, log)
 	// 5. Incomplete multipart uploads.
-	c.abortUploads(ctx, ns, now, &rep, log)
+	c.abortUploads(ctx, ns, uploads, uploadsErr, now, &rep, log)
 	return rep
 }
 
@@ -687,9 +720,19 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 		if idx.GC.Deletions == nil {
 			idx.GC.Deletions = map[string]metastore.Deletion{}
 		}
+		// Stale claims first, since exports naming them are refused until
+		// they are finished; then new candidates; MaxDeletes in all. The
+		// rest wait for later runs.
+		var staleKeys []string
 		for k, d := range idx.GC.Deletions {
-			if !stale(d, now, c.cfg.DeleteDeadline) {
-				continue
+			if stale(d, now, c.cfg.DeleteDeadline) {
+				staleKeys = append(staleKeys, k)
+			}
+		}
+		slices.Sort(staleKeys)
+		for _, k := range staleKeys {
+			if len(claimed) >= c.cfg.MaxDeletes {
+				break
 			}
 			if r.has(k) {
 				// Can't be (exports are refused while claimed), but
@@ -701,6 +744,9 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 			claimed = append(claimed, k)
 		}
 		for _, k := range cands {
+			if len(claimed) >= c.cfg.MaxDeletes {
+				break
+			}
 			if d, ok := idx.GC.Deletions[k]; (ok && d.InProgress()) || r.has(k) {
 				continue
 			}
@@ -977,9 +1023,8 @@ func (c *Collector) sweepStaging(ctx context.Context, ns string, l *listing, rul
 
 // abortUploads aborts the namespace's incomplete multipart uploads older than
 // StagingAge: promotions that a stopped service left.
-func (c *Collector) abortUploads(ctx context.Context, ns string, now time.Time, rep *Report, log *slog.Logger) {
+func (c *Collector) abortUploads(ctx context.Context, ns string, uploads []Upload, err error, now time.Time, rep *Report, log *slog.Logger) {
 	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
-	uploads, err := c.cfg.Bucket.ListUploads(ctx, prefix)
 	if err != nil {
 		rep.fail(fmt.Errorf("list uploads: %w", err))
 		return
