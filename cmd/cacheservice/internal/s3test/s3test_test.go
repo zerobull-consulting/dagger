@@ -474,6 +474,43 @@ func TestDeletePrefixReportsUploadsLeft(t *testing.T) {
 	}
 }
 
+// The Spaces jobs skip without their secrets, so CI can't show they are set up
+// right, and the others must never need them: only the Spaces jobs use an
+// external bucket, and each gives it to the step that runs the tests.
+func TestWorkflowOnlySpacesJobsAreExternal(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "..", ".github", "workflows", "remote-cache-tests.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, all, ok := strings.Cut(string(data), "\njobs:\n")
+	if !ok {
+		t.Fatal("no jobs in the workflow")
+	}
+	jobs := map[string]string{}
+	var name string
+	for _, line := range strings.Split(all, "\n") {
+		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "   ") && strings.HasSuffix(line, ":") {
+			name = strings.TrimSuffix(strings.TrimSpace(line), ":")
+		}
+		jobs[name] += line + "\n"
+	}
+	for _, job := range []string{"unit", "minio", "e2e", "spaces-store", "spaces-e2e"} {
+		body, ok := jobs[job]
+		if !ok {
+			t.Fatalf("no job %s", job)
+		}
+		spaces := strings.HasPrefix(job, "spaces-")
+		for _, want := range []string{"CACHESERVICE_TEST_EXTERNAL", "CACHESERVICE_TEST_STORE: spaces", "secrets.SPACES_ENDPOINT", "secrets.SPACES_SECRET_ACCESS_KEY", "CACHESERVICE_S3_PATH_STYLE"} {
+			if strings.Contains(body, want) != spaces {
+				t.Errorf("job %s: has %s: %v, want %v", job, want, !spaces, spaces)
+			}
+		}
+		if spaces && strings.Contains(strings.SplitN(body, "steps:", 2)[0], "secrets.") {
+			t.Errorf("job %s gives secrets to every step", job)
+		}
+	}
+}
+
 // External mode without a bucket would otherwise skip every real-store test,
 // and pass having tested nothing.
 func TestDevShExternalNeedsItsBucket(t *testing.T) {
