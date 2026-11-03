@@ -195,6 +195,9 @@ func (s *Service) newNamespace(name string) (*namespace, error) {
 				tracker.Imported(cacheID, generation, out)
 			}
 		}
+		if cfg.MaxAge == nil {
+			cfg.MaxAge = func() time.Duration { return s.Limits(name).MaxAge }
+		}
 		if n.importer, err = importer.New(cfg); err != nil {
 			return nil, err
 		}

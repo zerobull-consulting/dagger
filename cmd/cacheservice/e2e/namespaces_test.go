@@ -14,7 +14,6 @@ import (
 
 	"github.com/opencontainers/go-digest"
 
-	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -152,18 +151,6 @@ func (s *state) namespaces(t *testing.T) {
 		errs = append(errs, r.Msg)
 	}
 	Check(t, len(errs) == 0, "the service logged nothing at error level: %q", errs)
-}
-
-// IndexOf reads a namespace's index.
-func (e *Env) IndexOf(ns string) *metastore.Index {
-	e.T.Helper()
-	ctx, cancel := e.ctx()
-	defer cancel()
-	idx, err := e.Meta.Index(ctx, ns)
-	if err != nil {
-		e.T.Fatalf("index of %s: %v", ns, err)
-	}
-	return idx
 }
 
 // ChainLayersIn returns the longest fs chain of a namespace's bundles.

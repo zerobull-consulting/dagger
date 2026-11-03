@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -128,18 +131,52 @@ type MemObjects struct {
 	mu      sync.Mutex
 	objects map[string]memObject
 	version uint64
+	now     func() time.Time
 }
 
 type memObject struct {
-	body []byte
-	etag string
+	body     []byte
+	etag     string
+	modified time.Time
 }
 
 var _ Objects = (*MemObjects)(nil)
 
 // NewMemObjects returns an empty MemObjects.
 func NewMemObjects() *MemObjects {
-	return &MemObjects{objects: map[string]memObject{}}
+	return &MemObjects{objects: map[string]memObject{}, now: time.Now}
+}
+
+// SetClock sets the clock that stamps when objects are written, as List
+// reports it. Nil is time.Now.
+func (m *MemObjects) SetClock(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now == nil {
+		now = time.Now
+	}
+	m.now = now
+}
+
+// ObjectInfo is an object as a bucket listing shows it.
+type ObjectInfo struct {
+	Key      string
+	Size     int64
+	Modified time.Time
+}
+
+// List returns the objects whose keys start with prefix, in key order.
+func (m *MemObjects) List(prefix string) []ObjectInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []ObjectInfo
+	for k, o := range m.objects {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, ObjectInfo{Key: k, Size: int64(len(o.body)), Modified: o.modified})
+		}
+	}
+	slices.SortFunc(out, func(a, b ObjectInfo) int { return strings.Compare(a.Key, b.Key) })
+	return out
 }
 
 // Get returns a copy of the object.
@@ -166,7 +203,7 @@ func (m *MemObjects) Put(_ context.Context, key string, body []byte, cond Condit
 	}
 	m.version++
 	etag := strconv.Quote(strconv.FormatUint(m.version, 10))
-	m.objects[key] = memObject{body: bytes.Clone(body), etag: etag}
+	m.objects[key] = memObject{body: bytes.Clone(body), etag: etag, modified: m.now()}
 	return etag, nil
 }
 

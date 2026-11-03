@@ -21,6 +21,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, for a scraper that shouldn't reach the debug API |
 
 On the engine WebSocket, the service:
@@ -68,8 +69,8 @@ svc.Wait()
 `EnableExport` and `EnableImport` take stores directly, such as the in-memory
 ones the unit tests use. The stores and the export and import logic are in
 [`blobstore`](blobstore/), [`metastore`](metastore/),
-[`exporter`](exporter/) and [`importer`](importer/). What the service
-measures is in [`metrics`](metrics/).
+[`exporter`](exporter/) and [`importer`](importer/), and garbage collection
+in [`gc`](gc/). What the service measures is in [`metrics`](metrics/).
 
 ## Blob store
 
@@ -225,8 +226,13 @@ again (`TestVerifyRestartBetweenUploadedAndPromotion`).
 
 Abandoned staged uploads (an export cut short, an engine that uploaded and
 never answered, a store error during promotion) and incomplete multipart
-copies need a bucket lifecycle rule; the service never lists or sweeps
-staging. One day is safe: an export's uploads and promotions finish within
+copies are best expired by a bucket lifecycle rule, which costs the service
+no request. Garbage collection covers a namespace without one: it reports
+it (`gc_staging_rule_missing`, and a warning), and deletes its staged
+uploads older than an export's upload timeout plus an hour itself, and it aborts stale
+multipart uploads in every namespace (see
+[Retention and garbage collection](#retention-and-garbage-collection)). One
+day is safe for the rule: an export's uploads and promotions finish within
 its upload timeout (1h).
 
 S3 lifecycle filters match a key prefix, not a wildcard segment, so one rule
@@ -241,10 +247,10 @@ can't match `<prefix>/*/staging/`. The options, and the choice:
   so that promotion never crosses a namespace's prefix.
 - **One rule per namespace**, on `<prefix>/<ns>/staging/`: the choice. A
   namespace is added in the tokens file, so its rule can be generated from
-  the same file (below). A namespace without a rule leaks abandoned uploads,
-  which are never read; the GC of
-  [#11](https://github.com/zerobull-consulting/dagger/issues/11) is to cover
-  them. AWS allows 1,000 rules per bucket.
+  the same file (below). A namespace without a rule is covered by garbage
+  collection, which deletes its abandoned uploads itself and reports the
+  namespace ([#11](https://github.com/zerobull-consulting/dagger/issues/11)).
+  AWS allows 1,000 rules per bucket.
 
 Plus one rule for the whole prefix that aborts incomplete multipart uploads
 (a promotion aborts its own, but a service killed mid-copy leaves its parts).
@@ -333,7 +339,8 @@ addressing, expiries, static credentials,
 SDK's default chain. The service's credentials need `s3:GetObject` and
 `s3:DeleteObject` on staging keys (a copy reads its source), `s3:PutObject`
 and `s3:AbortMultipartUpload` on digest keys (the multipart copy), besides
-what the metadata store needs.
+what the metadata store needs, and what garbage collection needs (see
+[Retention and garbage collection](#retention-and-garbage-collection)).
 
 ## Metadata store
 
@@ -531,8 +538,21 @@ doesn't either: `Store.Record` stores it, and merges use it.
 
 `DropExpired` drops expired roots, expired entries and, transitively, the
 entries that depend on them, then every entry no remaining root depends on,
-with their mappings, exported and imported. Bundles stay in the bucket; collecting unreferenced ones
-is left for later.
+with their mappings, exported and imported. `Expire` does the same under a
+namespace's max age, which also expires a root that long after it was
+recorded (`Root.RecordedAtUnix`). Bundles, resolutions and blobs stay in the
+bucket; garbage collection runs both on a schedule, and deletes what no
+entry names any more (see
+[Retention and garbage collection](#retention-and-garbage-collection)).
+
+- **Index version 3.** Roots carry the time an export last recorded them
+  (`recordedAtUnix`), and the index holds GC's deletions (`gc`). A version 1
+  or 2 index reads as one whose roots have no recording time (GC stamps them
+  at its first run, so they get a whole max age from then) and no
+  deletions. A service that reads only version 2 refuses a version 3 index:
+  it doesn't check GC's deletions when it records an export, so during a
+  rolling upgrade the older replicas stop updating the scope instead of
+  naming an object GC is deleting.
 
 **Limits.** The whole index is one object, rewritten on every update, so its
 size and the update rate per scope are bounded by how fast one object can be
@@ -593,7 +613,19 @@ session's cache ID. If none is, the export waits and is tried again.
    tries the roots count as failed. The tracker tries them again later, up to
    5 times per value.
 4. Once every blob is stored (promoted, so verified), the bundle is published
-   and recorded in the index (`metastore.Record`).
+   and recorded in the index (`metastore.RecordFenced`). Each try reads
+   GC's epoch (`<prefix>/<ns>/gc-epoch.json`, one small GET, at most once per 10s) before it
+   checks any blob, and its index write is refused if it names a blob,
+   bundle or resolution GC is deleting, or deleted after that read: it
+   checked the object before it was deleted. The export is then tried again
+   from step 1, and asks for what is gone (`export_collected_total`; see
+   [Retention and garbage collection](#retention-and-garbage-collection)).
+   The layers of its records' pending offers, which the engine can't
+   upload, are checked too, after the epoch: an export naming one that is
+   no longer stored fails, since its bundle can't be stored whole
+   (`TestExportChecksOfferedLayers`).
+   The roots it records are stamped with the time, from which the
+   namespace's max age counts.
 
 A repeated export of stored entries uploads no blob again, and keeps the
 entries' service numbers. An unchanged bundle is not written again. Before a
@@ -653,8 +685,9 @@ itself; it reports it in `uploaded`, and the export is tried again as above.
 Nothing is published until every blob is stored, verified, and the index is
 written last, so a failure at any step leaves no index entry naming a
 missing bundle, and no stored bundle naming a missing or unverified blob; at
-worst, blobs or a bundle nothing names yet, which the next export reuses,
-and staged uploads, which the lifecycle rule expires. An export that fails as a whole (S3 down) counts a failure of its
+worst, blobs or a bundle nothing names yet, which the next export reuses or
+garbage collection deletes, and staged uploads, which the lifecycle rule or
+garbage collection expires. An export that fails as a whole (S3 down) counts a failure of its
 roots, which are tried again with backoff (2s doubling), up to 5 times per
 value.
 
@@ -699,7 +732,9 @@ again whenever another engine's export is stored, and every `-import-poll`
    resolution the record names. Roots
    that have expired, or whose entry or any entry it depends on has, are
    left out, as `DropExpired` would drop them, and so are an engine's own
-   exports: its cache has them. A bundle
+   exports: its cache has them. A root past the namespace's max age, counted
+   from when it was recorded, is left out too, as `Expire` would drop it,
+   whether or not GC has run. A bundle
    already merged into this cache, at this generation, with every root it
    needs now, is not merged again.
 2. **Merge.** Each bundle is rewritten for the engine: each value's
@@ -707,7 +742,9 @@ again whenever another engine's export is stored, and every `-import-poll`
    Cloud holding. The number is the bundle's stored resolution's: how its
    values resolved when it was recorded, not through the exporting cache's
    mappings now, which move as that cache's imports do (see
-   [Imported entries](#imported-entries)); the roots are the planned ones with the index's expiries;
+   [Imported entries](#imported-entries)); the roots are the planned ones with the index's expiries,
+   each capped at the namespace's max age after it was recorded, so engines
+   release imported roots on their own (most stored roots have no expiry);
    and each output's chain gets a presigned GET per layer, with the scope as
    its renewal key. Records name each other by ordinal, so values are not
    dropped or renumbered, and the engine refuses a bundle with a value
@@ -882,7 +919,63 @@ minute, and at most 10 times a minute in all, then at debug level, never at
 error level; `auth_rejected_total` counts them all.
 
 Nothing stored is deleted or changed when a token goes: its namespace's data
-stays, for its other tokens, and for the token if it comes back.
+stays, for its other tokens, and for the token if it comes back. Garbage
+collection still collects it, by its limits like any other namespace's:
+"no tokens" never means "delete" (`TestGCNamespaceWithoutTokens`).
+
+### The namespaces file
+
+`-namespaces-file FILE` sets per-namespace retention limits (see
+[Retention and garbage collection](#retention-and-garbage-collection)). One
+namespace per line, then `key=value` settings; blank lines and `#` comments
+are ignored:
+
+```text
+# defaults for namespaces with no line of their own
+*        max-age=720h
+team-a   max-age=168h max-bytes=500GiB
+team-b   max-bytes=2TiB
+```
+
+- `max-age` is a Go duration (`168h`), at least `1s`; `max-bytes` a size in
+  bytes, with `B`, `KB`, `MB`, `GB`, `TB` (powers of 1000) or `KiB`, `MiB`,
+  `GiB`, `TiB` (powers of 1024). `0` or `none` is no limit.
+- `-max-age` and `-max-bytes` are the defaults; a `*` line overrides them,
+  and a namespace's line overrides the keys it sets. Without a file, every
+  namespace has the flags' limits; both are 0 (no limit) by default.
+- A namespace is what a scope may be, as in the tokens file, and may appear
+  once.
+- `SIGHUP` reloads it with the tokens file. A file that can't be read or
+  parsed changes nothing: the limits loaded before stay, and the service
+  logs an error. The import path reads a namespace's max age at each sync,
+  and GC at each run.
+
+A `#` that starts a field begins a comment, to the end of its line, so a
+comment may follow a namespace's settings (`TestParseLimitsTrailingComment`).
+
+A namespace in no line, and a namespace with no tokens, is collected with
+the defaults: neither file decides that a namespace's data goes.
+
+**Why a file of its own**, not columns in the tokens file:
+
+- Limits belong to a namespace, not a token. A namespace has many tokens,
+  and repeating its limits on each line invites conflicts.
+- The tokens file holds secrets: it is mode 0600, rotated often, and
+  distributed differently. Limits are plain configuration anyone operating
+  the bucket can read.
+- A namespace can have limits and no tokens: `-scope` without a tokens file,
+  or a namespace whose tokens were all revoked, whose data still needs
+  collecting.
+- It is the one list of namespaces an operator maintains: the staging
+  lifecycle rules can be generated from it (below and
+  [Lifecycle rule for staging](#lifecycle-rule-for-staging)), as they can
+  from the tokens file:
+
+```bash
+awk '!/^#/ && NF >= 1 && $1 != "*" {print $1}' namespaces | sort -u |
+  jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
+    Filter: {Prefix: ($p + "/" + . + "/staging/")}, Expiration: {Days: 1}}' | jq -s .
+```
 
 ### Blobs are kept per namespace
 
@@ -911,7 +1004,7 @@ outside `<prefix>/<ns>/` (say `<prefix>/shared/<group>/blobs/`), and `Has`,
 GETs and `renew` would read it. Not built: sharing would still tell a tenant
 which digests the others in its group hold (an upload skipped is a blob
 someone stored), and GC would have to count references across the group's
-namespaces (#11).
+namespaces ([#11](https://github.com/zerobull-consulting/dagger/issues/11)).
 
 Without a tokens file, the one namespace is `-scope`, so blobs are at
 `<prefix>/<scope>/blobs/`. Blobs stored by earlier versions, at
@@ -953,9 +1046,380 @@ requests, which carry the token too, are encrypted. The debug and metrics
 addresses are never served over TLS: they are for local use.
 
 The debug API (`-debug-listen`) is **not authenticated**, and lists, exports
-and imports for every namespace's engines. It listens on `127.0.0.1` by
-default; never expose it. `-metrics-listen` serves only `/metrics`, whose
+and imports for every namespace's engines, and runs garbage collection
+(`POST /debug/gc`). It listens on `127.0.0.1` by default; never expose it.
+**Known gap ([#60](https://github.com/zerobull-consulting/dagger/issues/60)):**
+nothing enforces that; anyone who reaches it can run a collection at any
+time (`TestKnownGapDebugGCUnauthenticated`). `-metrics-listen` serves only `/metrics`, whose
 `scope` labels name the namespaces.
+
+## Retention and garbage collection
+
+[`gc`](gc/) keeps each namespace's storage bounded
+([#11](https://github.com/zerobull-consulting/dagger/issues/11)). It expires
+index entries by their own expiry, the namespace's max age and its max
+size, and deletes what no live entry names any more. **Every delete is the
+service's own decision**, from expiry, size or reachability in the index:
+nothing an engine reports (`engine.prune`, an offer's `gone`, a failed
+`renew`) and no change of tokens ever deletes anything
+(`TestGCIgnoresEngineSignals`, `TestGCNamespaceWithoutTokens`). Engine
+signals describe one engine's cache, not the stored copy (see
+[#11](https://github.com/zerobull-consulting/dagger/issues/11#issuecomment-6561084554)).
+
+It runs every `-gc-interval` (1h, jittered by ±25%, so replicas spread out;
+0 runs it only on `POST /debug/gc`), with the S3 stores
+(`CACHESERVICE_S3_BUCKET`). Without limits (`-max-age` and `-max-bytes` are 0
+by default, and no namespaces file), it expires only what engines gave an
+expiry, and deletes only what nothing names: bundles and blobs of exports
+that were never recorded or were superseded, and staged uploads. So an
+upgrade applies no age or size limit until one is configured.
+`-gc-dry-run`, or `POST /debug/gc?dry-run=1`, logs (`gc dry run: would
+delete`) and reports what a run would expire and delete, and changes
+nothing (`TestDryRunDeletesNothing`), including the stale claims a real run
+would take over (`TestDryRunReportsStaleClaims`). A dry run waits for a real
+run of the same service under way, rather than report a state half way
+through it (`TestDryRunWaitsForRun`). `POST /debug/gc?dry-run`,
+with no value, is a dry run too; a `dry-run` value that isn't a boolean is
+refused (400). Neither runs for real. A run that failed somewhere answers
+500, with the reports (`TestDebugGC`).
+
+### One run, per namespace
+
+GC lists the top level of `<prefix>/`, and the incomplete multipart
+uploads under it: every valid namespace name with objects or uploads is
+collected, including namespaces whose tokens were all removed, namespaces
+in no file, and a namespace whose only leftover is an upload
+(`TestNamespaceOfOnlyAnUpload`). `<prefix>/blobs/` (where blobs were kept before
+namespaces) and anything that isn't a valid namespace name are skipped. In
+each namespace, in order:
+
+1. **Expire.** One conditional index update (only when something changes):
+   roots past their own expiry or their max age, and entries past their
+   own expiry, are dropped, with what only they keep alive
+   (`metastore.Index.Expire`, the same rules as `DropExpired`). Roots with no
+   recording time (indexes before version 3) are stamped now. Finished
+   deletions older than 4h are dropped from the index.
+2. **List** every object under `<prefix>/<ns>/`: its sizes are the
+   namespace's stored bytes (`gc_stored_bytes`), by kind.
+3. **Mark.** What the index names: its entries' bundles and resolutions,
+   and every blob those bundles name, through their outputs' chains and
+   their records' pending offers (`metastore.BundleBlobs`). Bundles are read
+   once and their blob lists kept in memory (at most 65,536). A bundle the
+   index names that can't be read stops the namespace's sweep: GC can't
+   know its blobs (`TestMissingBundleStopsSweep`); so does one that is
+   readable but missing from the run's listing, which comes after the index
+   read, since bundles' blob lists are cached across runs
+   (`TestMissingBundleStopsSweepWarmCache`). A namespace with no index
+   is not swept either: GC can't tell what is in use
+   (`TestLeavesWhatItDoesNotKnow`). Nor is one whose index can't be read
+   (corrupt, or a later version a newer replica wrote); its staged and
+   multipart uploads, which don't need the index, are still collected
+   (`TestUnreadableIndexStillCollectsUploads`).
+4. **Max size**, below.
+5. **Sweep.** Bundles, resolutions and blobs nothing marks, older than the
+   grace period (`-gc-grace`, 2h), are claimed, deleted and finished (see
+   [Safety](#safety)), oldest first, at most `-gc-max-deletes` (5,000) per
+   run. What the index named when the run started isn't deleted by this
+   run, even if its expiry left nothing naming it: an import sync that read
+   the index just before may still be merging it, with GETs of its blobs.
+   The next run deletes it (`TestNamespacesApart`). **Known gap
+   ([#57](https://github.com/zerobull-consulting/dagger/issues/57)):** the
+   hold is the run's own, so another replica's run right after can delete
+   them, and a bundle a later export superseded has no hold
+   (`TestKnownGapHoldIsPerReplica`). The index stays consistent; an engine
+   whose merge was in flight computes those parts again.
+6. **Staging**, below.
+7. **Incomplete multipart uploads** under `<prefix>/<ns>/` older than the
+   staging age are aborted: promotions a stopped service left. They are
+   listed once per run, for every namespace.
+
+Keys GC doesn't know (`conditional-write-check/`, anything else) are
+counted as `other` and never deleted. A run of one namespace never deletes
+another's data (`TestNamespacesApart`, and the real-engine `gc` scenario,
+which checks the run's scope after collecting its own).
+
+### Max age
+
+A root expires `max-age` after an export last recorded it:
+`metastore.Root.RecordedAtUnix`, the service's clock when the index update
+that wrote its record ran. Times are whole seconds, and a max age with a
+fraction of a second counts as the next whole one
+(`TestCapExpiryRoundsUp`). The entries only that root keeps alive go with
+it; an entry a younger root depends on stays, whenever it was recorded
+(`TestExpireMaxAge`).
+
+An export refreshes a root's time **only when it writes the root's record**
+(`Index.RecordResolvedAt`, `TestRecordStampsRoots`):
+
+- a new root, with its record: stamped. A root from before version 3, with
+  no time yet, is stamped only with its record, or by GC's first run
+  (`TestUnstampedRootStampedOnlyWithItsRecord`);
+- a later state of the value from its own engine (a later generation, or
+  the same with as many replacements or more), or an imported value's
+  record that adds parts (see [Imported entries](#imported-entries)):
+  refreshed;
+- a late export from an older generation, or an engine exporting back an
+  import unchanged: not refreshed, and not added when the index has no such
+  root. A value whose root the max age expired, still stored as another
+  root's dependency, doesn't come back as a root with a fresh time
+  (`TestRootAddedOnlyWithItsRecord`). Merges hand stored entries to engines,
+  so a refresh by them would keep data alive forever by merging it around.
+  The tracker doesn't export unchanged imports anyway; the index doesn't
+  rely on it. **Known gap
+  ([#59](https://github.com/zerobull-consulting/dagger/issues/59)):** once
+  GC has dropped the value's entry and its cache mapping too, a late
+  export from an older generation has nothing to compare against. It is
+  recorded as new, with a fresh root, and kept for another max age
+  (`TestKnownGapLateOlderGenerationRevivesCollectedRoot`).
+
+**Merges are capped at it.** Most stored roots have no expiry (0), and a
+merge used to send the index's: every engine kept every imported root until
+its own GC removed it. The import path now caps each root's expiry in a
+merge at its recording time plus the max age
+(`metastore.Index.ApplyMaxAge`, on its own snapshot of the index, never
+written back), and leaves out roots past it, even before GC runs
+(`TestGCMaxAgeEndToEnd`; the real-engine `gc` scenario checks the expiry
+engine GB was sent). Engines then release imported roots on their own.
+When a root's capped expiry changes from what a merge sent (the max age
+was raised, lowered, set or removed, or an export recorded the root
+again), the importer merges its bundle again with it; it compares with what
+it sent, not with what the engine reported, so it does so once per change
+(`TestMergeAgainWhenCapMovesLater`, `TestMergeAgainWhenCapSet`). An engine
+keeps the earlier of the expiries it was sent for a root; GC expires the
+stored root on its own either way. **Known gap
+([#58](https://github.com/zerobull-consulting/dagger/issues/58)):** a cap
+that is already past when it changes is never sent: the root is left out of
+merges, and an engine skips a root sent with a past expiry rather than
+releasing it. An engine that had the root with no expiry, or a later one,
+keeps it until its own GC prunes it, and computes again any part whose blob
+GC then deletes (`TestKnownGapPastCapNotSentToEngines`). The
+importer's expiry guard is unchanged: a root over an entry that has expired,
+or depends on one that has, is not merged.
+
+### Max size
+
+`max-bytes` bounds what a namespace **keeps**: its index, and the bundles,
+resolutions and blobs its live entries name, at the sizes the listing
+found. Over it, GC expires roots **oldest first**, by recording time, then
+service number, until what is left fits: it finds how many with a binary
+search over the roots, walking the index about log2(roots) times. Their
+entries go as in step 1; their objects, now unreferenced, are deleted once
+past the grace period, by a later run (`TestMaxSizeExpiresOldestFirst`). A
+root an export recorded again since GC read the index is kept (it is
+younger now, or, within the same second, its record changed;
+`TestMaxSizeKeepsRootRecordedSameSecond`).
+
+What GC can't delete yet (objects younger than the grace period, staged
+uploads, keys it doesn't know) is measured and reported but doesn't make it
+expire roots: a burst of uploads shouldn't expire live data. Nor does an
+index that alone is at or over the limit: expiring roots can't shrink it
+enough, so GC expires none, reports it, and goes on with the rest of the
+run; raise `max-bytes` (`TestMaxSizeUnderTheIndexExpiresNothing`). The bucket can
+so hold more than `max-bytes` for up to a grace period plus an interval.
+`gc_entries_expired_total{reason="size"}` counts what the limit expired.
+
+### Bundles
+
+A bundle no entry names is deleted, with its resolution if no entry names
+that either; then their blobs, once nothing names them. That covers
+bundles of exports that were never recorded (the service stopped between
+the bundle and the index write), and bundles whose records are **all
+superseded** by later exports
+([#27](https://github.com/zerobull-consulting/dagger/issues/27)): the
+index moved each of their entries to a newer bundle, so none names them,
+and they are collected like any other. A bundle that still holds any
+entry's current record stays, and is still merged whole; #27's merge-order
+gap is unchanged for those (see [Import path](#import-path)). The order
+keeps the guarantee that the index never names a bundle or resolution that
+isn't stored: the index stops naming them first (expiry, or a later
+export), and an export can't name them again once GC has claimed them
+(below).
+
+### Safety
+
+Objects are content-addressed, so an export can name an object GC found
+unreferenced: a blob it found stored (`Has`) before uploading anything, or
+a bundle or resolution an earlier export stored. And GC's listing and an
+export's checks are both moments, not locks. The index is the one thing
+both write with conditional writes, so GC deletes in three steps, each
+serialized with exports on the index:
+
+1. **Claim.** In one index update, GC marks what it will delete
+   (`metastore.Collection`), after checking against that index, not its
+   listing, that nothing names it now and no other run has claimed it
+   (`TestClaimRechecksIndex`). An export recorded before the claim is seen;
+   one recorded after names a claimed object and is refused
+   (`metastore.ErrCollected`).
+2. **Delete**, with `DeleteObjects`, 1,000 keys per request, within 10
+   minutes of the claim: a run doesn't start a delete after that, and
+   cancels one still in flight (`TestDeletesCanceledAtDeadline`). A claim
+   is stamped with its own time, not the run's start, so a run that took
+   minutes to list doesn't make its claims look stale to other replicas
+   (`TestClaimStampedAtClaimTime`); and the deadline counts from that same
+   instant, on the monotonic clock, not from after the claim's index
+   update returns, so a slow claim can't stretch deletes past the time
+   other replicas take it over. A run whose claim took past its deadline
+   deletes nothing, and releases its claims
+   (`TestDeleteDeadlineFromClaimStamp`). `DeleteObjects` answers per key: keys
+   it reports failing are counted apart and reported, and the next batches
+   still run (`TestPartialDeleteFailure`).
+3. **Finish.** In a second update, GC marks them deleted in a new epoch,
+   then publishes the epoch in `<prefix>/<ns>/gc-epoch.json`. Each export
+   try reads that object before it checks any blob (one small GET, kept for 10s), and its
+   index write is refused if it names an object deleted in a later epoch: it
+   checked the object before it was deleted
+   (`TestRecordFenced`, `TestExportRacesSweep`).
+
+The epoch object only goes up (a conditional write), and each run
+republishes the index's epoch if the object lags it, such as after a failed
+publish (`TestWriteEpochMonotonic`, `TestEpochRepublished`). A lagging epoch
+is safe anyway: it only makes exports refuse more. A marker pruned while it
+lagged can't let an export through either: the deletion finished over 4h
+before, and an export that may still record started under 3h ago, so its
+checks came after the deletion (`TestStaleEpochAfterPruneIsSafe`).
+
+A refused export is tried again from the start: it finds what is gone, has
+the engine upload it again, and is recorded (`export_collected_total`).
+Refusals have their own budget of 3 tries, apart from the export's upload
+attempts, and when they run out the roots fail as "garbage collection
+deleted what the export named", not as failed uploads
+(`TestExportCollectedRetriesApart`). An exporter reads the epoch at most
+once per 10s and keeps it for later tries: a fence read earlier is still
+read before the try's checks, and at worst only refuses more. A refused try
+reads a fresh one (`TestExportFenceReadOncePerTTL`). So
+the index never names an object that isn't stored, whatever GC does at the
+same time. Shown with fake engines by `TestGCRacesExport`: an export held
+between its blob promotions and its index write while GC runs. With the
+default grace period GC collects nothing of it; with one too short, GC
+deletes its blobs, the export's write is refused, and the retry uploads
+them again and is stored; the index stays consistent either way.
+
+**The grace period** (2h) covers an export from its first check to its
+index write: it waits up to its upload timeout (1h) for the engine, then
+promotes and records. So a blob promoted for an export not yet recorded is
+younger than it, and never collected (`TestInFlightBlobKept`). Correctness
+doesn't rest on it, the fence does; it keeps in-flight exports from being
+refused. An export refuses a fence older than 3h, and a finished deletion
+stays in the index for 4h, so no export can check an object, see it
+deleted, and record it after its marker is gone.
+
+**Replicas.** Every step is a conditional index write or an idempotent
+delete, so any number of replicas may run GC at once, with no election
+(`TestConcurrentRuns`): a run claims only what no other run has claimed, and
+deletes only what it claimed. A run that stops between its claim and its
+finish leaves its claims in progress (exports naming them are refused);
+once they are 15 minutes old, a later run of any replica takes them over,
+deletes and finishes (`TestStaleClaimTakenOver`). That bound is fixed (the
+longest deadline a collector takes, 10 minutes, plus 5): a replica
+configured with a shorter deadline still waits for one with a longer one
+(`TestStalenessIgnoresOwnDeadline`). Claims taken over count
+against `-gc-max-deletes` with new ones, stale first, so one run never
+deletes more however many runs stopped (`TestStaleClaimsBoundedByMaxDeletes`). Clocks of replicas only
+need to agree within minutes.
+
+**Rolling upgrade.** Index version 3 holds the claims; a replica that reads
+only version 2 refuses it and stops updating the namespace, rather than
+record an export without checking them (see [Metadata store](#metadata-store)).
+
+### Staging and multipart uploads
+
+A staged upload is never read as cache (`Has`, every GET and `renew` read
+digest keys only), so deleting one is always safe: at worst a promotion
+still copying it fails, and its export asks for the blob again. GC reads
+the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
+
+- a namespace whose `<prefix>/<ns>/staging/` an enabled rule expires by
+  age (`Expiration.Days`, filtered by prefix alone; a rule with a `Date`
+  expires objects once, not as they age), with a prefix within the staging
+  prefix, is left to it (`gc_staging_rule_missing` 0,
+  `TestExpiringPrefixes`). A broader rule, over the namespace or the whole
+  prefix, doesn't count: it also expires the namespace's live blobs,
+  bundles and index by age, which the index still names. GC reports such a
+  rule (a warning, and `liveRules` in the run's report) and expires the
+  staged uploads itself (`TestBroadLifecycleRule`);
+- a namespace without one is reported (`gc_staging_rule_missing` 1, and a
+  warning when it has staged uploads), and GC deletes its staged uploads
+  older than `-gc-staging-age` itself: 2h, an export's upload timeout (1h)
+  plus an hour for its promotions, which take minutes for a large blob the
+  service hashes. A staged upload deleted before its promotion is uploaded
+  again (`TestStagingKeptThroughPromotion`);
+- when the rules can't be read (no `s3:GetLifecycleConfiguration`, or a
+  store without them), GC deletes old staged uploads in every namespace,
+  and removes `gc_staging_rule_missing` (`TestStagingRuleMetricUnknown`).
+
+Stale incomplete multipart uploads (`ListMultipartUploads`) are aborted
+whatever the rules (`TestStagingAndUploads`, `TestMinIOGC`). MinIO lists
+multipart uploads only for an exact key: a listing by prefix returns none.
+For an S3-compatible store (a custom `CACHESERVICE_S3_ENDPOINT`),
+`S3Bucket.ListUploads` then lists the bucket's uploads and keeps those
+under the prefix, once per run (`FilterAllUploads`). It doesn't on AWS
+S3, which lists by prefix, so a bucket shared with other uploaders is
+never listed whole. MinIO also drops stale uploads itself after 24h.
+
+**Lifecycle rules.** Keep the staging rules and the multipart rule of
+[Lifecycle rule for staging](#lifecycle-rule-for-staging): they cost the
+service nothing. Don't add rules for bundles, resolutions, blobs or the
+index: whether one is in use depends on the index, not its age, and a rule
+by age would delete live entries' data, leaving the index naming missing
+objects. GC does those.
+
+### Re-verifying old blobs
+
+GC lists every digest key of each namespace, so a sweep is where a
+re-verification of blobs stored before uploads were verified could run
+([#53](https://github.com/zerobull-consulting/dagger/issues/53)): re-hash
+the marked blobs last modified before a cutoff, once, and act only on the
+service's own hash. Not built here: hashing reads every such blob through
+the service or a copy, which a run shouldn't do unasked; the one-off job of
+[Repairing blobs stored before verification](#repairing-blobs-stored-before-verification)
+stays the way to do it.
+
+### Costs
+
+Per namespace and run:
+
+| Step | Requests |
+| --- | --- |
+| Expire | 1 index GET; 1 conditional PUT when something changed |
+| List | 1 `ListObjectsV2` per 1,000 objects |
+| Mark | 1 GET per live bundle not read before (kept in memory) |
+| Claim, finish | 1 index read and conditional PUT each, only when there is something to delete; 1 GET and conditional PUT of the epoch |
+| Epoch | 1 GET of the epoch object, once the namespace has deleted anything; exporters read it at most once per 10s each, and after a refused try |
+| Delete | 1 `DeleteObjects` per 1,000 objects |
+| Staging | none beyond the listing; 1 `DeleteObjects` per 1,000 deleted |
+
+and, per run: one `ListObjectsV2` of the top level, one
+`ListMultipartUploads` per 1,000 uploads under the prefix (plus one more of
+the bucket's when the store lists none by prefix, as MinIO), and one
+`GetBucketLifecycleConfiguration`. Each index update adds about 100
+bytes per claimed object, at most `-gc-max-deletes` (5,000, so about 500 KB)
+while a run deletes, and the finished ones stay 4h. Memory: the listing is
+held for the namespace's run, about 150 bytes per object.
+
+Measured against the local MinIO (`TestMinIOGCScale`, 2026-11-03), a
+namespace of 2,505 objects, 2,500 of them unreferenced: 1.0s, 3 list and 3
+delete requests (this is what CI runs, about 5s with the setup);
+`CACHESERVICE_TEST_GC_OBJECTS=20000`: 20,005 objects in 9s, 21 list and 20
+delete requests, so about 0.45 ms per deleted object, and 14s to store them
+first.
+
+### Configuration
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0) |
+| `-gc-dry-run` | false | Log and report what a run would do; change nothing |
+| `-gc-grace` | `2h` | How old an unreferenced bundle, resolution or blob must be to be deleted |
+| `-gc-staging-age` | `2h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |
+| `-gc-max-deletes` | 5000 | Most bundles, resolutions and blobs one run deletes per namespace |
+| `-max-age` | 0 | Default max age of a namespace's roots, such as `720h` (0: none) |
+| `-max-bytes` | 0 | Default max size of what a namespace keeps, such as `500GiB` (0: none) |
+| `-namespaces-file` | none | Per-namespace limits (see [The namespaces file](#the-namespaces-file)) |
+
+The service's credentials also need `s3:ListBucket`,
+`s3:ListBucketMultipartUploads`, `s3:DeleteObject` on every key under the
+prefix, and, to report namespaces without a staging rule,
+`s3:GetLifecycleConfiguration` on the bucket.
 
 ## Metrics
 
@@ -994,14 +1458,25 @@ paths record into them through their metadata store. All are prefixed
 | `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
 | `blob_hashed_bytes_total` | `scope`, `by` | Bytes hashed to verify uploads: `store` (as it copied them) or `service` (read through the service) |
 | `blob_promotion_duration_seconds` | `scope` | Time to verify and promote one blob, slot wait included: it grows with the blob's size (see [Verification and promotion](#verification-and-promotion)) |
+| `gc_stored_bytes`, `gc_stored_objects` | `scope`, `kind` | What GC's last listing of the namespace found, by kind: `blob`, `bundle`, `resolution`, `index`, `staging` or `other` |
+| `gc_deleted_objects_total`, `gc_deleted_bytes_total` | `scope`, `kind` | What GC deleted: `blob`, `bundle`, `resolution`, `staging`, or `upload` (an incomplete multipart upload aborted; 0 bytes) |
+| `gc_runs_total` | `scope`, `outcome` | GC runs of a namespace: `ok`, `error` or `dry_run` |
+| `gc_run_duration_seconds` | `scope` | Time of one namespace's GC run |
+| `gc_entries_expired_total` | `scope`, `reason` | Index entries GC dropped: `expired` (their own expiry, or the max age) or `size` (the max size) |
+| `gc_staging_rule_missing` | `scope` | 1 when no lifecycle rule expires the namespace's staging prefix (GC expires it itself), 0 when one does; absent when the rules can't be read |
+| `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
+The `gc_stored_*` and `gc_staging_rule_missing` series of a namespace gone
+from the bucket are removed at the next run (`TestGaugesOfGoneNamespaceRemoved`).
 No label comes from an engine-supplied string: `scope` is a validated
-namespace from the tokens file or `-scope`, and the others are the service's
+namespace from the tokens file or `-scope`, or, for the `gc_` metrics, a
+valid namespace name GC listed in the bucket; the others are the service's
 constants.
 
 `caller` is `export` or `import` for the path that read or updated the index,
-whether its scheduler, its sync loop or the debug API ran it, and `other` for
+whether its scheduler, its sync loop or the debug API ran it, `gc` for
+garbage collection, and `other` for
 the rest (a wiped cache's imports leaving the index). Debug-triggered exports
 and imports count in the export and import metrics too. `bundle_reads_total`
 counts the read `PutBundle` makes when the bundle is already stored, and
@@ -1021,6 +1496,12 @@ What to watch:
   engine that uploaded content that isn't the blob it named (a bug, or a
   compromised engine), in that namespace; the export logs its cache ID and
   the digest. `missing` is one that reported an upload it didn't make.
+- **Storage:** `gc_stored_bytes` per namespace against its `max-bytes`;
+  `gc_deleted_bytes_total` by kind; any `gc_staging_rule_missing` of 1 is a
+  namespace whose staging rule is missing; `gc_runs_total{outcome="error"}`
+  is a run that failed somewhere (the log says where). A rising
+  `export_collected_total` means exports keep naming what GC deletes: a
+  grace period too short for the exports' duration.
 - **Promotion cost:** `blob_promotion_duration_seconds` against the blobs'
   sizes, and `blob_hashed_bytes_total{by="service"}`, which is read through
   the service (blobs over 5 GiB, or a store that doesn't hash).

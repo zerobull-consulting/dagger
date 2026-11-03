@@ -19,6 +19,7 @@ import (
 const (
 	CallerExport = "export"
 	CallerImport = "import"
+	CallerGC     = "gc"
 	CallerOther  = "other"
 )
 
@@ -99,6 +100,15 @@ type Metrics struct {
 	blobPromotions      *prometheus.CounterVec
 	blobHashedBytes     *prometheus.CounterVec
 	blobPromoteDuration *prometheus.HistogramVec
+	gcStoredBytes       *prometheus.GaugeVec
+	gcStoredObjects     *prometheus.GaugeVec
+	gcDeletedObjects    *prometheus.CounterVec
+	gcDeletedBytes      *prometheus.CounterVec
+	gcRuns              *prometheus.CounterVec
+	gcRunDuration       *prometheus.HistogramVec
+	gcEntriesExpired    *prometheus.CounterVec
+	gcStagingRule       *prometheus.GaugeVec
+	exportCollected     *prometheus.CounterVec
 	collectors          []prometheus.Collector
 }
 
@@ -260,6 +270,43 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help:    "Time to verify and promote one uploaded blob, waiting for a slot included. It grows with the blob's size.",
 			Buckets: promotionBuckets,
 		}, []string{"scope"}),
+		gcStoredBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "gc_stored_bytes",
+			Help: "Bytes stored under the scope's prefix, by kind (blob, bundle, resolution, index, staging, other), as GC's last listing found them.",
+		}, []string{"scope", "kind"}),
+		gcStoredObjects: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "gc_stored_objects",
+			Help: "Objects stored under the scope's prefix, by kind, as GC's last listing found them.",
+		}, []string{"scope", "kind"}),
+		gcDeletedObjects: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gc_deleted_objects_total",
+			Help: "Objects GC deleted, by scope and kind: blob, bundle, resolution, staging, or upload (an incomplete multipart upload aborted).",
+		}, []string{"scope", "kind"}),
+		gcDeletedBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gc_deleted_bytes_total",
+			Help: "Bytes GC deleted, by scope and kind, as its listing sized them (0 for aborted uploads).",
+		}, []string{"scope", "kind"}),
+		gcRuns: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gc_runs_total",
+			Help: "GC runs of one scope, by outcome: ok, error, or dry_run.",
+		}, []string{"scope", "outcome"}),
+		gcRunDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "gc_run_duration_seconds",
+			Help:    "Time of one scope's GC run.",
+			Buckets: promotionBuckets,
+		}, []string{"scope"}),
+		gcEntriesExpired: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gc_entries_expired_total",
+			Help: "Index entries GC dropped, by scope and reason: expired (their own expiry, or the scope's max age) or size (the scope's max bytes).",
+		}, []string{"scope", "reason"}),
+		gcStagingRule: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "gc_staging_rule_missing",
+			Help: "1 when the bucket's lifecycle rules don't expire the scope's staging/ prefix (GC expires it itself), 0 when they do; absent when the rules can't be read.",
+		}, []string{"scope"}),
+		exportCollected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "export_collected_total",
+			Help: "Export tries refused because GC deleted, or was deleting, an object they named; each is tried again.",
+		}, []string{"scope"}),
 	}
 	m.collectors = []prometheus.Collector{
 		m.indexReads, m.indexReadBytes, m.indexReadDuration,
@@ -273,6 +320,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.exportRoots, m.exportBlobs, m.exportBundles,
 		m.authRejected, m.tokensRevoked, m.eventsIgnored,
 		m.blobPromotions, m.blobHashedBytes, m.blobPromoteDuration,
+		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
+		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule,
+		m.exportCollected,
 	}
 	if reg != nil {
 		reg.MustRegister(m.collectors...)
@@ -521,4 +571,109 @@ func (m *Metrics) BlobPromotion(scope, outcome, hashedBy string, bytes int64, d 
 		m.blobHashedBytes.WithLabelValues(scope, hashedBy).Add(float64(bytes))
 	}
 	m.blobPromoteDuration.WithLabelValues(scope).Observe(d.Seconds())
+}
+
+// GC kinds of stored and deleted objects.
+const (
+	KindBlob       = "blob"
+	KindBundle     = "bundle"
+	KindResolution = "resolution"
+	KindIndex      = "index"
+	KindStaging    = "staging"
+	KindUpload     = "upload"
+	KindOther      = "other"
+)
+
+// GC run outcomes.
+const (
+	GCOK     = "ok"
+	GCError  = "error"
+	GCDryRun = "dry_run"
+)
+
+// GC reasons for expired entries.
+const (
+	ExpiredByExpiry = "expired"
+	ExpiredBySize   = "size"
+)
+
+// GCStored records what GC's listing of a scope found, by kind. Every label
+// is the service's own: scope is a validated namespace, kind a constant.
+func (m *Metrics) GCStored(scope string, bytes, objects map[string]int64) {
+	if m == nil {
+		return
+	}
+	for _, k := range []string{KindBlob, KindBundle, KindResolution, KindIndex, KindStaging, KindOther} {
+		m.gcStoredBytes.WithLabelValues(scope, k).Set(float64(bytes[k]))
+		m.gcStoredObjects.WithLabelValues(scope, k).Set(float64(objects[k]))
+	}
+}
+
+// GCDeleted records objects GC deleted in a scope.
+func (m *Metrics) GCDeleted(scope, kind string, objects int, bytes int64) {
+	if m == nil || objects == 0 {
+		return
+	}
+	m.gcDeletedObjects.WithLabelValues(scope, kind).Add(float64(objects))
+	m.gcDeletedBytes.WithLabelValues(scope, kind).Add(float64(bytes))
+}
+
+// GCRun records one scope's GC run.
+func (m *Metrics) GCRun(scope, outcome string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.gcRuns.WithLabelValues(scope, outcome).Inc()
+	m.gcRunDuration.WithLabelValues(scope).Observe(d.Seconds())
+}
+
+// GCExpired records index entries GC dropped.
+func (m *Metrics) GCExpired(scope, reason string, entries int) {
+	if m == nil || entries == 0 {
+		return
+	}
+	m.gcEntriesExpired.WithLabelValues(scope, reason).Add(float64(entries))
+}
+
+// GCStagingRule records whether a lifecycle rule expires the scope's
+// staging prefix.
+func (m *Metrics) GCStagingRule(scope string, missing bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if missing {
+		v = 1
+	}
+	m.gcStagingRule.WithLabelValues(scope).Set(v)
+}
+
+// GCStagingRuleUnknown removes the scope's gc_staging_rule_missing, when
+// the bucket's rules can't be read: neither 0 nor 1 would be true.
+func (m *Metrics) GCStagingRuleUnknown(scope string) {
+	if m == nil {
+		return
+	}
+	m.gcStagingRule.DeleteLabelValues(scope)
+}
+
+// GCForget removes a scope's GC gauges, for a namespace no longer in the
+// bucket: they would otherwise report its last listing forever.
+func (m *Metrics) GCForget(scope string) {
+	if m == nil {
+		return
+	}
+	for _, k := range []string{KindBlob, KindBundle, KindResolution, KindIndex, KindStaging, KindOther} {
+		m.gcStoredBytes.DeleteLabelValues(scope, k)
+		m.gcStoredObjects.DeleteLabelValues(scope, k)
+	}
+	m.gcStagingRule.DeleteLabelValues(scope)
+}
+
+// ExportCollected records an export try refused by GC's fence.
+func (m *Metrics) ExportCollected(scope string) {
+	if m == nil {
+		return
+	}
+	m.exportCollected.WithLabelValues(scope).Inc()
 }
