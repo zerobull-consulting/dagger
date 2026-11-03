@@ -158,16 +158,21 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 	return c.Run(ctx)
 }
 
-// serveGC is POST /debug/gc[?dry-run=1]: run GC now. A dry-run value that
-// isn't a boolean is refused (400), rather than taken as false and run for
-// real. A run with errors answers 500, with its reports.
+// serveGC is POST /debug/gc[?dry-run[=1]]: run GC now. A dry-run
+// parameter with no value is a dry run; one whose value isn't a boolean is
+// refused (400). Neither is taken as false and run for real. A run with
+// errors answers 500, with its reports.
 func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
 	dry := false
-	if v := r.URL.Query().Get("dry-run"); v != "" {
-		var err error
-		if dry, err = strconv.ParseBool(v); err != nil {
-			http.Error(w, "dry-run: want true or false (1 or 0)", http.StatusBadRequest)
-			return
+	if q.Has("dry-run") {
+		dry = true
+		if v := q.Get("dry-run"); v != "" {
+			var err error
+			if dry, err = strconv.ParseBool(v); err != nil {
+				http.Error(w, "dry-run: want true or false (1 or 0), or no value", http.StatusBadRequest)
+				return
+			}
 		}
 	}
 	reports, err := s.CollectGarbage(r.Context(), dry)

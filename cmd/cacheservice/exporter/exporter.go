@@ -450,6 +450,9 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			err = fmt.Errorf("blob store: %w", err)
 		}
 	}
+	if err == nil {
+		err = x.checkOffered(ctx, exported.Bundle, blobs)
+	}
 	if err != nil {
 		// Release the chains; the export isn't stored.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
@@ -519,6 +522,33 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, false, nil
+}
+
+// checkOffered checks, after the fence, that every layer the bundle names
+// but doesn't upload is stored: the layers of its records' pending offers,
+// which the service offered the engine and the engine hasn't pulled, so it
+// can't upload them. The fence protects only what an export checked after
+// reading it; without this check, a layer GC deleted before the export
+// started would pass the fence, and the index would name a bundle whose
+// offered layer is gone. Such an export fails: it can't be stored whole.
+func (x *Exporter) checkOffered(ctx context.Context, bundle *dagql.ValueBundle, uploads []blobstore.Blob) error {
+	uploaded := make(map[digest.Digest]bool, len(uploads))
+	for _, b := range uploads {
+		uploaded[b.Digest] = true
+	}
+	for _, d := range metastore.BundleBlobs(bundle) {
+		if uploaded[d] {
+			continue
+		}
+		has, err := x.cfg.Blobs.Has(ctx, d)
+		if err != nil {
+			return fmt.Errorf("blob store: %w", err)
+		}
+		if !has {
+			return fmt.Errorf("a pending offer's layer %s is no longer stored, and the engine can't upload it", d)
+		}
+	}
+	return nil
 }
 
 // fence reads GC's epoch for the scope, now. A failed read fences at epoch

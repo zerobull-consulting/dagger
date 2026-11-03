@@ -21,7 +21,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
-| `-debug-listen` | `POST /debug/gc[?dry-run=1]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)) |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, for a scraper that shouldn't reach the debug API |
 
 On the engine WebSocket, the service:
@@ -229,7 +229,7 @@ never answered, a store error during promotion) and incomplete multipart
 copies are best expired by a bucket lifecycle rule, which costs the service
 no request. Garbage collection covers a namespace without one: it reports
 it (`gc_staging_rule_missing`, and a warning), and deletes its staged
-uploads older than an export's upload timeout itself, and it aborts stale
+uploads older than an export's upload timeout plus an hour itself, and it aborts stale
 multipart uploads in every namespace (see
 [Retention and garbage collection](#retention-and-garbage-collection)). One
 day is safe for the rule: an export's uploads and promotions finish within
@@ -620,6 +620,10 @@ session's cache ID. If none is, the export waits and is tried again.
    checked the object before it was deleted. The export is then tried again
    from step 1, and asks for what is gone (`export_collected_total`; see
    [Retention and garbage collection](#retention-and-garbage-collection)).
+   The layers of its records' pending offers, which the engine can't
+   upload, are checked too, after the epoch: an export naming one that is
+   no longer stored fails, since its bundle can't be stored whole
+   (`TestExportChecksOfferedLayers`).
    The roots it records are stamped with the time, from which the
    namespace's max age counts.
 
@@ -1065,9 +1069,11 @@ that were never recorded or were superseded, and staged uploads. So an
 upgrade applies no age or size limit until one is configured.
 `-gc-dry-run`, or `POST /debug/gc?dry-run=1`, logs (`gc dry run: would
 delete`) and reports what a run would expire and delete, and changes
-nothing (`TestDryRunDeletesNothing`). `POST /debug/gc` refuses a `dry-run`
-value that isn't a boolean (400) rather than run for real, and answers 500,
-with the reports, when a run failed somewhere (`TestDebugGC`).
+nothing (`TestDryRunDeletesNothing`), including the stale claims a real run
+would take over (`TestDryRunReportsStaleClaims`). `POST /debug/gc?dry-run`,
+with no value, is a dry run too; a `dry-run` value that isn't a boolean is
+refused (400). Neither runs for real. A run that failed somewhere answers
+500, with the reports (`TestDebugGC`).
 
 ### One run, per namespace
 
@@ -1282,7 +1288,10 @@ the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
   (`gc_staging_rule_missing` 0, `TestExpiringPrefixes`);
 - a namespace without one is reported (`gc_staging_rule_missing` 1, and a
   warning when it has staged uploads), and GC deletes its staged uploads
-  older than `-gc-staging-age` (1h, an export's upload timeout) itself;
+  older than `-gc-staging-age` itself: 2h, an export's upload timeout (1h)
+  plus an hour for its promotions, which take minutes for a large blob the
+  service hashes. A staged upload deleted before its promotion is uploaded
+  again (`TestStagingKeptThroughPromotion`);
 - when the rules can't be read (no `s3:GetLifecycleConfiguration`, or a
   store without them), GC deletes old staged uploads in every namespace,
   and removes `gc_staging_rule_missing` (`TestStagingRuleMetricUnknown`).
@@ -1347,7 +1356,7 @@ first.
 | `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0) |
 | `-gc-dry-run` | false | Log and report what a run would do; change nothing |
 | `-gc-grace` | `2h` | How old an unreferenced bundle, resolution or blob must be to be deleted |
-| `-gc-staging-age` | `1h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |
+| `-gc-staging-age` | `2h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |
 | `-gc-max-deletes` | 5000 | Most bundles, resolutions and blobs one run deletes per namespace |
 | `-max-age` | 0 | Default max age of a namespace's roots, such as `720h` (0: none) |
 | `-max-bytes` | 0 | Default max size of what a namespace keeps, such as `500GiB` (0: none) |

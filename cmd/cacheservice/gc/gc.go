@@ -68,11 +68,13 @@ const (
 	// (an hour) for the engine.
 	DefaultGrace = 2 * time.Hour
 	// DefaultStagingAge is how old a staged upload, or an incomplete
-	// multipart upload, must be to be deleted: an export's upload timeout.
-	// A staged object is never read as cache, so deleting it is always
-	// safe: at worst a promotion still copying it fails, and its export
-	// asks for the blob again.
-	DefaultStagingAge = exporter.DefaultUploadTimeout
+	// multipart upload, must be to be deleted: an export's upload timeout,
+	// plus an hour for its promotions. An export waits up to the upload
+	// timeout for the engine's uploads, then promotes them, which takes
+	// minutes for a large blob the service hashes; a staged upload deleted
+	// before its promotion is uploaded again. Deleting one is always safe:
+	// a staged object is never read as cache.
+	DefaultStagingAge = exporter.DefaultUploadTimeout + time.Hour
 	// DefaultMaxDeletes bounds the objects one run claims per namespace,
 	// so the claims in the index stay small (about 100 bytes each); a
 	// larger backlog drains over later runs.
@@ -667,10 +669,19 @@ func (c *Collector) sweep(ctx context.Context, ns string, prev, idx *metastore.I
 	}
 	cands := c.candidates(idx, keep, l, now)
 	if c.cfg.DryRun {
+		// What a real run would claim: stale claims it takes over first,
+		// then new candidates, MaxDeletes in all (see claimAndDelete).
+		would := staleKeys(idx, now)
 		for _, k := range cands {
+			if !slices.Contains(would, k) {
+				would = append(would, k)
+			}
+		}
+		would = would[:min(len(would), c.cfg.MaxDeletes)]
+		for _, k := range would {
 			log.Info("gc dry run: would delete", "key", k)
 		}
-		rep.WouldDelete = append(rep.WouldDelete, cands...)
+		rep.WouldDelete = append(rep.WouldDelete, would...)
 		return
 	}
 	if len(cands) == 0 && !hasStale(idx, now) {
@@ -729,6 +740,21 @@ func (c *Collector) candidates(idx *metastore.Index, r *refs, l *listing, now ti
 // than any run, of any replica, may still delete under it.
 func stale(d metastore.Deletion, now time.Time) bool {
 	return d.InProgress() && now.Unix()-d.StartedUnix > int64((MaxDeleteDeadline+staleSlack)/time.Second)
+}
+
+// staleKeys are the keys of the stale claims, sorted.
+func staleKeys(idx *metastore.Index, now time.Time) []string {
+	if idx.GC == nil {
+		return nil
+	}
+	var keys []string
+	for k, d := range idx.GC.Deletions {
+		if stale(d, now) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func hasStale(idx *metastore.Index, now time.Time) bool {

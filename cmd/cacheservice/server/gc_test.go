@@ -450,6 +450,17 @@ func TestDebugGC(t *testing.T) {
 	if code := post("?dry-run=1"); code != http.StatusOK {
 		t.Fatalf("dry-run=1: %d", code)
 	}
+	// ?dry-run with no value is a dry run too, never a real one.
+	resp, err := http.Post(h.debug.URL+"/debug/gc?dry-run", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct{ Reports []gc.Report }
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(out.Reports) == 0 || !out.Reports[0].DryRun {
+		t.Fatalf("?dry-run: %d, %+v", resp.StatusCode, out.Reports)
+	}
 	// A bundle the index names, gone: the run fails.
 	idx := h.waitIndex(10, 11)
 	for _, e := range idx.Entries {

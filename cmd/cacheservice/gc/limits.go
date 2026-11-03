@@ -34,9 +34,10 @@ type Limits struct {
 // takes the others from the defaults. Blank lines and lines starting with #
 // are ignored:
 //
-//   - max-age=720h
-//     team-a   max-age=168h max-bytes=500GiB
-//     team-b   max-bytes=2TiB
+//	# the defaults, then two namespaces
+//	*        max-age=720h
+//	team-a   max-age=168h max-bytes=500GiB
+//	team-b   max-bytes=2TiB
 //
 // A namespace that is in no line, and one with no tokens, is collected with
 // the defaults: the file never decides that a namespace's data goes.

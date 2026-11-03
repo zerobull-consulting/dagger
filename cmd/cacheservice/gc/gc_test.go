@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -457,7 +458,7 @@ func TestStagingAndUploads(t *testing.T) {
 	oldA := e.view("team-a").PutStaged(blobstore.NewStage(), layer("old", 100))
 	oldB := e.view("team-b").PutStaged(blobstore.NewStage(), layer("old", 100))
 	e.bucket.AddUpload(Upload{Key: prefix + "/team-a/blobs/sha256/old", ID: "1", Initiated: e.clock.Now()})
-	e.clock.Add(2 * time.Hour)
+	e.clock.Add(3 * time.Hour)
 	young := e.view("team-a").PutStaged(blobstore.NewStage(), layer("young", 100))
 	e.bucket.AddUpload(Upload{Key: prefix + "/team-a/blobs/sha256/young", ID: "2", Initiated: e.clock.Now()})
 	e.bucket.SetRules([]string{prefix + "/team-b/staging/"}, nil)
@@ -482,7 +483,7 @@ func TestStagingAndUploads(t *testing.T) {
 
 	// Rules that can't be read: GC expires staging itself.
 	e.bucket.SetRules(nil, ErrRulesUnknown)
-	e.clock.Add(2 * time.Hour)
+	e.clock.Add(3 * time.Hour)
 	reps = e.run(e.collector(nil))
 	if r := reportOf(reps, "team-b"); r.StagingRule != "unknown" || r.Deleted["staging"] != 1 {
 		t.Fatalf("unknown rules: %+v", r)
@@ -863,7 +864,7 @@ func TestNamespaceOfOnlyAnUpload(t *testing.T) {
 	e := newEnv(t)
 	e.bucket.AddUpload(Upload{Key: prefix + "/lonely/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
 	e.bucket.AddUpload(Upload{Key: prefix + "/blobs/sha256/" + strings.Repeat("1", 64), ID: "2", Initiated: e.clock.Now()})
-	e.clock.Add(2 * time.Hour)
+	e.clock.Add(3 * time.Hour)
 	reps := e.run(e.collector(nil))
 	if r := reportOf(reps, "lonely"); r.Deleted["upload"] != 1 {
 		t.Fatalf("lonely: %+v", r)
@@ -1015,7 +1016,7 @@ func TestUploadListingFailureFailsRun(t *testing.T) {
 	e := newEnv(t)
 	e.bucket.AddUpload(Upload{Key: prefix + "/lonely/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
 	e.bucket.FailUploadListings(errors.New("injected"))
-	e.clock.Add(2 * time.Hour)
+	e.clock.Add(3 * time.Hour)
 	if _, err := e.collector(nil).Run(context.Background()); err == nil || !strings.Contains(err.Error(), "list multipart uploads") {
 		t.Fatalf("run: %v", err)
 	}
@@ -1121,5 +1122,47 @@ func TestUnreadableIndexStillCollectsUploads(t *testing.T) {
 	}
 	if e.view("team").Len() != blobs || slices.Contains(e.view("team").Staged(), staged) {
 		t.Fatal("blobs deleted, or the staged upload kept")
+	}
+}
+
+// A staged upload is kept past the export upload timeout, by an hour: an
+// export waits that long for its uploads, then promotes them, which takes
+// minutes for a large blob. Deleting it then would cost its upload again.
+func TestStagingKeptThroughPromotion(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	staged := e.view("team").PutStaged(blobstore.NewStage(), layer("staged", 100))
+	e.clock.Add(exporter.DefaultUploadTimeout + 30*time.Minute)
+	if r := reportOf(e.run(e.collector(nil)), "team"); r.Deleted["staging"] != 0 {
+		t.Fatalf("deleted a staged upload %s after the upload timeout, before its promotion could finish", exporter.DefaultUploadTimeout+30*time.Minute)
+	}
+	e.clock.Add(time.Hour)
+	if r := reportOf(e.run(e.collector(nil)), "team"); r.Deleted["staging"] != 1 || slices.Contains(e.view("team").Staged(), staged) {
+		t.Fatalf("past the staging age: %+v", r)
+	}
+}
+
+// A dry run reports the stale claims a real run would take over and
+// delete, not only new candidates.
+func TestDryRunReportsStaleClaims(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.export("team", "a", buildX("x"), 2)
+	orphan := e.view("team").Put(layer("orphan", 100))
+	key := metastore.BlobRelKey(orphan)
+	if _, err := e.meta.UpdateIndex(ctx, "team", func(idx *metastore.Index) error {
+		idx.GC = &metastore.Collection{Deletions: map[string]metastore.Deletion{key: {Run: "gone", StartedUnix: e.clock.Now().Unix()}}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Add(MaxDeleteDeadline + staleSlack + time.Minute)
+	dry := reportOf(e.run(e.collector(func(cfg *Config) { cfg.DryRun = true })), "team")
+	if !slices.Contains(dry.WouldDelete, key) {
+		t.Fatalf("dry run would delete %v, missing the stale claim %s", dry.WouldDelete, key)
+	}
+	real := reportOf(e.run(e.collector(nil)), "team")
+	if real.Deleted["blob"] != 1 {
+		t.Fatalf("the real run: %+v", real)
 	}
 }

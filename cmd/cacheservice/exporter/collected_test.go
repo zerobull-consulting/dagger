@@ -8,9 +8,12 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/dagql"
+	"github.com/dagger/dagger/engine/snapshots"
 )
 
 // claimForever marks keys as being deleted by GC in the scope's index, so
@@ -101,5 +104,37 @@ func TestExportFenceReadOncePerTTL(t *testing.T) {
 	// Past the TTL: read again; then once more after each refusal.
 	if got := counted.n.Load(); got != maxCollectedTries {
 		t.Fatalf("%d epoch reads over %d refused tries, want one per try", got, maxCollectedTries)
+	}
+}
+
+// An export whose bundle names a pending offer's layer that isn't stored
+// (GC deleted it before the export started) fails: the engine can't
+// upload an offered layer, and the fence protects only what the export
+// checked. Once the layer is stored, the export is.
+func TestExportChecksOfferedLayers(t *testing.T) {
+	e := newTestEnv(t, nil)
+	offered := layer("offered")
+	d := digest.FromBytes(offered)
+	e.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{layer("base")}})
+	e.cache.Add(fakeengine.Entry{Number: 12, Deps: []uint64{10}, Offer: &dagql.PersistedPartOffer{
+		Address: fakeengine.FSPart,
+		Value:   dagql.SnapshotValue{Kind: "directory", Path: "/"},
+		Chain:   dagql.OfferedChain{Layers: []snapshots.ExportLayer{{Descriptor: ocispecs.Descriptor{MediaType: ocispecs.MediaTypeImageLayerGzip, Digest: d, Size: int64(len(offered))}}}},
+	}})
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{12}, Outputs: fsOutputs(10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Stored) != 0 || len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Error, "pending offer") {
+		t.Fatalf("with the offered layer missing: %+v", res)
+	}
+	if idx, _ := e.meta.Index(ctx, "team"); len(idx.Entries) != 0 {
+		t.Fatalf("recorded %d entries", len(idx.Entries))
+	}
+	e.blobs.Put(offered)
+	res, err = e.x.Export(ctx, e.eng, Request{Roots: []uint64{12}, Outputs: fsOutputs(10)})
+	if err != nil || len(res.Stored) != 1 {
+		t.Fatalf("with it stored: %+v, %v", res, err)
 	}
 }
