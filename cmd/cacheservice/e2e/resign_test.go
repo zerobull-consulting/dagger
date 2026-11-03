@@ -76,8 +76,9 @@ func TestMinIOProxySignsAgain(t *testing.T) {
 		name      string
 		pathStyle bool
 	}{{"path-style", true}}
-	// A local endpoint has no bucket subdomains.
-	if strings.HasPrefix(base.Endpoint, "https://") {
+	// Only where the bucket is configured for it: a local endpoint has no
+	// bucket subdomains, and HTTPS doesn't promise wildcard DNS or certificates.
+	if strings.HasPrefix(base.Endpoint, "https://") && !base.PathStyle {
 		modes = append(modes, struct {
 			name      string
 			pathStyle bool
@@ -244,6 +245,29 @@ func startFakeStore(t *testing.T, reached func()) string {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached() }))
 	t.Cleanup(srv.Close)
 	return srv.URL
+}
+
+// With no static credentials, the SDK's default chain signs for the store, as
+// it does for the service: the proxy has to use what it resolved, not the
+// configuration's nil, and forward rather than panic.
+func TestUpstreamUsesTheDefaultCredentialChain(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "from-the-chain")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	ctx := context.Background()
+	cfg := blobstore.S3Config{Endpoint: "https://store.test", Region: "r", Bucket: "bkt", PathStyle: true}
+	client, err := blobstore.NewS3Client(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := newUpstream(cfg, client)
+	if u.Credentials == nil {
+		t.Fatal("no credentials")
+	}
+	creds, err := u.Credentials.Retrieve(ctx)
+	if err != nil || creds.AccessKeyID != "from-the-chain" {
+		t.Fatalf("credentials %q, %v", creds.AccessKeyID, err)
+	}
 }
 
 // roundTripFunc records what the proxy sends the store, without a network.

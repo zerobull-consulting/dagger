@@ -313,6 +313,13 @@ optional `SPACES_DISPOSABLE_BUCKET`, set to `1`, runs the lifecycle part on a
 bucket dedicated to the tests. Concurrent runs with it replace each other's
 lifecycle rule, so leave it off if pull requests overlap.
 
+**Use a key for a dedicated test bucket, never a production one.** Pull requests
+from forks don't get these secrets, but anyone with write access can read them
+through a workflow on a branch of this repository, and a pull request's own code
+runs with them. To put a review in front of them, keep them in a
+[GitHub environment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)
+with required reviewers instead.
+
 ## Pointing an engine at the service and MinIO
 
 The engine reaches only the cache service. MinIO's address reaches it inside

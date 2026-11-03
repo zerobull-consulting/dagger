@@ -198,7 +198,7 @@ func New(t *testing.T) *Env {
 	guard := s3test.NewGuard(cfg.Bucket, cfg.Prefix, false)
 	opts := ProxyOptions{Guard: guard}
 	if ResignFor(cfg.Endpoint, cfg.PathStyle) {
-		opts.Upstream = &Upstream{Endpoint: cfg.Endpoint, Region: cfg.Region, Bucket: cfg.Bucket, PathStyle: cfg.PathStyle, Credentials: cfg.Credentials}
+		opts.Upstream = newUpstream(cfg, e.S3)
 		t.Logf("the S3 proxy signs requests again for the store (HTTPS or virtual-hosted endpoint)")
 	}
 	e.Proxy = StartS3ProxyWith(t, e.Gateway, cfg.Endpoint, opts)

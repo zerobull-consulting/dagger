@@ -12,6 +12,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 )
 
 // Upstream is what the S3 proxy needs to forward to an endpoint that routes on
@@ -36,6 +39,13 @@ type Upstream struct {
 	Credentials aws.CredentialsProvider
 	// Transport sends to the store. Nil is http.DefaultTransport.
 	Transport http.RoundTripper
+}
+
+// newUpstream is the Upstream of cfg's store. Its credentials are client's:
+// cfg's are nil when they come from the SDK's default chain, which client has
+// resolved.
+func newUpstream(cfg blobstore.S3Config, client *s3.Client) *Upstream {
+	return &Upstream{Endpoint: cfg.Endpoint, Region: cfg.Region, Bucket: cfg.Bucket, PathStyle: cfg.PathStyle, Credentials: client.Options().Credentials}
 }
 
 // amzQuery are the query parameters of a presigned URL's signature.
