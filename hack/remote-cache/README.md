@@ -237,8 +237,9 @@ enforces this in test setup:
   `PutBucketLifecycleConfiguration` replaces the whole bucket's. Without it,
   `TestMinIOGC` skips that part, and expects no rule. Reads are not limited:
   they change nothing.
-- Each test deletes its objects and aborts its uploads when it ends, failed or
-  not, and fails if any are left.
+- Each test deletes its objects, with their versions and delete markers on a
+  versioned bucket, and aborts its uploads when it ends, failed or not, and
+  fails if any are left. The key needs to be allowed to list versions.
 
 A process that is killed (`go test`'s `-timeout`) can't clean up: its objects
 stay under `<prefix>/<run>/`, whose name starts with the run's UTC time.

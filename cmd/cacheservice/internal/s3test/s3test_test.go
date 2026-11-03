@@ -3,10 +3,16 @@ package s3test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -305,5 +311,112 @@ func TestDeletePrefixRefusesTheBucket(t *testing.T) {
 		if err := DeletePrefix(context.Background(), nil, testBucket, p); err == nil {
 			t.Errorf("DeletePrefix(%q) took it", p)
 		}
+	}
+}
+
+// versionedStore is a fake versioned bucket: a plain delete adds a delete
+// marker, and only a delete by version removes anything.
+type versionedStore struct {
+	mu       sync.Mutex
+	versions map[string][]string // key -> version IDs
+	markers  map[string][]string
+	next     int
+}
+
+func (v *versionedStore) Do(r *http.Request) (*http.Response, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	q := r.URL.Query()
+	key := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/"+testBucket), "/")
+	body := ""
+	status := http.StatusOK
+	switch {
+	case r.Method == http.MethodGet && q.Has("versions"):
+		var b strings.Builder
+		b.WriteString("<ListVersionsResult>")
+		for k, ids := range v.versions {
+			if strings.HasPrefix(k, q.Get("prefix")) {
+				for _, id := range ids {
+					b.WriteString("<Version><Key>" + k + "</Key><VersionId>" + id + "</VersionId></Version>")
+				}
+			}
+		}
+		for k, ids := range v.markers {
+			if strings.HasPrefix(k, q.Get("prefix")) {
+				for _, id := range ids {
+					b.WriteString("<DeleteMarker><Key>" + k + "</Key><VersionId>" + id + "</VersionId></DeleteMarker>")
+				}
+			}
+		}
+		b.WriteString("</ListVersionsResult>")
+		body = b.String()
+	case r.Method == http.MethodGet && q.Has("uploads"):
+		body = "<ListMultipartUploadsResult/>"
+	case r.Method == http.MethodGet:
+		// Listing objects hides anything behind a delete marker.
+		var b strings.Builder
+		b.WriteString("<ListBucketResult>")
+		for k := range v.versions {
+			if strings.HasPrefix(k, q.Get("prefix")) && len(v.markers[k]) == 0 {
+				b.WriteString("<Contents><Key>" + k + "</Key></Contents>")
+			}
+		}
+		b.WriteString("</ListBucketResult>")
+		body = b.String()
+	case r.Method == http.MethodDelete && q.Get("versionId") != "":
+		id := q.Get("versionId")
+		v.versions[key] = slices.DeleteFunc(v.versions[key], func(s string) bool { return s == id })
+		v.markers[key] = slices.DeleteFunc(v.markers[key], func(s string) bool { return s == id })
+		status = http.StatusNoContent
+	case r.Method == http.MethodDelete:
+		v.next++
+		v.markers[key] = append(v.markers[key], fmt.Sprintf("marker-%d", v.next))
+		status = http.StatusNoContent
+	default:
+		status = http.StatusNotImplemented
+	}
+	return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+}
+
+// On a versioned bucket, cleaning up removes the versions and the delete
+// markers, not just what listing objects shows, and leaves other keys alone.
+func TestDeletePrefixVersionedBucket(t *testing.T) {
+	inside := testRoot + "/t/a"
+	outside := testRoot + "/t-sibling/a"
+	store := &versionedStore{
+		versions: map[string][]string{inside: {"v1", "v2"}, outside: {"v9"}},
+		markers:  map[string][]string{testRoot + "/t/gone": {"m1"}},
+	}
+	c := s3.New(s3.Options{
+		Region: "us-east-1", BaseEndpoint: aws.String("https://s3.example.test"), UsePathStyle: true,
+		Credentials: credentials.NewStaticCredentialsProvider("id", "secret", ""),
+		HTTPClient:  NewGuard(testBucket, testRoot, false).WithClient(store),
+	})
+	if err := DeletePrefix(context.Background(), c, testBucket, testRoot+"/t"); err != nil {
+		t.Fatal(err)
+	}
+	if left := store.versions[inside]; len(left) != 0 {
+		t.Errorf("versions left under the prefix: %v", left)
+	}
+	for k, ids := range store.markers {
+		if strings.HasPrefix(k, testRoot+"/t/") && len(ids) != 0 {
+			t.Errorf("delete markers left at %s: %v", k, ids)
+		}
+	}
+	if got := store.versions[outside]; len(got) != 1 {
+		t.Errorf("the sibling's versions: %v", got)
+	}
+}
+
+// Only the guarded store suites run against an external bucket here: the e2e
+// would have no guard or upload cleanup there.
+func TestDevShRefusesExternalE2E(t *testing.T) {
+	script := filepath.Join("..", "..", "..", "..", "hack", "remote-cache", "dev.sh")
+	cmd := exec.Command("bash", script, "e2e")
+	cmd.Env = append(os.Environ(), "CACHESERVICE_TEST_EXTERNAL=1")
+	out, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "CACHESERVICE_TEST_EXTERNAL") {
+		t.Fatalf("dev.sh e2e with an external bucket: %v\n%s", err, out)
 	}
 }

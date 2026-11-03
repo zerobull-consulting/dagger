@@ -15,9 +15,9 @@
 # MINIO_REGION and MINIO_BUCKET. MinIO listens on loopback unless
 # MINIO_BIND_ADDR says otherwise.
 #
-# With CACHESERVICE_TEST_EXTERNAL=1, `test` and `e2e` use the bucket in the
+# With CACHESERVICE_TEST_EXTERNAL=1, `test` uses the bucket in the
 # CACHESERVICE_S3_* variables instead of starting MinIO; see README.md,
-# "Testing against a real bucket".
+# "Testing against a real bucket". `e2e` refuses it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,6 +98,10 @@ test)
 	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/...
 	;;
 e2e)
+	if [[ "${CACHESERVICE_TEST_EXTERNAL:-}" == "1" ]]; then
+		echo "dev.sh e2e: CACHESERVICE_TEST_EXTERNAL=1 isn't supported yet: the e2e isn't kept to its prefix on a real bucket" >&2
+		exit 2
+	fi
 	# Extra arguments go to go test, such as -run 'TestRealEngines/^renew$'.
 	# E2E_SCENARIOS picks the scenarios after the first, which always runs.
 	scenarios="${E2E_SCENARIOS:-}"

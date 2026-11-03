@@ -338,10 +338,12 @@ func bulkDeleteKeys(r *http.Request) ([]string, error) {
 	return keys, nil
 }
 
-// DeletePrefix deletes every object under prefix and aborts every multipart
-// upload under it, and returns an error if it couldn't or any are left.
-// Uploads are listed for the whole bucket and filtered, since some stores
-// list them only by exact key (MinIO).
+// DeletePrefix deletes every object under prefix, every version of it on a
+// versioned bucket, and aborts every multipart upload under it, and returns an
+// error if it couldn't or any are left. Deleting by version matters: a plain
+// delete there only adds a delete marker, which listing objects hides. Uploads
+// are listed for the whole bucket and filtered, since some stores list them
+// only by exact key (MinIO).
 func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string) error {
 	if strings.Trim(prefix, "/") == "" {
 		return errors.New("refusing to delete the whole bucket")
@@ -360,6 +362,9 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 				errs = append(errs, fmt.Errorf("delete %s: %w", aws.ToString(o.Key), err))
 			}
 		}
+	}
+	if err := deleteVersions(ctx, client, bucket, under); err != nil {
+		errs = append(errs, err)
 	}
 	var keyMarker, uploadMarker *string
 	for {
@@ -384,12 +389,44 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	left, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &under, MaxKeys: aws.Int32(1)})
+	left, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &under, MaxKeys: aws.Int32(1)})
 	if err != nil {
 		return fmt.Errorf("list what is left: %w", err)
 	}
-	if len(left.Contents) > 0 {
-		return fmt.Errorf("objects left, such as %s", aws.ToString(left.Contents[0].Key))
+	if len(left.Versions) > 0 {
+		return fmt.Errorf("objects left, such as %s", aws.ToString(left.Versions[0].Key))
+	}
+	if len(left.DeleteMarkers) > 0 {
+		return fmt.Errorf("delete markers left, such as %s", aws.ToString(left.DeleteMarkers[0].Key))
 	}
 	return nil
+}
+
+// deleteVersions deletes every version and delete marker under the prefix. On
+// a bucket that isn't versioned, that finds what the plain deletes left, if
+// anything.
+func deleteVersions(ctx context.Context, client *s3.Client, bucket, under string) error {
+	var errs []error
+	del := func(key, version *string) {
+		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: key, VersionId: version}); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s version %s: %w", aws.ToString(key), aws.ToString(version), err))
+		}
+	}
+	var keyMarker, versionMarker *string
+	for {
+		out, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &under, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
+		if err != nil {
+			return errors.Join(append(errs, fmt.Errorf("list versions: %w", err))...)
+		}
+		for _, v := range out.Versions {
+			del(v.Key, v.VersionId)
+		}
+		for _, m := range out.DeleteMarkers {
+			del(m.Key, m.VersionId)
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return errors.Join(errs...)
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+	}
 }
