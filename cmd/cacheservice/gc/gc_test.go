@@ -1166,3 +1166,99 @@ func TestDryRunReportsStaleClaims(t *testing.T) {
 		t.Fatalf("the real run: %+v", real)
 	}
 }
+
+// A claim is stamped with the time it is made, not the run's start: on a
+// namespace that takes minutes to list and mark, a claim stamped with the
+// start would look stale to other replicas while this run still deletes.
+func TestClaimStampedAtClaimTime(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	orphan := e.view("team").Put(layer("orphan", 100))
+	e.clock.Add(3 * time.Hour)
+	b := &afterList{Bucket: e.bucket, hook: func() { e.clock.Add(20 * time.Minute) }} // a slow listing
+	var started int64
+	e.bucket.BeforeDelete(func([]string) {
+		started = e.index("team").GC.Deletions[metastore.BlobRelKey(orphan)].StartedUnix
+	})
+	e.run(e.collector(func(cfg *Config) { cfg.Bucket = b }))
+	if want := e.clock.Now().Unix(); started != want {
+		t.Fatalf("claim stamped %d, want the claim's time %d (the run started %ds before)", started, want, want-started)
+	}
+}
+
+// A delete whose request reports some keys failing counts the others as
+// deleted, reports the failures, and goes on with the next batches; the
+// failed keys stay, and nothing names them, so a later run claims them
+// again.
+func TestPartialDeleteFailure(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	bad := e.view("team").Put(layer("bad", 100))
+	good := e.view("team").Put(layer("good", 100))
+	e.bucket.FailDeletes(prefix + "/team/" + metastore.BlobRelKey(bad))
+	e.clock.Add(3 * time.Hour)
+	reps, err := e.collector(nil).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "1 of 2 keys failed") {
+		t.Fatalf("run: %v", err)
+	}
+	if r := reportOf(reps, "team"); r.Deleted["blob"] != 1 {
+		t.Fatalf("counted %v, want the one deleted", r.Deleted)
+	}
+	if _, ok := e.view("team").Get(good); ok {
+		t.Fatal("the key that didn't fail wasn't deleted")
+	}
+	if _, ok := e.view("team").Get(bad); !ok {
+		t.Fatal("the failed key is gone")
+	}
+	e.bucket.FailDeletes() // nothing new
+	e.bucket.failKeys = nil
+	if r := reportOf(e.run(e.collector(nil)), "team"); r.Deleted["blob"] != 1 {
+		t.Fatalf("a later run: %+v", r)
+	}
+}
+
+// liveBytes counts the index once, each bundle and resolution once, and
+// each blob once, however many bundles name it; and only what entries
+// reachable from the roots kept name.
+func TestLiveBytes(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2) // base 1000, exec 2000
+	// Another root sharing the base layer.
+	e.export("team", "a", []fakeengine.Entry{
+		{Number: 1, Recipe: "x-base", Layers: [][]byte{layer("xbase", 1000)}},
+		{Number: 3, Recipe: "x-other", Deps: []uint64{1}, Layers: [][]byte{layer("xbase", 1000), layer("other", 3000)}},
+	}, 3)
+	c := e.collector(nil)
+	idx := e.index("team")
+	l, err := c.list(context.Background(), "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.references(context.Background(), "team", idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta int64
+	for _, o := range l.bundles {
+		meta += o.Size
+	}
+	for _, o := range l.resolutions {
+		meta += o.Size
+	}
+	if got, want := liveBytes(idx, nil, r, l), l.indexBytes+meta+1000+2000+3000; got != want {
+		t.Fatalf("liveBytes %d, want %d (the shared base once)", got, want)
+	}
+	// Without the second root, nothing goes: the second export also carried
+	// the base, whose record moved to the second bundle, which the first
+	// root keeps through the base. GC keeps every blob a live bundle names
+	// (the mark is per bundle), and liveBytes counts what GC keeps.
+	var second uint64
+	for n := range idx.Roots {
+		if idx.Entries[n].Source.Number == 3 {
+			second = n
+		}
+	}
+	if got, want := liveBytes(idx, map[uint64]bool{second: true}, r, l), l.indexBytes+meta+1000+2000+3000; got != want {
+		t.Fatalf("without the second root: %d, want %d", got, want)
+	}
+}

@@ -3,6 +3,7 @@ package gc
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -30,6 +31,8 @@ type MemBucket struct {
 	rulesErr error
 	// uploadsErr, when set, is what ListUploads returns.
 	uploadsErr error
+	// failKeys are keys Delete reports failing, and leaves.
+	failKeys map[string]bool
 	// deletes counts Delete calls; beforeDelete runs before each.
 	deletes      int
 	beforeDelete func(keys []string)
@@ -128,49 +131,67 @@ func (b *MemBucket) List(_ context.Context, prefix string, fn func([]Object) err
 	return nil
 }
 
+// FailDeletes makes Delete report key failing, and leave it.
+func (b *MemBucket) FailDeletes(keys ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.failKeys == nil {
+		b.failKeys = map[string]bool{}
+	}
+	for _, k := range keys {
+		b.failKeys[k] = true
+	}
+}
+
 // Delete deletes keys from whichever store holds them.
-func (b *MemBucket) Delete(ctx context.Context, keys []string) error {
+func (b *MemBucket) Delete(ctx context.Context, keys []string) ([]string, error) {
 	if len(keys) > MaxDeleteBatch {
-		return fmt.Errorf("delete: %d keys, over %d", len(keys), MaxDeleteBatch)
+		return nil, fmt.Errorf("delete: %d keys, over %d", len(keys), MaxDeleteBatch)
 	}
 	b.mu.Lock()
 	b.deletes++
 	hook := b.beforeDelete
+	fail := maps.Clone(b.failKeys)
 	b.mu.Unlock()
 	if hook != nil {
 		hook(keys)
 	}
 	// As the S3 client: a call whose context ended fails.
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
+	var failed []string
 	for _, key := range keys {
+		if fail[key] {
+			failed = append(failed, key)
+			continue
+		}
 		rest, ok := strings.CutPrefix(key, b.top())
 		if !ok {
-			return fmt.Errorf("delete %s: not under the prefix", key)
+			return failed, fmt.Errorf("delete %s: not under the prefix", key)
 		}
 		ns, rel, _ := strings.Cut(rest, "/")
 		switch {
 		case strings.HasPrefix(rel, "blobs/"):
 			d, err := relDigest(strings.TrimPrefix(rel, "blobs/"))
 			if err != nil {
-				return err
+				return failed, err
 			}
 			b.Blobs.DeleteObject(ns, "", d)
 		case strings.HasPrefix(rel, "staging/"):
 			stage, dpath, _ := strings.Cut(strings.TrimPrefix(rel, "staging/"), "/")
 			d, err := relDigest(dpath)
 			if err != nil {
-				return err
+				return failed, err
 			}
 			b.Blobs.DeleteObject(ns, blobstore.Stage(stage), d)
 		default:
 			if err := b.Objects.Delete(ctx, key); err != nil {
-				return err
+				return failed, err
 			}
 		}
 	}
-	return nil
+	return failed, nil
 }
 
 // relDigest parses <alg>/<hex>.

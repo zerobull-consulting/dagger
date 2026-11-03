@@ -773,10 +773,14 @@ func hasStale(idx *metastore.Index, now time.Time) bool {
 // finishes. See the package doc.
 func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []string, l *listing, now time.Time, rep *Report, log *slog.Logger) {
 	run := newRunID()
-	nowUnix := now.Unix()
 	var claimed []string
 	_, err := c.cfg.Meta.UpdateIndex(ctx, ns, func(idx *metastore.Index) error {
 		claimed = claimed[:0]
+		// The claim's own time, not the run's start: a claim stamped with
+		// the start of a long run would look stale, to other replicas,
+		// while this run may still delete under it.
+		claimNow := c.cfg.Now()
+		nowUnix := claimNow.Unix()
 		// Against this index: what it names now, recorded since.
 		r, err := c.references(ctx, ns, idx)
 		if err != nil {
@@ -791,14 +795,7 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 		// Stale claims first, since exports naming them are refused until
 		// they are finished; then new candidates; MaxDeletes in all. The
 		// rest wait for later runs.
-		var staleKeys []string
-		for k, d := range idx.GC.Deletions {
-			if stale(d, now) {
-				staleKeys = append(staleKeys, k)
-			}
-		}
-		slices.Sort(staleKeys)
-		for _, k := range staleKeys {
+		for _, k := range staleKeys(idx, claimNow) {
 			if len(claimed) >= c.cfg.MaxDeletes {
 				break
 			}
@@ -861,11 +858,20 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 			// so a later run claims it again.
 			attempted[k] = true
 		}
-		if err := c.cfg.Bucket.Delete(dctx, keys); err != nil {
+		failed, err := c.cfg.Bucket.Delete(dctx, keys)
+		if err != nil {
 			rep.fail(fmt.Errorf("delete: %w", err))
 			break
 		}
+		if len(failed) > 0 {
+			// The others are deleted; the next batches still run.
+			rep.fail(fmt.Errorf("delete: %d of %d keys failed, such as %s", len(failed), len(keys), failed[0]))
+		}
+		gone := failedSet(failed)
 		for _, k := range batch {
+			if gone[prefix+k] {
+				continue
+			}
 			kind, size := l.kindSize(k)
 			rep.deleted(kind, 1, size)
 			c.cfg.Metrics.GCDeleted(ns, kind, 1, size)
@@ -912,6 +918,15 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 			rep.fail(err)
 		}
 	}
+}
+
+// failedSet is a set of keys a Delete reported failing.
+func failedSet(keys []string) map[string]bool {
+	m := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		m[k] = true
+	}
+	return m
 }
 
 // sameRecord reports whether two entries are the same, in every field that
@@ -1111,12 +1126,23 @@ func (c *Collector) sweepStaging(ctx context.Context, ns string, l *listing, rul
 			keys[j] = o.Key
 			bytes += o.Size
 		}
-		if err := c.cfg.Bucket.Delete(ctx, keys); err != nil {
+		failed, err := c.cfg.Bucket.Delete(ctx, keys)
+		if err != nil {
 			rep.fail(fmt.Errorf("delete staged uploads: %w", err))
 			return
 		}
-		rep.deleted(metrics.KindStaging, len(batch), bytes)
-		c.cfg.Metrics.GCDeleted(ns, metrics.KindStaging, len(batch), bytes)
+		if len(failed) > 0 {
+			rep.fail(fmt.Errorf("delete staged uploads: %d of %d keys failed, such as %s", len(failed), len(keys), failed[0]))
+			miss := failedSet(failed)
+			for _, o := range batch {
+				if miss[o.Key] {
+					bytes -= o.Size
+				}
+			}
+		}
+		n := len(batch) - len(failed)
+		rep.deleted(metrics.KindStaging, n, bytes)
+		c.cfg.Metrics.GCDeleted(ns, metrics.KindStaging, n, bytes)
 	}
 }
 

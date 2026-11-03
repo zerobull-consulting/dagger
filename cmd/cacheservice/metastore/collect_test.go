@@ -456,3 +456,42 @@ func TestRootAddedOnlyWithItsRecord(t *testing.T) {
 		t.Fatalf("a newer record: root %+v, %v", r, ok)
 	}
 }
+
+// A root from before version 3 (no recording time) gets one only from an
+// export that writes its record, or from GC (StampRoots): an import
+// exported back unchanged doesn't stamp it either.
+func TestUnstampedRootStampedOnlyWithItsRecord(t *testing.T) {
+	ctx := context.Background()
+	s, clock := newClockedStore(t, NewMemObjects())
+	x, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nx := x.Numbers[1]
+	if _, err := s.UpdateIndex(ctx, "s1", func(idx *Index) error {
+		r := idx.Roots[nx]
+		r.RecordedAtUnix = 0 // as in a version 2 index
+		idx.Roots[nx] = r
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.add(time.Hour)
+	if _, err := s.RecordImports(ctx, "s1", "b", 1, []Import{{Number: nx, Engine: 70}}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.Record(ctx, "s1", testBundle([]val{{sender: 70}}, root(1, 0)), "b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Index.Roots[nx].RecordedAtUnix; got != 0 {
+		t.Fatalf("an unchanged import exported back stamped the root: %d", got)
+	}
+	rec, err = s.Record(ctx, "s1", testBundle([]val{{sender: 10, replacements: 1}}, root(1, 0)), "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Index.Roots[nx].RecordedAtUnix; got != clock.now().Unix() {
+		t.Fatalf("a newer record: %d", got)
+	}
+}

@@ -75,7 +75,8 @@ func newMinIOEnv(t *testing.T) *minioEnv {
 			for i, o := range objs {
 				keys[i] = o.Key
 			}
-			return e.gcb.Delete(ctx, keys)
+			_, err := e.gcb.Delete(ctx, keys)
+			return err
 		})
 		ups, _ := e.gcb.ListUploads(ctx, e.prefix+"/")
 		for _, u := range ups {
@@ -251,7 +252,7 @@ func (b *countingBucket) List(ctx context.Context, p string, fn func([]Object) e
 	})
 }
 
-func (b *countingBucket) Delete(ctx context.Context, keys []string) error {
+func (b *countingBucket) Delete(ctx context.Context, keys []string) ([]string, error) {
 	b.deletes.Add(1)
 	return b.Bucket.Delete(ctx, keys)
 }

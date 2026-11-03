@@ -1138,7 +1138,9 @@ it; an entry a younger root depends on stays, whenever it was recorded
 An export refreshes a root's time **only when it writes the root's record**
 (`Index.RecordResolvedAt`, `TestRecordStampsRoots`):
 
-- a new root, or a root with no time yet: stamped;
+- a new root, with its record: stamped. A root from before version 3, with
+  no time yet, is stamped only with its record, or by GC's first run
+  (`TestUnstampedRootStampedOnlyWithItsRecord`);
 - a later state of the value from its own engine (a later generation, or
   the same with as many replacements or more), or an imported value's
   record that adds parts (see [Imported entries](#imported-entries)):
@@ -1216,7 +1218,12 @@ serialized with exports on the index:
    (`metastore.ErrCollected`).
 2. **Delete**, with `DeleteObjects`, 1,000 keys per request, within 10
    minutes of the claim: a run doesn't start a delete after that, and
-   cancels one still in flight (`TestDeletesCanceledAtDeadline`).
+   cancels one still in flight (`TestDeletesCanceledAtDeadline`). A claim
+   is stamped with its own time, not the run's start, so a run that took
+   minutes to list doesn't make its claims look stale to other replicas
+   (`TestClaimStampedAtClaimTime`). `DeleteObjects` answers per key: keys
+   it reports failing are counted apart and reported, and the next batches
+   still run (`TestPartialDeleteFailure`).
 3. **Finish.** In a second update, GC marks them deleted in a new epoch,
    then publishes the epoch in `<prefix>/<ns>/gc-epoch.json`. Each export
    try reads that object before it checks any blob (one small GET, kept for 10s), and its

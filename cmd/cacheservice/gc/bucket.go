@@ -17,9 +17,11 @@ type Bucket interface {
 	// List calls fn with each page of the objects under prefix, in key
 	// order. An error from fn ends the listing with that error.
 	List(ctx context.Context, prefix string, fn func([]Object) error) error
-	// Delete deletes up to MaxDeleteBatch objects. A missing object is
-	// not an error.
-	Delete(ctx context.Context, keys []string) error
+	// Delete deletes up to MaxDeleteBatch objects, and returns the keys it
+	// failed to delete. A missing object is not a failure. An error is a
+	// request that failed as a whole: any of its keys may be deleted or
+	// not.
+	Delete(ctx context.Context, keys []string) (failed []string, err error)
 	// ListUploads returns the incomplete multipart uploads under prefix.
 	ListUploads(ctx context.Context, prefix string) ([]Upload, error)
 	// AbortUpload aborts one. An upload already gone is not an error.

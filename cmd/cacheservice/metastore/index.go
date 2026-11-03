@@ -450,17 +450,15 @@ func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cac
 
 // RecordResolvedAt is RecordResolved at nowUnix: it also stamps the
 // bundle's roots with nowUnix as their recording time (Root.RecordedAtUnix),
-// which a namespace's max age counts from, when that is what happened at
-// nowUnix:
+// which a namespace's max age counts from, when this export wrote the
+// root's record: a root new to the index with its record, a later state of
+// the value from its own engine, or an imported value's record with more
+// parts (see Record).
 //
-//   - a root new to the index;
-//   - a root whose record this export wrote: a later state of the value
-//     from its own engine, or an imported value's record with more parts
-//     (see Record);
-//   - a root with no recording time yet (one recorded before version 3).
-//
-// A root whose record this export did not write keeps its time: a late
-// export from an older generation, or an import exported back unchanged.
+// A root whose record this export did not write keeps its time, or none
+// (a root from before version 3, which GC stamps), and is not added when
+// new: a late export from an older generation, or an import exported back
+// unchanged.
 // So merging stored entries into engines never keeps them alive by itself:
 // only a new record does. nowUnix 0 stamps nothing.
 func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64, nowUnix int64) (map[dagql.TransferOrdinal]uint64, *Resolution, error) {
@@ -578,7 +576,10 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 		if !existed || !laterExpiry(root.ExpiresAtUnix, r.ExpiresAtUnix) {
 			root.ExpiresAtUnix = r.ExpiresAtUnix
 		}
-		if nowUnix > 0 && (!existed || written[r.Ordinal] || root.RecordedAtUnix == 0) {
+		// Only with its record: a root this export added, or whose record
+		// it wrote. A root from before version 3 (no time) that this
+		// export didn't write keeps none; GC stamps it.
+		if nowUnix > 0 && written[r.Ordinal] {
 			root.RecordedAtUnix = max(root.RecordedAtUnix, nowUnix)
 		}
 		idx.Roots[n] = root

@@ -70,13 +70,14 @@ func (b *S3Bucket) List(ctx context.Context, prefix string, fn func([]Object) er
 	return nil
 }
 
-// Delete deletes keys with one DeleteObjects, and fails if any key failed.
-func (b *S3Bucket) Delete(ctx context.Context, keys []string) error {
+// Delete deletes keys with one DeleteObjects, which answers per key: it
+// returns the keys S3 reported failing.
+func (b *S3Bucket) Delete(ctx context.Context, keys []string) ([]string, error) {
 	if len(keys) == 0 {
-		return nil
+		return nil, nil
 	}
 	if len(keys) > MaxDeleteBatch {
-		return fmt.Errorf("delete: %d keys, over %d", len(keys), MaxDeleteBatch)
+		return nil, fmt.Errorf("delete: %d keys, over %d", len(keys), MaxDeleteBatch)
 	}
 	ids := make([]types.ObjectIdentifier, len(keys))
 	for i := range keys {
@@ -87,13 +88,13 @@ func (b *S3Bucket) Delete(ctx context.Context, keys []string) error {
 		Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
 	})
 	if err != nil {
-		return fmt.Errorf("delete %d objects: %w", len(keys), err)
+		return nil, fmt.Errorf("delete %d objects: %w", len(keys), err)
 	}
-	if len(out.Errors) > 0 {
-		e := out.Errors[0]
-		return fmt.Errorf("delete %d objects: %d failed, such as %s: %s", len(keys), len(out.Errors), aws.ToString(e.Key), aws.ToString(e.Message))
+	failed := make([]string, 0, len(out.Errors))
+	for _, e := range out.Errors {
+		failed = append(failed, aws.ToString(e.Key))
 	}
-	return nil
+	return failed, nil
 }
 
 // ListUploads lists incomplete multipart uploads: one
