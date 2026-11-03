@@ -1,15 +1,13 @@
 package gc
 
 // GC against a real S3-compatible store: the MinIO dev environment in
-// hack/remote-cache. These skip unless CACHESERVICE_S3_ENDPOINT is set;
+// hack/remote-cache, or any bucket (s3test keeps them to their own keys).
+// These skip unless CACHESERVICE_S3_ENDPOINT is set;
 // `hack/remote-cache/dev.sh test` starts MinIO and runs them.
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
 	"os"
 	"slices"
 	"strconv"
@@ -26,6 +24,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -56,9 +55,9 @@ func newMinIOEnv(t *testing.T) *minioEnv {
 	if cfg.Bucket == "" {
 		cfg.Bucket = "dagger-cache"
 	}
-	suffix := make([]byte, 6)
-	_, _ = rand.Read(suffix)
-	cfg.Prefix = fmt.Sprintf("test/%s-%s", t.Name(), hex.EncodeToString(suffix))
+	scope := s3test.NewScope(t, cfg.Bucket)
+	cfg.Prefix = scope.Prefix
+	cfg.HTTPClient = scope.Guard
 	ctx := context.Background()
 	client, err := blobstore.NewS3Client(ctx, cfg)
 	if err != nil {
@@ -68,22 +67,8 @@ func newMinIOEnv(t *testing.T) *minioEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &minioEnv{t: t, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, meta: meta, gcb: &S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: true}}
-	t.Cleanup(func() {
-		_ = e.gcb.List(ctx, e.prefix+"/", func(objs []Object) error {
-			keys := make([]string, len(objs))
-			for i, o := range objs {
-				keys[i] = o.Key
-			}
-			_, err := e.gcb.Delete(ctx, keys)
-			return err
-		})
-		ups, _ := e.gcb.ListUploads(ctx, e.prefix+"/")
-		for _, u := range ups {
-			_ = e.gcb.AbortUpload(ctx, u)
-		}
-	})
-	return e
+	scope.DeleteOnCleanup(t, client)
+	return &minioEnv{t: t, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, meta: meta, gcb: &S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: true}}
 }
 
 func (e *minioEnv) put(key string, body []byte) {
@@ -152,25 +137,47 @@ func TestMinIOGC(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A lifecycle rule for team-b's staging. It replaces the bucket's
-	// configuration, so it is removed again; the dev bucket has none.
-	rule := e.prefix + "/team-b/staging/"
-	if _, err := e.client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
-		Bucket: &e.bucket,
-		LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: []types.LifecycleRule{{
+	// A lifecycle rule for team-b's staging, on a disposable bucket only: it
+	// replaces the whole bucket's configuration, so it is removed again; the
+	// dev bucket has none.
+	wantRuleB := "missing"
+	if s3test.Disposable() {
+		wantRuleB = "present"
+		rule := e.prefix + "/team-b/staging/"
+		rules := []types.LifecycleRule{{
 			ID: aws.String("gc-test"), Status: types.ExpirationStatusEnabled,
 			Filter:     &types.LifecycleRuleFilter{Prefix: aws.String(rule)},
 			Expiration: &types.LifecycleExpiration{Days: aws.Int32(1)},
-		}}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_, _ = e.client.DeleteBucketLifecycle(context.Background(), &s3.DeleteBucketLifecycleInput{Bucket: &e.bucket})
-	}()
-	prefixes, err := e.gcb.ExpirationPrefixes(ctx)
-	if err != nil || !slices.Contains(prefixes, rule) {
-		t.Fatalf("lifecycle prefixes %v, %v", prefixes, err)
+		}}
+		abortRule := types.LifecycleRule{
+			ID: aws.String("gc-test-uploads"), Status: types.ExpirationStatusEnabled,
+			Filter:                         &types.LifecycleRuleFilter{Prefix: aws.String(e.prefix + "/")},
+			AbortIncompleteMultipartUpload: &types.AbortIncompleteMultipartUpload{DaysAfterInitiation: aws.Int32(1)},
+		}
+		if s3test.StoreBehavior(t).LifecycleAbortRule {
+			rules = append(rules, abortRule)
+		} else if _, err := e.client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+			Bucket:                 &e.bucket,
+			LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: []types.LifecycleRule{abortRule}},
+		}); err == nil {
+			_, _ = e.client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: &e.bucket})
+			t.Fatal("the store accepted a rule with AbortIncompleteMultipartUpload; it changed (update its behavior and the README)")
+		}
+		if _, err := e.client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+			Bucket:                 &e.bucket,
+			LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: rules},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_, _ = e.client.DeleteBucketLifecycle(context.Background(), &s3.DeleteBucketLifecycleInput{Bucket: &e.bucket})
+		}()
+		prefixes, err := e.gcb.ExpirationPrefixes(ctx)
+		if err != nil || !slices.Contains(prefixes, rule) {
+			t.Fatalf("lifecycle prefixes %v, %v", prefixes, err)
+		}
+	} else {
+		t.Logf("not setting a lifecycle rule: %s is not 1, and it would replace the bucket's configuration", s3test.EnvDisposableBucket)
 	}
 
 	clock := NewNow(time.Now().Add(3 * time.Hour))
@@ -192,7 +199,7 @@ func TestMinIOGC(t *testing.T) {
 	if a.Deleted["blob"] != 1 || a.Deleted["staging"] != 1 || a.Deleted["upload"] != 1 || a.StagingRule != "missing" {
 		t.Fatalf("team-a: %+v", a)
 	}
-	if b := reportOf(reps, "team-b"); b.StagingRule != "present" || len(b.Deleted) != 0 {
+	if b := reportOf(reps, "team-b"); b.StagingRule != wantRuleB || len(b.Deleted) != 0 {
 		t.Fatalf("team-b: %+v", b)
 	}
 	keys := e.keys("team-a")

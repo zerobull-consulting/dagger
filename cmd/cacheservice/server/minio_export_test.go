@@ -44,6 +44,7 @@ func newMinIOStores(t *testing.T) (blobstore.Store, *metastore.Store, *minioTest
 	}
 	cfg.Bucket = env.bucket
 	cfg.Prefix = env.prefix
+	cfg.HTTPClient = env.guard
 	if os.Getenv(blobstore.EnvPathStyle) == "" {
 		cfg.PathStyle = true
 	}
@@ -158,6 +159,7 @@ func TestMinIOEnableS3(t *testing.T) {
 	}
 	cfg.Bucket = env.bucket
 	cfg.Prefix = env.prefix
+	cfg.HTTPClient = env.guard
 	if os.Getenv(blobstore.EnvPathStyle) == "" {
 		cfg.PathStyle = true
 	}
@@ -177,7 +179,9 @@ func TestMinIOEnableS3(t *testing.T) {
 		}
 	}
 
+	// Past the guard, which keeps requests to the test's bucket.
 	bad := cfg
+	bad.HTTPClient = nil
 	bad.Bucket = "no-such-bucket-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
 	if err := New(slog.New(slog.DiscardHandler), "").EnableS3(ctx, bad, S3Options{Scope: testScope}); err == nil {
 		t.Fatal("EnableS3 accepted a missing bucket")
