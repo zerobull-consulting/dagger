@@ -58,4 +58,13 @@ The resilience scenarios (#12) are in `resilience_test.go`; they run last,
 since `service-restart` replaces the main service. `namespaces` (#10), in
 `namespaces_test.go`, runs its own service with a tokens file, and its own
 engines. `verify` (#23), in `verify_test.go`, runs after `namespaces` and
-before the resilience scenarios.
+before the resilience scenarios. `gc` (#11), in `gc_test.go`, runs after
+`verify`, on its own service, namespace (`gc`) and engines, so it deletes
+nothing the other scenarios use.
+
+Every service has garbage collection on, run only when a scenario asks
+(`Service.CollectGarbage`): `ServiceOptions.NamespacesFile` gives
+namespaces their limits (`Service.ReloadLimits` reads it again, as
+`SIGHUP` does), and `ServiceOptions.GCGrace` shortens the grace period.
+`Env.CheckConsistentIn` checks another namespace than the run's scope,
+and `Env.IndexOf` and `Env.BundleIDsIn` read one.

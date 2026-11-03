@@ -98,8 +98,34 @@ func (b *S3Bucket) Delete(ctx context.Context, keys []string) error {
 
 // ListUploads lists incomplete multipart uploads: one
 // ListMultipartUploads per 1,000.
+//
+// MinIO lists uploads only for an exact object name: a listing by prefix
+// returns none (seen on the dev MinIO, TestMinIOGC). So when the listing by
+// prefix finds none, it lists the bucket's uploads and keeps those under
+// prefix: a second request, per namespace and run, on a store that has
+// none.
 func (b *S3Bucket) ListUploads(ctx context.Context, prefix string) ([]Upload, error) {
-	in := &s3.ListMultipartUploadsInput{Bucket: &b.Bucket, Prefix: aws.String(prefix)}
+	out, err := b.listUploads(ctx, prefix)
+	if err != nil || len(out) > 0 || prefix == "" {
+		return out, err
+	}
+	all, err := b.listUploads(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range all {
+		if strings.HasPrefix(u.Key, prefix) {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+func (b *S3Bucket) listUploads(ctx context.Context, prefix string) ([]Upload, error) {
+	in := &s3.ListMultipartUploadsInput{Bucket: &b.Bucket}
+	if prefix != "" {
+		in.Prefix = aws.String(prefix)
+	}
 	var out []Upload
 	for {
 		page, err := b.Client.ListMultipartUploads(ctx, in)
@@ -173,7 +199,7 @@ func rulePrefix(r types.LifecycleRule) (string, bool) {
 		}
 		return aws.ToString(a.Prefix), true
 	}
-	return strings.Clone(aws.ToString(f.Prefix)), true
+	return aws.ToString(f.Prefix), true
 }
 
 func status(err error) int {

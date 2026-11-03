@@ -370,6 +370,11 @@ func TestMaxSizeExpiresOldestFirst(t *testing.T) {
 
 // GC of one namespace never deletes another's data, even the same layer
 // stored under both.
+//
+// It also pins, on purpose, that the run that expires entries doesn't
+// delete their objects, however old: an import sync that read the index
+// just before may still be merging them, with GETs of their blobs. The next
+// run, an interval later, deletes them.
 func TestNamespacesApart(t *testing.T) {
 	e := newEnv(t)
 	e.export("team-a", "a", buildX("x"), 2)
@@ -379,6 +384,10 @@ func TestNamespacesApart(t *testing.T) {
 	c := e.collector(nil)
 	e.clock.Add(10 * time.Hour)
 	reps := e.run(c)
+	if r := reportOf(reps, "team-a"); r.Expired != 2 || len(r.Deleted) != 0 {
+		t.Fatalf("the expiring run: %+v", r)
+	}
+	reps = e.run(c)
 	if d := reportOf(reps, "team-a").Deleted; d["blob"] != 2 {
 		t.Fatalf("team-a deleted %v", d)
 	}
@@ -413,12 +422,23 @@ func TestDryRunDeletesNothing(t *testing.T) {
 	if !slices.Equal(keys, e.keys("team")) || idx != body() || len(e.bucket.Uploads()) != 1 || e.bucket.Deletes() != 0 {
 		t.Fatal("a dry run changed the store")
 	}
-	if rep.Expired != 2 || len(rep.WouldDelete) != 6 || len(rep.Deleted) != 0 {
+	// The run that expires entries doesn't delete their objects; the next
+	// does (TestNamespacesApart).
+	if rep.Expired != 2 || len(rep.WouldDelete) != 2 || len(rep.Deleted) != 0 {
 		t.Fatalf("dry run report: expired %d, would delete %v", rep.Expired, rep.WouldDelete)
 	}
-	// The real run then does what the dry run said.
+	// The real runs then do what dry runs say.
 	rep = reportOf(e.run(e.collector(nil)), "team")
-	if n := rep.Deleted["blob"] + rep.Deleted["bundle"] + rep.Deleted["resolution"] + rep.Deleted["staging"] + rep.Deleted["upload"]; n != 6 {
+	if rep.Expired != 2 || rep.Deleted["staging"] != 1 || rep.Deleted["upload"] != 1 || len(rep.Deleted) != 2 {
+		t.Fatalf("deleted %v", rep.Deleted)
+	}
+	keys = e.keys("team")
+	rep = reportOf(e.run(c), "team")
+	if len(rep.WouldDelete) != 4 || !slices.Equal(keys, e.keys("team")) {
+		t.Fatalf("second dry run: %v", rep.WouldDelete)
+	}
+	rep = reportOf(e.run(e.collector(nil)), "team")
+	if n := rep.Deleted["blob"] + rep.Deleted["bundle"] + rep.Deleted["resolution"]; n != 4 {
 		t.Fatalf("deleted %v", rep.Deleted)
 	}
 }
@@ -538,7 +558,8 @@ func TestExportRacesSweep(t *testing.T) {
 	e.setLimits("team", Limits{MaxAge: time.Minute})
 	e.export("team", "a", buildX("x"), 2)
 	e.clock.Add(3 * time.Hour)
-	e.run(e.collector(nil)) // expires; the objects are 3h old: claimed and deleted
+	e.run(e.collector(nil)) // expires them
+	e.run(e.collector(nil)) // deletes their objects, 3h old
 	e.setLimits("team", Limits{})
 	// Again: stored by an export, then dropped from the index.
 	e.export("team", "a", buildX("x"), 2)
@@ -768,7 +789,6 @@ func TestNamespacesFromBucket(t *testing.T) {
 		t.Fatalf("namespaces %v", got)
 	}
 }
-
 
 // afterList runs a hook once, after the first listing of a namespace's
 // objects: between what GC saw and its claim.

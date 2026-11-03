@@ -376,7 +376,12 @@ func TestGCNamespaceWithoutTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	reps := collect(t, h.svc)
-	if r := reportIn(reps, "team-a"); r.Expired != 2 || r.Deleted["blob"] != 2 {
+	if r := reportIn(reps, "team-a"); r.Expired != 2 {
+		t.Fatalf("team-a: %+v", r)
+	}
+	// The run that expires entries leaves their objects to the next.
+	reps = collect(t, h.svc)
+	if r := reportIn(reps, "team-a"); r.Deleted["blob"] != 2 || r.Deleted["bundle"] != 1 {
 		t.Fatalf("team-a: %+v", r)
 	}
 	if r := reportIn(reps, "team-b"); r.Expired != 0 || len(r.Deleted) != 0 {

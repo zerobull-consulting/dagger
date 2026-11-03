@@ -90,6 +90,8 @@ func TestRealEngines(t *testing.T) {
 	env.Run("namespaces", st.namespaces)
 	// Upload verification (#23): A's uploads corrupted on their way to S3.
 	env.Run("verify", st.verify)
+	// Retention and GC (#11): its own service, namespace and engines.
+	env.Run("gc", st.gc)
 	// The resilience scenarios (#12), last: they break things on purpose,
 	// and service-restart replaces the main service.
 	env.Run("disconnect", st.disconnect)

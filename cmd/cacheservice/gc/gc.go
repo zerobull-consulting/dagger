@@ -467,7 +467,7 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 	now := c.cfg.Now()
 
 	// 1. Expire by expiry and max age; stamp roots with no recording time.
-	idx, err := c.expire(ctx, ns, lim, now, &rep)
+	prev, idx, err := c.expire(ctx, ns, lim, now, &rep)
 	if err != nil {
 		rep.fail(fmt.Errorf("expire: %w", err))
 		rep.Skipped = "the index couldn't be read or updated"
@@ -489,7 +489,7 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 	if !l.hasIndex {
 		rep.Skipped = "no index"
 	} else {
-		c.sweep(ctx, ns, idx, l, lim, now, &rep, log)
+		c.sweep(ctx, ns, prev, idx, l, lim, now, &rep, log)
 	}
 
 	// 4. Staged uploads, unless a lifecycle rule expires them.
@@ -503,11 +503,11 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 // update, and only when there is something to change: GC writes no index
 // that didn't need it, and never creates one. It also drops finished
 // deletions older than metastore.DeletionRetention. A dry run changes a
-// copy.
-func (c *Collector) expire(ctx context.Context, ns string, lim Limits, now time.Time, rep *Report) (*metastore.Index, error) {
+// copy. It returns the index it read, and the index after.
+func (c *Collector) expire(ctx context.Context, ns string, lim Limits, now time.Time, rep *Report) (*metastore.Index, *metastore.Index, error) {
 	snap, err := c.cfg.Meta.Index(ctx, ns)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	nowUnix := now.Unix()
 	apply := func(idx *metastore.Index) (stamped, dropped, pruned int) {
@@ -519,11 +519,11 @@ func (c *Collector) expire(ctx context.Context, ns string, lim Limits, now time.
 	trial := snap.Clone()
 	s, d, p := apply(trial)
 	if s+d+p == 0 {
-		return snap, nil
+		return snap, snap, nil
 	}
 	if c.cfg.DryRun {
 		rep.Stamped, rep.Expired = s, d
-		return trial, nil
+		return snap, trial, nil
 	}
 	idx, err := c.cfg.Meta.UpdateIndex(ctx, ns, func(idx *metastore.Index) error {
 		rep.Stamped, rep.Expired, _ = apply(idx)
@@ -531,10 +531,10 @@ func (c *Collector) expire(ctx context.Context, ns string, lim Limits, now time.
 	})
 	if err != nil {
 		rep.Stamped, rep.Expired = 0, 0
-		return nil, err
+		return nil, nil, err
 	}
 	c.cfg.Metrics.GCExpired(ns, metrics.ExpiredByExpiry, rep.Expired)
-	return idx, nil
+	return snap, idx, nil
 }
 
 // pruneDeletions drops finished deletions older than DeletionRetention.
@@ -555,7 +555,12 @@ func pruneDeletions(idx *metastore.Index, now time.Time) int {
 
 // sweep enforces the max size, then claims, deletes and finishes the
 // bundles, resolutions and blobs no entry names.
-func (c *Collector) sweep(ctx context.Context, ns string, idx *metastore.Index, l *listing, lim Limits, now time.Time, rep *Report, log *slog.Logger) {
+//
+// What the index named when this run started (prev) isn't deleted by this
+// run, even when this run's expiry left nothing naming it: an import sync
+// that read the index just before may still be merging it, with GETs of
+// its blobs. It is deleted by the next run, an interval later.
+func (c *Collector) sweep(ctx context.Context, ns string, prev, idx *metastore.Index, l *listing, lim Limits, now time.Time, rep *Report, log *slog.Logger) {
 	r, err := c.references(ctx, ns, idx)
 	if err != nil {
 		rep.fail(err)
@@ -578,7 +583,15 @@ func (c *Collector) sweep(ctx context.Context, ns string, idx *metastore.Index, 
 		rep.LiveBytes = liveBytes(idx, nil, r, l)
 	}
 
-	cands := c.candidates(idx, r, l, now)
+	keep := r
+	if prev != idx || rep.SizeRoots > 0 {
+		if keep, err = c.references(ctx, ns, prev); err != nil {
+			rep.fail(err)
+			rep.Skipped = "a bundle the index names couldn't be read"
+			return
+		}
+	}
+	cands := c.candidates(idx, keep, l, now)
 	if c.cfg.DryRun {
 		for _, k := range cands {
 			log.Info("gc dry run: would delete", "key", k)
@@ -592,8 +605,8 @@ func (c *Collector) sweep(ctx context.Context, ns string, idx *metastore.Index, 
 	c.claimAndDelete(ctx, ns, cands, l, now, rep, log)
 }
 
-// candidates are the unreferenced objects older than Grace, oldest first,
-// that no run has claimed, at most MaxDeletes.
+// candidates are the objects r doesn't name, older than Grace, oldest
+// first, that no run has claimed, at most MaxDeletes.
 func (c *Collector) candidates(idx *metastore.Index, r *refs, l *listing, now time.Time) []string {
 	cutoff := now.Add(-c.cfg.Grace)
 	type cand struct {
