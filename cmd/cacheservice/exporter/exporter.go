@@ -9,14 +9,20 @@
 //     under the reply's exportID until upload.
 //  2. The service works out which layer blobs the bundle's outputs need,
 //     drops those the blob store already has, and sends upload with a
-//     presigned PUT for each of the rest. An empty map needs nothing, and
+//     presigned PUT for each of the rest, to staging keys under a new
+//     blobstore.Stage of this try's own. An empty map needs nothing, and
 //     releases the chains.
 //  3. The engine PUTs each blob and answers uploaded: which blobs are done,
 //     and which failed.
-//  4. Only once every blob is stored does the service publish the bundle and
-//     record its values in the scope's index. If a blob failed, the export
-//     is tried again from step 1, since the engine released the chains with
-//     its answer. Blobs stored by the earlier try are not asked for again.
+//  4. The service verifies each blob the engine reported done, and promotes
+//     it to its digest key only if its content hashes to the digest
+//     (blobstore.Promote). A blob that doesn't is never stored, and counts
+//     as failed.
+//  5. Only once every blob is stored (verified) does the service publish the
+//     bundle and record its values in the scope's index. If a blob failed,
+//     the export is tried again from step 1, since the engine released the
+//     chains with its answer. Blobs stored by the earlier try are not asked
+//     for again; a blob that failed verification is.
 //
 // The engine works on at most remotecache.ExportsInFlight exports at once,
 // and queues the rest, so the service sends no more than that to one engine.
@@ -50,6 +56,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
@@ -89,6 +96,9 @@ type Config struct {
 	Scope string
 	// Logger receives progress and failures. Nil discards.
 	Logger *slog.Logger
+	// Metrics records each blob's promotion, under Scope. Nil records
+	// nothing.
+	Metrics *metrics.Metrics
 	// UploadAttempts, RetryBackoff, ExportTimeout and UploadTimeout default
 	// to the Default* values when zero.
 	UploadAttempts int
@@ -203,10 +213,15 @@ type Result struct {
 	Failed []FailedRoot `json:"failed,omitempty"`
 	// Bundles are the IDs of the published bundles.
 	Bundles []string `json:"bundles,omitempty"`
-	// Uploaded are the blobs the engine uploaded, and Present those it was
-	// not asked for because the store had them.
+	// Uploaded are the blobs the engine uploaded and the service verified
+	// and stored, and Present those it was not asked for because the store
+	// had them.
 	Uploaded []digest.Digest `json:"uploaded,omitempty"`
 	Present  []digest.Digest `json:"present,omitempty"`
+	// Rejected are the blobs the engine reported uploaded that were not
+	// stored: their content didn't match the digest, or nothing was
+	// uploaded. Each try that rejected one is counted.
+	Rejected []digest.Digest `json:"rejected,omitempty"`
 }
 
 // FailedRoot is a root that could not be stored, and why.
@@ -225,6 +240,7 @@ func (r *Result) Merge(o Result) {
 	r.Bundles = append(r.Bundles, o.Bundles...)
 	r.Uploaded = append(r.Uploaded, o.Uploaded...)
 	r.Present = append(r.Present, o.Present...)
+	r.Rejected = append(r.Rejected, o.Rejected...)
 }
 
 func (r *Result) fail(roots []uint64, err error) {
@@ -394,9 +410,12 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	if err != nil {
 		err = fmt.Errorf("invalid bundle: %w", err)
 	}
+	// Each try uploads under a stage of its own: a blob it stages is never
+	// at the same key as another try's or another export's.
+	stage := blobstore.NewStage()
 	var urls map[digest.Digest]string
 	if err == nil {
-		urls, err = blobstore.UploadURLs(ctx, x.cfg.Blobs, blobs)
+		urls, err = blobstore.UploadURLs(ctx, x.cfg.Blobs, stage, blobs)
 		if err != nil {
 			err = fmt.Errorf("blob store: %w", err)
 		}
@@ -430,21 +449,18 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	if err != nil {
 		return res, nil, err
 	}
-	done := make(map[digest.Digest]bool, len(uploaded.Done))
-	for _, d := range uploaded.Done {
-		if _, asked := urls[d]; asked {
-			done[d] = true
-			res.Uploaded = append(res.Uploaded, d)
-		}
+	for _, f := range uploaded.Failed {
+		x.log.Warn("export: blob upload failed", "digest", f.Digest, "error", f.Message)
+	}
+	done, err := x.promote(ctx, eng, stage, blobs, urls, uploaded.Done, &res)
+	if err != nil {
+		return res, nil, err
 	}
 	var missing int
 	for d := range urls {
 		if !done[d] {
 			missing++
 		}
-	}
-	for _, f := range uploaded.Failed {
-		x.log.Warn("export: blob upload failed", "digest", f.Digest, "error", f.Message)
 	}
 	if missing > 0 {
 		return res, survivors, nil
@@ -464,6 +480,49 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, nil
+}
+
+// promote verifies and promotes the blobs the engine reported done, of those
+// it was asked for, and returns those now stored. A blob whose content
+// doesn't match its digest, or that wasn't uploaded at all, isn't stored and
+// is in res.Rejected; one the store failed to promote isn't either, and is
+// asked for again on the next try like a failed upload. It fails only when
+// ctx ends: the staged blobs not yet promoted are then left to the bucket's
+// lifecycle rule, and the next export asks for them again.
+func (x *Exporter) promote(ctx context.Context, eng Engine, stage blobstore.Stage, blobs []blobstore.Blob, urls map[digest.Digest]string, reported []digest.Digest, res *Result) (map[digest.Digest]bool, error) {
+	sizes := make(map[digest.Digest]int64, len(blobs))
+	for _, b := range blobs {
+		sizes[b.Digest] = b.Size
+	}
+	var todo []blobstore.Blob
+	seen := make(map[digest.Digest]bool, len(reported))
+	for _, d := range reported {
+		if _, asked := urls[d]; asked && !seen[d] {
+			seen[d] = true
+			todo = append(todo, blobstore.Blob{Digest: d, Size: sizes[d]})
+		}
+	}
+	done := make(map[digest.Digest]bool, len(todo))
+	for _, r := range blobstore.PromoteAll(ctx, x.cfg.Blobs, stage, todo) {
+		if r.Err != nil {
+			if ctx.Err() != nil {
+				return done, context.Cause(ctx)
+			}
+			x.cfg.Metrics.BlobPromotion(x.cfg.Scope, metrics.PromotionError, "", 0, r.Duration)
+			x.log.Warn("export: blob promotion failed; asking for it again", "digest", r.Digest, "error", r.Err)
+			continue
+		}
+		x.cfg.Metrics.BlobPromotion(x.cfg.Scope, string(r.Outcome), r.HashedBy, r.Bytes, r.Duration)
+		if r.Stored() {
+			done[r.Digest] = true
+			res.Uploaded = append(res.Uploaded, r.Digest)
+			continue
+		}
+		res.Rejected = append(res.Rejected, r.Digest)
+		x.log.Warn("export: uploaded blob not stored; asking for it again", "cacheID", eng.CacheID(),
+			"digest", r.Digest, "size", r.Size, "outcome", string(r.Outcome), "hashedBy", r.HashedBy)
+	}
+	return done, nil
 }
 
 // survivingRoots are the roots not skipped.

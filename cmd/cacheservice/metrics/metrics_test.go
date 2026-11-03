@@ -29,6 +29,7 @@ func TestNilRecordsNothing(t *testing.T) {
 	m.ImportBundleCache(true)
 	m.ImportSync("team", false, time.Millisecond)
 	m.ExportBatch(metrics.ExportBatch{Outcome: metrics.OutcomeOK})
+	m.BlobPromotion("s", "promoted", "store", 1, time.Millisecond)
 	if m.Collectors() != nil {
 		t.Fatal("nil metrics has collectors")
 	}
@@ -159,7 +160,7 @@ func TestExportBatch(t *testing.T) {
 	m, reg := newTest(t)
 	m.ExportBatch(metrics.ExportBatch{
 		Scope: "team", Outcome: metrics.OutcomeOK, Duration: time.Second, Roots: 5,
-		Stored: 3, Gone: 1, Refused: 1, Uploaded: 2, Present: 4, Bundles: 1,
+		Stored: 3, Gone: 1, Refused: 1, Uploaded: 2, Present: 4, Rejected: 1, Bundles: 1,
 	})
 	m.ExportBatch(metrics.ExportBatch{Scope: "team", Outcome: metrics.ExportInterrupted, Roots: 2})
 	for _, c := range []struct {
@@ -174,6 +175,7 @@ func TestExportBatch(t *testing.T) {
 		{"cacheservice_export_roots_total", map[string]string{"result": "refused"}, 1},
 		{"cacheservice_export_blobs_total", map[string]string{"result": "uploaded"}, 2},
 		{"cacheservice_export_blobs_total", map[string]string{"result": "present"}, 4},
+		{"cacheservice_export_blobs_total", map[string]string{"result": "rejected"}, 1},
 		{"cacheservice_export_bundles_total", nil, 1},
 	} {
 		if got := metricstest.Value(t, reg, c.name, c.labels); got != c.want {
@@ -186,5 +188,35 @@ func TestExportBatch(t *testing.T) {
 	}
 	if s := metricstest.Read(t, reg, "cacheservice_export_batch_roots", nil); s.Count != 2 || s.Sum != 7 {
 		t.Fatalf("batch roots %+v", s)
+	}
+}
+
+func TestBlobPromotion(t *testing.T) {
+	m, reg := newTest(t)
+	m.BlobPromotion("team", "promoted", "store", 100, 2*time.Second)
+	m.BlobPromotion("team", "mismatch", "service", 40, time.Second)
+	m.BlobPromotion("team", "existing", "", 0, time.Millisecond)
+	m.BlobPromotion("other", metrics.PromotionError, "", 0, time.Millisecond)
+	for _, c := range []struct {
+		name   string
+		labels map[string]string
+		want   float64
+	}{
+		{"cacheservice_blob_promotions_total", map[string]string{"scope": "team", "outcome": "promoted"}, 1},
+		{"cacheservice_blob_promotions_total", map[string]string{"scope": "team", "outcome": "mismatch"}, 1},
+		{"cacheservice_blob_promotions_total", map[string]string{"scope": "team", "outcome": "existing"}, 1},
+		{"cacheservice_blob_promotions_total", map[string]string{"scope": "other", "outcome": "error"}, 1},
+		{"cacheservice_blob_hashed_bytes_total", map[string]string{"scope": "team", "by": "store"}, 100},
+		{"cacheservice_blob_hashed_bytes_total", map[string]string{"scope": "team", "by": "service"}, 40},
+	} {
+		if got := metricstest.Value(t, reg, c.name, c.labels); got != c.want {
+			t.Errorf("%s%v = %v, want %v", c.name, c.labels, got, c.want)
+		}
+	}
+	if s := metricstest.Read(t, reg, "cacheservice_blob_hashed_bytes_total", map[string]string{"scope": "team", "by": ""}); s.Found {
+		t.Fatalf("bytes counted for a promotion that hashed nothing: %+v", s)
+	}
+	if s := metricstest.Read(t, reg, "cacheservice_blob_promotion_duration_seconds", map[string]string{"scope": "team"}); s.Count != 3 || s.Sum < 3 {
+		t.Fatalf("promotion durations %+v", s)
 	}
 }

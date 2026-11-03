@@ -87,9 +87,9 @@ e2e)
 	scenarios="${E2E_SCENARIOS:-}"
 	for sc in $scenarios; do
 		case "$sc" in
-		reexport | renew | prune | superseded | namespaces | disconnect | engine-restart | s3-faults | service-restart) ;;
+		reexport | renew | prune | superseded | namespaces | verify | disconnect | engine-restart | s3-faults | service-restart) ;;
 		*)
-			echo "dev.sh e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: reexport renew prune superseded namespaces disconnect engine-restart s3-faults service-restart)" >&2
+			echo "dev.sh e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: reexport renew prune superseded namespaces verify disconnect engine-restart s3-faults service-restart)" >&2
 			exit 2
 			;;
 		esac

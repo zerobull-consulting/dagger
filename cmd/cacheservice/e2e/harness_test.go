@@ -33,6 +33,7 @@ func TestS3ProxyRecords(t *testing.T) {
 
 	d := digest.FromString("layer")
 	blob := p.URL + "/bucket/prefix/blobs/sha256/" + d.Encoded()
+	staged := p.URL + "/bucket/prefix/staging/0123456789abcdef0123456789abcdef/sha256/" + d.Encoded()
 	before := p.Mark()
 	resp, err := http.Get(blob)
 	if err != nil {
@@ -43,7 +44,14 @@ func TestS3ProxyRecords(t *testing.T) {
 	if string(body) != "ok" {
 		t.Fatalf("body %q", body)
 	}
-	req, _ := http.NewRequest(http.MethodPut, blob, strings.NewReader("data"))
+	req, _ := http.NewRequest(http.MethodPut, staged, strings.NewReader("data"))
+	if resp, err = http.DefaultClient.Do(req); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	// A promotion's part copy, a PUT to the digest key, is the service's,
+	// not an engine's upload.
+	req, _ = http.NewRequest(http.MethodPut, blob+"?partNumber=1&uploadId=x", nil)
 	if resp, err = http.DefaultClient.Do(req); err != nil {
 		t.Fatal(err)
 	}
@@ -171,5 +179,39 @@ func TestField(t *testing.T) {
 	}
 	if got := stampSums("exec1 u1 aaaa\nexec2 u2 bbbb\n"); got != "aaaa\nbbbb" {
 		t.Errorf("stampSums: %q", got)
+	}
+}
+
+// A Rewrite fault passes the request on with its body replaced, at the same
+// length, and the store answers it: as an engine uploading other content of
+// the declared size would.
+func TestS3ProxyRewrite(t *testing.T) {
+	var got []string
+	var lengths []int64
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got = append(got, string(body))
+		lengths = append(lengths, r.ContentLength)
+	}))
+	defer store.Close()
+	p := StartS3Proxy(t, "127.0.0.1", store.URL)
+	f := p.Inject(&Fault{Name: "corrupt", Match: Methods("/staging/", http.MethodPut), Rewrite: SameSizeCorruption, Count: 1})
+	for range 2 {
+		req, _ := http.NewRequest(http.MethodPut, p.URL+"/b/staging/s/sha256/1", strings.NewReader("data"))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	}
+	if len(got) != 2 || got[0] == "data" || len(got[0]) != 4 || lengths[0] != 4 || got[1] != "data" || p.Hits(f) != 1 {
+		t.Fatalf("the store got %q (lengths %v), hits %d", got, lengths, p.Hits(f))
+	}
+	rs := p.Since(0)
+	if !rs[0].Rewritten || rs[0].Fault != "corrupt" || rs[0].Status != http.StatusOK || rs[1].Rewritten || !rs[0].IsBlob() {
+		t.Fatalf("recorded %+v", rs)
 	}
 }
