@@ -474,15 +474,31 @@ func TestDeletePrefixReportsUploadsLeft(t *testing.T) {
 	}
 }
 
-// Only the guarded store suites run against an external bucket here: the e2e
-// would have no guard or upload cleanup there.
-func TestDevShRefusesExternalE2E(t *testing.T) {
+// External mode without a bucket would otherwise skip every real-store test,
+// and pass having tested nothing.
+func TestDevShExternalNeedsItsBucket(t *testing.T) {
 	script := filepath.Join("..", "..", "..", "..", "hack", "remote-cache", "dev.sh")
-	cmd := exec.Command("bash", script, "e2e")
-	cmd.Env = append(os.Environ(), "CACHESERVICE_TEST_EXTERNAL=1")
-	out, err := cmd.CombinedOutput()
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "CACHESERVICE_TEST_EXTERNAL") {
-		t.Fatalf("dev.sh e2e with an external bucket: %v\n%s", err, out)
+	full := map[string]string{
+		"CACHESERVICE_S3_ENDPOINT": "https://s3.example.test",
+		"CACHESERVICE_S3_BUCKET":   "bkt",
+		"CACHESERVICE_S3_PREFIX":   "test",
+	}
+	for _, command := range []string{"test", "e2e"} {
+		for missing := range full {
+			t.Run(command+" without "+missing, func(t *testing.T) {
+				cmd := exec.Command("bash", script, command)
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CACHESERVICE_TEST_EXTERNAL=1"}
+				for name, value := range full {
+					if name != missing {
+						cmd.Env = append(cmd.Env, name+"="+value)
+					}
+				}
+				out, err := cmd.CombinedOutput()
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), missing) {
+					t.Fatalf("%v\n%s", err, out)
+				}
+			})
+		}
 	}
 }

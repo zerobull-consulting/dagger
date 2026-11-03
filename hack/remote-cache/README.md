@@ -200,25 +200,28 @@ Set it yourself to run `go test` by hand.
 
 ## Testing against a real bucket
 
-The store suites run against any S3-compatible bucket, under a prefix of their
-own. With `CACHESERVICE_TEST_EXTERNAL=1`, `dev.sh test` doesn't start MinIO, and
-uses the bucket in the `CACHESERVICE_S3_*` variables:
+Both layers run against any S3-compatible bucket, under a prefix of their own.
+With `CACHESERVICE_TEST_EXTERNAL=1`, `dev.sh test` and `dev.sh e2e` don't start
+MinIO, and use the bucket in the `CACHESERVICE_S3_*` variables, refusing to run
+without an endpoint, bucket and prefix, since the tests would otherwise skip and
+pass:
 
 ```bash
 # Encrypted values, with dotenvx, from cmd/cacheservice/.env:
 cd cmd/cacheservice
 npx @dotenvx/dotenvx run -- bash -c '
   export CACHESERVICE_TEST_EXTERNAL=1 CACHESERVICE_TEST_STORE=spaces
-  cd ../.. && ./hack/remote-cache/dev.sh test'
+  cd ../.. && ./hack/remote-cache/dev.sh test && ./hack/remote-cache/dev.sh e2e'
 ```
 
 | Variable | Meaning |
 | --- | --- |
-| `CACHESERVICE_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | The bucket. |
+| `CACHESERVICE_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | The bucket. The e2e's proxy signs with static credentials. |
 | `CACHESERVICE_S3_PREFIX` | Required: everything happens under it. Empty or `/` is refused. |
-| `CACHESERVICE_S3_PATH_STYLE` | `true` or `false`; set it. Unset, the `blobstore`, `gc` and `metastore` suites use virtual-hosted addressing, and `server` path-style. |
+| `CACHESERVICE_S3_PATH_STYLE` | `true` or `false`; set it. Unset, the `blobstore`, `gc` and `metastore` suites use virtual-hosted addressing, and `server` and the e2e path-style. |
 | `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
 | `CACHESERVICE_TEST_STORE` | `minio` (default) or `spaces`: what the tests expect where stores differ ([below](#what-each-store-does)). |
+| `E2E_S3_RESIGN` | `1` makes the e2e's proxy sign requests again for any store, to run that path against MinIO. |
 | `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration. Leave it unset on a shared bucket. |
 
 ### What keeps a shared bucket safe
@@ -227,8 +230,9 @@ The bucket doesn't have to be disposable. `cmd/cacheservice/internal/s3test`
 enforces this in test setup:
 
 - A run refuses an empty or `/` prefix.
-- Every key a test writes, deletes or aborts is under `<prefix>/<run>/`. Every
-  S3 client of the tests goes through a guard (`s3test.Guard`) that refuses
+- Every key a test writes, deletes or aborts is under `<prefix>/<run>/` (the
+  e2e: `<prefix>/e2e/<run>/`). Every S3 client of the tests, and the e2e's
+  proxy, goes through a guard (`s3test.Guard`) that refuses
   anything else before it reaches the store, and fails the test. It reads the
   keys of bulk deletes too. Presigned PUTs a test sends itself are checked by
   `s3test.CheckURL`. The ones the service hands a fake engine go through
@@ -249,7 +253,29 @@ stay under `<prefix>/<run>/`, whose name starts with the run's UTC time.
 
 `TestGuardWithSDK` and `TestGuardBucketConfiguration` check the guard with the
 requests the SDK really makes, in both ways of addressing the bucket, and
-`TestMinIODeletePrefix` the cleanup, against a real store.
+`TestMinIODeletePrefix` the cleanup, against a real store. `TestS3ProxyGuard`
+checks the proxy's, and an e2e run fails if a request outside its prefix reached
+it.
+
+### The e2e's proxy on an HTTPS store
+
+Engines and services reach the store through the run's recording proxy, and
+most scenarios read its record or inject faults, so bypassing it would leave
+little of the e2e. A store checks a signature against the `Host` it receives,
+and URLs are signed for the proxy's address. MinIO takes that, but a hosted
+store needs its own name. So for an HTTPS or virtual-hosted endpoint the proxy
+(`e2e/resign.go`) checks the signature it received, then signs again for the
+store with the same signed headers, time and expiry. A tampered URL or the
+wrong body size gets 403 from the proxy, and the store itself still enforces
+expiry. Services always address the proxy path-style, and it forwards in the
+addressing `CACHESERVICE_S3_PATH_STYLE` says. Every scenario runs, faults
+included. `TestMinIOProxySignsAgain` checks this against the real store, and
+`TestS3ProxyForwardsToTheStore` the host and path it sends.
+
+What this doesn't cover: in the e2e, the store checks the proxy's signature
+rather than the service's, and engines talk plain HTTP to the proxy. The store
+suites cover those directly, with the service's own presigned URLs and an
+engine-style PUT over HTTPS.
 
 ### What each store does
 
@@ -272,9 +298,20 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
 | Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
 | Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |
+| The e2e with real engines | Passes | Passes, every scenario, virtual-hosted, faults included | None needed. |
 
 `CACHESERVICE_S3_HASH_IN_SERVICE` needn't be set on Spaces: the fallback is
 automatic. AWS S3 is still open in zerobull-consulting/dagger#55.
+
+### In CI
+
+`Remote cache tests` has two optional jobs, `S3 tests against Spaces` and
+`real engines (e2e) against Spaces`. They are skipped unless these repository
+secrets are set: `SPACES_ENDPOINT`, `SPACES_REGION`, `SPACES_BUCKET`,
+`SPACES_PREFIX`, `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY`. An
+optional `SPACES_DISPOSABLE_BUCKET`, set to `1`, runs the lifecycle part on a
+bucket dedicated to the tests. Concurrent runs with it replace each other's
+lifecycle rule, so leave it off if pull requests overlap.
 
 ## Pointing an engine at the service and MinIO
 

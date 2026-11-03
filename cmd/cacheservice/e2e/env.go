@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,6 +25,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 )
@@ -108,7 +108,7 @@ type Env struct {
 	// Scope is the scope the services record entries in.
 	Scope string
 
-	// S3Config is MinIO's, under this run's prefix: S3 and Meta read the
+	// S3Config is the store's, under this run's prefix: S3 and Meta read the
 	// bucket with it directly, past the proxy, so what they read isn't
 	// recorded as the engines' traffic.
 	S3Config blobstore.S3Config
@@ -174,8 +174,15 @@ func New(t *testing.T) *Env {
 		cfg.PathStyle = true
 	}
 	// The run's own prefix: no reset of the bucket, and runs don't see each
-	// other's entries.
-	cfg.Prefix = strings.Trim(strings.Trim(cfg.Prefix, "/")+"/e2e/"+e.RunID, "/")
+	// other's entries. Everything the run does is kept under it (s3test), on
+	// its direct client and in the proxy.
+	base, err := s3test.CleanPrefix(cfg.Prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Prefix = base + "/e2e/" + e.RunID
+	direct := s3test.NewGuard(cfg.Bucket, cfg.Prefix, false).WithEndpoint(cfg.Endpoint)
+	cfg.HTTPClient = direct
 	e.S3Config = cfg
 	ctx := context.Background()
 	if e.S3, err = blobstore.NewS3Client(ctx, cfg); err != nil {
@@ -187,10 +194,29 @@ func New(t *testing.T) *Env {
 	if !settings.Keep {
 		t.Cleanup(e.deletePrefix)
 	}
-	e.Proxy = StartS3Proxy(t, e.Gateway, cfg.Endpoint)
+	// Not bound to the endpoint: requests arrive at the proxy's own address.
+	guard := s3test.NewGuard(cfg.Bucket, cfg.Prefix, false)
+	opts := ProxyOptions{Guard: guard}
+	if ResignFor(cfg.Endpoint, cfg.PathStyle) {
+		opts.Upstream = &Upstream{Endpoint: cfg.Endpoint, Region: cfg.Region, Bucket: cfg.Bucket, PathStyle: cfg.PathStyle, Credentials: cfg.Credentials}
+		t.Logf("the S3 proxy signs requests again for the store (HTTPS or virtual-hosted endpoint)")
+	}
+	e.Proxy = StartS3ProxyWith(t, e.Gateway, cfg.Endpoint, opts)
+	t.Cleanup(func() {
+		for _, r := range append(guard.Refused(), direct.Refused()...) {
+			t.Errorf("a request outside the run's prefix was refused: %s", r)
+		}
+	})
 
 	e.build()
 	return e
+}
+
+// ResignFor reports whether the proxy has to sign again for a store: one that
+// routes on its host name. E2E_S3_RESIGN=1 does it for any store, to run that
+// path against MinIO.
+func ResignFor(endpoint string, pathStyle bool) bool {
+	return os.Getenv("E2E_S3_RESIGN") == "1" || strings.HasPrefix(endpoint, "https://") || !pathStyle
 }
 
 // Run runs a scenario as a subtest of the run's test, with e.T set to it.
@@ -509,16 +535,10 @@ func (e *Env) CheckConsistentIn(t *testing.T, ns, when string) {
 }
 
 func (e *Env) deletePrefix() {
-	ctx, cancel := e.ctx()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	var errs []error
-	for _, key := range e.listKeys(e.S3Config.Prefix + "/") {
-		if _, err := e.S3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(e.S3Config.Bucket), Key: aws.String(key)}); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if err := errors.Join(errs...); err != nil {
-		e.T.Logf("deleting the run's objects: %v", err)
+	if err := s3test.DeletePrefix(ctx, e.S3, e.S3Config.Bucket, e.S3Config.Prefix); err != nil {
+		e.root.Errorf("deleting the run's objects: %v", err)
 	}
 }
 
