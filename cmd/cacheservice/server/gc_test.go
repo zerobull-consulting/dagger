@@ -556,3 +556,32 @@ func TestMergeAgainWhenCapSet(t *testing.T) {
 		t.Fatalf("a later sync merged again: %d %+v", code, res)
 	}
 }
+
+// Known gap (zerobull-consulting/dagger#58): a max age lowered so far that a
+// root's capped expiry is already past never reaches an engine that had the
+// root merged with a later expiry (here, none). Plan leaves the root out,
+// and the engine would skip a root sent with a past expiry anyway
+// (dagql/cache_value_merge.go), so only an engine change can release it.
+func TestKnownGapPastCapNotSentToEngines(t *testing.T) {
+	st := newGCStores(t, nil)
+	h := newExportHarnessWith(t, st.blobs, st.meta, nil, func(c *ImportConfig) { c.Importer.Now = st.clock.Now })
+	h.buildRecipes()
+	h.exportBuild()
+	idx := h.waitIndex(10, 11)
+	root := idx.Caches[h.cache.ID].Numbers[11].Number
+	b := fakeengine.New("cache-b", 1)
+	engB := h.connectEngine(b)
+	waitLookup(t, b, "withExec(make)", hasOffer)
+	waitImports(t, h.meta, "cache-b", 2)
+	if got := h.debugImports(engB).Merged[0].Retained[root]; got != 0 {
+		t.Fatalf("first merge, no max age: expiry %d", got)
+	}
+	merges := b.Merges()
+	st.clock.Add(2 * time.Hour)
+	if err := h.svc.UseLimits("", gc.Limits{MaxAge: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if code, res := h.debugImport(engB); code != http.StatusOK || len(res.Merged) != 0 || b.Merges() != merges {
+		t.Fatalf("the past cap was sent: %d %+v; if engines now get it, the gap is fixed: update #58 and this test", code, res)
+	}
+}

@@ -1176,9 +1176,15 @@ When a root's capped expiry changes from what a merge sent (the max age
 was raised, lowered, set or removed, or an export recorded the root
 again), the importer merges its bundle again with it; it compares with what
 it sent, not with what the engine reported, so it does so once per change
-(`TestMergeAgainWhenCapMovesLater`, `TestMergeAgainWhenCapSet`). Whether an
-engine shortens a retention on a merge with an earlier expiry is the
-engine's; GC expires the stored root on its own either way. The
+(`TestMergeAgainWhenCapMovesLater`, `TestMergeAgainWhenCapSet`). An engine
+keeps the earlier of the expiries it was sent for a root; GC expires the
+stored root on its own either way. **Known gap
+([#58](https://github.com/zerobull-consulting/dagger/issues/58)):** a cap
+that is already past when it changes is never sent: the root is left out of
+merges, and an engine skips a root sent with a past expiry rather than
+releasing it. An engine that had the root with no expiry, or a later one,
+keeps it until its own GC prunes it, and computes again any part whose blob
+GC then deletes (`TestKnownGapPastCapNotSentToEngines`). The
 importer's expiry guard is unchanged: a root over an entry that has expired,
 or depends on one that has, is not merged.
 
