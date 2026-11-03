@@ -1134,7 +1134,9 @@ which checks the run's scope after collecting its own).
 
 A root expires `max-age` after an export last recorded it:
 `metastore.Root.RecordedAtUnix`, the service's clock when the index update
-that wrote its record ran. The entries only that root keeps alive go with
+that wrote its record ran. Times are whole seconds, and a max age with a
+fraction of a second counts as the next whole one
+(`TestCapExpiryRoundsUp`). The entries only that root keeps alive go with
 it; an entry a younger root depends on stays, whenever it was recorded
 (`TestExpireMaxAge`).
 
@@ -1164,7 +1166,12 @@ merge at its recording time plus the max age
 (`metastore.Index.ApplyMaxAge`, on its own snapshot of the index, never
 written back), and leaves out roots past it, even before GC runs
 (`TestGCMaxAgeEndToEnd`; the real-engine `gc` scenario checks the expiry
-engine GB was sent). Engines then release imported roots on their own. The
+engine GB was sent). Engines then release imported roots on their own.
+When a root's capped expiry moves later than what a merge sent (the max
+age was raised, or an export recorded the root again), the importer merges
+its bundle again, so the engine doesn't release it at the earlier one; it
+compares with what it sent, not with what the engine reported, so it does
+so once (`TestMergeAgainWhenCapMovesLater`). The
 importer's expiry guard is unchanged: a root over an entry that has expired,
 or depends on one that has, is not merged.
 
@@ -1183,7 +1190,10 @@ younger now, or, within the same second, its record changed;
 
 What GC can't delete yet (objects younger than the grace period, staged
 uploads, keys it doesn't know) is measured and reported but doesn't make it
-expire roots: a burst of uploads shouldn't expire live data. The bucket can
+expire roots: a burst of uploads shouldn't expire live data. Nor does an
+index that alone is at or over the limit: expiring roots can't shrink it
+enough, so GC expires none, reports it, and goes on with the rest of the
+run; raise `max-bytes` (`TestMaxSizeUnderTheIndexExpiresNothing`). The bucket can
 so hold more than `max-bytes` for up to a grace period plus an interval.
 `gc_entries_expired_total{reason="size"}` counts what the limit expired.
 

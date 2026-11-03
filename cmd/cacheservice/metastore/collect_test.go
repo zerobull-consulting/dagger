@@ -495,3 +495,19 @@ func TestUnstampedRootStampedOnlyWithItsRecord(t *testing.T) {
 		t.Fatalf("a newer record: %d", got)
 	}
 }
+
+// A max age with a fraction of a second counts as the next whole second:
+// it never cuts a root short of its max age.
+func TestCapExpiryRoundsUp(t *testing.T) {
+	r := Root{RecordedAtUnix: 100}
+	for age, want := range map[time.Duration]int64{
+		90 * time.Second:        190,
+		90*time.Second + 900e6:  191,
+		1500 * time.Millisecond: 102,
+		time.Second:             101,
+	} {
+		if got := CapExpiry(r, age); got != want {
+			t.Errorf("max age %s: expiry %d, want %d", age, got, want)
+		}
+	}
+}

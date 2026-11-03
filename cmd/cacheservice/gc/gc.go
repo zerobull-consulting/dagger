@@ -659,7 +659,13 @@ func (c *Collector) sweep(ctx context.Context, ns string, prev, idx *metastore.I
 	}
 	rep.LiveBytes = liveBytes(idx, nil, r, l)
 	if lim.MaxBytes > 0 && rep.LiveBytes > lim.MaxBytes {
-		idx, err = c.shrink(ctx, ns, idx, r, l, lim, now, rep, log)
+		shrunk, err := c.shrink(ctx, ns, idx, r, l, lim, now, rep, log)
+		if errors.Is(err, errIndexOverMax) {
+			// Nothing expired; the rest of the sweep still runs.
+			rep.fail(fmt.Errorf("max size: %w", err))
+			shrunk, err = idx, nil
+		}
+		idx = shrunk
 		if err != nil {
 			rep.fail(fmt.Errorf("max size: %w", err))
 			rep.Skipped = "the max size couldn't be applied"
@@ -972,6 +978,10 @@ func (l *listing) kindSize(k string) (string, int64) {
 	}
 }
 
+// errIndexOverMax is a namespace whose index alone is over its max size:
+// expiring roots can't bring it under.
+var errIndexOverMax = errors.New("the max size can't be reached by expiring roots")
+
 // liveBytes is what the index keeps: its own size, and the listed sizes of
 // the bundles, resolutions and blobs its entries reachable from the roots
 // not in removed name.
@@ -1058,6 +1068,12 @@ func (c *Collector) shrink(ctx context.Context, ns string, idx *metastore.Index,
 			m[rt.n] = true
 		}
 		return m
+	}
+	// Expiring roots can't shrink the index itself: when it alone is over
+	// the limit, no number of roots would do, and the search would expire
+	// every one of them for nothing.
+	if l.indexBytes >= lim.MaxBytes {
+		return idx, fmt.Errorf("%w: the index alone is %d bytes, at or over the max size of %d; no root expired; raise max-bytes", errIndexOverMax, l.indexBytes, lim.MaxBytes)
 	}
 	// The fewest oldest roots whose removal brings it under.
 	k := sort.Search(len(roots), func(k int) bool {

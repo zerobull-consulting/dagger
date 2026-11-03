@@ -197,6 +197,14 @@ type MergedBundle struct {
 	// Retained are the roots the engine retains, by service number, with
 	// the retention's expiry (0: never).
 	Retained map[uint64]int64 `json:"retained"`
+	// Sent are the expiries the merge sent for its roots, by service
+	// number (0: never): the index's, capped at the namespace's max age.
+	// When the index's capped expiry of a root moves later (the max age
+	// was raised, or an export recorded the root again), the bundle is
+	// merged again, so the engine doesn't release the root at the earlier
+	// one. Compared with what was sent, not what the engine reported, so
+	// an engine that keeps an earlier expiry isn't merged again and again.
+	Sent map[uint64]int64 `json:"sent,omitempty"`
 	// Expired are the roots the engine skipped as expired.
 	Expired []uint64 `json:"expired,omitempty"`
 	// Values counts the records merged.
@@ -449,7 +457,7 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		done := st.merged[c.Key()]
 		failures := st.failures[c.Key()]
 		im.mu.Unlock()
-		if done != nil && subset(c.Roots, done.Roots) {
+		if done != nil && subset(c.Roots, done.Roots) && !expiryMovedLater(idx, c.Roots, done.Sent) {
 			continue
 		}
 		if failures >= im.cfg.MergeAttempts {
@@ -483,6 +491,22 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		return res, err
 	}
 	return res, nil
+}
+
+// expiryMovedLater reports whether the index's expiry of one of roots (in
+// a snapshot capped at the max age) is later than the one a merge sent.
+func expiryMovedLater(idx *metastore.Index, roots []uint64, sent map[uint64]int64) bool {
+	for _, n := range roots {
+		was, ok := sent[n]
+		if !ok {
+			continue
+		}
+		now := idx.Roots[n].ExpiresAtUnix
+		if was != 0 && (now == 0 || now > was) {
+			return true
+		}
+	}
+	return false
 }
 
 // subset reports whether every number in a is in b.
@@ -669,6 +693,7 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 		Source:     c.Source,
 		Roots:      slices.Clone(c.Roots),
 		Retained:   map[uint64]int64{},
+		Sent:       map[uint64]int64{},
 		Values:     len(reply.Values),
 		Generation: reply.Generation,
 		EngineTime: time.Unix(0, reply.EngineTime).UTC(),
@@ -676,6 +701,11 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 	for _, r := range reply.Retained {
 		if n, ok := rootNumber[r.Ordinal]; ok {
 			out.Retained[n] = r.ExpiresAtUnix
+		}
+	}
+	for _, r := range mb.Bundle.Roots {
+		if n, ok := rootNumber[r.Ordinal]; ok {
+			out.Sent[n] = r.ExpiresAtUnix
 		}
 	}
 	for _, s := range reply.Skipped {
@@ -1108,6 +1138,7 @@ func (im *Importer) State(cacheID string) (State, bool) {
 		cp := *m
 		cp.Roots = slices.Clone(m.Roots)
 		cp.Retained = maps.Clone(m.Retained)
+		cp.Sent = maps.Clone(m.Sent)
 		cp.Expired = slices.Clone(m.Expired)
 		out.Merged = append(out.Merged, cp)
 	}

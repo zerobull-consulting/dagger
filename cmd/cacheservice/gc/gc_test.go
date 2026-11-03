@@ -1337,3 +1337,26 @@ func TestGaugesOfGoneNamespaceRemoved(t *testing.T) {
 		t.Fatal("a namespace still there lost its gauge")
 	}
 }
+
+// A namespace whose index alone is over its max size has no root expired:
+// expiring roots can't shrink the index, and searching for how many would
+// expire every one for nothing. It is reported, and the rest of the run
+// (unreferenced objects) goes on.
+func TestMaxSizeUnderTheIndexExpiresNothing(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	orphan := e.view("team").Put(layer("orphan", 100))
+	e.clock.Add(3 * time.Hour)
+	e.setLimits("team", Limits{MaxBytes: 10})
+	reps, err := e.collector(nil).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "index alone") {
+		t.Fatalf("run: %v", err)
+	}
+	r := reportOf(reps, "team")
+	if r.SizeRoots != 0 || len(e.index("team").Roots) != 1 {
+		t.Fatalf("expired %d roots under a max size the index alone is over", r.SizeRoots)
+	}
+	if _, ok := e.view("team").Get(orphan); ok || r.Deleted["blob"] != 1 {
+		t.Fatalf("the sweep didn't go on: %+v", r)
+	}
+}

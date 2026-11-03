@@ -23,12 +23,18 @@ import (
 // CapExpiry returns when a root expires under a namespace's max age: its own
 // expiry, or maxAge after it was recorded, whichever comes first (0:
 // never). A root with no recording time yet, and any root when maxAge is 0,
-// keeps its own expiry.
+// keeps its own expiry. Times are whole seconds: a max age with a fraction
+// of a second counts as the next whole second, so a root is never cut
+// short of it by more than the recording time's own rounding.
 func CapExpiry(r Root, maxAge time.Duration) int64 {
 	if maxAge <= 0 || r.RecordedAtUnix == 0 {
 		return r.ExpiresAtUnix
 	}
-	aged := r.RecordedAtUnix + max(int64(maxAge/time.Second), 1)
+	secs := int64(maxAge / time.Second)
+	if maxAge%time.Second != 0 {
+		secs++
+	}
+	aged := r.RecordedAtUnix + max(secs, 1)
 	if aged < r.RecordedAtUnix { // overflow: no cap
 		return r.ExpiresAtUnix
 	}

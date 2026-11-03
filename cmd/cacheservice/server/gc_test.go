@@ -486,3 +486,40 @@ func TestEnableGCRefusesNegativeInterval(t *testing.T) {
 		t.Fatalf("GC on after a refused config: %v", err)
 	}
 }
+
+// When the expiry a merge sent for a root moves later (here, the max age is
+// raised), the bundle is merged again, so the engine doesn't release the
+// root at the earlier, capped expiry. Once, not at every sync.
+func TestMergeAgainWhenCapMovesLater(t *testing.T) {
+	st := newGCStores(t, nil)
+	h := newExportHarnessWith(t, st.blobs, st.meta, nil, func(c *ImportConfig) { c.Importer.Now = st.clock.Now })
+	if err := h.svc.UseLimits("", gc.Limits{MaxAge: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	h.buildRecipes()
+	h.exportBuild()
+	idx := h.waitIndex(10, 11)
+	root := idx.Caches[h.cache.ID].Numbers[11].Number
+	recorded := idx.Roots[root].RecordedAtUnix
+	b := fakeengine.New("cache-b", 1)
+	engB := h.connectEngine(b)
+	waitLookup(t, b, "withExec(make)", hasOffer)
+	waitImports(t, h.meta, "cache-b", 2)
+	if got := h.debugImports(engB).Merged[0].Retained[root]; got != recorded+3600 {
+		t.Fatalf("first merge: expiry %d, want %d", got, recorded+3600)
+	}
+	merges := b.Merges()
+
+	if err := h.svc.UseLimits("", gc.Limits{MaxAge: 2 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if code, res := h.debugImport(engB); code != http.StatusOK || len(res.Merged) != 1 {
+		t.Fatalf("after raising the max age: %d %+v", code, res)
+	}
+	if got := h.debugImports(engB).Merged[0].Retained[root]; got != recorded+7200 {
+		t.Fatalf("merged again with expiry %d, want %d", got, recorded+7200)
+	}
+	if code, res := h.debugImport(engB); code != http.StatusOK || len(res.Merged) != 0 || b.Merges() != merges+1 {
+		t.Fatalf("a later sync merged again: %d %+v, %d merges", code, res, b.Merges()-merges)
+	}
+}
