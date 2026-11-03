@@ -1024,3 +1024,26 @@ func TestUploadListingFailureFailsRun(t *testing.T) {
 		t.Fatalf("after: %+v", r)
 	}
 }
+
+// sameRecord compares every field that decides what an entry keeps alive and
+// until when, not only which record it is.
+func TestSameRecord(t *testing.T) {
+	base := metastore.Entry{Bundle: strings.Repeat("a", 64), Ordinal: 1, Source: metastore.Source{CacheID: "c", Number: 5}, Deps: []uint64{2}, Parts: []string{"p"}, ExpiresAtUnix: 10}
+	if !sameRecord(base, base) {
+		t.Fatal("an entry differs from itself")
+	}
+	for name, change := range map[string]func(*metastore.Entry){
+		"deps":    func(e *metastore.Entry) { e.Deps = []uint64{2, 3} },
+		"parts":   func(e *metastore.Entry) { e.Parts = []string{"p", "q"} },
+		"expiry":  func(e *metastore.Entry) { e.ExpiresAtUnix = 20 },
+		"bundle":  func(e *metastore.Entry) { e.Bundle = strings.Repeat("b", 64) },
+		"replace": func(e *metastore.Entry) { e.Replacements = 1 },
+	} {
+		e := base
+		e.Deps, e.Parts = slices.Clone(base.Deps), slices.Clone(base.Parts)
+		change(&e)
+		if sameRecord(base, e) {
+			t.Errorf("%s changed, and sameRecord says same", name)
+		}
+	}
+}

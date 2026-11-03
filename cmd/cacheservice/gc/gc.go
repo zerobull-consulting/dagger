@@ -871,10 +871,13 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 	}
 }
 
-// sameRecord reports whether two entries hold the same record.
+// sameRecord reports whether two entries are the same, in every field that
+// decides what they keep alive and until when: an entry changed in any of
+// them since GC's snapshot was recorded again, and is kept.
 func sameRecord(a, b metastore.Entry) bool {
 	return a.Bundle == b.Bundle && a.Ordinal == b.Ordinal && a.Resolution == b.Resolution &&
-		a.Source == b.Source && a.Replacements == b.Replacements
+		a.Source == b.Source && a.Replacements == b.Replacements &&
+		a.ExpiresAtUnix == b.ExpiresAtUnix && slices.Equal(a.Deps, b.Deps) && slices.Equal(a.Parts, b.Parts)
 }
 
 // kindSize is a relative key's kind and listed size.

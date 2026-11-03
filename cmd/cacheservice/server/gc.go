@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -99,6 +100,11 @@ func (s *Service) Limits(ns string) gc.Limits {
 // until ctx ends. It collects every namespace in the bucket, not only those
 // with tokens, with the service's limits.
 func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
+	// Only 0 turns the schedule off: a negative interval is a typo, and
+	// taking it as 0 would leave retention off without a word.
+	if cfg.Interval < 0 {
+		return fmt.Errorf("gc: negative interval %s (0 runs GC only when asked)", cfg.Interval)
+	}
 	c := cfg.Collector
 	if c.Limits == nil {
 		c.Limits = s.Limits

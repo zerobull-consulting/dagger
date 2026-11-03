@@ -1327,7 +1327,7 @@ first.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`) |
+| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0) |
 | `-gc-dry-run` | false | Log and report what a run would do; change nothing |
 | `-gc-grace` | `2h` | How old an unreferenced bundle, resolution or blob must be to be deleted |
 | `-gc-staging-age` | `1h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |

@@ -9,6 +9,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -457,5 +459,19 @@ func TestDebugGC(t *testing.T) {
 	}
 	if code := post(""); code != http.StatusInternalServerError {
 		t.Fatalf("failed run: %d", code)
+	}
+}
+
+// A negative GC interval is refused: only 0 turns the schedule off, and a
+// typo must not leave retention off without a word.
+func TestEnableGCRefusesNegativeInterval(t *testing.T) {
+	st := newGCStores(t, nil)
+	svc := New(slog.New(slog.DiscardHandler), "")
+	err := svc.EnableGC(context.Background(), GCConfig{Interval: -time.Second, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta}})
+	if err == nil || !strings.Contains(err.Error(), "negative interval") {
+		t.Fatalf("EnableGC: %v", err)
+	}
+	if _, err := svc.CollectGarbage(context.Background(), true); !errors.Is(err, ErrGCOff) {
+		t.Fatalf("GC on after a refused config: %v", err)
 	}
 }
