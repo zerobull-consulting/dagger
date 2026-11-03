@@ -52,12 +52,33 @@ type Upload struct {
 	Initiated time.Time
 }
 
-// coveredBy reports whether one of the prefixes covers every key under p.
-func coveredBy(p string, prefixes []string) bool {
+// stagingCovered reports whether one of the rules' prefixes covers every
+// key under a namespace's staging prefix (nsPrefix + "staging/") and is
+// within it: a broader rule, over the whole namespace or prefix, expires
+// live data too, and doesn't count (see liveRules).
+func stagingCovered(nsPrefix string, prefixes []string) bool {
+	staging := nsPrefix + "staging/"
 	for _, r := range prefixes {
-		if strings.HasPrefix(p, r) {
+		if strings.HasPrefix(staging, r) && strings.HasPrefix(r, nsPrefix+"staging") {
 			return true
 		}
 	}
 	return false
+}
+
+// liveRules returns the rules' prefixes that expire keys of a namespace's
+// live data, by age: its blobs, bundles, resolutions or index. Such a rule
+// deletes what the index names, whatever GC decides.
+func liveRules(nsPrefix string, prefixes []string) []string {
+	var out []string
+	for _, r := range prefixes {
+		for _, live := range []string{"blobs/", "bundles/", "resolutions/", "index.json"} {
+			k := nsPrefix + live
+			if strings.HasPrefix(k, r) || strings.HasPrefix(r, k) {
+				out = append(out, r)
+				break
+			}
+		}
+	}
+	return out
 }

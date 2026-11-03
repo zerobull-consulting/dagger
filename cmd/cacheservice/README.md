@@ -1073,7 +1073,9 @@ upgrade applies no age or size limit until one is configured.
 `-gc-dry-run`, or `POST /debug/gc?dry-run=1`, logs (`gc dry run: would
 delete`) and reports what a run would expire and delete, and changes
 nothing (`TestDryRunDeletesNothing`), including the stale claims a real run
-would take over (`TestDryRunReportsStaleClaims`). `POST /debug/gc?dry-run`,
+would take over (`TestDryRunReportsStaleClaims`). A dry run waits for a real
+run of the same service under way, rather than report a state half way
+through it (`TestDryRunWaitsForRun`). `POST /debug/gc?dry-run`,
 with no value, is a dry run too; a `dry-run` value that isn't a boolean is
 refused (400). Neither runs for real. A run that failed somewhere answers
 500, with the reports (`TestDebugGC`).
@@ -1101,7 +1103,10 @@ each namespace, in order:
    their records' pending offers (`metastore.BundleBlobs`). Bundles are read
    once and their blob lists kept in memory (at most 65,536). A bundle the
    index names that can't be read stops the namespace's sweep: GC can't
-   know its blobs (`TestMissingBundleStopsSweep`). A namespace with no index
+   know its blobs (`TestMissingBundleStopsSweep`); so does one that is
+   readable but missing from the run's listing, which comes after the index
+   read, since bundles' blob lists are cached across runs
+   (`TestMissingBundleStopsSweepWarmCache`). A namespace with no index
    is not swept either: GC can't tell what is in use
    (`TestLeavesWhatItDoesNotKnow`). Nor is one whose index can't be read
    (corrupt, or a later version a newer replica wrote); its staged and
@@ -1167,11 +1172,13 @@ merge at its recording time plus the max age
 written back), and leaves out roots past it, even before GC runs
 (`TestGCMaxAgeEndToEnd`; the real-engine `gc` scenario checks the expiry
 engine GB was sent). Engines then release imported roots on their own.
-When a root's capped expiry moves later than what a merge sent (the max
-age was raised, or an export recorded the root again), the importer merges
-its bundle again, so the engine doesn't release it at the earlier one; it
-compares with what it sent, not with what the engine reported, so it does
-so once (`TestMergeAgainWhenCapMovesLater`). The
+When a root's capped expiry changes from what a merge sent (the max age
+was raised, lowered, set or removed, or an export recorded the root
+again), the importer merges its bundle again with it; it compares with what
+it sent, not with what the engine reported, so it does so once per change
+(`TestMergeAgainWhenCapMovesLater`, `TestMergeAgainWhenCapSet`). Whether an
+engine shortens a retention on a merge with an earlier expiry is the
+engine's; GC expires the stored root on its own either way. The
 importer's expiry guard is unchanged: a root over an entry that has expired,
 or depends on one that has, is not merged.
 
@@ -1309,8 +1316,13 @@ the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
 
 - a namespace whose `<prefix>/<ns>/staging/` an enabled rule expires by
   age (`Expiration.Days`, filtered by prefix alone; a rule with a `Date`
-  expires objects once, not as they age) is left to it
-  (`gc_staging_rule_missing` 0, `TestExpiringPrefixes`);
+  expires objects once, not as they age), with a prefix within the staging
+  prefix, is left to it (`gc_staging_rule_missing` 0,
+  `TestExpiringPrefixes`). A broader rule, over the namespace or the whole
+  prefix, doesn't count: it also expires the namespace's live blobs,
+  bundles and index by age, which the index still names. GC reports such a
+  rule (a warning, and `liveRules` in the run's report) and expires the
+  staged uploads itself (`TestBroadLifecycleRule`);
 - a namespace without one is reported (`gc_staging_rule_missing` 1, and a
   warning when it has staged uploads), and GC deletes its staged uploads
   older than `-gc-staging-age` itself: 2h, an export's upload timeout (1h)

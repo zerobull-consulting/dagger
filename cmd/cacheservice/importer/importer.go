@@ -199,11 +199,13 @@ type MergedBundle struct {
 	Retained map[uint64]int64 `json:"retained"`
 	// Sent are the expiries the merge sent for its roots, by service
 	// number (0: never): the index's, capped at the namespace's max age.
-	// When the index's capped expiry of a root moves later (the max age
-	// was raised, or an export recorded the root again), the bundle is
-	// merged again, so the engine doesn't release the root at the earlier
-	// one. Compared with what was sent, not what the engine reported, so
-	// an engine that keeps an earlier expiry isn't merged again and again.
+	// When the index's capped expiry of a root changes (the max age was
+	// raised, lowered, set or removed, or an export recorded the root
+	// again), the bundle is merged again with it. Compared with what was
+	// sent, not what the engine reported, so it is merged once per change,
+	// whatever the engine keeps. Whether an engine shortens a retention
+	// on a merge with an earlier expiry is the engine's; GC expires the
+	// stored root on its own either way.
 	Sent map[uint64]int64 `json:"sent,omitempty"`
 	// Expired are the roots the engine skipped as expired.
 	Expired []uint64 `json:"expired,omitempty"`
@@ -457,7 +459,7 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		done := st.merged[c.Key()]
 		failures := st.failures[c.Key()]
 		im.mu.Unlock()
-		if done != nil && subset(c.Roots, done.Roots) && !expiryMovedLater(idx, c.Roots, done.Sent) {
+		if done != nil && subset(c.Roots, done.Roots) && !expiryChanged(idx, c.Roots, done.Sent) {
 			continue
 		}
 		if failures >= im.cfg.MergeAttempts {
@@ -493,16 +495,18 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	return res, nil
 }
 
-// expiryMovedLater reports whether the index's expiry of one of roots (in
-// a snapshot capped at the max age) is later than the one a merge sent.
-func expiryMovedLater(idx *metastore.Index, roots []uint64, sent map[uint64]int64) bool {
+// expiryChanged reports whether the index's expiry of one of roots (in a
+// snapshot capped at the max age) differs from the one a merge sent: later
+// (the max age raised, a root recorded again), earlier (lowered), or a cap
+// where there was none (a max age set where there was no limit), or none
+// where there was one.
+func expiryChanged(idx *metastore.Index, roots []uint64, sent map[uint64]int64) bool {
 	for _, n := range roots {
 		was, ok := sent[n]
 		if !ok {
 			continue
 		}
-		now := idx.Roots[n].ExpiresAtUnix
-		if was != 0 && (now == 0 || now > was) {
+		if idx.Roots[n].ExpiresAtUnix != was {
 			return true
 		}
 	}

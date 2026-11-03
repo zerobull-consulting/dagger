@@ -45,6 +45,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	mrand "math/rand/v2"
 	"regexp"
 	"slices"
@@ -130,10 +131,10 @@ type Collector struct {
 	cfg Config
 	log *slog.Logger
 
-	// run serializes this collector's runs.
-	run sync.Mutex
+	// run serializes this collector's runs, and those of its DryRunner.
+	run *sync.Mutex
 
-	mu sync.Mutex
+	mu *sync.Mutex
 	// bundles caches the blob keys each bundle names, by scope/id.
 	// Bundles never change, so an entry never goes stale.
 	bundles map[string][]string
@@ -175,7 +176,17 @@ func New(cfg Config) (*Collector, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Collector{cfg: cfg, log: log, bundles: map[string][]string{}}, nil
+	return &Collector{cfg: cfg, log: log, run: &sync.Mutex{}, mu: &sync.Mutex{}, bundles: map[string][]string{}}, nil
+}
+
+// DryRunner returns a collector of the same configuration that deletes
+// nothing (Config.DryRun), and runs one at a time with this one: a dry run
+// asked for while a real run is under way waits for it, rather than report
+// a state half way through it. It shares this one's bundle cache.
+func (c *Collector) DryRunner() *Collector {
+	d := &Collector{cfg: c.cfg, log: c.log, run: c.run, mu: c.mu, bundles: c.bundles}
+	d.cfg.DryRun = true
+	return d
 }
 
 // Report is what one run did in one namespace.
@@ -203,6 +214,10 @@ type Report struct {
 	// StagingRule is whether a lifecycle rule expires the namespace's
 	// staging prefix: present, missing or unknown.
 	StagingRule string `json:"stagingRule"`
+	// LiveRules are lifecycle rules' prefixes that expire the namespace's
+	// live data (blobs, bundles, resolutions, index) by age: a
+	// misconfiguration that deletes what the index names.
+	LiveRules []string `json:"liveRules,omitempty"`
 	// Skipped says why the reachability sweep (bundles, resolutions,
 	// blobs) didn't run, if it didn't.
 	Skipped string `json:"skipped,omitempty"`
@@ -657,6 +672,15 @@ func (c *Collector) sweep(ctx context.Context, ns string, prev, idx *metastore.I
 		rep.Skipped = "a bundle the index names couldn't be read"
 		return
 	}
+	// Every bundle and resolution the index names must be in the listing,
+	// which came after the index was read: the blob lists are cached
+	// across runs, so a bundle gone since (deleted by hand, say) would
+	// otherwise go unnoticed, and its blobs be swept.
+	if missing := missingNamed(r, l); missing != "" {
+		rep.fail(fmt.Errorf("%s, which the index names, is not in the listing", missing))
+		rep.Skipped = "an object the index names is missing"
+		return
+	}
 	rep.LiveBytes = liveBytes(idx, nil, r, l)
 	if lim.MaxBytes > 0 && rep.LiveBytes > lim.MaxBytes {
 		shrunk, err := c.shrink(ctx, ns, idx, r, l, lim, now, rep, log)
@@ -978,6 +1002,22 @@ func (l *listing) kindSize(k string) (string, int64) {
 	}
 }
 
+// missingNamed returns a bundle or resolution r names that the listing
+// doesn't hold, by relative key, or "".
+func missingNamed(r *refs, l *listing) string {
+	for _, id := range slices.Sorted(maps.Keys(r.bundles)) {
+		if _, ok := l.bundles[id]; !ok {
+			return metastore.BundleRelKey(id)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(r.resolutions)) {
+		if _, ok := l.resolutions[id]; !ok {
+			return metastore.ResolutionRelKey(id)
+		}
+	}
+	return ""
+}
+
 // errIndexOverMax is a namespace whose index alone is over its max size:
 // expiring roots can't bring it under.
 var errIndexOverMax = errors.New("the max size can't be reached by expiring roots")
@@ -1127,11 +1167,15 @@ func (c *Collector) shrink(ctx context.Context, ns string, idx *metastore.Index,
 // namespace without one.
 func (c *Collector) sweepStaging(ctx context.Context, ns string, l *listing, rules []string, rulesKnown bool, now time.Time, rep *Report, log *slog.Logger) {
 	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
+	if live := liveRules(prefix, rules); len(live) > 0 {
+		rep.LiveRules = live
+		log.Warn("gc: a lifecycle rule expires this namespace's live data by age: it deletes blobs, bundles or the index that entries still name; limit it to the staging prefix", "rules", live, "staging", prefix+"staging/")
+	}
 	switch {
 	case !rulesKnown:
 		rep.StagingRule = "unknown"
 		c.cfg.Metrics.GCStagingRuleUnknown(ns)
-	case coveredBy(prefix+"staging/", rules):
+	case stagingCovered(prefix, rules):
 		rep.StagingRule = "present"
 		c.cfg.Metrics.GCStagingRule(ns, false)
 		return

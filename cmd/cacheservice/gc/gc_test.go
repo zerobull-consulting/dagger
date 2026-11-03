@@ -1360,3 +1360,91 @@ func TestMaxSizeUnderTheIndexExpiresNothing(t *testing.T) {
 		t.Fatalf("the sweep didn't go on: %+v", r)
 	}
 }
+
+// A bundle the index names that is gone from the bucket stops the sweep
+// even when an earlier run cached its blobs: the check is against the run's
+// own listing, not a read that the cache skips.
+func TestMissingBundleStopsSweepWarmCache(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	rec := e.export("team", "a", buildX("x"), 2)
+	c := e.collector(nil)
+	e.run(c) // caches the bundle's blobs
+	orphan := e.view("team").Put(layer("orphan", 100))
+	if err := e.objs.Delete(ctx, prefix+"/team/"+metastore.BundleRelKey(rec.BundleID)); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Add(1000 * time.Hour)
+	reps, err := c.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "not in the listing") {
+		t.Fatalf("run: %v", err)
+	}
+	if r := reportOf(reps, "team"); len(r.Deleted) != 0 {
+		t.Fatalf("deleted %v while a named bundle was missing", r.Deleted)
+	}
+	if _, ok := e.view("team").Get(orphan); !ok {
+		t.Fatal("swept with a named bundle missing")
+	}
+}
+
+// Only a lifecycle rule within a namespace's staging prefix counts as
+// covering it. A broader one, over the whole prefix or namespace, doesn't
+// (GC still expires the staged uploads itself), and is reported: it
+// expires the namespace's live data by age, which the index still names.
+func TestBroadLifecycleRule(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	staged := e.view("team").PutStaged(blobstore.NewStage(), layer("staged", 100))
+	e.clock.Add(3 * time.Hour)
+	e.bucket.SetRules([]string{prefix + "/"}, nil)
+	r := reportOf(e.run(e.collector(nil)), "team")
+	if r.StagingRule != "missing" || r.Deleted["staging"] != 1 || slices.Contains(e.view("team").Staged(), staged) {
+		t.Fatalf("a broad rule counted as staging's: %+v", r)
+	}
+	if !slices.Equal(r.LiveRules, []string{prefix + "/"}) {
+		t.Fatalf("live rules %v", r.LiveRules)
+	}
+	e.bucket.SetRules([]string{prefix + "/team/staging/"}, nil)
+	if r := reportOf(e.run(e.collector(nil)), "team"); r.StagingRule != "present" || len(r.LiveRules) != 0 {
+		t.Fatalf("the staging rule: %+v", r)
+	}
+}
+
+// A dry run waits for a real run of the same collector under way, rather
+// than report a state half way through it.
+func TestDryRunWaitsForRun(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	e.view("team").Put(layer("orphan", 100))
+	e.clock.Add(3 * time.Hour)
+	c := e.collector(nil)
+	inDelete, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	e.bucket.BeforeDelete(func([]string) {
+		once.Do(func() { close(inDelete) })
+		<-release
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := c.Run(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	<-inDelete
+	dry := make(chan struct{})
+	go func() {
+		defer close(dry)
+		if _, err := c.DryRunner().Run(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-dry:
+		t.Fatal("the dry run ran during the real one")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	<-dry
+}

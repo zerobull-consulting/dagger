@@ -147,13 +147,9 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 		return nil, ErrGCOff
 	}
 	c := p.collector
-	if dryRun && !p.cfg.DryRun {
-		cfg := p.cfg
-		cfg.DryRun = true
-		var err error
-		if c, err = gc.New(cfg); err != nil {
-			return nil, err
-		}
+	if dryRun {
+		// Shares the collector's run lock: it waits for a run under way.
+		c = c.DryRunner()
 	}
 	return c.Run(ctx)
 }

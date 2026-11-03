@@ -523,3 +523,36 @@ func TestMergeAgainWhenCapMovesLater(t *testing.T) {
 		t.Fatalf("a later sync merged again: %d %+v, %d merges", code, res, b.Merges()-merges)
 	}
 }
+
+// A max age set where there was none is sent to engines that had the roots
+// merged without one: the bundle is merged again, with the capped expiry,
+// once.
+func TestMergeAgainWhenCapSet(t *testing.T) {
+	st := newGCStores(t, nil)
+	h := newExportHarnessWith(t, st.blobs, st.meta, nil, func(c *ImportConfig) { c.Importer.Now = st.clock.Now })
+	h.buildRecipes()
+	h.exportBuild()
+	idx := h.waitIndex(10, 11)
+	root := idx.Caches[h.cache.ID].Numbers[11].Number
+	recorded := idx.Roots[root].RecordedAtUnix
+	b := fakeengine.New("cache-b", 1)
+	engB := h.connectEngine(b)
+	waitLookup(t, b, "withExec(make)", hasOffer)
+	waitImports(t, h.meta, "cache-b", 2)
+	if got := h.debugImports(engB).Merged[0].Retained[root]; got != 0 {
+		t.Fatalf("first merge, no max age: expiry %d", got)
+	}
+	merges := b.Merges()
+	if err := h.svc.UseLimits("", gc.Limits{MaxAge: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if code, res := h.debugImport(engB); code != http.StatusOK || len(res.Merged) != 1 {
+		t.Fatalf("after setting a max age: %d %+v", code, res)
+	}
+	if got := h.debugImports(engB).Merged[0].Retained[root]; got != recorded+3600 {
+		t.Fatalf("merged again with expiry %d, want %d", got, recorded+3600)
+	}
+	if code, res := h.debugImport(engB); code != http.StatusOK || len(res.Merged) != 0 || b.Merges() != merges+1 {
+		t.Fatalf("a later sync merged again: %d %+v", code, res)
+	}
+}
