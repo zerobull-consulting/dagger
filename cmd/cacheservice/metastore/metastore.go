@@ -68,6 +68,9 @@ type Config struct {
 	// Metrics records index and bundle reads and writes. Nil records
 	// nothing.
 	Metrics *metrics.Metrics
+	// Now is the clock that stamps roots' recording times. Nil means
+	// time.Now.
+	Now func() time.Time
 }
 
 // Store keeps bundles and indexes in Objects. It holds no state of its own,
@@ -79,6 +82,7 @@ type Store struct {
 	metrics     *metrics.Metrics
 	// sleep waits between attempts; tests replace it.
 	sleep func(context.Context, time.Duration) error
+	now   func() time.Time
 }
 
 // New returns a Store for cfg. It makes no requests.
@@ -92,7 +96,11 @@ func New(cfg Config) (*Store, error) {
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = DefaultMaxAttempts
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	return &Store{
+		now:         cfg.Now,
 		objects:     cfg.Objects,
 		prefix:      strings.Trim(cfg.Prefix, "/"),
 		maxAttempts: cfg.MaxAttempts,
@@ -100,6 +108,9 @@ func New(cfg Config) (*Store, error) {
 		sleep:       sleepCtx,
 	}, nil
 }
+
+// Now returns the Store's clock.
+func (s *Store) Now() time.Time { return s.now() }
 
 // Metrics returns what the Store records into, or nil.
 func (s *Store) Metrics() *metrics.Metrics { return s.metrics }

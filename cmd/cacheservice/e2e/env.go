@@ -314,6 +314,18 @@ func (e *Env) Index() *metastore.Index {
 	return idx
 }
 
+// IndexOf reads a namespace's index.
+func (e *Env) IndexOf(ns string) *metastore.Index {
+	e.T.Helper()
+	ctx, cancel := e.ctx()
+	defer cancel()
+	idx, err := e.Meta.Index(ctx, ns)
+	if err != nil {
+		e.T.Fatalf("index of %s: %v", ns, err)
+	}
+	return idx
+}
+
 // Bundle reads a stored bundle from MinIO.
 func (e *Env) Bundle(id string) *dagql.ValueBundle {
 	e.T.Helper()
@@ -341,7 +353,13 @@ func (e *Env) Resolution(id string) *metastore.Resolution {
 // BundleIDs lists the stored bundles, sorted.
 func (e *Env) BundleIDs() []string {
 	e.T.Helper()
-	prefix := e.S3Config.Prefix + "/" + e.Scope + "/bundles/"
+	return e.BundleIDsIn(e.Scope)
+}
+
+// BundleIDsIn lists a namespace's stored bundles, sorted.
+func (e *Env) BundleIDsIn(ns string) []string {
+	e.T.Helper()
+	prefix := e.S3Config.Prefix + "/" + ns + "/bundles/"
 	var ids []string
 	for _, key := range e.listKeys(prefix) {
 		ids = append(ids, strings.TrimSuffix(strings.TrimPrefix(key, prefix), ".json"))
@@ -407,13 +425,19 @@ func (e *Env) DeleteBlob(d digest.Digest) {
 // is missing.
 func (e *Env) CheckConsistent(t *testing.T, when string) {
 	t.Helper()
-	idx := e.Index()
+	e.CheckConsistentIn(t, e.Scope, when)
+}
+
+// CheckConsistentIn is CheckConsistent for a namespace's objects.
+func (e *Env) CheckConsistentIn(t *testing.T, ns, when string) {
+	t.Helper()
+	idx := e.IndexOf(ns)
 	stored := map[string]bool{}
-	ids := e.BundleIDs()
+	ids := e.BundleIDsIn(ns)
 	for _, id := range ids {
 		stored[id] = true
 	}
-	resPrefix := e.S3Config.Prefix + "/" + e.Scope + "/resolutions/"
+	resPrefix := e.S3Config.Prefix + "/" + ns + "/resolutions/"
 	resolutions := map[string]bool{}
 	for _, key := range e.listKeys(resPrefix) {
 		resolutions[strings.TrimSuffix(strings.TrimPrefix(key, resPrefix), ".json")] = true
@@ -434,14 +458,19 @@ func (e *Env) CheckConsistent(t *testing.T, when string) {
 	slices.Sort(missingBundles)
 	slices.Sort(missingResolutions)
 	blobs := map[string]bool{}
-	for _, key := range e.listKeys(e.S3Config.Prefix + "/" + e.Scope + "/blobs/") {
+	for _, key := range e.listKeys(e.S3Config.Prefix + "/" + ns + "/blobs/") {
 		blobs[key] = true
 	}
 	named := map[digest.Digest]bool{}
 	var missingBlobs []string
 	deleted := 0
+	ctx, cancel := e.ctx()
+	defer cancel()
 	for _, id := range ids {
-		b := e.Bundle(id)
+		b, err := e.Meta.GetBundle(ctx, ns, id)
+		if err != nil {
+			t.Fatalf("bundle %s of %s: %v", id, ns, err)
+		}
 		var chains []*dagql.OfferedChain
 		for _, o := range b.Outputs {
 			chains = append(chains, o.Chain)
@@ -462,8 +491,8 @@ func (e *Env) CheckConsistent(t *testing.T, when string) {
 				}
 				named[d] = true
 				switch {
-				case blobs[e.BlobKey(d)]:
-				case e.deleted[d]:
+				case blobs[e.BlobKeyIn(ns, d)]:
+				case ns == e.Scope && e.deleted[d]:
 					deleted++
 				default:
 					missingBlobs = append(missingBlobs, fmt.Sprintf("%s (in bundle %s)", Short(d.String()), Short(id)))

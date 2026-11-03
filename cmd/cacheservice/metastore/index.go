@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/dagger/dagger/dagql"
 )
@@ -20,7 +21,14 @@ import (
 // rewrite it without the resolutions: so during a rolling upgrade the older
 // replicas stop updating the scope instead of erasing what the newer ones
 // recorded.
-const IndexVersion = 2
+//
+// Version 3 added Root.RecordedAtUnix and Index.GC (#11). Versions 1 and 2
+// read as an index whose roots have no recording time yet (garbage
+// collection stamps them when it first runs, so they get a whole max age
+// from then) and that no collection has touched. A service that reads only
+// version 2 refuses a version 3 index: it doesn't check GC's deletions when
+// it records an export, so it could name an object GC is deleting.
+const IndexVersion = 3
 
 // oldestIndexVersion is the oldest index format this package reads.
 const oldestIndexVersion = 1
@@ -72,6 +80,10 @@ type Index struct {
 	Roots map[uint64]Root `json:"roots"`
 	// Caches maps engine entry numbers to service numbers, by cacheID.
 	Caches map[string]*EngineCache `json:"caches"`
+	// GC is what garbage collection keeps here: the objects it is deleting
+	// or deleted lately, which an export may no longer name (see
+	// Collection). Nil until it first deletes something.
+	GC *Collection `json:"gc,omitempty"`
 }
 
 // Entry is one stored entry: where its record is, and what it depends on.
@@ -113,9 +125,15 @@ type Source struct {
 	Number     uint64 `json:"number"`
 }
 
-// Root is a retained entry, until ExpiresAtUnix (0: never).
+// Root is a retained entry, until ExpiresAtUnix (0: never), and, under a
+// namespace's max age, until that long after RecordedAtUnix (see
+// RootExpiry).
 type Root struct {
 	ExpiresAtUnix int64 `json:"expiresAtUnix,omitempty"`
+	// RecordedAtUnix is when an export last wrote the root's record (see
+	// Store.Record): the time its max age counts from. 0 for a root
+	// recorded before version 3, until GC stamps it (StampRoots).
+	RecordedAtUnix int64 `json:"recordedAtUnix,omitempty"`
 }
 
 // EngineCache maps one engine cache's entry numbers to service numbers.
@@ -205,6 +223,33 @@ func decodeIndex(body []byte) (*Index, error) {
 	return &idx, nil
 }
 
+// Clone returns a deep copy of the index.
+func (idx *Index) Clone() *Index {
+	body, err := json.Marshal(idx)
+	if err != nil {
+		panic(fmt.Sprintf("encode index: %v", err))
+	}
+	var c Index
+	if err := json.Unmarshal(body, &c); err != nil {
+		panic(fmt.Sprintf("decode index: %v", err))
+	}
+	if c.Entries == nil {
+		c.Entries = map[uint64]*Entry{}
+	}
+	if c.Roots == nil {
+		c.Roots = map[uint64]Root{}
+	}
+	if c.Caches == nil {
+		c.Caches = map[string]*EngineCache{}
+	}
+	for _, ec := range c.Caches {
+		if ec.Numbers == nil {
+			ec.Numbers = map[uint64]Mapping{}
+		}
+	}
+	return &c
+}
+
 // Validate checks that the index refers only to what it has: every number is
 // below NextNumber, and every dependency, root and mapping names a stored
 // entry.
@@ -275,6 +320,9 @@ func (idx *Index) Validate() error {
 			}
 			targets[m.Number] = engineNum
 		}
+	}
+	if err := idx.GC.validate(); err != nil {
+		return err
 	}
 	// And the other way: every entry is its source's mapping.
 	for n, e := range idx.Entries {
@@ -394,8 +442,26 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 }
 
 // RecordResolved is Record, and also returns the bundle's resolution, which
-// the records it wrote name by its ID.
+// the records it wrote name by its ID. It stamps no root with a recording
+// time; RecordResolvedAt does.
 func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (map[dagql.TransferOrdinal]uint64, *Resolution, error) {
+	return idx.RecordResolvedAt(bundleID, bundle, cacheID, generation, 0)
+}
+
+// RecordResolvedAt is RecordResolved at nowUnix: it also stamps the
+// bundle's roots with nowUnix as their recording time (Root.RecordedAtUnix),
+// which a namespace's max age counts from, when this export wrote the
+// root's record: a root new to the index with its record, a later state of
+// the value from its own engine, or an imported value's record with more
+// parts (see Record).
+//
+// A root whose record this export did not write keeps its time, or none
+// (a root from before version 3, which GC stamps), and is not added when
+// new: a late export from an older generation, or an import exported back
+// unchanged.
+// So merging stored entries into engines never keeps them alive by itself:
+// only a new record does. nowUnix 0 stamps nothing.
+func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64, nowUnix int64) (map[dagql.TransferOrdinal]uint64, *Resolution, error) {
 	if !bundleIDPattern.MatchString(bundleID) {
 		return nil, nil, fmt.Errorf("invalid bundle ID %q", bundleID)
 	}
@@ -443,6 +509,7 @@ func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cac
 		return nil, nil, err
 	}
 	parts := bundleParts(bundle)
+	written := map[dagql.TransferOrdinal]bool{}
 	for _, v := range values {
 		n := numbers[v.Ordinal]
 		if imported[v.Ordinal] {
@@ -482,6 +549,7 @@ func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cac
 		}
 		slices.Sort(deps)
 		deps = slices.Compact(deps)
+		written[v.Ordinal] = true
 		idx.Entries[n] = &Entry{
 			Bundle:        bundleID,
 			Ordinal:       v.Ordinal,
@@ -495,11 +563,26 @@ func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cac
 	}
 	for _, r := range bundle.Roots {
 		n := numbers[r.Ordinal]
-		old, ok := idx.Roots[n]
-		if ok && laterExpiry(old.ExpiresAtUnix, r.ExpiresAtUnix) {
+		root, existed := idx.Roots[n]
+		if !existed && !written[r.Ordinal] {
+			// A root is added only with its record. This export didn't
+			// write it (a late export from an older generation, or an
+			// import exported back unchanged): the stored entry stays,
+			// kept alive by whatever keeps it now, and no root, with a
+			// fresh recording time, revives a value whose own root
+			// expired. Merges never keep data alive by themselves.
 			continue
 		}
-		idx.Roots[n] = Root{ExpiresAtUnix: r.ExpiresAtUnix}
+		if !existed || !laterExpiry(root.ExpiresAtUnix, r.ExpiresAtUnix) {
+			root.ExpiresAtUnix = r.ExpiresAtUnix
+		}
+		// Only with its record: a root this export added, or whose record
+		// it wrote. A root from before version 3 (no time) that this
+		// export didn't write keeps none; GC stamps it.
+		if nowUnix > 0 && written[r.Ordinal] {
+			root.RecordedAtUnix = max(root.RecordedAtUnix, nowUnix)
+		}
+		idx.Roots[n] = root
 	}
 	return numbers, res, nil
 }
@@ -643,10 +726,17 @@ func expired(expiresAtUnix, nowUnix int64) bool {
 // or imported, go too.
 // Their numbers are not handed out again.
 //
-// Bundles stay in the store, even when no entry refers to them any more.
+// Bundles, resolutions and blobs stay in the store: garbage collection
+// (package gc) deletes those no entry names any more.
 func (idx *Index) DropExpired(nowUnix int64) []uint64 {
+	return idx.Expire(nowUnix, 0)
+}
+
+// Expire is DropExpired under a namespace's max age: a root also expires
+// maxAge after it was recorded (see RootExpiry). maxAge 0 is no max age.
+func (idx *Index) Expire(nowUnix int64, maxAge time.Duration) []uint64 {
 	for n, r := range idx.Roots {
-		if expired(r.ExpiresAtUnix, nowUnix) {
+		if expired(CapExpiry(r, maxAge), nowUnix) {
 			delete(idx.Roots, n)
 		}
 	}
@@ -751,7 +841,21 @@ type Recorded struct {
 // names: nothing reads it, and the export is not recorded (as before
 // resolutions, an export the service didn't record is exported again by a
 // later session). A resolution of a losing attempt is left the same way.
+//
+// Roots it writes are stamped with the store's clock (see
+// Index.RecordResolvedAt). Record refuses to name an object GC is deleting
+// (ErrCollected); an export uses RecordFenced, which also refuses one GC
+// deleted after the export checked it.
 func (s *Store) Record(ctx context.Context, scope string, bundle *dagql.ValueBundle, cacheID string, generation uint64) (Recorded, error) {
+	return s.RecordFenced(ctx, scope, bundle, cacheID, generation, noFence)
+}
+
+// RecordFenced is Record for an export that read GC's epoch (Store.ReadEpoch)
+// at fence.Started, before it checked any blob, bundle or resolution. It
+// refuses, with ErrCollected and without writing the index, to name an
+// object GC is deleting, or deleted in a round after fence.Epoch, and a fence
+// older than MaxFenceAge (see Collection).
+func (s *Store) RecordFenced(ctx context.Context, scope string, bundle *dagql.ValueBundle, cacheID string, generation uint64, fence Fence) (Recorded, error) {
 	if err := ValidateBundle(bundle); err != nil {
 		return Recorded{}, fmt.Errorf("record bundle: %w", err)
 	}
@@ -768,10 +872,25 @@ func (s *Store) Record(ctx context.Context, scope string, bundle *dagql.ValueBun
 		resID   string
 		stored  = map[string]bool{}
 	)
+	var named []string
+	for _, d := range BundleBlobs(bundle) {
+		named = append(named, BlobRelKey(d))
+	}
 	idx, err := s.updateIndex(ctx, scope, func(idx *Index) error {
+		now := s.now()
+		if !fence.Started.IsZero() && now.Sub(fence.Started) > MaxFenceAge {
+			return fmt.Errorf("the export started %s ago, over %s: %w", now.Sub(fence.Started).Round(time.Second), MaxFenceAge, ErrCollected)
+		}
 		var err error
-		numbers, res, err = idx.RecordResolved(id, bundle, cacheID, generation)
-		return err
+		numbers, res, err = idx.RecordResolvedAt(id, bundle, cacheID, generation, now.Unix())
+		if err != nil {
+			return err
+		}
+		rid, _, err := ResolutionID(res)
+		if err != nil {
+			return err
+		}
+		return idx.checkFence(append(named[:len(named):len(named)], BundleRelKey(id), ResolutionRelKey(rid)), fence)
 	}, func(*Index) error {
 		rid, _, err := ResolutionID(res)
 		if err != nil {

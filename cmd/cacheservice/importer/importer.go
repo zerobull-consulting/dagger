@@ -104,6 +104,12 @@ type Config struct {
 	// values. The export path uses it to know an unchanged
 	// import is already stored.
 	Imported func(cacheID string, generation uint64, values map[uint64]Value)
+	// MaxAge returns the namespace's max age (0: none), read at each sync,
+	// so a reload of the limits applies at the next one. A root is merged
+	// only until its max age after it was recorded, and its expiry in a
+	// merge is capped there, so engines release imported roots on their
+	// own (see metastore.Index.ApplyMaxAge). Nil is no max age.
+	MaxAge func() time.Duration
 	// Metrics records whether the bundles a merge needs were in memory.
 	// Nil records nothing.
 	Metrics *metrics.Metrics
@@ -191,6 +197,16 @@ type MergedBundle struct {
 	// Retained are the roots the engine retains, by service number, with
 	// the retention's expiry (0: never).
 	Retained map[uint64]int64 `json:"retained"`
+	// Sent are the expiries the merge sent for its roots, by service
+	// number (0: never): the index's, capped at the namespace's max age.
+	// When the index's capped expiry of a root changes (the max age was
+	// raised, lowered, set or removed, or an export recorded the root
+	// again), the bundle is merged again with it. Compared with what was
+	// sent, not what the engine reported, so it is merged once per change,
+	// whatever the engine keeps. Whether an engine shortens a retention
+	// on a merge with an earlier expiry is the engine's; GC expires the
+	// stored root on its own either way.
+	Sent map[uint64]int64 `json:"sent,omitempty"`
 	// Expired are the roots the engine skipped as expired.
 	Expired []uint64 `json:"expired,omitempty"`
 	// Values counts the records merged.
@@ -429,6 +445,11 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	if err != nil {
 		return res, fmt.Errorf("read index: %w", err)
 	}
+	// This snapshot is only read: Plan leaves out roots past their max age,
+	// and BuildMerge sends the capped expiry.
+	if im.cfg.MaxAge != nil {
+		idx.ApplyMaxAge(im.cfg.MaxAge())
+	}
 	for _, c := range Plan(idx, cacheID, im.cfg.Now().Unix()) {
 		im.mu.Lock()
 		if !im.currentLocked(eng, st) {
@@ -438,7 +459,7 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		done := st.merged[c.Key()]
 		failures := st.failures[c.Key()]
 		im.mu.Unlock()
-		if done != nil && subset(c.Roots, done.Roots) {
+		if done != nil && subset(c.Roots, done.Roots) && !expiryChanged(idx, c.Roots, done.Sent) {
 			continue
 		}
 		if failures >= im.cfg.MergeAttempts {
@@ -472,6 +493,24 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 		return res, err
 	}
 	return res, nil
+}
+
+// expiryChanged reports whether the index's expiry of one of roots (in a
+// snapshot capped at the max age) differs from the one a merge sent: later
+// (the max age raised, a root recorded again), earlier (lowered), or a cap
+// where there was none (a max age set where there was no limit), or none
+// where there was one.
+func expiryChanged(idx *metastore.Index, roots []uint64, sent map[uint64]int64) bool {
+	for _, n := range roots {
+		was, ok := sent[n]
+		if !ok {
+			continue
+		}
+		if idx.Roots[n].ExpiresAtUnix != was {
+			return true
+		}
+	}
+	return false
 }
 
 // subset reports whether every number in a is in b.
@@ -658,6 +697,7 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 		Source:     c.Source,
 		Roots:      slices.Clone(c.Roots),
 		Retained:   map[uint64]int64{},
+		Sent:       map[uint64]int64{},
 		Values:     len(reply.Values),
 		Generation: reply.Generation,
 		EngineTime: time.Unix(0, reply.EngineTime).UTC(),
@@ -665,6 +705,11 @@ func (im *Importer) applyMerged(ctx context.Context, eng Engine, st *cacheState,
 	for _, r := range reply.Retained {
 		if n, ok := rootNumber[r.Ordinal]; ok {
 			out.Retained[n] = r.ExpiresAtUnix
+		}
+	}
+	for _, r := range mb.Bundle.Roots {
+		if n, ok := rootNumber[r.Ordinal]; ok {
+			out.Sent[n] = r.ExpiresAtUnix
 		}
 	}
 	for _, s := range reply.Skipped {
@@ -1097,6 +1142,7 @@ func (im *Importer) State(cacheID string) (State, bool) {
 		cp := *m
 		cp.Roots = slices.Clone(m.Roots)
 		cp.Retained = maps.Clone(m.Retained)
+		cp.Sent = maps.Clone(m.Sent)
 		cp.Expired = slices.Clone(m.Expired)
 		out.Merged = append(out.Merged, cp)
 	}
