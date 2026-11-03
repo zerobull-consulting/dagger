@@ -593,7 +593,7 @@ func (c *Collector) sweep(ctx context.Context, ns string, idx *metastore.Index, 
 }
 
 // candidates are the unreferenced objects older than Grace, oldest first,
-// that no deletion marks yet, at most MaxDeletes.
+// that no run has claimed, at most MaxDeletes.
 func (c *Collector) candidates(idx *metastore.Index, r *refs, l *listing, now time.Time) []string {
 	cutoff := now.Add(-c.cfg.Grace)
 	type cand struct {
@@ -601,12 +601,15 @@ func (c *Collector) candidates(idx *metastore.Index, r *refs, l *listing, now ti
 		mod time.Time
 	}
 	var all []cand
+	// Claimed by a run now: that run deletes it. An object deleted before
+	// (a finished deletion) can be claimed again: it was stored again
+	// since, and the new claim only makes exports refuse more.
 	marked := func(k string) bool {
 		if idx.GC == nil {
 			return false
 		}
-		_, ok := idx.GC.Deletions[k]
-		return ok
+		d, ok := idx.GC.Deletions[k]
+		return ok && d.InProgress()
 	}
 	add := func(k string, o Object) {
 		if !r.has(k) && o.Modified.Before(cutoff) && !marked(k) {
@@ -685,7 +688,7 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 			claimed = append(claimed, k)
 		}
 		for _, k := range cands {
-			if _, ok := idx.GC.Deletions[k]; ok || r.has(k) {
+			if d, ok := idx.GC.Deletions[k]; (ok && d.InProgress()) || r.has(k) {
 				continue
 			}
 			idx.GC.Deletions[k] = metastore.Deletion{Run: run, StartedUnix: nowUnix}
