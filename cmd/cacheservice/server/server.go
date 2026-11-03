@@ -102,7 +102,9 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 		return err
 	}
 	g := *opts.GC
-	g.Collector.Bucket = &gc.S3Bucket{Client: client, Bucket: cfg.Bucket}
+	// A custom endpoint is an S3-compatible store, which may list multipart
+	// uploads only by exact key (MinIO); AWS S3 lists them by prefix.
+	g.Collector.Bucket = &gc.S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: cfg.Endpoint != ""}
 	g.Collector.Meta = meta
 	return s.EnableGC(ctx, g)
 }

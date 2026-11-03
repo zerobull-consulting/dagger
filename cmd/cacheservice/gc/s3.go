@@ -23,6 +23,12 @@ import (
 type S3Bucket struct {
 	Client *s3.Client
 	Bucket string
+	// FilterAllUploads lists the bucket's uploads and keeps those under
+	// the prefix, when a listing by prefix finds none: for S3-compatible
+	// stores that list multipart uploads only by exact key, such as MinIO.
+	// AWS S3 lists them by prefix, so it is off there: in a bucket shared
+	// with other uploaders, the bucket's listing could be large.
+	FilterAllUploads bool
 }
 
 var _ Bucket = (*S3Bucket)(nil)
@@ -101,13 +107,12 @@ func (b *S3Bucket) Delete(ctx context.Context, keys []string) ([]string, error) 
 // ListMultipartUploads per 1,000.
 //
 // MinIO lists uploads only for an exact object name: a listing by prefix
-// returns none (seen on the dev MinIO, TestMinIOGC). So when the listing by
-// prefix finds none, it lists the bucket's uploads and keeps those under
-// prefix: a second request, per namespace and run, on a store that has
-// none.
+// returns none (seen on the dev MinIO, TestMinIOGC). With FilterAllUploads,
+// when the listing by prefix finds none, it lists the bucket's uploads and
+// keeps those under prefix: a second request, once per run.
 func (b *S3Bucket) ListUploads(ctx context.Context, prefix string) ([]Upload, error) {
 	out, err := b.listUploads(ctx, prefix)
-	if err != nil || len(out) > 0 || prefix == "" {
+	if err != nil || len(out) > 0 || prefix == "" || !b.FilterAllUploads {
 		return out, err
 	}
 	all, err := b.listUploads(ctx, "")

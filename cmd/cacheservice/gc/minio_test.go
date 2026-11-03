@@ -68,7 +68,7 @@ func newMinIOEnv(t *testing.T) *minioEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &minioEnv{t: t, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, meta: meta, gcb: &S3Bucket{Client: client, Bucket: cfg.Bucket}}
+	e := &minioEnv{t: t, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, meta: meta, gcb: &S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: true}}
 	t.Cleanup(func() {
 		_ = e.gcb.List(ctx, e.prefix+"/", func(objs []Object) error {
 			keys := make([]string, len(objs))

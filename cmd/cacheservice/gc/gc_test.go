@@ -1262,3 +1262,55 @@ func TestLiveBytes(t *testing.T) {
 		t.Fatalf("without the second root: %d, want %d", got, want)
 	}
 }
+
+// slowIndexWrites delays every index write by delay.
+type slowIndexWrites struct {
+	metastore.Objects
+	delay time.Duration
+}
+
+func (o *slowIndexWrites) Put(ctx context.Context, key string, body []byte, cond metastore.Condition) (string, error) {
+	if strings.HasSuffix(key, "/index.json") {
+		time.Sleep(o.delay)
+	}
+	return o.Objects.Put(ctx, key, body, cond)
+}
+
+// The delete deadline counts from the claim's stamp, not from after the
+// claim's index update returns: when that update is slow (lost writes, a
+// slow store), deletes counted from after it could run past the time other
+// replicas take the claim over (its stamp plus MaxDeleteDeadline plus
+// slack), and remove an object re-uploaded since. A run whose claim took
+// past its deadline deletes nothing, and releases its claims.
+func TestDeleteDeadlineFromClaimStamp(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	e.view("team").Put(layer("orphan", 100))
+	e.clock.Add(3 * time.Hour)
+	e.run(e.collector(nil)) // stamps and settles everything else first
+	orphan2 := e.view("team").Put(layer("orphan2", 100))
+	e.clock.Add(3 * time.Hour)
+	slow, err := metastore.New(metastore.Config{Objects: &slowIndexWrites{Objects: e.objs, delay: 200 * time.Millisecond}, Prefix: prefix, Now: e.clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := e.collector(func(cfg *Config) {
+		cfg.Meta = slow
+		cfg.DeleteDeadline = 100 * time.Millisecond
+	})
+	reps, err := c.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("run: %v", err)
+	}
+	if r := reportOf(reps, "team"); len(r.Deleted) != 0 {
+		t.Fatalf("deleted %v after the deadline counted from the claim", r.Deleted)
+	}
+	if _, ok := e.view("team").Get(orphan2); !ok {
+		t.Fatal("an object was deleted past the claim's deadline")
+	}
+	for k, d := range e.index("team").GC.Deletions {
+		if d.InProgress() {
+			t.Fatalf("%s left claimed", k)
+		}
+	}
+}

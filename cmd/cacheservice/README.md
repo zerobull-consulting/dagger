@@ -1221,7 +1221,12 @@ serialized with exports on the index:
    cancels one still in flight (`TestDeletesCanceledAtDeadline`). A claim
    is stamped with its own time, not the run's start, so a run that took
    minutes to list doesn't make its claims look stale to other replicas
-   (`TestClaimStampedAtClaimTime`). `DeleteObjects` answers per key: keys
+   (`TestClaimStampedAtClaimTime`); and the deadline counts from that same
+   instant, on the monotonic clock, not from after the claim's index
+   update returns, so a slow claim can't stretch deletes past the time
+   other replicas take it over. A run whose claim took past its deadline
+   deletes nothing, and releases its claims
+   (`TestDeleteDeadlineFromClaimStamp`). `DeleteObjects` answers per key: keys
    it reports failing are counted apart and reported, and the next batches
    still run (`TestPartialDeleteFailure`).
 3. **Finish.** In a second update, GC marks them deleted in a new epoch,
@@ -1306,8 +1311,11 @@ the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
 Stale incomplete multipart uploads (`ListMultipartUploads`) are aborted
 whatever the rules (`TestStagingAndUploads`, `TestMinIOGC`). MinIO lists
 multipart uploads only for an exact key: a listing by prefix returns none.
+For an S3-compatible store (a custom `CACHESERVICE_S3_ENDPOINT`),
 `S3Bucket.ListUploads` then lists the bucket's uploads and keeps those
-under the prefix; MinIO also drops them itself after 24h.
+under the prefix, once per run (`FilterAllUploads`). It doesn't on AWS
+S3, which lists by prefix, so a bucket shared with other uploaders is
+never listed whole. MinIO also drops stale uploads itself after 24h.
 
 **Lifecycle rules.** Keep the staging rules and the multipart rule of
 [Lifecycle rule for staging](#lifecycle-rule-for-staging): they cost the

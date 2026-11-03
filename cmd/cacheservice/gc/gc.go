@@ -774,6 +774,7 @@ func hasStale(idx *metastore.Index, now time.Time) bool {
 func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []string, l *listing, now time.Time, rep *Report, log *slog.Logger) {
 	run := newRunID()
 	var claimed []string
+	var claimedAt time.Time
 	_, err := c.cfg.Meta.UpdateIndex(ctx, ns, func(idx *metastore.Index) error {
 		claimed = claimed[:0]
 		// The claim's own time, not the run's start: a claim stamped with
@@ -781,6 +782,12 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 		// while this run may still delete under it.
 		claimNow := c.cfg.Now()
 		nowUnix := claimNow.Unix()
+		// The delete deadline counts from this same instant, on the
+		// monotonic clock: the claim's own update may take a while (lost
+		// conditional writes, a slow store), and a deadline counted from
+		// after it would let deletes run past the time other replicas
+		// take this claim over (StartedUnix + MaxDeleteDeadline + slack).
+		claimedAt = time.Now()
 		// Against this index: what it names now, recorded since.
 		r, err := c.references(ctx, ns, idx)
 		if err != nil {
@@ -830,9 +837,10 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 	slices.Sort(claimed)
 	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
 
-	// Delete, within the deadline (monotonic, from the claim): no batch
-	// starts after it, and one in flight is canceled at it.
-	deadline := time.Now().Add(c.cfg.DeleteDeadline)
+	// Delete, within the deadline (monotonic, from the claim's stamp): no
+	// batch starts after it, and one in flight is canceled at it. A claim
+	// whose update took past it deletes nothing, and is released.
+	deadline := claimedAt.Add(c.cfg.DeleteDeadline)
 	dctx, cancelDeletes := context.WithDeadline(ctx, deadline)
 	defer cancelDeletes()
 	attempted := map[string]bool{}
