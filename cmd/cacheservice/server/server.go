@@ -32,6 +32,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 )
@@ -52,6 +53,9 @@ type S3Options struct {
 	// or to reconnect after its connection was lost mid-export; 0 means
 	// the export path's default (10s).
 	NoEngineWait time.Duration
+	// GC turns on garbage collection when set (see EnableGC); its
+	// Collector's Bucket and Meta are the S3 stores'.
+	GC *GCConfig
 }
 
 // EnableS3 turns on the export path, and the import path unless
@@ -80,13 +84,29 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	}
 	if opts.NoImport {
 		s.logger.Info("import path off")
+	} else {
+		s.logger.Info("import path on", "scope", opts.Scope, "poll", opts.ImportPoll)
+		if err := s.EnableImport(ctx, ImportConfig{
+			Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: opts.Scope},
+			Poll:     opts.ImportPoll,
+		}); err != nil {
+			return err
+		}
+	}
+	if opts.GC == nil {
+		s.logger.Info("gc off")
 		return nil
 	}
-	s.logger.Info("import path on", "scope", opts.Scope, "poll", opts.ImportPoll)
-	return s.EnableImport(ctx, ImportConfig{
-		Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: opts.Scope},
-		Poll:     opts.ImportPoll,
-	})
+	client, err := blobstore.NewS3Client(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	g := *opts.GC
+	// A custom endpoint is an S3-compatible store, which may list multipart
+	// uploads only by exact key (MinIO); AWS S3 lists them by prefix.
+	g.Collector.Bucket = &gc.S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: cfg.Endpoint != ""}
+	g.Collector.Meta = meta
+	return s.EnableGC(ctx, g)
 }
 
 // Wait waits for the exports in flight and the import sync loops, after the
@@ -94,4 +114,5 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 func (s *Service) Wait() {
 	s.waitExports()
 	s.waitImports()
+	s.waitGC()
 }

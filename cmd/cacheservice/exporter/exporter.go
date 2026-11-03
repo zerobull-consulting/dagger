@@ -127,7 +127,18 @@ type Exporter struct {
 	// addressBytes is the size of a presigned GET from the blob store, as
 	// a merge carries it; 0 until measured.
 	addressBytes int
+	// epoch is the last fence read, when epochOK (see fence).
+	epoch   metastore.Fence
+	epochOK bool
 }
+
+const (
+	// epochTTL is how long a fence read is used for later tries.
+	epochTTL = 10 * time.Second
+	// maxCollectedTries bounds the tries of an export that GC's fence
+	// keeps refusing.
+	maxCollectedTries = 3
+)
 
 // New returns an Exporter for cfg.
 func New(cfg Config) (*Exporter, error) {
@@ -343,21 +354,35 @@ func (x *Exporter) export(ctx context.Context, eng Engine, roots []uint64, outpu
 }
 
 // exportWithRetries exports roots, and tries again while blobs fail to
-// upload, up to UploadAttempts tries.
+// upload, up to UploadAttempts tries, and while GC's fence refuses the
+// index write (metastore.ErrCollected), up to maxCollectedTries more: a
+// refusal is GC racing the export, not a failed upload, and is counted and
+// reported apart.
 func (x *Exporter) exportWithRetries(ctx context.Context, eng Engine, roots []uint64, outputs []protocol.ExportOutput) (Result, error) {
 	var all Result
 	wait := x.cfg.RetryBackoff
-	for attempt := 1; ; attempt++ {
-		res, retry, err := x.exportOnce(ctx, eng, roots, outputs)
+	uploads, collections := 0, 0
+	for {
+		res, retry, collected, err := x.exportOnce(ctx, eng, roots, outputs)
 		all.Merge(res)
 		if err != nil || len(retry) == 0 {
 			return all, err
 		}
-		if attempt >= x.cfg.UploadAttempts {
-			all.fail(retry, fmt.Errorf("blobs failed to upload %d times", attempt))
-			return all, nil
+		if collected {
+			collections++
+			if collections >= maxCollectedTries {
+				all.fail(retry, fmt.Errorf("garbage collection deleted what the export named %d times in a row", collections))
+				return all, nil
+			}
+			x.log.Info("export: trying again after garbage collection", "roots", len(retry), "try", collections)
+		} else {
+			uploads++
+			if uploads >= x.cfg.UploadAttempts {
+				all.fail(retry, fmt.Errorf("blobs failed to upload %d times", uploads))
+				return all, nil
+			}
+			x.log.Info("export: blobs failed to upload; trying again", "roots", len(retry), "attempt", uploads, "wait", wait)
 		}
-		x.log.Info("export: blobs failed to upload; trying again", "roots", len(retry), "attempt", attempt, "wait", wait)
 		if err := x.sleep(ctx, wait); err != nil {
 			return all, err
 		}
@@ -367,19 +392,20 @@ func (x *Exporter) exportWithRetries(ctx context.Context, eng Engine, roots []ui
 }
 
 // exportOnce runs one export, upload and publish. It returns the roots to
-// try again because blobs failed to upload.
-func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, outputs []protocol.ExportOutput) (res Result, retry []uint64, _ error) {
+// try again because blobs failed to upload, or, with collected, because
+// GC's fence refused the index write.
+func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, outputs []protocol.ExportOutput) (res Result, retry []uint64, collected bool, _ error) {
 	slots := x.engineSlots(eng)
 	select {
 	case slots <- struct{}{}:
 	case <-ctx.Done():
-		return res, nil, context.Cause(ctx)
+		return res, nil, false, context.Cause(ctx)
 	}
 	defer func() { <-slots }()
 
 	exported, err := x.requestExport(ctx, eng, roots, outputs)
 	if err != nil {
-		return res, nil, err
+		return res, nil, false, err
 	}
 	for _, s := range exported.Skipped {
 		switch s.Reason {
@@ -392,7 +418,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		}
 	}
 	if exported.Bundle == nil {
-		return res, nil, nil
+		return res, nil, false, nil
 	}
 	survivors := survivingRoots(roots, exported.Skipped)
 
@@ -401,9 +427,9 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// Not stored: release the chains, and let the caller split the
 		// roots.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, rerr
+			return res, nil, false, rerr
 		}
-		return Result{}, nil, err
+		return Result{}, nil, false, err
 	}
 
 	blobs, err := neededBlobs(exported.Bundle)
@@ -413,6 +439,10 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	// Each try uploads under a stage of its own: a blob it stages is never
 	// at the same key as another try's or another export's.
 	stage := blobstore.NewStage()
+	// GC's epoch, read before any check of the store, fences this try's
+	// index write against objects GC deletes after the checks (see
+	// metastore.Collection).
+	fence := x.fence(ctx)
 	var urls map[digest.Digest]string
 	if err == nil {
 		urls, err = blobstore.UploadURLs(ctx, x.cfg.Blobs, stage, blobs)
@@ -420,16 +450,19 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			err = fmt.Errorf("blob store: %w", err)
 		}
 	}
+	if err == nil {
+		err = x.checkOffered(ctx, exported.Bundle, blobs)
+	}
 	if err != nil {
 		// Release the chains; the export isn't stored.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, rerr
+			return res, nil, false, rerr
 		}
 		if ctx.Err() != nil {
-			return res, nil, context.Cause(ctx)
+			return res, nil, false, context.Cause(ctx)
 		}
 		res.fail(survivors, err)
-		return res, nil, nil
+		return res, nil, false, nil
 	}
 	for _, b := range blobs {
 		if _, asked := urls[b.Digest]; !asked {
@@ -442,19 +475,19 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// Our own upload request is too large to send: release the chains
 		// and let the caller split the roots.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, rerr
+			return res, nil, false, rerr
 		}
-		return Result{}, nil, errTooLarge
+		return Result{}, nil, false, errTooLarge
 	}
 	if err != nil {
-		return res, nil, err
+		return res, nil, false, err
 	}
 	for _, f := range uploaded.Failed {
 		x.log.Warn("export: blob upload failed", "digest", f.Digest, "error", f.Message)
 	}
 	done, err := x.promote(ctx, eng, stage, blobs, urls, uploaded.Done, &res)
 	if err != nil {
-		return res, nil, err
+		return res, nil, false, err
 	}
 	var missing int
 	for d := range urls {
@@ -463,23 +496,94 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		}
 	}
 	if missing > 0 {
-		return res, survivors, nil
+		return res, survivors, false, nil
 	}
 
-	rec, err := x.cfg.Meta.Record(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation())
+	rec, err := x.cfg.Meta.RecordFenced(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation(), fence)
 	if err != nil {
 		if ctx.Err() != nil {
-			return res, nil, context.Cause(ctx)
+			return res, nil, false, context.Cause(ctx)
+		}
+		if errors.Is(err, metastore.ErrCollected) {
+			// GC deleted, or is deleting, an object this try found
+			// stored. Try again from the start: its checks will see
+			// what is stored then, and ask for what is gone.
+			x.cfg.Metrics.ExportCollected(x.cfg.Scope)
+			x.log.Info("export: garbage collection raced it; trying again", "cacheID", eng.CacheID(), "roots", len(survivors), "error", err)
+			x.forgetEpoch()
+			return res, survivors, true, nil
 		}
 		res.fail(survivors, fmt.Errorf("publish: %w", err))
-		return res, nil, nil
+		return res, nil, false, nil
 	}
 	res.Stored = append(res.Stored, survivors...)
 	res.Bundles = append(res.Bundles, rec.BundleID)
 	x.log.Info("export stored", "cacheID", eng.CacheID(), "roots", len(survivors),
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
-	return res, nil, nil
+	return res, nil, false, nil
+}
+
+// checkOffered checks, after the fence, that every layer the bundle names
+// but doesn't upload is stored: the layers of its records' pending offers,
+// which the service offered the engine and the engine hasn't pulled, so it
+// can't upload them. The fence protects only what an export checked after
+// reading it; without this check, a layer GC deleted before the export
+// started would pass the fence, and the index would name a bundle whose
+// offered layer is gone. Such an export fails: it can't be stored whole.
+func (x *Exporter) checkOffered(ctx context.Context, bundle *dagql.ValueBundle, uploads []blobstore.Blob) error {
+	uploaded := make(map[digest.Digest]bool, len(uploads))
+	for _, b := range uploads {
+		uploaded[b.Digest] = true
+	}
+	for _, d := range metastore.BundleBlobs(bundle) {
+		if uploaded[d] {
+			continue
+		}
+		has, err := x.cfg.Blobs.Has(ctx, d)
+		if err != nil {
+			return fmt.Errorf("blob store: %w", err)
+		}
+		if !has {
+			return fmt.Errorf("a pending offer's layer %s is no longer stored, and the engine can't upload it", d)
+		}
+	}
+	return nil
+}
+
+// fence reads GC's epoch for the scope, now. A failed read fences at epoch
+// 0, which refuses every object GC deleted lately: an export that names one
+// is tried again.
+//
+// The fence is read at most once per epochTTL, and kept: a fence read
+// earlier is still read before this try's checks, so it is as safe, and at
+// worst older, which only refuses more. A refused export forgets it
+// (forgetEpoch), so its next try reads a fresh one.
+func (x *Exporter) fence(ctx context.Context) metastore.Fence {
+	x.mu.Lock()
+	f, ok := x.epoch, x.epochOK
+	x.mu.Unlock()
+	if ok && x.cfg.Meta.Now().Sub(f.Started) < epochTTL {
+		return f
+	}
+	started := x.cfg.Meta.Now()
+	epoch, err := x.cfg.Meta.ReadEpoch(ctx, x.cfg.Scope)
+	if err != nil {
+		x.log.Warn("export: reading GC's epoch failed; fencing at 0", "error", err)
+		return metastore.Fence{Epoch: 0, Started: started}
+	}
+	f = metastore.Fence{Epoch: epoch, Started: started}
+	x.mu.Lock()
+	x.epoch, x.epochOK = f, true
+	x.mu.Unlock()
+	return f
+}
+
+// forgetEpoch drops the kept fence.
+func (x *Exporter) forgetEpoch() {
+	x.mu.Lock()
+	x.epochOK = false
+	x.mu.Unlock()
 }
 
 // promote verifies and promotes the blobs the engine reported done, of those

@@ -686,7 +686,7 @@ func TestReadIndexRefuses(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct{ name, body, want string }{
 		{"not JSON", "{", "decode"},
-		{"a later version", `{"version":3,"nextNumber":1}`, "version 3"},
+		{"a later version", `{"version":4,"nextNumber":1}`, "version 4"},
 		{"version 0", `{"version":0,"nextNumber":1}`, "version 0"},
 		{"no next number", `{"version":1}`, "next number"},
 		{"a root not stored", `{"version":1,"nextNumber":5,"roots":{"3":{}}}`, "root 3"},

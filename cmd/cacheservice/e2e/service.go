@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
@@ -49,6 +50,12 @@ type ServiceOptions struct {
 	// command. Without it, the service takes any token, in the run's
 	// scope.
 	TokensFile string
+	// NamespacesFile, when set, gives namespaces their limits (server's
+	// UseLimits); ReloadLimits reads it again.
+	NamespacesFile string
+	// GCGrace is GC's grace period (0: its default). GC runs only when a
+	// scenario calls CollectGarbage.
+	GCGrace time.Duration
 }
 
 // noEngineWait is how long an export waits for its engine to reconnect:
@@ -84,9 +91,17 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 		Tracker:      exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},
 		ImportPoll:   poll,
 		NoEngineWait: noEngineWait,
+		// Only when a scenario asks (CollectGarbage).
+		GC: &server.GCConfig{Collector: gc.Config{Grace: opts.GCGrace}},
 	}); err != nil {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
+	}
+	if opts.NamespacesFile != "" {
+		if err := svc.UseLimits(opts.NamespacesFile, gc.Limits{}); err != nil {
+			cancel()
+			t.Fatalf("service %s: %v", name, err)
+		}
 	}
 	if opts.TokensFile != "" {
 		if err := svc.UseTokensFile(opts.TokensFile); err != nil {
