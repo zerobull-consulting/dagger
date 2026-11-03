@@ -511,3 +511,37 @@ func TestCapExpiryRoundsUp(t *testing.T) {
 		}
 	}
 }
+
+// Known gap (zerobull-consulting/dagger#59): once a root's entry and its
+// cache mapping are fully collected, a late export of the same engine entry
+// from an older generation of that cache finds nothing to compare against.
+// It is recorded as new, with a fresh root, and the value lives on for
+// another max age. The data is valid (the engine had it), but retention
+// was decided by a stale record.
+func TestKnownGapLateOlderGenerationRevivesCollectedRoot(t *testing.T) {
+	ctx := context.Background()
+	s, clock := newClockedStore(t, NewMemObjects())
+	x, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nx := x.Numbers[1]
+	clock.add(2 * time.Hour)
+	if _, err := s.UpdateIndex(ctx, "s1", func(idx *Index) error {
+		idx.Expire(clock.now().Unix(), 90*time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	idx := mustIndex(t, s, "s1")
+	if idx.Entries[nx] != nil || len(idx.Roots) != 0 {
+		t.Fatalf("setup: X not collected: entry %+v, roots %v", idx.Entries[nx], idx.Roots)
+	}
+	rec, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Index.Roots) != 1 {
+		t.Fatalf("roots after the late gen-1 export: %v; if it no longer revives X, the gap is fixed: update #59 and this test", rec.Index.Roots)
+	}
+}

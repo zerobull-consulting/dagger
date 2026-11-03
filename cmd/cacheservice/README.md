@@ -1162,7 +1162,12 @@ An export refreshes a root's time **only when it writes the root's record**
   (`TestRootAddedOnlyWithItsRecord`). Merges hand stored entries to engines,
   so a refresh by them would keep data alive forever by merging it around.
   The tracker doesn't export unchanged imports anyway; the index doesn't
-  rely on it.
+  rely on it. **Known gap
+  ([#59](https://github.com/zerobull-consulting/dagger/issues/59)):** once
+  GC has dropped the value's entry and its cache mapping too, a late
+  export from an older generation has nothing to compare against. It is
+  recorded as new, with a fresh root, and kept for another max age
+  (`TestKnownGapLateOlderGenerationRevivesCollectedRoot`).
 
 **Merges are capped at it.** Most stored roots have no expiry (0), and a
 merge used to send the index's: every engine kept every imported root until
