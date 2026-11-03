@@ -21,7 +21,7 @@ the settings. Data persists in the `dagger-remote-cache_minio-data` volume.
 | `dev.sh reset` | Stop MinIO and delete the data. |
 | `dev.sh status` | Show the containers. |
 | `dev.sh env` | Print the settings as `export` lines: `eval "$(./hack/remote-cache/dev.sh env)"`. |
-| `dev.sh test` | Start MinIO and run the Go tests against it. |
+| `dev.sh test` | Start MinIO and run the Go tests against it, or any bucket with `CACHESERVICE_TEST_EXTERNAL=1` ([Testing against a real bucket](#testing-against-a-real-bucket)). |
 | `dev.sh e2e` | Start MinIO and run the remote cache with real engines, and its scenarios (`cmd/cacheservice/e2e`). See [Real engines](#real-engines-devsh-e2e). |
 | `dev.sh e2e-down` | Remove the engine containers and volumes a run with `E2E_KEEP=1` left. |
 
@@ -192,8 +192,85 @@ and over it only once the GETs are added, and checks that each is stored
 (split when over) and imported
 ([#12](https://github.com/zerobull-consulting/dagger/issues/12)).
 
-Each run writes under its own `test/` prefix in the bucket and deletes it
-afterwards. The `Remote cache tests` workflow runs them on every pull request.
+Each test writes under `test/<run>/` in the bucket and deletes it afterwards.
+The `Remote cache tests` workflow runs them on every pull request. They need
+`CACHESERVICE_S3_PREFIX`, which `dev.sh test` and `dev.sh e2e` set to `test`
+for MinIO, but `dev.sh env` doesn't, since it's also the service's settings.
+Set it yourself to run `go test` by hand.
+
+## Testing against a real bucket
+
+The store suites run against any S3-compatible bucket, under a prefix of their
+own. With `CACHESERVICE_TEST_EXTERNAL=1`, `dev.sh test` doesn't start MinIO, and
+uses the bucket in the `CACHESERVICE_S3_*` variables:
+
+```bash
+# Encrypted values, with dotenvx, from cmd/cacheservice/.env:
+cd cmd/cacheservice
+npx @dotenvx/dotenvx run -- bash -c '
+  export CACHESERVICE_TEST_EXTERNAL=1 CACHESERVICE_TEST_STORE=spaces
+  cd ../.. && ./hack/remote-cache/dev.sh test'
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `CACHESERVICE_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | The bucket. |
+| `CACHESERVICE_S3_PREFIX` | Required: everything happens under it. Empty or `/` is refused. |
+| `CACHESERVICE_S3_PATH_STYLE` | `true` or `false`. Unset, the store suites use virtual-hosted addressing. |
+| `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
+| `CACHESERVICE_TEST_STORE` | `minio` (default) or `spaces`: what the tests expect where stores differ ([below](#what-each-store-does)). |
+| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration. Leave it unset on a shared bucket. |
+
+### What keeps a shared bucket safe
+
+The bucket doesn't have to be disposable. `cmd/cacheservice/internal/s3test`
+enforces this in test setup:
+
+- A run refuses an empty or `/` prefix.
+- Every key a test writes, deletes or aborts is under `<prefix>/<run>/`. Every
+  S3 client of the tests goes through a guard (`s3test.Guard`) that refuses
+  anything else before it reaches the store, and fails the test. It reads the
+  keys of bulk deletes too. Presigned PUTs are checked by `s3test.CheckURL`.
+- Nothing changes the bucket's configuration. The guard refuses every
+  bucket-level change. The one exception is the lifecycle configuration with
+  `CACHESERVICE_TEST_DISPOSABLE_BUCKET=1`, since
+  `PutBucketLifecycleConfiguration` replaces the whole bucket's. Without it,
+  `TestMinIOGC` skips that part, and expects no rule. Reads are not limited:
+  they change nothing.
+- Each test deletes its objects and aborts its uploads when it ends, failed or
+  not, and fails if any are left.
+
+A process that is killed (`go test`'s `-timeout`) can't clean up: its objects
+stay under `<prefix>/<run>/`, whose name starts with the run's UTC time.
+
+`TestGuardWithSDK` and `TestGuardBucketConfiguration` check the guard with the
+requests the SDK really makes, in both ways of addressing the bucket, and
+`TestMinIODeletePrefix` the cleanup, against a real store.
+
+### What each store does
+
+The checks of
+[zerobull-consulting/dagger#55](https://github.com/zerobull-consulting/dagger/issues/55),
+from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
+(`s3test.StoreBehavior`), so a store that changes fails them.
+
+| Check | MinIO | DigitalOcean Spaces | What the service does on Spaces |
+| --- | --- | --- | --- |
+| `If-None-Match: *` on `PutObject` | Honored | Honored | Relies on it for the index. |
+| `If-Match` on `PutObject` | Honored, quoted or not | **Honored only unquoted**; a quoted current ETag gets 412. A stale one gets 412 either way. 8 racing writers lost no update in 80. | Sends it unquoted, on every store. |
+| Store-side checksum on a one-part `UploadPartCopy` | Full SHA-256 | **None returned** | Detects it on the first copy and hashes in the service from then on, so blob bytes pass through the service. |
+| `If-None-Match: *` on `CompleteMultipartUpload` | Honored (412) | **Ignored**: overwrites | Accepts it: only verified copies complete, so racing exports write the same bytes. |
+| `CopySourceIfMatch` on copies | Honored (412) | **Ignored** | Compares each copied part's ETag with the MD5 it took while hashing. |
+| `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
+| Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
+| Presigned expiry | 403 | 403 | None needed. |
+| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)** | Both accepted with a key allowed to; **403 with a limited key** | Whether they take effect isn't checked: rules run on a scale of days. |
+| A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
+| Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
+| Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |
+
+`CACHESERVICE_S3_HASH_IN_SERVICE` needn't be set on Spaces: the fallback is
+automatic. AWS S3 is still open in zerobull-consulting/dagger#55.
 
 ## Pointing an engine at the service and MinIO
 
@@ -239,7 +316,7 @@ MinIO and runs it with `CACHESERVICE_E2E=1`, which it skips without. The
 `Remote cache tests` workflow runs it on every pull request.
 
 Each run starts from nothing without deleting anything: it works under its
-own prefix in the bucket (`e2e/<run>/`), and gives each engine a new, empty
+own prefix in the bucket (`test/e2e/<run>/`), and gives each engine a new, empty
 cache volume. It:
 
 1. builds `dagger-engine`, `dagger-init-session` and the `dagger` CLI from
@@ -254,7 +331,7 @@ cache volume. It:
    engine makes to the store is recorded, with its time and status. MinIO
    itself can stay on loopback. The main service has no tokens file: it is
    unauthenticated, so only the bridge reaches it, and every engine is in the
-   run's scope (`e2e`), whose blobs are at `e2e/<run>/e2e/blobs/`;
+   run's scope (`e2e`), whose blobs are at `test/e2e/<run>/e2e/blobs/`;
 3. starts engines A and B in containers, each with
    `_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL`, `DAGGER_CLOUD_TOKEN` and
    `DAGGER_CLOUD_URL` pointing at the service;

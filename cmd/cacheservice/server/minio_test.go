@@ -13,7 +13,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -25,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 )
 
 type minioTestEnv struct {
@@ -32,6 +33,8 @@ type minioTestEnv struct {
 	bucket string
 	// prefix holds this run's objects, so runs don't see each other's.
 	prefix string
+	// guard keeps every S3 client of the test to the run's keys.
+	guard *s3test.Guard
 }
 
 func newMinIOTestEnv(t *testing.T) *minioTestEnv {
@@ -46,7 +49,10 @@ func newMinIOTestEnv(t *testing.T) *minioTestEnv {
 		}
 		return def
 	}
+	bucket := env("CACHESERVICE_S3_BUCKET", "dagger-cache")
+	scope := s3test.NewScope(t, bucket)
 	client := s3.New(s3.Options{
+		HTTPClient:   scope.Guard,
 		BaseEndpoint: aws.String(endpoint),
 		Region:       env("CACHESERVICE_S3_REGION", "us-east-1"),
 		Credentials: credentials.NewStaticCredentialsProvider(
@@ -59,35 +65,11 @@ func newMinIOTestEnv(t *testing.T) *minioTestEnv {
 		// the engine's upload sends none of them.
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 	})
-	suffix := make([]byte, 6)
-	_, _ = rand.Read(suffix)
-	e := &minioTestEnv{
-		client: client,
-		bucket: env("CACHESERVICE_S3_BUCKET", "dagger-cache"),
-		prefix: fmt.Sprintf("test/%s-%s", t.Name(), hex.EncodeToString(suffix)),
-	}
-	t.Cleanup(e.deleteAll)
-	return e
+	scope.DeleteOnCleanup(t, client)
+	return &minioTestEnv{client: client, bucket: bucket, prefix: scope.Prefix, guard: scope.Guard}
 }
 
 func (e *minioTestEnv) key(rest string) string { return e.prefix + "/" + rest }
-
-func (e *minioTestEnv) deleteAll() {
-	ctx := context.Background()
-	pages := s3.NewListObjectsV2Paginator(e.client, &s3.ListObjectsV2Input{
-		Bucket: &e.bucket,
-		Prefix: aws.String(e.prefix + "/"),
-	})
-	for pages.HasMorePages() {
-		page, err := pages.NextPage(ctx)
-		if err != nil {
-			return
-		}
-		for _, obj := range page.Contents {
-			_, _ = e.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &e.bucket, Key: obj.Key})
-		}
-	}
-}
 
 // exists reports whether key is in the bucket, the way the blob store's Has
 // will: HeadObject, with 404 as false.
@@ -183,6 +165,7 @@ func TestMinIOPresignedPutGet(t *testing.T) {
 			t.Errorf("presigned PUT signs header %q, which the engine won't send", name)
 		}
 	}
+	s3test.CheckURL(t, http.MethodPut, put.URL, e.bucket)
 	status, err := enginePut(ctx, put.URL, blob)
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +222,7 @@ func TestMinIOPresignedPutSizeBound(t *testing.T) {
 		{"one byte shorter", blob[:len(blob)-1]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			s3test.CheckURL(t, http.MethodPut, put.URL, e.bucket)
 			status, err := enginePut(ctx, put.URL, tc.body)
 			if err != nil {
 				t.Fatal(err)
@@ -282,8 +266,10 @@ func TestMinIOPresignedGetExpires(t *testing.T) {
 	}
 }
 
-// MinIO honors conditional writes, which #6 needs for atomic index updates:
-// If-None-Match: * creates only, and If-Match replaces only the version read.
+// The store honors conditional writes, which #6 needs for atomic index
+// updates: If-None-Match: * creates only, and If-Match replaces only the
+// version read. The ETag goes unquoted, as the metadata store sends it: Spaces
+// answers 412 to the quoted ETag it returned itself, even when it is current.
 func TestMinIOConditionalWrites(t *testing.T) {
 	e := newMinIOTestEnv(t)
 	ctx := context.Background()
@@ -304,16 +290,17 @@ func TestMinIOConditionalWrites(t *testing.T) {
 		t.Fatalf("second create with If-None-Match: %v, want 412", err)
 	}
 
+	unquoted := aws.String(strings.Trim(aws.ToString(first.ETag), `"`))
 	second, err := e.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &e.bucket, Key: &key, Body: strings.NewReader(`{"v":2}`),
-		IfMatch: first.ETag,
+		IfMatch: unquoted,
 	})
 	if err != nil {
 		t.Fatalf("update with current If-Match: %v", err)
 	}
 	_, err = e.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &e.bucket, Key: &key, Body: strings.NewReader(`{"v":"stale"}`),
-		IfMatch: first.ETag,
+		IfMatch: unquoted,
 	})
 	if httpStatus(err) != http.StatusPreconditionFailed {
 		t.Fatalf("update with stale If-Match: %v, want 412", err)
@@ -327,5 +314,19 @@ func TestMinIOConditionalWrites(t *testing.T) {
 	body, _ := io.ReadAll(out.Body)
 	if string(body) != `{"v":2}` || aws.ToString(out.ETag) != aws.ToString(second.ETag) {
 		t.Fatalf("index holds %s (ETag %s), want the If-Match update", body, aws.ToString(out.ETag))
+	}
+
+	// The current ETag as the store returned it, quoted: pinned, since it's
+	// why the metadata store unquotes it.
+	quotedKey := e.key("quoted")
+	created, err := e.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &e.bucket, Key: &quotedKey, Body: strings.NewReader("1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &e.bucket, Key: &quotedKey, Body: strings.NewReader("2"), IfMatch: created.ETag})
+	if takes := s3test.StoreBehavior(t).QuotedIfMatch; takes && err != nil {
+		t.Fatalf("If-Match with the quoted current ETag: %v", err)
+	} else if !takes && httpStatus(err) != http.StatusPreconditionFailed {
+		t.Fatalf("If-Match with the quoted current ETag: %v, want 412; the store changed (update its behavior and the README)", err)
 	}
 }

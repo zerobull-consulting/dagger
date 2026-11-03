@@ -169,7 +169,17 @@ and so does AWS S3 for objects up to 5 GB (`TestMinIOStoreHashesCopies`).
   of 1 GiB (larger when that would make over S3's 10,000 parts), each
   conditioned on the ETag it read (`CopySourceIfMatch`), so a staged object
   overwritten in between is not what gets promoted
-  (`TestMinIOPromoteManyParts`, with the limits lowered to 5 MiB).
+  (`TestMinIOPromoteManyParts`, with the limits lowered to 5 MiB). A store
+  may ignore that condition, as DigitalOcean Spaces does, so the service also
+  takes each part's MD5 as it reads and compares it with the ETag the store
+  returns for that part's copy. A difference is a mismatch, and the upload
+  never completes (`TestPromoteChecksCopiedParts`,
+  `TestMinIOPromoteStagedOverwritten`). This can't apply to a store whose
+  ETags aren't MD5s, such as AWS S3 with SSE-KMS; the staged object's own ETag
+  shows that, and only the condition protects the copy there. Since MD5 isn't
+  collision resistant, someone who holds the presigned PUT, prepares a
+  same-MD5 pair and wins the race could still get past it on a store that
+  ignores the condition.
 - So is every blob with `CACHESERVICE_S3_HASH_IN_SERVICE=true`, for a store
   whose copy checksums can't be trusted, and every blob once a store returns
   a part copy without a checksum: the service then hashes from that point
@@ -179,7 +189,9 @@ and so does AWS S3 for objects up to 5 GB (`TestMinIOStoreHashesCopies`).
 second conditional copy overwrote the key), but honors it on
 `CompleteMultipartUpload` (412), and honors `CopySourceIfMatch`
 (`TestMinIOConditionalPromotion`). AWS S3 documents both conditions on
-those calls too. Correctness doesn't
+those calls too. Spaces ignores both, so racing exports may both write there
+([what each store does](../../hack/remote-cache/README.md#what-each-store-does)).
+Correctness doesn't
 rest on the condition: only verified copies are ever promoted, so a store
 that ignored it would overwrite a blob with identical bytes.
 
@@ -384,8 +396,12 @@ backoff, reads the new index, and applies its change again. After
 writers, in one process or in several replicas, never lose each other's
 updates. All state is in the bucket, so a restarted service loses nothing.
 
-MinIO honors these conditional writes (`TestMinIOConditionalWrites`,
-`TestMinIOMetastoreConditionalWrites`), and so does AWS S3 since 2024.
+MinIO and DigitalOcean Spaces honor these conditional writes
+(`TestMinIOConditionalWrites`, `TestMinIOMetastoreConditionalWrites`), and so
+does AWS S3 since 2024, by its documentation. The ETag goes in `If-Match`
+without its quotes: Spaces answers 412 to the quoted ETag it returned itself,
+even when it is current. MinIO takes either; AWS S3 hasn't been run with this
+yet, and `VerifyConditionalWrites` would refuse it at startup if it didn't.
 `VerifyConditionalWrites` checks a store at startup, with a probe object it
 deletes afterwards. A store that ignored them
 would silently let writers overwrite each other, so a service should refuse

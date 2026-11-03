@@ -1,15 +1,14 @@
 package blobstore
 
 // Tests of S3Store against a real S3-compatible store: the MinIO dev
-// environment in hack/remote-cache. They skip unless CACHESERVICE_S3_ENDPOINT
-// is set; `hack/remote-cache/dev.sh test` starts MinIO and runs them.
+// environment in hack/remote-cache, or any bucket (s3test keeps them to their
+// own keys). They skip unless CACHESERVICE_S3_ENDPOINT is set;
+// `hack/remote-cache/dev.sh test` starts MinIO and runs them.
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -19,10 +18,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/opencontainers/go-digest"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 )
 
-// newMinIOStore returns a store under a prefix of its own, emptied when the
-// test ends.
+// minioBucket is the bucket under test.
+func minioBucket() string {
+	if b := os.Getenv(EnvBucket); b != "" {
+		return b
+	}
+	return "dagger-cache"
+}
+
+// newMinIOStore returns a store under a prefix of its own in the run's root,
+// emptied when the test ends, and kept to the root by s3test's guard.
 func newMinIOStore(t *testing.T, modify func(*S3Config)) *S3Store {
 	t.Helper()
 	if os.Getenv(EnvEndpoint) == "" {
@@ -35,12 +44,17 @@ func newMinIOStore(t *testing.T, modify func(*S3Config)) *S3Store {
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
 	}
-	if cfg.Bucket == "" {
-		cfg.Bucket = "dagger-cache"
+	cfg.Bucket = minioBucket()
+	scope := s3test.NewScope(t, cfg.Bucket)
+	cfg.Prefix = scope.Prefix
+	cfg.HTTPClient = scope.Guard
+	// Cleaning up uses the real credentials, whatever modify does to the
+	// store's.
+	cleanup, err := NewS3Client(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	suffix := make([]byte, 6)
-	_, _ = rand.Read(suffix)
-	cfg.Prefix = fmt.Sprintf("test/%s-%s", t.Name(), hex.EncodeToString(suffix))
+	scope.DeleteOnCleanup(t, cleanup)
 	if modify != nil {
 		modify(&cfg)
 	}
@@ -48,31 +62,14 @@ func newMinIOStore(t *testing.T, modify func(*S3Config)) *S3Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { deletePrefix(s) })
 	return s
-}
-
-func deletePrefix(s *S3Store) {
-	ctx := context.Background()
-	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: &s.bucket,
-		Prefix: aws.String(s.prefix + "/"),
-	})
-	for pages.HasMorePages() {
-		page, err := pages.NextPage(ctx)
-		if err != nil {
-			return
-		}
-		for _, obj := range page.Contents {
-			_, _ = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: obj.Key})
-		}
-	}
 }
 
 // enginePut uploads body the way the engine does (engine/remotecache's
 // httpPut): a bare PUT with Content-Length and no other headers.
 func enginePut(t *testing.T, url string, body []byte) int {
 	t.Helper()
+	s3test.CheckURL(t, http.MethodPut, url, minioBucket())
 	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +187,7 @@ func TestMinIOStorePutGet(t *testing.T) {
 		t.Fatalf("after the upload: stored %v, staged %v; want staged only", mustHas(t, s, d), objectExists(t, s, staged))
 	}
 	p, err := s.Promote(ctx, stage, d, int64(len(blob)))
-	if err != nil || p.Outcome != Promoted || p.HashedBy != HashedByStore || p.Bytes != int64(len(blob)) {
+	if err != nil || p.Outcome != Promoted || p.HashedBy != wantHashedBy(t, HashedByStore) || p.Bytes != int64(len(blob)) {
 		t.Fatalf("promote: %+v, %v", p, err)
 	}
 	if !mustHas(t, s, d) || objectExists(t, s, staged) {
