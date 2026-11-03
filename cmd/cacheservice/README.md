@@ -614,7 +614,7 @@ session's cache ID. If none is, the export waits and is tried again.
    5 times per value.
 4. Once every blob is stored (promoted, so verified), the bundle is published
    and recorded in the index (`metastore.RecordFenced`). Each try reads
-   GC's epoch (`<prefix>/<ns>/gc-epoch.json`, one small GET) before it
+   GC's epoch (`<prefix>/<ns>/gc-epoch.json`, one small GET, at most once per 10s) before it
    checks any blob, and its index write is refused if it names a blob,
    bundle or resolution GC is deleting, or deleted after that read: it
    checked the object before it was deleted. The export is then tried again
@@ -1094,7 +1094,10 @@ each namespace, in order:
    index names that can't be read stops the namespace's sweep: GC can't
    know its blobs (`TestMissingBundleStopsSweep`). A namespace with no index
    is not swept either: GC can't tell what is in use
-   (`TestLeavesWhatItDoesNotKnow`).
+   (`TestLeavesWhatItDoesNotKnow`). Nor is one whose index can't be read
+   (corrupt, or a later version a newer replica wrote); its staged and
+   multipart uploads, which don't need the index, are still collected
+   (`TestUnreadableIndexStillCollectsUploads`).
 4. **Max size**, below.
 5. **Sweep.** Bundles, resolutions and blobs nothing marks, older than the
    grace period (`-gc-grace`, 2h), are claimed, deleted and finished (see
@@ -1135,7 +1138,10 @@ An export refreshes a root's time **only when it writes the root's record**
   record that adds parts (see [Imported entries](#imported-entries)):
   refreshed;
 - a late export from an older generation, or an engine exporting back an
-  import unchanged: not refreshed. Merges hand stored entries to engines,
+  import unchanged: not refreshed, and not added when the index has no such
+  root. A value whose root the max age expired, still stored as another
+  root's dependency, doesn't come back as a root with a fresh time
+  (`TestRootAddedOnlyWithItsRecord`). Merges hand stored entries to engines,
   so a refresh by them would keep data alive forever by merging it around.
   The tracker doesn't export unchanged imports anyway; the index doesn't
   rely on it.
@@ -1203,10 +1209,11 @@ serialized with exports on the index:
    one recorded after names a claimed object and is refused
    (`metastore.ErrCollected`).
 2. **Delete**, with `DeleteObjects`, 1,000 keys per request, within 10
-   minutes of the claim (a run doesn't start a delete after that).
+   minutes of the claim: a run doesn't start a delete after that, and
+   cancels one still in flight (`TestDeletesCanceledAtDeadline`).
 3. **Finish.** In a second update, GC marks them deleted in a new epoch,
    then publishes the epoch in `<prefix>/<ns>/gc-epoch.json`. Each export
-   try reads that object before it checks any blob (one small GET), and its
+   try reads that object before it checks any blob (one small GET, kept for 10s), and its
    index write is refused if it names an object deleted in a later epoch: it
    checked the object before it was deleted
    (`TestRecordFenced`, `TestExportRacesSweep`).
@@ -1220,7 +1227,14 @@ before, and an export that may still record started under 3h ago, so its
 checks came after the deletion (`TestStaleEpochAfterPruneIsSafe`).
 
 A refused export is tried again from the start: it finds what is gone, has
-the engine upload it again, and is recorded (`export_collected_total`). So
+the engine upload it again, and is recorded (`export_collected_total`).
+Refusals have their own budget of 3 tries, apart from the export's upload
+attempts, and when they run out the roots fail as "garbage collection
+deleted what the export named", not as failed uploads
+(`TestExportCollectedRetriesApart`). An exporter reads the epoch at most
+once per 10s and keeps it for later tries: a fence read earlier is still
+read before the try's checks, and at worst only refuses more. A refused try
+reads a fresh one (`TestExportFenceReadOncePerTTL`). So
 the index never names an object that isn't stored, whatever GC does at the
 same time. Shown with fake engines by `TestGCRacesExport`: an export held
 between its blob promotions and its index write while GC runs. With the
@@ -1243,7 +1257,10 @@ delete, so any number of replicas may run GC at once, with no election
 deletes only what it claimed. A run that stops between its claim and its
 finish leaves its claims in progress (exports naming them are refused);
 once they are 15 minutes old, a later run of any replica takes them over,
-deletes and finishes (`TestStaleClaimTakenOver`). Claims taken over count
+deletes and finishes (`TestStaleClaimTakenOver`). That bound is fixed (the
+longest deadline a collector takes, 10 minutes, plus 5): a replica
+configured with a shorter deadline still waits for one with a longer one
+(`TestStalenessIgnoresOwnDeadline`). Claims taken over count
 against `-gc-max-deletes` with new ones, stale first, so one run never
 deletes more however many runs stopped (`TestStaleClaimsBoundedByMaxDeletes`). Clocks of replicas only
 need to agree within minutes.
@@ -1304,7 +1321,7 @@ Per namespace and run:
 | List | 1 `ListObjectsV2` per 1,000 objects |
 | Mark | 1 GET per live bundle not read before (kept in memory) |
 | Claim, finish | 1 index read and conditional PUT each, only when there is something to delete; 1 GET and conditional PUT of the epoch |
-| Epoch | 1 GET of the epoch object, once the namespace has deleted anything |
+| Epoch | 1 GET of the epoch object, once the namespace has deleted anything; exporters read it at most once per 10s each, and after a refused try |
 | Delete | 1 `DeleteObjects` per 1,000 objects |
 | Staging | none beyond the listing; 1 `DeleteObjects` per 1,000 deleted |
 

@@ -1047,3 +1047,79 @@ func TestSameRecord(t *testing.T) {
 		}
 	}
 }
+
+// A collector refuses a delete deadline over MaxDeleteDeadline, and takes a
+// claim over only once it is MaxDeleteDeadline (plus slack) old, whatever
+// its own, shorter, deadline: another replica may still be deleting under
+// a longer one.
+func TestStalenessIgnoresOwnDeadline(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	if _, err := New(Config{Bucket: e.bucket, Meta: e.meta, DeleteDeadline: MaxDeleteDeadline + time.Second}); err == nil {
+		t.Fatal("a delete deadline over the max: no error")
+	}
+	e.export("team", "a", buildX("x"), 2)
+	orphan := e.view("team").Put(layer("orphan", 100))
+	key := metastore.BlobRelKey(orphan)
+	if _, err := e.meta.UpdateIndex(ctx, "team", func(idx *metastore.Index) error {
+		idx.GC = &metastore.Collection{Deletions: map[string]metastore.Deletion{key: {Run: "other", StartedUnix: e.clock.Now().Unix()}}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	short := e.collector(func(cfg *Config) { cfg.DeleteDeadline = time.Minute })
+	// Past the short deadline plus slack, within the max one's.
+	e.clock.Add(time.Minute + staleSlack + time.Minute)
+	if r := reportOf(e.run(short), "team"); len(r.Deleted) != 0 {
+		t.Fatalf("took over a claim another replica may still delete under: %v", r.Deleted)
+	}
+	e.clock.Add(MaxDeleteDeadline)
+	if r := reportOf(e.run(short), "team"); r.Deleted["blob"] != 1 {
+		t.Fatalf("past the max deadline: %v", r.Deleted)
+	}
+}
+
+// A delete still in flight at the deadline is canceled: nothing is deleted
+// after it, when another replica may take the claim over.
+func TestDeletesCanceledAtDeadline(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	orphan := e.view("team").Put(layer("orphan", 100))
+	e.clock.Add(3 * time.Hour)
+	e.bucket.BeforeDelete(func([]string) { time.Sleep(200 * time.Millisecond) })
+	c := e.collector(func(cfg *Config) { cfg.DeleteDeadline = 50 * time.Millisecond })
+	reps, err := c.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("run: %v", err)
+	}
+	if _, ok := e.view("team").Get(orphan); !ok {
+		t.Fatalf("deleted after its deadline: %+v", reportOf(reps, "team"))
+	}
+}
+
+// A namespace whose index can't be read keeps its bundles and blobs (GC
+// can't tell what is in use) but still has its staged and multipart
+// uploads collected: those don't need the index.
+func TestUnreadableIndexStillCollectsUploads(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.export("team", "a", buildX("x"), 2)
+	if _, err := e.objs.Put(ctx, prefix+"/team/index.json", []byte(`{"version":99,"nextNumber":1}`), metastore.Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	staged := e.view("team").PutStaged(blobstore.NewStage(), layer("staged", 100))
+	e.bucket.AddUpload(Upload{Key: prefix + "/team/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
+	blobs := e.view("team").Len()
+	e.clock.Add(1000 * time.Hour)
+	reps, err := e.collector(nil).Run(ctx)
+	if err == nil {
+		t.Fatal("no error for an unreadable index")
+	}
+	r := reportOf(reps, "team")
+	if r.Deleted["staging"] != 1 || r.Deleted["upload"] != 1 || r.Deleted["blob"] != 0 {
+		t.Fatalf("report %+v", r)
+	}
+	if e.view("team").Len() != blobs || slices.Contains(e.view("team").Staged(), staged) {
+		t.Fatal("blobs deleted, or the staged upload kept")
+	}
+}

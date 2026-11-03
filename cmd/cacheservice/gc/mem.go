@@ -140,6 +140,10 @@ func (b *MemBucket) Delete(ctx context.Context, keys []string) error {
 	if hook != nil {
 		hook(keys)
 	}
+	// As the S3 client: a call whose context ended fails.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, key := range keys {
 		rest, ok := strings.CutPrefix(key, b.top())
 		if !ok {

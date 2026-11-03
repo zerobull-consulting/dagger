@@ -566,6 +566,15 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	for _, r := range bundle.Roots {
 		n := numbers[r.Ordinal]
 		root, existed := idx.Roots[n]
+		if !existed && !written[r.Ordinal] {
+			// A root is added only with its record. This export didn't
+			// write it (a late export from an older generation, or an
+			// import exported back unchanged): the stored entry stays,
+			// kept alive by whatever keeps it now, and no root, with a
+			// fresh recording time, revives a value whose own root
+			// expired. Merges never keep data alive by themselves.
+			continue
+		}
 		if !existed || !laterExpiry(root.ExpiresAtUnix, r.ExpiresAtUnix) {
 			root.ExpiresAtUnix = r.ExpiresAtUnix
 		}

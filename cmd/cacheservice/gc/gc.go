@@ -78,9 +78,15 @@ const (
 	// larger backlog drains over later runs.
 	DefaultMaxDeletes = 5000
 	// DefaultDeleteDeadline bounds a run's deletes after its claim. A run
-	// doesn't start a delete after it; a later run takes over its claims
-	// once they are DeleteDeadline plus staleSlack old.
+	// doesn't start a delete after it, and cancels a delete still in flight
+	// at it.
 	DefaultDeleteDeadline = 10 * time.Minute
+	// MaxDeleteDeadline is the longest DeleteDeadline a collector takes.
+	// Every replica takes a claim over once it is MaxDeleteDeadline plus
+	// staleSlack old, whatever its own deadline: a staleness bound that
+	// followed each replica's own setting would let one with a shorter
+	// deadline take over, and finish, claims another is still deleting.
+	MaxDeleteDeadline = 10 * time.Minute
 	// staleSlack is the margin before a claim counts as stale, for clocks
 	// of different replicas.
 	staleSlack = 5 * time.Minute
@@ -150,6 +156,9 @@ func New(cfg Config) (*Collector, error) {
 	}
 	if cfg.DeleteDeadline == 0 {
 		cfg.DeleteDeadline = DefaultDeleteDeadline
+	}
+	if cfg.DeleteDeadline > MaxDeleteDeadline {
+		return nil, fmt.Errorf("gc: delete deadline %s is over %s, after which other replicas take a run's claims over", cfg.DeleteDeadline, MaxDeleteDeadline)
 	}
 	if cfg.Limits == nil {
 		cfg.Limits = func(string) Limits { return Limits{} }
@@ -508,14 +517,15 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 	// 1. Expire by expiry and max age; stamp roots with no recording time.
 	prev, idx, err := c.expire(ctx, ns, lim, now, &rep)
 	if err != nil {
+		// The bundles, resolutions and blobs need the index; staged and
+		// multipart uploads don't, and are still collected.
 		rep.fail(fmt.Errorf("expire: %w", err))
 		rep.Skipped = "the index couldn't be read or updated"
-		return rep
 	}
 
 	// The published epoch must not lag the index's: a finish whose publish
 	// failed, or a replica that published late, is caught up here.
-	if !c.cfg.DryRun {
+	if !c.cfg.DryRun && idx != nil {
 		c.publishEpoch(ctx, ns, idx, &rep)
 	}
 
@@ -529,11 +539,14 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 	rep.StoredBytes, rep.StoredObjects = l.bytes, l.objects
 	c.cfg.Metrics.GCStored(ns, l.bytes, l.objects)
 
-	// 3. Bundles, resolutions and blobs, only where an index is: without
-	// one, GC can't tell an object in use from one that isn't.
-	if !l.hasIndex {
+	// 3. Bundles, resolutions and blobs, only where an index is, and was
+	// read: without one, GC can't tell an object in use from one that
+	// isn't.
+	switch {
+	case idx == nil:
+	case !l.hasIndex:
 		rep.Skipped = "no index"
-	} else {
+	default:
 		c.sweep(ctx, ns, prev, idx, l, lim, now, &rep, log)
 	}
 
@@ -660,7 +673,7 @@ func (c *Collector) sweep(ctx context.Context, ns string, prev, idx *metastore.I
 		rep.WouldDelete = append(rep.WouldDelete, cands...)
 		return
 	}
-	if len(cands) == 0 && !hasStale(idx, now, c.cfg.DeleteDeadline) {
+	if len(cands) == 0 && !hasStale(idx, now) {
 		return
 	}
 	c.claimAndDelete(ctx, ns, cands, l, now, rep, log)
@@ -712,17 +725,18 @@ func (c *Collector) candidates(idx *metastore.Index, r *refs, l *listing, now ti
 	return out
 }
 
-// stale reports whether a claim was left by a run that stopped.
-func stale(d metastore.Deletion, now time.Time, deadline time.Duration) bool {
-	return d.InProgress() && now.Unix()-d.StartedUnix > int64((deadline+staleSlack)/time.Second)
+// stale reports whether a claim was left by a run that stopped: one older
+// than any run, of any replica, may still delete under it.
+func stale(d metastore.Deletion, now time.Time) bool {
+	return d.InProgress() && now.Unix()-d.StartedUnix > int64((MaxDeleteDeadline+staleSlack)/time.Second)
 }
 
-func hasStale(idx *metastore.Index, now time.Time, deadline time.Duration) bool {
+func hasStale(idx *metastore.Index, now time.Time) bool {
 	if idx.GC == nil {
 		return false
 	}
 	for _, d := range idx.GC.Deletions {
-		if stale(d, now, deadline) {
+		if stale(d, now) {
 			return true
 		}
 	}
@@ -753,7 +767,7 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 		// rest wait for later runs.
 		var staleKeys []string
 		for k, d := range idx.GC.Deletions {
-			if stale(d, now, c.cfg.DeleteDeadline) {
+			if stale(d, now) {
 				staleKeys = append(staleKeys, k)
 			}
 		}
@@ -793,8 +807,11 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 	slices.Sort(claimed)
 	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
 
-	// Delete, within the deadline (monotonic, from the claim).
+	// Delete, within the deadline (monotonic, from the claim): no batch
+	// starts after it, and one in flight is canceled at it.
 	deadline := time.Now().Add(c.cfg.DeleteDeadline)
+	dctx, cancelDeletes := context.WithDeadline(ctx, deadline)
+	defer cancelDeletes()
 	attempted := map[string]bool{}
 	for i := 0; i < len(claimed); i += MaxDeleteBatch {
 		batch := claimed[i:min(i+MaxDeleteBatch, len(claimed))]
@@ -818,7 +835,7 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 			// so a later run claims it again.
 			attempted[k] = true
 		}
-		if err := c.cfg.Bucket.Delete(ctx, keys); err != nil {
+		if err := c.cfg.Bucket.Delete(dctx, keys); err != nil {
 			rep.fail(fmt.Errorf("delete: %w", err))
 			break
 		}

@@ -397,3 +397,62 @@ func TestStaleEpochAfterPruneIsSafe(t *testing.T) {
 		t.Fatalf("an export older than MaxFenceAge: %v", err)
 	}
 }
+
+// A root is added only with its record: an export that doesn't write the
+// record (an import exported back unchanged, or a late export from an older
+// generation) adds no root. Otherwise a value whose root the max age
+// expired, still stored as another root's dependency, would come back as a
+// root with a fresh recording time, kept alive by merges alone.
+func TestRootAddedOnlyWithItsRecord(t *testing.T) {
+	ctx := context.Background()
+	s, clock := newClockedStore(t, NewMemObjects())
+	// X (sender 10) as a root, then Y (20) on it.
+	x, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.add(time.Hour)
+	if _, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}, {sender: 20, deps: []uint64{1}}}, root(2, 0)), "c", 2); err != nil {
+		t.Fatal(err)
+	}
+	nx := x.Numbers[1]
+	// X's root expires by its max age; X stays, as Y's dependency.
+	clock.add(time.Hour)
+	if _, err := s.UpdateIndex(ctx, "s1", func(idx *Index) error {
+		idx.Expire(clock.now().Unix(), 90*time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	idx := mustIndex(t, s, "s1")
+	if _, ok := idx.Roots[nx]; ok || idx.Entries[nx] == nil {
+		t.Fatalf("setup: root %v, entry %v", idx.Roots[nx], idx.Entries[nx])
+	}
+	// Cache b had X merged, and exports it back unchanged, as a root.
+	if _, err := s.RecordImports(ctx, "s1", "b", 1, []Import{{Number: nx, Engine: 70}}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.Record(ctx, "s1", testBundle([]val{{sender: 70}}, root(1, 0)), "b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rec.Index.Roots[nx]; ok {
+		t.Fatal("an import exported back unchanged made X a root again")
+	}
+	// A late export of X from c's generation 1: not written, no root.
+	rec, err = s.Record(ctx, "s1", testBundle([]val{{sender: 10, replacements: 9}}, root(1, 0)), "c", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rec.Index.Roots[nx]; ok {
+		t.Fatal("a late older-generation export made X a root again")
+	}
+	// A newer state of X from c: written, a root again.
+	rec, err = s.Record(ctx, "s1", testBundle([]val{{sender: 10, replacements: 1}}, root(1, 0)), "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := rec.Index.Roots[nx]; !ok || r.RecordedAtUnix != clock.now().Unix() {
+		t.Fatalf("a newer record: root %+v, %v", r, ok)
+	}
+}
