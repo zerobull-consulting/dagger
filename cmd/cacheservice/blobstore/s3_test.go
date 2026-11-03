@@ -153,6 +153,28 @@ func TestNewS3Validates(t *testing.T) {
 	}
 }
 
+// MaxPromotions bounds the promotions of every namespace's view together:
+// the views share one set of slots.
+func TestMaxPromotionsShared(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxPromotions = 3
+	s := newTestStore(t, cfg)
+	view, err := s.Namespace("team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(s.promotions) != 3 || view.(*S3Store).promotions != s.promotions || view.(*S3Store).noStoreHash != s.noStoreHash {
+		t.Fatal("a namespace's view doesn't share the store's promotion slots")
+	}
+	if cap(newTestStore(t, testConfig()).promotions) != DefaultMaxPromotions {
+		t.Fatal("default promotion slots")
+	}
+	cfg.MaxPromotions = -1
+	if _, err := NewS3(context.Background(), cfg); err == nil {
+		t.Fatal("negative MaxPromotions accepted")
+	}
+}
+
 func TestNewS3DefaultCredentials(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "ENVID")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "ENVSECRET")
@@ -183,7 +205,7 @@ func parseURL(t *testing.T, raw string) (*url.URL, url.Values) {
 func TestPresignPut(t *testing.T) {
 	s := newTestStore(t, testConfig())
 	before := time.Now()
-	addr, err := s.PresignPut(context.Background(), testDigest, 12345)
+	addr, err := s.PresignPut(context.Background(), testStage, testDigest, 12345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +213,8 @@ func TestPresignPut(t *testing.T) {
 	if u.Host != "s3.test:9000" {
 		t.Errorf("host %q, want the endpoint's", u.Host)
 	}
-	if want := "/cache/team/blobs/sha256/" + testDigest.Encoded(); u.Path != want {
+	// Uploads go to the stage's staging key, never the digest key.
+	if want := "/cache/team/staging/" + string(testStage) + "/sha256/" + testDigest.Encoded(); u.Path != want {
 		t.Errorf("path %q, want %q", u.Path, want)
 	}
 	if got := q.Get("X-Amz-Expires"); got != strconv.Itoa(int(DefaultPutExpiry.Seconds())) {
@@ -217,7 +240,7 @@ func TestPresignPut(t *testing.T) {
 // not be bounded: it is refused.
 func TestPresignPutZeroSize(t *testing.T) {
 	s := newTestStore(t, testConfig())
-	_, err := s.PresignPut(context.Background(), digest.FromString(""), 0)
+	_, err := s.PresignPut(context.Background(), testStage, digest.FromString(""), 0)
 	if !errors.Is(err, ErrNotPositiveSize) {
 		t.Fatalf("err = %v, want ErrNotPositiveSize", err)
 	}
@@ -225,11 +248,14 @@ func TestPresignPutZeroSize(t *testing.T) {
 
 func TestPresignPutRejects(t *testing.T) {
 	s := newTestStore(t, testConfig())
-	if _, err := s.PresignPut(context.Background(), testDigest, -1); err == nil {
+	if _, err := s.PresignPut(context.Background(), testStage, testDigest, -1); err == nil {
 		t.Error("negative size: no error")
 	}
-	if _, err := s.PresignPut(context.Background(), "sha256:bad", 1); err == nil {
+	if _, err := s.PresignPut(context.Background(), testStage, "sha256:bad", 1); err == nil {
 		t.Error("bad digest: no error")
+	}
+	if _, err := s.PresignPut(context.Background(), "../../blobs", testDigest, 1); err == nil {
+		t.Error("bad stage: no error")
 	}
 	if _, err := s.PresignGet(context.Background(), "sha256:bad"); err == nil {
 		t.Error("bad digest GET: no error")
@@ -356,7 +382,7 @@ func TestHasErrors(t *testing.T) {
 
 func TestS3ConfigFromEnv(t *testing.T) {
 	for _, name := range []string{EnvEndpoint, EnvRegion, EnvBucket, EnvPrefix, EnvPathStyle,
-		EnvAccessKeyID, EnvSecretAccessKey, EnvPutExpiry, EnvGetExpiry} {
+		EnvAccessKeyID, EnvSecretAccessKey, EnvPutExpiry, EnvGetExpiry, EnvMaxPromotions, EnvHashInService} {
 		t.Setenv(name, "")
 	}
 	t.Setenv(EnvEndpoint, "http://localhost:9000")
@@ -366,6 +392,8 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	t.Setenv(EnvPathStyle, "true")
 	t.Setenv(EnvPutExpiry, "5m")
 	t.Setenv(EnvGetExpiry, "2h")
+	t.Setenv(EnvMaxPromotions, "3")
+	t.Setenv(EnvHashInService, "true")
 	t.Setenv(EnvAccessKeyID, "id")
 	t.Setenv(EnvSecretAccessKey, "secret")
 
@@ -374,7 +402,8 @@ func TestS3ConfigFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Endpoint != "http://localhost:9000" || cfg.Region != "us-east-1" || cfg.Bucket != "b" ||
-		cfg.Prefix != "p" || !cfg.PathStyle || cfg.PutExpiry != 5*time.Minute || cfg.GetExpiry != 2*time.Hour {
+		cfg.Prefix != "p" || !cfg.PathStyle || cfg.PutExpiry != 5*time.Minute || cfg.GetExpiry != 2*time.Hour ||
+		cfg.MaxPromotions != 3 || !cfg.HashInService {
 		t.Errorf("cfg = %+v", cfg)
 	}
 	creds, err := cfg.Credentials.Retrieve(context.Background())
@@ -386,6 +415,9 @@ func TestS3ConfigFromEnv(t *testing.T) {
 		{EnvPathStyle, "maybe", EnvPathStyle},
 		{EnvPutExpiry, "soon", EnvPutExpiry},
 		{EnvGetExpiry, "later", EnvGetExpiry},
+		{EnvMaxPromotions, "0", EnvMaxPromotions},
+		{EnvMaxPromotions, "many", EnvMaxPromotions},
+		{EnvHashInService, "perhaps", EnvHashInService},
 		{EnvSecretAccessKey, "", "set both"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -437,7 +469,7 @@ func TestPresignExpiryCappedByCredentials(t *testing.T) {
 		t.Errorf("GET ExpiresAt %v, want the credentials' expiry %v", get.ExpiresAt, credsExpire)
 	}
 	// The PUT's own 15m expiry outlasts the credentials too.
-	put, err := s.PresignPut(ctx, testDigest, 1)
+	put, err := s.PresignPut(ctx, testStage, testDigest, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +481,7 @@ func TestPresignExpiryCappedByCredentials(t *testing.T) {
 	cfg.PutExpiry = 5 * time.Minute
 	s = newTestStore(t, cfg)
 	before := time.Now()
-	put, err = s.PresignPut(ctx, testDigest, 1)
+	put, err = s.PresignPut(ctx, testStage, testDigest, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,5 +497,57 @@ func TestHasOnlyNotFoundIsMissing(t *testing.T) {
 		if ok, err := s.Has(context.Background(), testDigest); err == nil {
 			t.Errorf("HEAD %d: Has = %v, nil; want an error", status, ok)
 		}
+	}
+}
+
+// Staging keys sit under the store's (or namespace's) own prefix, next to
+// its blobs, and a namespace's staging never overlaps another's.
+func TestStagingKeys(t *testing.T) {
+	s := newTestStore(t, testConfig())
+	key, err := s.StagingKey(testStage, testDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "team/staging/" + string(testStage) + "/sha256/" + testDigest.Encoded(); key != want {
+		t.Fatalf("staging key %s, want %s", key, want)
+	}
+	if s.StagingPrefix() != "team/staging/" {
+		t.Fatalf("staging prefix %s", s.StagingPrefix())
+	}
+	view, err := s.Namespace("team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := view.(*S3Store).StagingPrefix(); got != "team/team-a/staging/" {
+		t.Fatalf("namespace staging prefix %s", got)
+	}
+	cfg := testConfig()
+	cfg.Prefix = ""
+	if got := newTestStore(t, cfg).StagingPrefix(); got != "staging/" {
+		t.Fatalf("staging prefix without a prefix: %s", got)
+	}
+}
+
+// Promote refuses a bad stage, digest or size before any request, and a
+// staged object that doesn't exist is Missing, not an error.
+func TestPromoteRejectsAndMissing(t *testing.T) {
+	f := &fakeS3{objects: map[string]bool{}}
+	s := newFakeS3Store(t, f)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		stage Stage
+		dgst  digest.Digest
+		size  int64
+	}{{"bad", testDigest, 1}, {testStage, "sha256:bad", 1}, {testStage, testDigest, 0}} {
+		if _, err := s.Promote(ctx, tc.stage, tc.dgst, tc.size); err == nil {
+			t.Errorf("promote %+v: no error", tc)
+		}
+	}
+	if len(f.requests) != 0 {
+		t.Fatalf("%d requests for refused promotions", len(f.requests))
+	}
+	p, err := s.Promote(ctx, testStage, testDigest, 5)
+	if err != nil || p.Outcome != Missing || p.Stored() {
+		t.Fatalf("promote of nothing staged: %+v, %v", p, err)
 	}
 }
