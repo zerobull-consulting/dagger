@@ -19,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/opencontainers/go-digest"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 )
 
 // hashModes are the two ways a promotion is hashed: by the store as it
@@ -32,6 +34,16 @@ var hashModes = []struct {
 }{
 	{"store", false, HashedByStore},
 	{"service", true, HashedByService},
+}
+
+// wantHashedBy is who hashes a promotion in a mode on the store under test: a
+// store that returns no checksums is hashed by the service in either.
+func wantHashedBy(t *testing.T, want string) string {
+	t.Helper()
+	if !s3test.StoreBehavior(t).HashesCopies {
+		return HashedByService
+	}
+	return want
 }
 
 // #23's acceptance, replacing TestMinIOStoreKnownGapMisdeclaredDigest: S3
@@ -65,8 +77,8 @@ func TestMinIOStoreMisdeclaredDigestNeverStored(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if p.Outcome != Mismatch || p.HashedBy != mode.hashedBy || p.Bytes != int64(len(blob)) {
-				t.Fatalf("promote: %+v, want a mismatch hashed by the %s", p, mode.hashedBy)
+			if p.Outcome != Mismatch || p.HashedBy != wantHashedBy(t, mode.hashedBy) || p.Bytes != int64(len(blob)) {
+				t.Fatalf("promote: %+v, want a mismatch hashed by the %s", p, wantHashedBy(t, mode.hashedBy))
 			}
 			if mustHas(t, s, d) || objectExists(t, s, key) {
 				t.Fatal("the wrong content reached the digest key")
@@ -139,6 +151,9 @@ func TestMinIOStoreHashesCopies(t *testing.T) {
 	}
 	sum := sha256.Sum256(blob)
 	want := base64.StdEncoding.EncodeToString(sum[:])
+	if !s3test.StoreBehavior(t).HashesCopies {
+		want = "" // Promote falls back to hashing in the service.
+	}
 
 	dst := s.prefix + "/probe/copy"
 	out, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
@@ -171,15 +186,18 @@ func TestMinIOStoreHashesCopies(t *testing.T) {
 	}
 }
 
-// Promotion's conditional write, and what MinIO honors of it:
+// Promotion's conditional write, and what the store honors of it:
 //
 //   - If-None-Match on CopyObject is ignored: a second conditional copy
 //     overwrites the key. That is why Promote never uses CopyObject.
-//   - If-None-Match on CompleteMultipartUpload is honored (412), and so is
-//     CopySourceIfMatch on a copy, which the service-hashed path relies on.
+//   - MinIO honors If-None-Match on CompleteMultipartUpload (412) and
+//     CopySourceIfMatch on a copy. Spaces ignores both
+//     (TestMinIOPromoteStagedOverwritten has what guards a copy there).
 //   - Two exports racing to promote one blob from two stages both end with
-//     the blob stored and correct: whichever completes first wins, and the
-//     other finds it Existing. Neither staged object is left.
+//     the blob stored and correct. Where the completion's condition is
+//     honored, whichever completes first wins and the other finds it
+//     Existing; elsewhere both may write the same verified bytes. Neither
+//     staged object is left.
 func TestMinIOConditionalPromotion(t *testing.T) {
 	s := newMinIOStore(t, nil)
 	ctx := context.Background()
@@ -196,8 +214,10 @@ func TestMinIOConditionalPromotion(t *testing.T) {
 		}
 	}
 	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: &s.bucket, Key: aws.String(dst + "2"), CopySource: aws.String(copySource(s.bucket, src)), CopySourceIfMatch: aws.String(`"0123"`)})
-	if !isConditionFailed(err) {
+	if behavior := s3test.StoreBehavior(t); behavior.CopyConditions && !isConditionFailed(err) {
 		t.Fatalf("copy with a stale CopySourceIfMatch: %v, want 412", err)
+	} else if !behavior.CopyConditions && err != nil {
+		t.Fatalf("copy with a stale CopySourceIfMatch: %v; the store now honors it (update %s's behavior and the README)", err, os.Getenv(s3test.EnvStore))
 	}
 	up, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &s.bucket, Key: &dst})
 	if err != nil {
@@ -208,11 +228,15 @@ func TestMinIOConditionalPromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	outcome, err := s.complete(ctx, dst, up.UploadId, []types.CompletedPart{{PartNumber: aws.Int32(1), ETag: part.CopyPartResult.ETag}}, d)
-	if err == nil || outcome != "" {
-		t.Fatalf("CompleteMultipartUpload over an existing key: %q, %v; want a 412", outcome, err)
-	}
-	if !isConditionFailed(err) {
-		t.Fatalf("CompleteMultipartUpload over an existing key: %v, want a 412", err)
+	if s3test.StoreBehavior(t).CompleteConditions {
+		if err == nil || outcome != "" {
+			t.Fatalf("CompleteMultipartUpload over an existing key: %q, %v; want a 412", outcome, err)
+		}
+		if !isConditionFailed(err) {
+			t.Fatalf("CompleteMultipartUpload over an existing key: %v, want a 412", err)
+		}
+	} else if err != nil || outcome != Promoted {
+		t.Fatalf("CompleteMultipartUpload over an existing key: %q, %v; the store now honors its condition (update %s's behavior and the README)", outcome, err, os.Getenv(s3test.EnvStore))
 	}
 
 	for _, mode := range hashModes {
@@ -250,8 +274,9 @@ func TestMinIOConditionalPromotion(t *testing.T) {
 			}
 			// Exactly one promotes: the other either sees the blob in its
 			// Has check, or, when both copied, loses the conditional
-			// CompleteMultipartUpload.
-			if promoted != 1 {
+			// CompleteMultipartUpload. A store that ignores that condition
+			// lets both write, the same verified bytes.
+			if promoted < 1 || (promoted != 1 && s3test.StoreBehavior(t).CompleteConditions) {
 				t.Fatalf("outcomes %v, want one promoted and one existing", outcomes)
 			}
 			get, _ := s.PresignGet(ctx, d)
@@ -260,6 +285,76 @@ func TestMinIOConditionalPromotion(t *testing.T) {
 			}
 			if left := listKeys(t, s, s.StagingPrefix()); len(left) != 0 {
 				t.Fatalf("staged objects left: %v", left)
+			}
+			if left := listUploads(t, s); len(left) != 0 {
+				t.Fatalf("multipart uploads left: %v", left)
+			}
+		})
+	}
+}
+
+// overwriteOnCopy overwrites the staged object just before the first part
+// copy reaches the store: after the service hashed it, as a holder of the
+// still-valid presigned PUT could.
+type overwriteOnCopy struct {
+	aws.HTTPClient
+	once      sync.Once
+	overwrite func()
+}
+
+func (o *overwriteOnCopy) Do(r *http.Request) (*http.Response, error) {
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		o.once.Do(o.overwrite)
+	}
+	return o.HTTPClient.Do(r)
+}
+
+// A staged object overwritten between the service's hash and the store's copy
+// never reaches the digest key, on a store that honors CopySourceIfMatch (the
+// copy fails) and on one that ignores it (the part's ETag shows it).
+func TestMinIOPromoteStagedOverwritten(t *testing.T) {
+	ctx := context.Background()
+	for _, parts := range []struct {
+		name string
+		size int64
+	}{{"one part", 0}, {"many parts", 5 << 20}} {
+		t.Run(parts.name, func(t *testing.T) {
+			hook := &overwriteOnCopy{}
+			s := newMinIOStore(t, func(c *S3Config) {
+				c.HashInService = true
+				hook.HTTPClient = c.HTTPClient
+				c.HTTPClient = hook
+			})
+			if parts.size > 0 {
+				s.maxPartCopy, s.copyPartSize = parts.size, parts.size
+			}
+			blob, d := randomBlob(t, 12<<20+3)
+			wrong := bytes.Clone(blob)
+			wrong[len(wrong)-1] ^= 0xff
+			stage := NewStage()
+			staged, _ := s.StagingKey(stage, d)
+			hook.overwrite = func() {
+				if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &staged, Body: bytes.NewReader(wrong)}); err != nil {
+					t.Errorf("overwrite the staged object: %v", err)
+				}
+			}
+			put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status := enginePut(t, put.URL, blob); status != http.StatusOK {
+				t.Fatalf("PUT: status %d", status)
+			}
+			p, err := s.Promote(ctx, stage, d, int64(len(blob)))
+			if s3test.StoreBehavior(t).CopyConditions {
+				if !isConditionFailed(err) {
+					t.Fatalf("promote: %+v, %v; want the copy to fail its condition", p, err)
+				}
+			} else if err != nil || p.Outcome != Mismatch {
+				t.Fatalf("promote: %+v, %v; want a mismatch", p, err)
+			}
+			if mustHas(t, s, d) {
+				t.Fatal("the overwritten content reached the digest key")
 			}
 			if left := listUploads(t, s); len(left) != 0 {
 				t.Fatalf("multipart uploads left: %v", left)
@@ -338,7 +433,7 @@ func TestMinIOPromoteLatency(t *testing.T) {
 			}
 			uploaded := time.Since(start)
 			p, err := s.Promote(context.Background(), stage, d, int64(size))
-			if err != nil || p.Outcome != Promoted || p.HashedBy != mode.hashedBy {
+			if err != nil || p.Outcome != Promoted || p.HashedBy != wantHashedBy(t, mode.hashedBy) {
 				t.Fatalf("promote: %+v, %v", p, err)
 			}
 			t.Logf("hashed by the %s: %8.1f MiB uploaded in %v, promoted in %v (%.0f MiB/s)",
