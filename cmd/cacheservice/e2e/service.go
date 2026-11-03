@@ -76,6 +76,11 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 
 	cfg := e.S3Config
 	cfg.Endpoint = e.Proxy.URL
+	// The proxy forwards in the store's addressing; a proxy's address has no
+	// bucket subdomains.
+	cfg.PathStyle = true
+	// The proxy has its own guard; the direct client's is bound to the store.
+	cfg.HTTPClient = nil
 	if opts.GetExpiry > 0 {
 		cfg.GetExpiry = opts.GetExpiry
 	}

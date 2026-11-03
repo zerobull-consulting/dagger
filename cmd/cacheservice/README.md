@@ -179,7 +179,8 @@ and so does AWS S3 for objects up to 5 GB (`TestMinIOStoreHashesCopies`).
   shows that, and only the condition protects the copy there. Since MD5 isn't
   collision resistant, someone who holds the presigned PUT, prepares a
   same-MD5 pair and wins the race could still get past it on a store that
-  ignores the condition.
+  ignores the condition
+  ([zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)).
 - So is every blob with `CACHESERVICE_S3_HASH_IN_SERVICE=true`, for a store
   whose copy checksums can't be trusted, and every blob once a store returns
   a part copy without a checksum: the service then hashes from that point
@@ -1588,6 +1589,10 @@ For a local S3-compatible store (MinIO), see
    unsampled `TRACEPARENT` (see [Real-engine run](#real-engine-run)).
 
 ## Real-engine run
+
+To run this and the store suites against a real bucket, safely, and for what
+each store did, see
+[Testing against a real bucket](../../hack/remote-cache/README.md#testing-against-a-real-bucket).
 
 `./hack/remote-cache/dev.sh e2e` runs both paths with real engines built
 from this repo

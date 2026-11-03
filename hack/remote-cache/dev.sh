@@ -15,9 +15,9 @@
 # MINIO_REGION and MINIO_BUCKET. MinIO listens on loopback unless
 # MINIO_BIND_ADDR says otherwise.
 #
-# With CACHESERVICE_TEST_EXTERNAL=1, `test` uses the bucket in the
+# With CACHESERVICE_TEST_EXTERNAL=1, `test` and `e2e` use the bucket in the
 # CACHESERVICE_S3_* variables instead of starting MinIO; see README.md,
-# "Testing against a real bucket". `e2e` refuses it.
+# "Testing against a real bucket".
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,6 +78,14 @@ up() {
 # lifecycle configuration.
 use_store() {
 	if [[ "${CACHESERVICE_TEST_EXTERNAL:-}" == "1" ]]; then
+		# Without these, every real-store test would skip, and the run pass.
+		for name in ENDPOINT BUCKET PREFIX; do
+			var="CACHESERVICE_S3_$name"
+			if [[ -z "${!var:-}" ]]; then
+				echo "dev.sh: CACHESERVICE_TEST_EXTERNAL=1 needs $var" >&2
+				exit 2
+			fi
+		done
 		return
 	fi
 	up >/dev/null
@@ -98,10 +106,6 @@ test)
 	go test -count=1 -run 'TestMinIO' -v ./cmd/cacheservice/...
 	;;
 e2e)
-	if [[ "${CACHESERVICE_TEST_EXTERNAL:-}" == "1" ]]; then
-		echo "dev.sh e2e: CACHESERVICE_TEST_EXTERNAL=1 isn't supported yet: the e2e isn't kept to its prefix on a real bucket" >&2
-		exit 2
-	fi
 	# Extra arguments go to go test, such as -run 'TestRealEngines/^renew$'.
 	# E2E_SCENARIOS picks the scenarios after the first, which always runs.
 	scenarios="${E2E_SCENARIOS:-}"

@@ -474,15 +474,68 @@ func TestDeletePrefixReportsUploadsLeft(t *testing.T) {
 	}
 }
 
-// Only the guarded store suites run against an external bucket here: the e2e
-// would have no guard or upload cleanup there.
-func TestDevShRefusesExternalE2E(t *testing.T) {
+// The Spaces jobs skip without their secrets, so CI can't show they are set up
+// right, and the others must never need them: only the Spaces jobs use an
+// external bucket, and each gives it to the step that runs the tests.
+func TestWorkflowOnlySpacesJobsAreExternal(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "..", ".github", "workflows", "remote-cache-tests.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, all, ok := strings.Cut(string(data), "\njobs:\n")
+	if !ok {
+		t.Fatal("no jobs in the workflow")
+	}
+	jobs := map[string]string{}
+	var name string
+	for _, line := range strings.Split(all, "\n") {
+		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "   ") && strings.HasSuffix(line, ":") {
+			name = strings.TrimSuffix(strings.TrimSpace(line), ":")
+		}
+		jobs[name] += line + "\n"
+	}
+	for _, job := range []string{"unit", "minio", "e2e", "spaces-store", "spaces-e2e"} {
+		body, ok := jobs[job]
+		if !ok {
+			t.Fatalf("no job %s", job)
+		}
+		spaces := strings.HasPrefix(job, "spaces-")
+		for _, want := range []string{"CACHESERVICE_TEST_EXTERNAL", "CACHESERVICE_TEST_STORE: spaces", "secrets.SPACES_ENDPOINT", "secrets.SPACES_SECRET_ACCESS_KEY", "CACHESERVICE_S3_PATH_STYLE"} {
+			if strings.Contains(body, want) != spaces {
+				t.Errorf("job %s: has %s: %v, want %v", job, want, !spaces, spaces)
+			}
+		}
+		if spaces && strings.Contains(strings.SplitN(body, "steps:", 2)[0], "secrets.") {
+			t.Errorf("job %s gives secrets to every step", job)
+		}
+	}
+}
+
+// External mode without a bucket would otherwise skip every real-store test,
+// and pass having tested nothing.
+func TestDevShExternalNeedsItsBucket(t *testing.T) {
 	script := filepath.Join("..", "..", "..", "..", "hack", "remote-cache", "dev.sh")
-	cmd := exec.Command("bash", script, "e2e")
-	cmd.Env = append(os.Environ(), "CACHESERVICE_TEST_EXTERNAL=1")
-	out, err := cmd.CombinedOutput()
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "CACHESERVICE_TEST_EXTERNAL") {
-		t.Fatalf("dev.sh e2e with an external bucket: %v\n%s", err, out)
+	full := map[string]string{
+		"CACHESERVICE_S3_ENDPOINT": "https://s3.example.test",
+		"CACHESERVICE_S3_BUCKET":   "bkt",
+		"CACHESERVICE_S3_PREFIX":   "test",
+	}
+	for _, command := range []string{"test", "e2e"} {
+		for missing := range full {
+			t.Run(command+" without "+missing, func(t *testing.T) {
+				cmd := exec.Command("bash", script, command)
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CACHESERVICE_TEST_EXTERNAL=1"}
+				for name, value := range full {
+					if name != missing {
+						cmd.Env = append(cmd.Env, name+"="+value)
+					}
+				}
+				out, err := cmd.CombinedOutput()
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), missing) {
+					t.Fatalf("%v\n%s", err, out)
+				}
+			})
+		}
 	}
 }
