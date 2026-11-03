@@ -1102,7 +1102,12 @@ each namespace, in order:
    run. What the index named when the run started isn't deleted by this
    run, even if its expiry left nothing naming it: an import sync that read
    the index just before may still be merging it, with GETs of its blobs.
-   The next run deletes it (`TestNamespacesApart`).
+   The next run deletes it (`TestNamespacesApart`). **Known gap
+   ([#57](https://github.com/zerobull-consulting/dagger/issues/57)):** the
+   hold is the run's own, so another replica's run right after can delete
+   them, and a bundle a later export superseded has no hold
+   (`TestKnownGapHoldIsPerReplica`). The index stays consistent; an engine
+   whose merge was in flight computes those parts again.
 6. **Staging**, below.
 7. **Incomplete multipart uploads** under `<prefix>/<ns>/` older than the
    staging age are aborted: promotions a stopped service left. They are
@@ -1156,7 +1161,8 @@ search over the roots, walking the index about log2(roots) times. Their
 entries go as in step 1; their objects, now unreferenced, are deleted once
 past the grace period, by a later run (`TestMaxSizeExpiresOldestFirst`). A
 root an export recorded again since GC read the index is kept (it is
-younger now).
+younger now, or, within the same second, its record changed;
+`TestMaxSizeKeepsRootRecordedSameSecond`).
 
 What GC can't delete yet (objects younger than the grace period, staged
 uploads, keys it doesn't know) is measured and reported but doesn't make it
@@ -1253,14 +1259,16 @@ digest keys only), so deleting one is always safe: at worst a promotion
 still copying it fails, and its export asks for the blob again. GC reads
 the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
 
-- a namespace whose `<prefix>/<ns>/staging/` an enabled expiration rule
-  covers (by prefix alone) is left to it (`gc_staging_rule_missing` 0);
+- a namespace whose `<prefix>/<ns>/staging/` an enabled rule expires by
+  age (`Expiration.Days`, filtered by prefix alone; a rule with a `Date`
+  expires objects once, not as they age) is left to it
+  (`gc_staging_rule_missing` 0, `TestExpiringPrefixes`);
 - a namespace without one is reported (`gc_staging_rule_missing` 1, and a
   warning when it has staged uploads), and GC deletes its staged uploads
   older than `-gc-staging-age` (1h, an export's upload timeout) itself;
 - when the rules can't be read (no `s3:GetLifecycleConfiguration`, or a
   store without them), GC deletes old staged uploads in every namespace,
-  and reports nothing.
+  and removes `gc_staging_rule_missing` (`TestStagingRuleMetricUnknown`).
 
 Stale incomplete multipart uploads (`ListMultipartUploads`) are aborted
 whatever the rules (`TestStagingAndUploads`, `TestMinIOGC`). MinIO lists

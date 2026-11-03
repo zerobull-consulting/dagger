@@ -803,7 +803,13 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 		keys := make([]string, len(batch))
 		for j, k := range batch {
 			keys[j] = prefix + k
-			// Before the call: one that fails may still have deleted.
+			// Before the call: one that fails may still have deleted
+			// some of its keys (DeleteObjects answers per key), so each
+			// attempted key is finished as deleted. That is the safe
+			// side: an export that checked a key before must be refused.
+			// A key that survived costs one refused export, which is
+			// tried again, finds it, and records; and nothing names it,
+			// so a later run claims it again.
 			attempted[k] = true
 		}
 		if err := c.cfg.Bucket.Delete(ctx, keys); err != nil {
@@ -857,6 +863,12 @@ func (c *Collector) claimAndDelete(ctx context.Context, ns string, cands []strin
 			rep.fail(err)
 		}
 	}
+}
+
+// sameRecord reports whether two entries hold the same record.
+func sameRecord(a, b metastore.Entry) bool {
+	return a.Bundle == b.Bundle && a.Ordinal == b.Ordinal && a.Resolution == b.Resolution &&
+		a.Source == b.Source && a.Replacements == b.Replacements
 }
 
 // kindSize is a relative key's kind and listed size.
@@ -924,6 +936,8 @@ func (c *Collector) shrink(ctx context.Context, ns string, idx *metastore.Index,
 	type root struct {
 		n  uint64
 		at int64
+		// rec is the root's entry's record when GC read the index.
+		rec metastore.Entry
 	}
 	roots := make([]root, 0, len(idx.Roots))
 	for n, rt := range idx.Roots {
@@ -931,7 +945,11 @@ func (c *Collector) shrink(ctx context.Context, ns string, idx *metastore.Index,
 		if at == 0 {
 			at = nowUnix
 		}
-		roots = append(roots, root{n, at})
+		var rec metastore.Entry
+		if e := idx.Entries[n]; e != nil {
+			rec = *e
+		}
+		roots = append(roots, root{n: n, at: at, rec: rec})
 	}
 	slices.SortFunc(roots, func(a, b root) int {
 		if a.at != b.at {
@@ -971,6 +989,12 @@ func (c *Collector) shrink(ctx context.Context, ns string, idx *metastore.Index,
 			if cur.RecordedAtUnix != 0 && cur.RecordedAtUnix > rt.at {
 				continue // recorded again since: younger now
 			}
+			// Recorded again within the same second: its record changed.
+			// (An identical record written again that second can't be
+			// told apart, and goes: it was the oldest.)
+			if e := x.Entries[rt.n]; e == nil || !sameRecord(*e, rt.rec) {
+				continue
+			}
 			delete(x.Roots, rt.n)
 			dropped++
 		}
@@ -1001,6 +1025,7 @@ func (c *Collector) sweepStaging(ctx context.Context, ns string, l *listing, rul
 	switch {
 	case !rulesKnown:
 		rep.StagingRule = "unknown"
+		c.cfg.Metrics.GCStagingRuleUnknown(ns)
 	case coveredBy(prefix+"staging/", rules):
 		rep.StagingRule = "present"
 		c.cfg.Metrics.GCStagingRule(ns, false)

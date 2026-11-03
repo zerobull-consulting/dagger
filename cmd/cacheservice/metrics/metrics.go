@@ -648,6 +648,15 @@ func (m *Metrics) GCStagingRule(scope string, missing bool) {
 	m.gcStagingRule.WithLabelValues(scope).Set(v)
 }
 
+// GCStagingRuleUnknown removes the scope's gc_staging_rule_missing, when
+// the bucket's rules can't be read: neither 0 nor 1 would be true.
+func (m *Metrics) GCStagingRuleUnknown(scope string) {
+	if m == nil {
+		return
+	}
+	m.gcStagingRule.DeleteLabelValues(scope)
+}
+
 // ExportCollected records an export try refused by GC's fence.
 func (m *Metrics) ExportCollected(scope string) {
 	if m == nil {

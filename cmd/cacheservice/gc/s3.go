@@ -167,20 +167,28 @@ func (b *S3Bucket) ExpirationPrefixes(ctx context.Context) ([]string, error) {
 		}
 		return nil, fmt.Errorf("%w: %v", ErrRulesUnknown, err)
 	}
+	return expiringPrefixes(out.Rules), nil
+}
+
+// expiringPrefixes are the prefixes under which rules expire every current
+// object by its age: enabled rules with an Expiration in Days, filtered by
+// prefix alone.
+func expiringPrefixes(rules []types.LifecycleRule) []string {
 	var prefixes []string
-	for _, r := range out.Rules {
+	for _, r := range rules {
 		if r.Status != types.ExpirationStatusEnabled || r.Expiration == nil {
 			continue
 		}
-		if r.Expiration.Days == nil && r.Expiration.Date == nil {
+		// Only an age (Days) expires staged uploads as they get old; a
+		// Date expires what exists on that day, once.
+		if r.Expiration.Days == nil || *r.Expiration.Days <= 0 {
 			continue
 		}
-		p, ok := rulePrefix(r)
-		if ok {
+		if p, ok := rulePrefix(r); ok {
 			prefixes = append(prefixes, p)
 		}
 	}
-	return prefixes, nil
+	return prefixes
 }
 
 // rulePrefix is the prefix a rule applies to, and false when it filters by

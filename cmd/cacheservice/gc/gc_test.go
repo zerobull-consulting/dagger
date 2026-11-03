@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -924,4 +927,83 @@ func TestEpochRepublished(t *testing.T) {
 	if ep, _ := e.meta.ReadEpoch(ctx, "team"); ep != 3 {
 		t.Fatalf("published epoch %d, want 3", ep)
 	}
+}
+
+// A root an export records again (a new record) within the same second as
+// GC's snapshot is kept by the max size: its recording time can't show it
+// (one-second resolution), but its record changed.
+func TestMaxSizeKeepsRootRecordedSameSecond(t *testing.T) {
+	e := newEnv(t)
+	var recs []metastore.Recorded
+	for i := range 3 {
+		tag := fmt.Sprintf("r%d", i)
+		recs = append(recs, e.export("team", "a", []fakeengine.Entry{
+			{Number: uint64(10 + i), Recipe: tag, Layers: [][]byte{layer(tag, 10_000)}},
+		}, uint64(10+i)))
+		e.clock.Add(time.Minute)
+	}
+	e.setLimits("team", Limits{MaxBytes: 25_000})
+	// Between GC's snapshot and its update, in the same second, the oldest
+	// root's value is exported again, changed.
+	b := &afterList{Bucket: e.bucket, hook: func() {
+		e.clock.Add(-3 * time.Minute) // its recording time, as GC read it
+		e.export("team", "a", []fakeengine.Entry{{Number: 10, Replacements: 1, Recipe: "r0", Layers: [][]byte{layer("r0", 10_000)}}}, 10)
+		e.clock.Add(3 * time.Minute)
+	}}
+	// The hook runs after the listing, which comes before the max size.
+	rep := reportOf(e.run(e.collector(func(cfg *Config) { cfg.Bucket = b })), "team")
+	idx := e.index("team")
+	if _, ok := idx.Roots[recs[0].Numbers[1]]; !ok {
+		t.Fatalf("the root recorded again was expired: %+v", rep)
+	}
+	// GC had chosen that root alone; it expires nothing else this run, and
+	// a later run, on a fresh snapshot, enforces the limit.
+	if r := idx.Roots[recs[0].Numbers[1]]; r.RecordedAtUnix != recs[0].Index.Roots[recs[0].Numbers[1]].RecordedAtUnix {
+		t.Fatalf("the test's re-record isn't in the same second: %d", r.RecordedAtUnix)
+	}
+	if rep.SizeRoots != 0 || len(idx.Roots) != 3 {
+		t.Fatalf("expired %d roots; roots %v", rep.SizeRoots, idx.Roots)
+	}
+}
+
+// When the bucket's rules can't be read, the namespace's
+// gc_staging_rule_missing is removed: neither 0 nor 1 would be true.
+func TestStagingRuleMetricUnknown(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	c := e.collector(func(cfg *Config) { cfg.Metrics = m })
+	e.bucket.SetRules([]string{prefix + "/team/staging/"}, nil)
+	e.run(c)
+	if s := metricstest.Read(t, reg, "cacheservice_gc_staging_rule_missing", map[string]string{"scope": "team"}); !s.Found || s.Value != 0 {
+		t.Fatalf("with a rule: %+v", s)
+	}
+	e.bucket.SetRules(nil, ErrRulesUnknown)
+	e.run(c)
+	if s := metricstest.Read(t, reg, "cacheservice_gc_staging_rule_missing", map[string]string{"scope": "team"}); s.Found {
+		t.Fatalf("rules unknown: still %v", s.Value)
+	}
+}
+
+// Known gap (zerobull-consulting/dagger#57): the hold that keeps a run from
+// deleting what its own expiry just released (TestNamespacesApart) is the
+// run's, not durable. Another replica's run right after sees no change, and
+// deletes those objects at once. Benign for consistency (the index never
+// names them); a merge in flight may hand out GETs of blobs that then go,
+// and the engine computes those parts again.
+func TestKnownGapHoldIsPerReplica(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	e.setLimits("team", Limits{MaxAge: time.Minute})
+	e.clock.Add(10 * time.Hour)
+	a, b := e.collector(nil), e.collector(nil)
+	if r := reportOf(e.run(a), "team"); r.Expired != 2 || len(r.Deleted) != 0 {
+		t.Fatalf("replica A, the expiring run: %+v", r)
+	}
+	r := reportOf(e.run(b), "team")
+	if r.Deleted["blob"] != 2 {
+		t.Fatalf("replica B: %+v; if it held the objects, the gap is fixed: update #57 and this test", r)
+	}
+	e.checkConsistent("team")
 }
