@@ -408,6 +408,37 @@ func TestDeletePrefixVersionedBucket(t *testing.T) {
 	}
 }
 
+// stuckUploads is a store whose aborts answer success and do nothing.
+type stuckUploads struct{ key string }
+
+func (u stuckUploads) Do(r *http.Request) (*http.Response, error) {
+	q := r.URL.Query()
+	body := "<ListBucketResult/>"
+	switch {
+	case q.Has("uploads"):
+		body = "<ListMultipartUploadsResult><Upload><Key>" + u.key + "</Key><UploadId>u1</UploadId></Upload></ListMultipartUploadsResult>"
+	case q.Has("versions"):
+		body = "<ListVersionsResult/>"
+	case r.Method == http.MethodDelete:
+		return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+}
+
+// An upload still there after its abort is left behind, and billed: cleaning
+// up says so.
+func TestDeletePrefixReportsUploadsLeft(t *testing.T) {
+	c := s3.New(s3.Options{
+		Region: "us-east-1", BaseEndpoint: aws.String("https://s3.example.test"), UsePathStyle: true,
+		Credentials: credentials.NewStaticCredentialsProvider("id", "secret", ""),
+		HTTPClient:  NewGuard(testBucket, testRoot, false).WithClient(stuckUploads{key: testRoot + "/t/upload"}),
+	})
+	err := DeletePrefix(context.Background(), c, testBucket, testRoot+"/t")
+	if err == nil || !strings.Contains(err.Error(), "uploads left") {
+		t.Fatalf("DeletePrefix: %v, want it to report the upload left", err)
+	}
+}
+
 // Only the guarded store suites run against an external bucket here: the e2e
 // would have no guard or upload cleanup there.
 func TestDevShRefusesExternalE2E(t *testing.T) {

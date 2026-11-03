@@ -216,7 +216,7 @@ npx @dotenvx/dotenvx run -- bash -c '
 | --- | --- |
 | `CACHESERVICE_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | The bucket. |
 | `CACHESERVICE_S3_PREFIX` | Required: everything happens under it. Empty or `/` is refused. |
-| `CACHESERVICE_S3_PATH_STYLE` | `true` or `false`. Unset, the store suites use virtual-hosted addressing. |
+| `CACHESERVICE_S3_PATH_STYLE` | `true` or `false`; set it. Unset, the `blobstore`, `gc` and `metastore` suites use virtual-hosted addressing, and `server` path-style. |
 | `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
 | `CACHESERVICE_TEST_STORE` | `minio` (default) or `spaces`: what the tests expect where stores differ ([below](#what-each-store-does)). |
 | `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration. Leave it unset on a shared bucket. |
@@ -230,7 +230,10 @@ enforces this in test setup:
 - Every key a test writes, deletes or aborts is under `<prefix>/<run>/`. Every
   S3 client of the tests goes through a guard (`s3test.Guard`) that refuses
   anything else before it reaches the store, and fails the test. It reads the
-  keys of bulk deletes too. Presigned PUTs are checked by `s3test.CheckURL`.
+  keys of bulk deletes too. Presigned PUTs a test sends itself are checked by
+  `s3test.CheckURL`. The ones the service hands a fake engine go through
+  `remotecache`'s own HTTP client, past the guard: their keys come from a store
+  configured with the test's prefix, which is what keeps them in it.
 - Nothing changes the bucket's configuration. The guard refuses every
   bucket-level change. The one exception is the lifecycle configuration with
   `CACHESERVICE_TEST_DISPOSABLE_BUCKET=1`, since
@@ -265,7 +268,7 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
-| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)** | Both accepted with a key allowed to; **403 with a limited key** | Whether they take effect isn't checked: rules run on a scale of days. |
+| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)** | Both accepted with a full-access key; **403 with a more limited key** | Whether they take effect isn't checked: rules run on a scale of days. |
 | A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
 | Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
 | Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |

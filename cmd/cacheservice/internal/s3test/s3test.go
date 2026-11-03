@@ -32,6 +32,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 const (
@@ -366,25 +367,14 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 	if err := deleteVersions(ctx, client, bucket, under); err != nil {
 		errs = append(errs, err)
 	}
-	var keyMarker, uploadMarker *string
-	for {
-		out, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &bucket, KeyMarker: keyMarker, UploadIdMarker: uploadMarker})
-		if err != nil {
-			errs = append(errs, fmt.Errorf("list uploads: %w", err))
-			break
+	uploads, err := uploadsUnder(ctx, client, bucket, under)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	for _, u := range uploads {
+		if _, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: u.Key, UploadId: u.UploadId}); err != nil {
+			errs = append(errs, fmt.Errorf("abort %s: %w", aws.ToString(u.Key), err))
 		}
-		for _, u := range out.Uploads {
-			if !strings.HasPrefix(aws.ToString(u.Key), under) {
-				continue
-			}
-			if _, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: u.Key, UploadId: u.UploadId}); err != nil {
-				errs = append(errs, fmt.Errorf("abort %s: %w", aws.ToString(u.Key), err))
-			}
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			break
-		}
-		keyMarker, uploadMarker = out.NextKeyMarker, out.NextUploadIdMarker
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -399,7 +389,36 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 	if len(left.DeleteMarkers) > 0 {
 		return fmt.Errorf("delete markers left, such as %s", aws.ToString(left.DeleteMarkers[0].Key))
 	}
+	uploads, err = uploadsUnder(ctx, client, bucket, under)
+	if err != nil {
+		return fmt.Errorf("list what is left: %w", err)
+	}
+	if len(uploads) > 0 {
+		return fmt.Errorf("uploads left, such as %s", aws.ToString(uploads[0].Key))
+	}
 	return nil
+}
+
+// uploadsUnder lists the bucket's multipart uploads and keeps those under the
+// prefix.
+func uploadsUnder(ctx context.Context, client *s3.Client, bucket, under string) ([]types.MultipartUpload, error) {
+	var out []types.MultipartUpload
+	var keyMarker, uploadMarker *string
+	for {
+		page, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &bucket, KeyMarker: keyMarker, UploadIdMarker: uploadMarker})
+		if err != nil {
+			return out, fmt.Errorf("list uploads: %w", err)
+		}
+		for _, u := range page.Uploads {
+			if strings.HasPrefix(aws.ToString(u.Key), under) {
+				out = append(out, u)
+			}
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			return out, nil
+		}
+		keyMarker, uploadMarker = page.NextKeyMarker, page.NextUploadIdMarker
+	}
 }
 
 // deleteVersions deletes every version and delete marker under the prefix. On

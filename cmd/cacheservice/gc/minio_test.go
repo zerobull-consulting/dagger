@@ -149,12 +149,19 @@ func TestMinIOGC(t *testing.T) {
 			Filter:     &types.LifecycleRuleFilter{Prefix: aws.String(rule)},
 			Expiration: &types.LifecycleExpiration{Days: aws.Int32(1)},
 		}}
+		abortRule := types.LifecycleRule{
+			ID: aws.String("gc-test-uploads"), Status: types.ExpirationStatusEnabled,
+			Filter:                         &types.LifecycleRuleFilter{Prefix: aws.String(e.prefix + "/")},
+			AbortIncompleteMultipartUpload: &types.AbortIncompleteMultipartUpload{DaysAfterInitiation: aws.Int32(1)},
+		}
 		if s3test.StoreBehavior(t).LifecycleAbortRule {
-			rules = append(rules, types.LifecycleRule{
-				ID: aws.String("gc-test-uploads"), Status: types.ExpirationStatusEnabled,
-				Filter:                         &types.LifecycleRuleFilter{Prefix: aws.String(e.prefix + "/")},
-				AbortIncompleteMultipartUpload: &types.AbortIncompleteMultipartUpload{DaysAfterInitiation: aws.Int32(1)},
-			})
+			rules = append(rules, abortRule)
+		} else if _, err := e.client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+			Bucket:                 &e.bucket,
+			LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: []types.LifecycleRule{abortRule}},
+		}); err == nil {
+			_, _ = e.client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: &e.bucket})
+			t.Fatal("the store accepted a rule with AbortIncompleteMultipartUpload; it changed (update its behavior and the README)")
 		}
 		if _, err := e.client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
 			Bucket:                 &e.bucket,
