@@ -585,3 +585,32 @@ func TestKnownGapPastCapNotSentToEngines(t *testing.T) {
 		t.Fatalf("the past cap was sent: %d %+v; if engines now get it, the gap is fixed: update #58 and this test", code, res)
 	}
 }
+
+// Known gap (zerobull-consulting/dagger#60): the debug API is not
+// authenticated, and POST /debug/gc runs a real collection. It deletes only
+// what a scheduled run would, by the same limits, but anyone who reaches
+// -debug-listen (127.0.0.1 by default) can run one at any time.
+func TestKnownGapDebugGCUnauthenticated(t *testing.T) {
+	st := newGCStores(t, nil)
+	svc := New(slog.New(slog.DiscardHandler), "")
+	tokens := filepath.Join(t.TempDir(), "tokens")
+	if err := os.WriteFile(tokens, []byte(testTokens), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UseTokensFile(tokens); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnableGC(context.Background(), GCConfig{Collector: gc.Config{Bucket: st.bucket, Meta: st.meta}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(svc.DebugHandler())
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/debug/gc", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /debug/gc with no credentials: %d; if the debug API now checks them, the gap is fixed: update #60 and this test", resp.StatusCode)
+	}
+}

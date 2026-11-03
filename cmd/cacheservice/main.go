@@ -54,8 +54,9 @@
 //     -gc-interval: per namespace in the bucket, it expires entries past
 //     their expiry, -max-age or -max-bytes (per namespace with
 //     -namespaces-file, which SIGHUP reloads too), and deletes what no live
-//     entry names, staged uploads older than an export's upload timeout,
-//     and stale multipart uploads. POST /debug/gc runs it now. See
+//     entry names, and staged and incomplete multipart uploads older than
+//     -gc-staging-age (an export's upload timeout plus an hour). POST
+//     /debug/gc runs it now (?dry-run: report only). See
 //     README.md, "Retention and garbage collection".
 //
 // With -tls-cert and -tls-key, the engine address serves HTTPS (wss:// for

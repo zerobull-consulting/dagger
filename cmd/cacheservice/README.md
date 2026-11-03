@@ -1046,8 +1046,11 @@ requests, which carry the token too, are encrypted. The debug and metrics
 addresses are never served over TLS: they are for local use.
 
 The debug API (`-debug-listen`) is **not authenticated**, and lists, exports
-and imports for every namespace's engines. It listens on `127.0.0.1` by
-default; never expose it. `-metrics-listen` serves only `/metrics`, whose
+and imports for every namespace's engines, and runs garbage collection
+(`POST /debug/gc`). It listens on `127.0.0.1` by default; never expose it.
+**Known gap ([#60](https://github.com/zerobull-consulting/dagger/issues/60)):**
+nothing enforces that; anyone who reaches it can run a collection at any
+time (`TestKnownGapDebugGCUnauthenticated`). `-metrics-listen` serves only `/metrics`, whose
 `scope` labels name the namespaces.
 
 ## Retention and garbage collection
