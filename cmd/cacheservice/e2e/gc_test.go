@@ -101,15 +101,23 @@ func (s *state) gc(t *testing.T) {
 	Check(t, len(left) == 0 && len(env.BundleIDsIn(gcNS)) == 0 && rep.deleted["bundle"] == len(bundles) && rep.deleted["resolution"] > 0,
 		"GC deleted their %d bundles, %d resolutions and %d blobs from MinIO (blobs left: %v)", rep.deleted["bundle"], rep.deleted["resolution"], rep.deleted["blob"], left)
 	env.CheckConsistentIn(t, gcNS, "after GC")
-	// Every other namespace of the run is untouched: the main scope still
-	// has A's chain.
+	// GC ran over every namespace of the run's prefix, with this service's
+	// short grace period: the run's scope (A's chain, less the layer
+	// renew deleted on purpose) and the namespaces scenario's are still
+	// whole.
 	var mainLeft int
 	for _, d := range s.layersA {
-		if env.HasKey(env.BlobKey(d)) {
+		if env.HasKey(env.BlobKey(d)) || env.deleted[d] {
 			mainLeft++
 		}
 	}
-	Check(t, mainLeft == len(s.layersA), "GC of gc left the run's scope alone: %d of A's %d layers stored", mainLeft, len(s.layersA))
+	Check(t, mainLeft == len(s.layersA), "GC of gc left the run's scope alone: %d of A's %d layers stored or deleted on purpose", mainLeft, len(s.layersA))
+	env.CheckConsistent(t, "in the run's scope after GC")
+	for _, ns := range []string{"team-a", "team-b"} {
+		if len(env.IndexOf(ns).Entries) > 0 {
+			env.CheckConsistentIn(t, ns, "in "+ns+" after GC")
+		}
+	}
 
 	// GB, started now, gets nothing merged.
 	gb := env.StartEnginesWithTokens(svc, map[string]string{"gb": tokB}, "gb")[0]

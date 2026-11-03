@@ -220,6 +220,13 @@ func TestMinIOGC(t *testing.T) {
 	mu.Lock()
 	limits["team-a"] = Limits{MaxAge: time.Hour}
 	mu.Unlock()
+	// The run that expires it leaves its objects to the next run.
+	if _, err := c.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if keys := e.keys("team-a"); !slices.Equal(keys, want) {
+		t.Fatalf("team-a after the expiring run: %v", keys)
+	}
 	if _, err := c.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
