@@ -52,7 +52,14 @@ var (
 	attemptBuckets = []float64{1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 50}
 	// rootBuckets cover an export batch's roots, up to its limit of 1,000.
 	rootBuckets = prometheus.ExponentialBuckets(1, 2, 11)
+	// promotionBuckets span 10ms to about 22 minutes: a promotion takes
+	// time in proportion to the blob's size.
+	promotionBuckets = prometheus.ExponentialBuckets(0.01, 2, 18)
 )
+
+// Promotion outcomes of an uploaded blob (see blobstore.Outcome), and
+// PromotionError for a promotion the store failed.
+const PromotionError = "error"
 
 // Metrics holds the service's collectors.
 type Metrics struct {
@@ -89,6 +96,9 @@ type Metrics struct {
 	authRejected        *prometheus.CounterVec
 	tokensRevoked       *prometheus.CounterVec
 	eventsIgnored       *prometheus.CounterVec
+	blobPromotions      *prometheus.CounterVec
+	blobHashedBytes     *prometheus.CounterVec
+	blobPromoteDuration *prometheus.HistogramVec
 	collectors          []prometheus.Collector
 }
 
@@ -219,7 +229,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"result"}),
 		exportBlobs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_blobs_total",
-			Help: "Layer blobs exports needed, by result: uploaded, or present (the store had them).",
+			Help: "Layer blobs exports needed, by result: uploaded (and verified), present (the store had them), or rejected (an upload that failed verification, per try).",
 		}, []string{"result"}),
 		exportBundles: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_bundles_total",
@@ -237,6 +247,19 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "engine_events_ignored_total",
 			Help: "Engine events dropped because they came with a token other than the engine's, by scope and kind.",
 		}, []string{"scope", "kind"}),
+		blobPromotions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "blob_promotions_total",
+			Help: "Uploaded blobs verified and promoted to their digest keys, by scope and outcome: promoted, existing (already stored), mismatch (content not the digest's), missing (nothing uploaded) or error.",
+		}, []string{"scope", "outcome"}),
+		blobHashedBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "blob_hashed_bytes_total",
+			Help: "Bytes of uploaded blobs hashed to verify them, by scope and by whom: store (as it copied them) or service (read through the service).",
+		}, []string{"scope", "by"}),
+		blobPromoteDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "blob_promotion_duration_seconds",
+			Help:    "Time to verify and promote one uploaded blob, waiting for a slot included. It grows with the blob's size.",
+			Buckets: promotionBuckets,
+		}, []string{"scope"}),
 	}
 	m.collectors = []prometheus.Collector{
 		m.indexReads, m.indexReadBytes, m.indexReadDuration,
@@ -249,6 +272,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.exportBatches, m.exportBatchDuration, m.exportBatchRoots,
 		m.exportRoots, m.exportBlobs, m.exportBundles,
 		m.authRejected, m.tokensRevoked, m.eventsIgnored,
+		m.blobPromotions, m.blobHashedBytes, m.blobPromoteDuration,
 	}
 	if reg != nil {
 		reg.MustRegister(m.collectors...)
@@ -421,8 +445,10 @@ type ExportBatch struct {
 	// Roots is how many roots the batch asked for.
 	Roots                               int
 	Stored, Gone, Busy, Refused, Failed int
-	Uploaded, Present                   int
-	Bundles                             int
+	// Uploaded and Present are blobs stored (uploaded and verified, or
+	// already there), Rejected uploads that failed verification.
+	Uploaded, Present, Rejected int
+	Bundles                     int
 }
 
 // ExportInterrupted is an export cut short because its engine went away or
@@ -450,6 +476,9 @@ func (m *Metrics) ExportBatch(b ExportBatch) {
 	if b.Present > 0 {
 		m.exportBlobs.WithLabelValues("present").Add(float64(b.Present))
 	}
+	if b.Rejected > 0 {
+		m.exportBlobs.WithLabelValues("rejected").Add(float64(b.Rejected))
+	}
 	m.exportBundles.Add(float64(b.Bundles))
 }
 
@@ -476,4 +505,20 @@ func (m *Metrics) IgnoredEvent(scope, kind string) {
 		return
 	}
 	m.eventsIgnored.WithLabelValues(scope, kind).Inc()
+}
+
+// BlobPromotion records one uploaded blob's verification and promotion in a
+// scope: its outcome (a blobstore.Outcome, or PromotionError), who hashed it
+// ("store", "service", or "" when nothing was) and how many bytes, and how
+// long it took. Every label is the service's own: scope is a validated
+// namespace, and outcome and hashedBy are constants.
+func (m *Metrics) BlobPromotion(scope, outcome, hashedBy string, bytes int64, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.blobPromotions.WithLabelValues(scope, outcome).Inc()
+	if hashedBy != "" {
+		m.blobHashedBytes.WithLabelValues(scope, hashedBy).Add(float64(bytes))
+	}
+	m.blobPromoteDuration.WithLabelValues(scope).Observe(d.Seconds())
 }

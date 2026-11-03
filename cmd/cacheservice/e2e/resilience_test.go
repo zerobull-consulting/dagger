@@ -121,7 +121,7 @@ func (s *state) checkServing(t *testing.T, svc *Service, en *Engine, bundles []s
 func (s *state) midUpload(t *testing.T, out string) (stall *Fault, query, want string, stalled []digest.Digest, logMark int) {
 	t.Helper()
 	env := s.env
-	stall = env.Proxy.Inject(&Fault{Name: "stall-blob-puts", Match: Methods("/blobs/", http.MethodPut)})
+	stall = env.Proxy.Inject(&Fault{Name: "stall-blob-puts", Match: Methods("/staging/", http.MethodPut)})
 	t.Cleanup(func() { env.Proxy.Remove(stall) })
 	logMark, s3Mark := s.main.Logs.Mark(), env.Proxy.Mark()
 	query = faultQuery(Nonce())
@@ -257,8 +257,8 @@ func (s *state) engineRestart(t *testing.T) {
 
 // s3Faults (#12, case 4): S3 throttles and fails requests. First a few
 // requests of one export answer 503 SlowDown or 500 InternalError: the blob
-// PUT the engine makes is retried by the export path (a new export, with
-// backoff), the bundle and index writes the service makes by its S3 client,
+// PUT the engine makes (to a staging key) is retried by the export path (a
+// new export, with backoff, under a new stage), the bundle and index writes the service makes by its S3 client,
 // and the export is stored. Then S3 answers every request with 503: the
 // export fails, publishes nothing, and is stored once S3 is back.
 func (s *state) s3Faults(t *testing.T) {
@@ -269,7 +269,7 @@ func (s *state) s3Faults(t *testing.T) {
 		t.Fatal(err)
 	}
 	faults := []*Fault{
-		{Name: "blob-put-503", Match: Methods("/blobs/", http.MethodPut), Status: http.StatusServiceUnavailable, Code: "SlowDown", Count: 2},
+		{Name: "blob-put-503", Match: Methods("/staging/", http.MethodPut), Status: http.StatusServiceUnavailable, Code: "SlowDown", Count: 2},
 		{Name: "bundle-put-500", Match: Methods("/bundles/", http.MethodPut), Status: http.StatusInternalServerError, Code: "InternalError", Count: 1},
 		{Name: "index-put-503", Match: Methods(indexKey, http.MethodPut), Status: http.StatusServiceUnavailable, Code: "SlowDown", Count: 2},
 	}
@@ -303,8 +303,14 @@ func (s *state) s3Faults(t *testing.T) {
 				continue
 			}
 			answered = append(answered, fmt.Sprintf("%s %d", r.Method, r.Status))
+			// A blob upload is made again under the retry's own stage, so
+			// at another key: the same blob's.
+			same := func(o S3Request) bool { return o.Path == r.Path }
+			if r.IsBlob() {
+				same = func(o S3Request) bool { return o.IsBlob() && blobDigest(o) == blobDigest(r) }
+			}
 			if !slices.ContainsFunc(reqs[i+1:], func(o S3Request) bool {
-				return o.Path == r.Path && o.Method == r.Method && o.Fault == "" && o.Status/100 == 2
+				return same(o) && o.Method == r.Method && o.Fault == "" && o.Status/100 == 2
 			}) {
 				recovered = false
 			}

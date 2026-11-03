@@ -16,7 +16,7 @@ What it does, its scenarios and its settings are in
 | Piece | Where it runs | How the test drives it |
 | --- | --- | --- |
 | Cache service (`Service`, `StartService`) | In the test process, on the Docker bridge gateway | `server.Service`'s Go API: `Engines`, `Entries`, `Imports`, `Export`, `Import`. A recording `slog` handler (`LogRecorder`) keeps what it logs: cache spans, envelopes, engine events, exports and merges. |
-| S3 proxy (`S3Proxy`) | In the test process, on the gateway | The services' S3 endpoint, so presigned URLs point at it too. It records every request (method, key, time, status) instead of tracing MinIO, and injects faults (`Fault`): S3 errors or stalls for the requests they match. |
+| S3 proxy (`S3Proxy`) | In the test process, on the gateway | The services' S3 endpoint, so presigned URLs point at it too. It records every request (method, key, query, time, status) instead of tracing MinIO, and injects faults (`Fault`): S3 errors or stalls for the requests they match, or a rewrite of their body before MinIO gets it. An engine's blob requests (`S3Request.IsBlob`) are its uploads, PUTs to staging keys (`<ns>/staging/<stage>/<alg>/<hex>`), and its downloads, GETs of digest keys (`<ns>/blobs/<alg>/<hex>`); the service's own (HEADs, and a promotion's copies and reads) are not. |
 | MinIO | `hack/remote-cache/compose.yaml`, on loopback | Through the proxy for the services and engines; directly (`Env.S3`, `Env.Meta`) to read the index and bundles and delete blobs, so the test's own reads aren't recorded as the engines'. |
 | Engines (`Engine`, `StartEngines`, `StartEnginesWithTokens`) | Docker containers from an image built for the run | The `docker` CLI: start, restart, remove, logs (`Engine.Logs`). Each authenticates with `Engine.Token`: its host name, or the token it was started with. |
 | Client (`Engine.CLI`, `Engine.Query`) | The `dagger` CLI built for the run | With a clean environment. The CLI's Cloud settings come from the environment, which is process-wide, so it runs as its own process rather than as the engine client in this one. Its token is `e2e-cli`, or its engine's when the engine was started with a token: session spans reach the service under the CLI's token, which must be in the engine's namespace. |
@@ -41,12 +41,21 @@ report each check with `Check`. To break something on purpose, use
 connection), `Env.RestartService` (a new service on the same address, scope
 and options; `Engine.Attach` the engines to it), or a `Fault` in the S3
 proxy (`Proxy.Inject`: an S3 error such as 503 `SlowDown` for the requests
-it matches, up to a count, or a stall until `Proxy.Remove`; requests it
-answered are recorded with its name). After breaking something,
+it matches, up to a count, a stall until `Proxy.Remove`, or a `Rewrite` of
+their body, such as `SameSizeCorruption`; requests it answered or rewrote
+are recorded with its name). After breaking something,
 `Env.CheckConsistent` checks the store from MinIO directly: no index entry
 names a missing bundle, and no stored bundle a missing layer.
+`Env.StoredDigest` hashes what a digest key holds, and `Env.StagedKeys`
+lists the scope's staged uploads.
+
+Engine uploads go to staging keys, under a stage of each export try's own,
+and reach the digest key only once the service has verified them (#23): to
+match an engine's upload of a blob in a fault, match `/staging/` PUTs, and
+compare a retried upload by its digest (`blobDigest`), not its key.
 
 The resilience scenarios (#12) are in `resilience_test.go`; they run last,
 since `service-restart` replaces the main service. `namespaces` (#10), in
 `namespaces_test.go`, runs its own service with a tokens file, and its own
-engines.
+engines. `verify` (#23), in `verify_test.go`, runs after `namespaces` and
+before the resilience scenarios.
