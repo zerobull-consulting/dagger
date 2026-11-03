@@ -28,6 +28,8 @@ type MemBucket struct {
 	rules   []string
 	// rulesErr, when set, is what ExpirationPrefixes returns.
 	rulesErr error
+	// uploadsErr, when set, is what ListUploads returns.
+	uploadsErr error
 	// deletes counts Delete calls; beforeDelete runs before each.
 	deletes      int
 	beforeDelete func(keys []string)
@@ -181,6 +183,9 @@ func relDigest(p string) (digest.Digest, error) {
 func (b *MemBucket) ListUploads(_ context.Context, prefix string) ([]Upload, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.uploadsErr != nil {
+		return nil, b.uploadsErr
+	}
 	var out []Upload
 	for _, u := range b.uploads {
 		if strings.HasPrefix(u.Key, prefix) {
@@ -196,6 +201,13 @@ func (b *MemBucket) AbortUpload(_ context.Context, u Upload) error {
 	defer b.mu.Unlock()
 	b.uploads = slices.DeleteFunc(b.uploads, func(x Upload) bool { return x.Key == u.Key && x.ID == u.ID })
 	return nil
+}
+
+// FailUploadListings makes ListUploads fail with err; nil stops it.
+func (b *MemBucket) FailUploadListings(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.uploadsErr = err
 }
 
 // Uploads returns the uploads not aborted.

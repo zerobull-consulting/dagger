@@ -294,6 +294,12 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 	// staged source has since expired) has no object to list it by, so
 	// their namespaces join the set.
 	byNS, uerr := c.uploadsByNamespace(ctx)
+	if uerr != nil {
+		// Each namespace's run reports it too; this one also covers the
+		// namespaces it can't find without the listing (those with only
+		// an upload), whatever else there is.
+		uerr = fmt.Errorf("gc: list multipart uploads: %w", uerr)
+	}
 	for ns := range byNS {
 		if !slices.Contains(names, ns) {
 			names = append(names, ns)
@@ -317,7 +323,7 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 			errs = append(errs, fmt.Errorf("namespace %s: %s", ns, strings.Join(rep.Errors, "; ")))
 		}
 	}
-	return reports, errors.Join(errs...)
+	return reports, errors.Join(append([]error{uerr}, errs...)...)
 }
 
 // RunNamespace collects one namespace.

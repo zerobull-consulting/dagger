@@ -1007,3 +1007,20 @@ func TestKnownGapHoldIsPerReplica(t *testing.T) {
 	}
 	e.checkConsistent("team")
 }
+
+// A failed listing of multipart uploads fails the run, even when no
+// namespace with objects reports it: the namespaces with only an upload,
+// which only that listing finds, were skipped.
+func TestUploadListingFailureFailsRun(t *testing.T) {
+	e := newEnv(t)
+	e.bucket.AddUpload(Upload{Key: prefix + "/lonely/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
+	e.bucket.FailUploadListings(errors.New("injected"))
+	e.clock.Add(2 * time.Hour)
+	if _, err := e.collector(nil).Run(context.Background()); err == nil || !strings.Contains(err.Error(), "list multipart uploads") {
+		t.Fatalf("run: %v", err)
+	}
+	e.bucket.FailUploadListings(nil)
+	if r := reportOf(e.run(e.collector(nil)), "lonely"); r.Deleted["upload"] != 1 {
+		t.Fatalf("after: %+v", r)
+	}
+}
