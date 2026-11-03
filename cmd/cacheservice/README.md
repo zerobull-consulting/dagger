@@ -950,6 +950,9 @@ team-b   max-bytes=2TiB
   logs an error. The import path reads a namespace's max age at each sync,
   and GC at each run.
 
+A `#` that starts a field begins a comment, to the end of its line, so a
+comment may follow a namespace's settings (`TestParseLimitsTrailingComment`).
+
 A namespace in no line, and a namespace with no tokens, is collected with
 the defaults: neither file decides that a namespace's data goes.
 
@@ -1428,6 +1431,8 @@ paths record into them through their metadata store. All are prefixed
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
+The `gc_stored_*` and `gc_staging_rule_missing` series of a namespace gone
+from the bucket are removed at the next run (`TestGaugesOfGoneNamespaceRemoved`).
 No label comes from an engine-supplied string: `scope` is a validated
 namespace from the tokens file or `-scope`, or, for the `gc_` metrics, a
 valid namespace name GC listed in the bucket; the others are the service's

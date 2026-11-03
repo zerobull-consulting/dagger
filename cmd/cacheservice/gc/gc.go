@@ -137,6 +137,9 @@ type Collector struct {
 	// bundles caches the blob keys each bundle names, by scope/id.
 	// Bundles never change, so an entry never goes stale.
 	bundles map[string][]string
+	// listed are the namespaces the last Run found: their gauges are set.
+	// At most the bucket's namespaces.
+	listed map[string]bool
 }
 
 // New returns a Collector for cfg.
@@ -334,6 +337,17 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 			errs = append(errs, fmt.Errorf("namespace %s: %s", ns, strings.Join(rep.Errors, "; ")))
 		}
 	}
+	// The gauges of namespaces gone from the bucket go too.
+	found := make(map[string]bool, len(names))
+	for _, ns := range names {
+		found[ns] = true
+	}
+	for ns := range c.listed {
+		if !found[ns] {
+			c.cfg.Metrics.GCForget(ns)
+		}
+	}
+	c.listed = found
 	return reports, errors.Join(append([]error{uerr}, errs...)...)
 }
 

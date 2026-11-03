@@ -31,12 +31,12 @@ type Limits struct {
 // is no limit. A `*` line sets the defaults for namespaces with no line of
 // their own, over the defaults the file was parsed with (the -max-age and
 // -max-bytes flags); a namespace's line sets only the keys it names, and
-// takes the others from the defaults. Blank lines and lines starting with #
-// are ignored:
+// takes the others from the defaults. Blank lines are ignored, and a #
+// that starts a field begins a comment, to the end of its line:
 //
 //	# the defaults, then two namespaces
 //	*        max-age=720h
-//	team-a   max-age=168h max-bytes=500GiB
+//	team-a   max-age=168h max-bytes=500GiB   # CI images
 //	team-b   max-bytes=2TiB
 //
 // A namespace that is in no line, and one with no tokens, is collected with
@@ -80,6 +80,13 @@ func ParseLimits(data []byte, defaults Limits) (*LimitsFile, error) {
 			continue
 		}
 		fields := strings.Fields(text)
+		// A comment may end a line too: from a field that starts with #.
+		for i, f := range fields {
+			if strings.HasPrefix(f, "#") {
+				fields = fields[:i]
+				break
+			}
+		}
 		ns := fields[0]
 		if ns != "*" {
 			if err := metastore.ValidateScope(ns); err != nil {

@@ -657,6 +657,19 @@ func (m *Metrics) GCStagingRuleUnknown(scope string) {
 	m.gcStagingRule.DeleteLabelValues(scope)
 }
 
+// GCForget removes a scope's GC gauges, for a namespace no longer in the
+// bucket: they would otherwise report its last listing forever.
+func (m *Metrics) GCForget(scope string) {
+	if m == nil {
+		return
+	}
+	for _, k := range []string{KindBlob, KindBundle, KindResolution, KindIndex, KindStaging, KindOther} {
+		m.gcStoredBytes.DeleteLabelValues(scope, k)
+		m.gcStoredObjects.DeleteLabelValues(scope, k)
+	}
+	m.gcStagingRule.DeleteLabelValues(scope)
+}
+
 // ExportCollected records an export try refused by GC's fence.
 func (m *Metrics) ExportCollected(scope string) {
 	if m == nil {

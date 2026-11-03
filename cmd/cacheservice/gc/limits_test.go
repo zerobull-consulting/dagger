@@ -68,3 +68,14 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 }
+
+// A comment may end a line, as well as fill one.
+func TestParseLimitsTrailingComment(t *testing.T) {
+	f, err := ParseLimits([]byte("team-a max-age=1h  # CI images\n* max-bytes=1GiB #defaults\n"), Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.For("team-a"); got.MaxAge != time.Hour || got.MaxBytes != 1<<30 {
+		t.Fatalf("team-a: %+v", got)
+	}
+}

@@ -1314,3 +1314,26 @@ func TestDeleteDeadlineFromClaimStamp(t *testing.T) {
 		}
 	}
 }
+
+// The gauges of a namespace gone from the bucket are removed, rather than
+// report its last listing forever.
+func TestGaugesOfGoneNamespaceRemoved(t *testing.T) {
+	e := newEnv(t)
+	e.view("gone").Put(layer("x", 10))
+	e.export("team", "a", buildX("x"), 2)
+	reg := prometheus.NewRegistry()
+	c := e.collector(func(cfg *Config) { cfg.Metrics = metrics.New(reg) })
+	e.run(c)
+	labels := map[string]string{"scope": "gone", "kind": "blob"}
+	if s := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels); !s.Found || s.Value != 10 {
+		t.Fatalf("gone, listed: %+v", s)
+	}
+	e.view("gone").DeleteObject("gone", "", digest.FromBytes(layer("x", 10)))
+	e.run(c)
+	if s := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels); s.Found {
+		t.Fatalf("a namespace gone from the bucket still reports %v bytes", s.Value)
+	}
+	if s := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", map[string]string{"scope": "team", "kind": "blob"}); !s.Found {
+		t.Fatal("a namespace still there lost its gauge")
+	}
+}
