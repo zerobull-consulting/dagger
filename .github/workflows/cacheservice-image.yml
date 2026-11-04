@@ -1,0 +1,105 @@
+name: Cache service image
+# Builds cmd/cacheservice/Dockerfile and smoke-tests it
+# (hack/remote-cache/image-smoke.sh). Pull requests push nothing. Pushes to
+# feature/remote-cache, and workflow_dispatch on it, push
+# ghcr.io/zerobull-consulting/cacheservice:<commit SHA> and the moving
+# :feature-remote-cache tag. See cmd/cacheservice/README.md, "Image".
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    # The service's own packages and the ones that change most with it. Its
+    # other dependencies (engine/, internal/, util/) aren't listed, so a pull
+    # request touching only them isn't checked here; the push after its merge
+    # still builds the image.
+    paths:
+      - cmd/cacheservice/**
+      - engine/remotecache/**
+      - dagql/**
+      - go.mod
+      - go.sum
+      - hack/remote-cache/image-smoke.sh
+      - .github/workflows/cacheservice-image.yml
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Pull requests cancel their older runs. Pushes queue instead, so each
+  # merge pushes its SHA tag and the moving tag ends on the newest one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  IMAGE: ghcr.io/zerobull-consulting/cacheservice
+jobs:
+  # Pull requests, and workflow_dispatch on any other branch: build and
+  # smoke-test, push nothing.
+  build:
+    name: image build and smoke test
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # The Go build runs inside the Dockerfile (the builder stage), so the
+      # image builds the same from a fresh clone and here; its cache mounts
+      # start empty on each runner.
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" -t cacheservice:ci .
+          docker image inspect cacheservice:ci \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        run: ./hack/remote-cache/image-smoke.sh cacheservice:ci
+  # Pushes to feature/remote-cache, and workflow_dispatch on it: build,
+  # smoke-test, then push. The only job with packages: write; it never runs
+  # for a pull request.
+  publish:
+    name: image build, smoke test and push
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" \
+            -t "$IMAGE:$REVISION" -t "$IMAGE:feature-remote-cache" .
+          docker image inspect "$IMAGE:$REVISION" \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        env:
+          REVISION: ${{ github.sha }}
+        run: ./hack/remote-cache/image-smoke.sh "$IMAGE:$REVISION"
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # The SHA tag first: the moving tag only ever names an image that is
+      # also pushed under its commit.
+      - name: Push
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker push "$IMAGE:$REVISION"
+          docker push "$IMAGE:feature-remote-cache"
+          echo "pushed $IMAGE:$REVISION and $IMAGE:feature-remote-cache" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
