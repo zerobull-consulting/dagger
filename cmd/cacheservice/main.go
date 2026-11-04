@@ -170,8 +170,9 @@ func main() {
 	}
 
 	// The first SIGTERM or interrupt drains, the second ends the drain.
-	// ctx runs the export, import and GC paths: it ends only once the drain
-	// is done, so the exports the drain waits for aren't cut off.
+	// ctx runs the export, import and GC paths: it ends once the drain is
+	// done (shutdown), so the exports the drain waits for aren't cut off,
+	// or at once with -drain-timeout 0.
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	ctx, stop := context.WithCancel(context.Background())
@@ -282,14 +283,27 @@ func main() {
 	case err := <-errs:
 		logger.Error("serve", "error", err)
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	shutdown(svc, servers, stop, shutdownGrace)
+}
+
+// shutdownGrace bounds the wait for the HTTP servers' requests to end.
+const shutdownGrace = 5 * time.Second
+
+// shutdown stops svc after its drain, or without one: it ends what is still
+// in flight (exports, import syncs, GC runs) by canceling the context the
+// service's paths run on, closes the engine connections, shuts the servers
+// down, waiting up to grace for their requests, and waits for the paths.
+// The cancel comes first, as when the signal itself canceled that context:
+// a request tied to it, such as POST /debug/gc, then ends at once rather
+// than holding the shutdown for grace.
+func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, grace time.Duration) {
+	cancelPaths()
 	svc.CloseEngines()
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
 	for _, srv := range servers {
-		_ = srv.Shutdown(shutdownCtx)
+		_ = srv.Shutdown(ctx)
 	}
-	// End the exports still in flight, and wait for them.
-	stop()
 	svc.Wait()
 }
 

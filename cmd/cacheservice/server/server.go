@@ -23,8 +23,8 @@
 // which merges stored entries into the engines that lack them.
 //
 // To stop a service cleanly: Drain, while it still serves, with the drain's
-// deadline in its context; then CloseEngines, stop serving, cancel the
-// context passed to the Enable methods, and Wait. Without Drain, the exports
+// deadline in its context; then cancel the context passed to the Enable
+// methods, CloseEngines, stop serving, and Wait. Without Drain, the exports
 // pending or in flight are lost (cmd/cacheservice's README, "Stopping and
 // draining").
 package server

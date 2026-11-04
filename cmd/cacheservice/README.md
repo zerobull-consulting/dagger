@@ -1477,8 +1477,9 @@ SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops:
 
 It ends when nothing is left that it could export, or `-drain-timeout`
 (30s) passes. The service then does what it did before drains existed: it
-closes the engine connections, shuts down its HTTP servers, cuts off what is
-still in flight, and exits 0. A second signal ends the drain at once.
+cuts off what is still in flight (exports, import syncs, GC runs), closes the
+engine connections, shuts down its HTTP servers, and exits 0. With
+`-drain-timeout 0` it does that at once, as before. A second signal ends the drain at once.
 `-drain-timeout 0` stops without a drain. A CI job sets it long, such as
 `10m`.
 
