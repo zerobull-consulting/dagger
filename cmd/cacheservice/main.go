@@ -60,6 +60,13 @@
 //     follows). A second signal stops it at once. GET
 //     /debug/drain shows the drain. See README.md, "Stopping and draining".
 //
+//   - with -export=false, a read-only instance: the import path alone. It
+//     never writes to or deletes from the bucket, so it runs with a
+//     read-only key: no export path (spans are received and dropped), no
+//     conditional write check at startup, no GC, and no import records in
+//     the index. It refuses -import=false, and an explicit nonzero
+//     -gc-interval. See README.md, "Read-only instances".
+//
 //   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
 //     -gc-interval: per namespace in the bucket, it expires entries past
 //     their expiry, -max-age or -max-bytes (per namespace with
@@ -109,6 +116,7 @@ func main() {
 		quiet         time.Duration
 		endGrace      time.Duration
 		imports       bool
+		exports       bool
 		importPoll    time.Duration
 		tokensFile    string
 		tlsCert       string
@@ -134,12 +142,13 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", "", "the key of -tls-cert (PEM)")
 	flag.DurationVar(&quiet, "export-quiet", exporter.DefaultQuietPeriod, "export a session's entries after this long without a cache span from it, if its end isn't seen")
 	flag.DurationVar(&endGrace, "export-end-grace", exporter.DefaultEndGrace, "after a session ends, wait this long for the cache spans it said were coming")
+	flag.BoolVar(&exports, "export", true, "export engines' entries to the bucket, and run garbage collection (needs "+blobstore.EnvBucket+"); false: read-only, it only imports, and never writes to or deletes from the bucket, so it runs with a read-only key; can't be combined with -import=false")
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
 	flag.StringVar(&nsFile, "namespaces-file", "", "file of per-namespace limits, one '<namespace> max-age=<duration> max-bytes=<size>' per line, '*' for the defaults; SIGHUP reloads it (empty: -max-age and -max-bytes for every namespace)")
 	flag.StringVar(&maxAge, "max-age", "0", "default max age of a namespace's roots, from when an export last recorded them, such as 720h (0: no limit)")
 	flag.StringVar(&maxBytes, "max-bytes", "0", "default max size of what a namespace keeps, such as 500GiB (0: no limit)")
-	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25% (0: only POST /debug/gc; needs "+blobstore.EnvBucket+")")
+	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25% (0: only POST /debug/gc; needs "+blobstore.EnvBucket+"); GC is off with -export=false, which refuses an explicit nonzero value")
 	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
@@ -162,6 +171,11 @@ func main() {
 
 	if drainTimeout < 0 {
 		logger.Error("-drain-timeout must not be negative (0: no drain)")
+		os.Exit(2)
+	}
+
+	if err := checkReadOnly(exports, imports, gcInterval, explicitFlags()); err != nil {
+		logger.Error(err.Error())
 		os.Exit(2)
 	}
 
@@ -220,15 +234,22 @@ func main() {
 			"shares namespace " + scope + ": it can read everything stored there and add to it. " +
 			"Set -tokens-file to authenticate engines and keep namespaces apart.")
 	}
-	if os.Getenv(blobstore.EnvBucket) != "" {
+	store := os.Getenv(blobstore.EnvBucket) != ""
+	if store {
 		cfg, err := blobstore.S3ConfigFromEnv()
 		if err == nil {
-			err = svc.EnableS3(ctx, cfg, server.S3Options{
+			opts := server.S3Options{
 				Scope:      scope,
 				Tracker:    exporter.TrackerConfig{QuietPeriod: quiet, EndGrace: endGrace},
+				NoExport:   !exports,
 				NoImport:   !imports,
 				ImportPoll: importPoll,
-				GC: &server.GCConfig{
+			}
+			// A read-only instance never deletes from the bucket: GC is
+			// off whatever -gc-interval says (its default; an explicit
+			// one was refused above).
+			if exports {
+				opts.GC = &server.GCConfig{
 					Interval: gcInterval,
 					Collector: gc.Config{
 						DryRun:     gcDryRun,
@@ -236,8 +257,9 @@ func main() {
 						StagingAge: gcStagingAge,
 						MaxDeletes: gcMaxDeletes,
 					},
-				},
-			})
+				}
+			}
+			err = svc.EnableS3(ctx, cfg, opts)
 		}
 		if err != nil {
 			logger.Error("export path", "error", err)
@@ -246,6 +268,7 @@ func main() {
 	} else {
 		logger.Info("export path off: set " + blobstore.EnvBucket + " to store exports in S3")
 	}
+	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", store && !exports)
 
 	servers := []*http.Server{{Addr: listen, Handler: svc.Handler()}}
 	if debugListen != "" {
@@ -328,6 +351,38 @@ func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, time
 		}
 	}()
 	svc.Drain(ctx)
+}
+
+// explicitFlags returns the flags set on the command line, by name.
+func explicitFlags() map[string]bool {
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return set
+}
+
+// checkReadOnly refuses the flag combinations -export=false can't honor:
+// with -import=false too, the service would have nothing to do; and an
+// explicit nonzero -gc-interval asks for GC, which a read-only instance never
+// runs (it never deletes from the bucket). The default -gc-interval alone is
+// fine: GC is then off. set holds the flags set on the command line.
+func checkReadOnly(exports, imports bool, gcInterval time.Duration, set map[string]bool) error {
+	if exports {
+		return nil
+	}
+	if !imports {
+		return errors.New("-export=false and -import=false: with both paths off the service has nothing to do; drop one of them")
+	}
+	if set["gc-interval"] && gcInterval != 0 {
+		return fmt.Errorf("-gc-interval=%s and -export=false: a read-only instance never runs garbage collection, which deletes from the bucket; drop -gc-interval, or set it to 0", gcInterval)
+	}
+	return nil
+}
+
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 // parseLimits reads -max-age and -max-bytes.

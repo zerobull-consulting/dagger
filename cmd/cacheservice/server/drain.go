@@ -130,6 +130,10 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 
 	p := s.export
+	if p == nil && s.readOnly {
+		s.logger.Info("drain: nothing to export (read-only: -export=false)")
+		return s.endDrain(start, metrics.DrainComplete, nil)
+	}
 	if p == nil || p.ctx.Err() != nil {
 		s.logger.Info("drain: nothing to export (the export path is off)")
 		return s.endDrain(start, metrics.DrainComplete, nil)

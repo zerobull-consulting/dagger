@@ -55,6 +55,9 @@ type ExportConfig struct {
 // is the namespace of a service without tokens. Call it before the service
 // serves engines.
 func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
+	if s.readOnly {
+		return errors.New("export path: the service is read-only (SetReadOnly)")
+	}
 	if cfg.Exporter.Logger == nil {
 		cfg.Exporter.Logger = s.logger.With("component", "export")
 	}
@@ -89,6 +92,7 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 		ctx:          ctx,
 	}
 	s.export = p
+	s.metrics.ExportEnabled(true)
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -412,7 +416,7 @@ func intAttr(kvs []*commonpb.KeyValue, key string) int64 {
 // answers with what was stored.
 func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
 	if s.export == nil {
-		writeDebugError(w, ErrExportOff)
+		writeDebugError(w, s.exportOff())
 		return
 	}
 	conn, ok := debugConnID(w, r)
@@ -436,7 +440,7 @@ func (s *Service) serveExport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) serveEntries(w http.ResponseWriter, r *http.Request) {
 	if s.export == nil {
-		writeDebugError(w, ErrExportOff)
+		writeDebugError(w, s.exportOff())
 		return
 	}
 	conn, ok := debugConnID(w, r)

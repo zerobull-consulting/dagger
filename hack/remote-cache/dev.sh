@@ -92,6 +92,11 @@ use_store() {
 	eval "$(print_env)"
 	export CACHESERVICE_S3_PREFIX=test
 	export CACHESERVICE_TEST_DISPOSABLE_BUCKET=1
+	# A user that can only read under the prefix, for the tests of a
+	# read-only instance (-export=false).
+	READONLY_PREFIX=test compose run --rm create-readonly-user >/dev/null
+	export CACHESERVICE_TEST_READONLY_ACCESS_KEY_ID="${READONLY_USER:-dagger-readonly}"
+	export CACHESERVICE_TEST_READONLY_SECRET_ACCESS_KEY="${READONLY_PASSWORD:-dagger-readonly-secret}"
 }
 
 case "${1:-}" in

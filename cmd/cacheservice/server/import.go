@@ -62,6 +62,11 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	if cfg.Importer.Metrics == nil {
 		cfg.Importer.Metrics = s.metrics
 	}
+	// A read-only service writes nothing to the bucket, the import path's
+	// index records included (importer.Config.NoRecordImports).
+	if s.readOnly {
+		cfg.Importer.NoRecordImports = true
+	}
 	// Checked now, so a bad config fails here rather than on a connection.
 	if _, err := importer.New(cfg.Importer); err != nil {
 		return err

@@ -104,6 +104,9 @@ func (s *Service) Limits(ns string) gc.Limits {
 // until ctx ends. It collects every namespace in the bucket, not only those
 // with tokens, with the service's limits.
 func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
+	if s.readOnly {
+		return ErrGCReadOnly
+	}
 	// Only 0 turns the schedule off: a negative interval is a typo, and
 	// taking it as 0 would leave retention off without a word.
 	if cfg.Interval < 0 {
@@ -140,13 +143,22 @@ func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 	return nil
 }
 
-// ErrGCOff is returned by CollectGarbage when GC is off.
-var ErrGCOff = errors.New("gc is off")
+var (
+	// ErrGCOff is returned by CollectGarbage when GC is off.
+	ErrGCOff = errors.New("gc is off")
+	// ErrGCReadOnly is returned by CollectGarbage, and EnableGC, on a
+	// read-only service (SetReadOnly, -export=false): GC deletes from the
+	// bucket, which such a service never does.
+	ErrGCReadOnly = errors.New("gc is off: the instance is read-only (-export=false), and never deletes from the bucket")
+)
 
 // CollectGarbage runs garbage collection now, over every namespace, and
 // returns what it did. dryRun makes this run delete nothing, whatever the
 // configuration.
 func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report, error) {
+	if s.readOnly {
+		return nil, ErrGCReadOnly
+	}
 	p := s.gc
 	if p == nil {
 		return nil, ErrGCOff
@@ -189,6 +201,10 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 	reports, err := s.CollectGarbage(r.Context(), dry)
 	if errors.Is(err, ErrGCOff) {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, ErrGCReadOnly) {
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 	if errors.Is(err, ErrDraining) {

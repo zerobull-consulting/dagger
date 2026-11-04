@@ -51,5 +51,34 @@ services:
         mc mb --ignore-existing "local/$$BUCKET"
     restart: "no"
 
+  # Creates a user that can only read under the test prefix, for the tests of
+  # a read-only instance (-export=false): s3:GetObject on the prefix's
+  # objects, and s3:ListBucket limited to the prefix. Safe to run again.
+  create-readonly-user:
+    image: *minio-image
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dagger-dev}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-dagger-dev-secret}
+      BUCKET: ${MINIO_BUCKET:-dagger-cache}
+      PREFIX: ${READONLY_PREFIX:-test}
+      READONLY_USER: ${READONLY_USER:-dagger-readonly}
+      READONLY_PASSWORD: ${READONLY_PASSWORD:-dagger-readonly-secret}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        printf '{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::%s/%s/*"]},
+        {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::%s"],"Condition":{"StringLike":{"s3:prefix":["%s/*"]}}}]}'
+        "$$BUCKET" "$$PREFIX" "$$BUCKET" "$$PREFIX" > /tmp/readonly.json &&
+        mc admin policy create local cacheservice-readonly /tmp/readonly.json &&
+        mc admin user add local "$$READONLY_USER" "$$READONLY_PASSWORD" &&
+        { mc admin policy attach local cacheservice-readonly --user "$$READONLY_USER" ||
+          mc admin user info local "$$READONLY_USER" | grep -q cacheservice-readonly; }
+    restart: "no"
+
 volumes:
   minio-data:

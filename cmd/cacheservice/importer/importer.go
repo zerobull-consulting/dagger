@@ -113,6 +113,14 @@ type Config struct {
 	// Metrics records whether the bundles a merge needs were in memory.
 	// Nil records nothing.
 	Metrics *metrics.Metrics
+	// NoRecordImports leaves the index alone: the importer records no
+	// imports after a merge (RecordImports), and ForgetImports does
+	// nothing, so it only reads the bucket. For a service whose export
+	// path is off (-export=false), which can run with a read-only key:
+	// the imports exist only so that a later export of the engine's
+	// entries reuses the stored ones, and such a service never exports.
+	// Imported is then never called.
+	NoRecordImports bool
 }
 
 // Importer merges stored bundles into engines, and offers them stored parts.
@@ -368,6 +376,9 @@ func (im *Importer) Forget(cacheID string) {
 // its engine entries are gone. Call Forget first: a merge whose imports land
 // after this drop finds the cache forgotten, and drops them again.
 func (im *Importer) ForgetImports(ctx context.Context, cacheID string) error {
+	if im.cfg.NoRecordImports {
+		return nil
+	}
 	return im.cfg.Meta.ForgetImports(ctx, im.cfg.Scope, cacheID)
 }
 
@@ -539,7 +550,13 @@ func (im *Importer) currentLocked(eng Engine, st *cacheState) bool {
 // wiped, the imports may have landed after the wipe dropped them, so they
 // are dropped again. A new generation of the same cache keeps them, as its
 // entries are the same.
+//
+// With Config.NoRecordImports, it records nothing, and the values stay
+// unrecorded: nothing is retried.
 func (im *Importer) recordImports(ctx context.Context, eng Engine, st *cacheState, imports []metastore.Import) error {
+	if im.cfg.NoRecordImports {
+		return nil
+	}
 	recorded, err := im.cfg.Meta.RecordImports(ctx, im.cfg.Scope, eng.CacheID(), eng.Generation(), imports)
 	if err != nil {
 		return err
