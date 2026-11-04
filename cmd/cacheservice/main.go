@@ -56,7 +56,8 @@
 //     uploads, up to -drain-timeout (30s; 0: no drain). The engines stay
 //     connected meanwhile, since exports run over them: stop the service
 //     before its engines, and give the process manager a stop timeout longer
-//     than -drain-timeout. A second signal stops it at once. GET
+//     than -drain-timeout plus 5s (the HTTP servers' grace in the stop that
+//     follows). A second signal stops it at once. GET
 //     /debug/drain shows the drain. See README.md, "Stopping and draining".
 //
 //   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
@@ -142,7 +143,7 @@ func main() {
 	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
-	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once); the process manager's stop timeout must be longer")
+	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once); the process manager's stop timeout must be longer than this plus 5s")
 	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 

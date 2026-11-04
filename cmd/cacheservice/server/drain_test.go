@@ -802,3 +802,28 @@ func TestKnownGapDrainDoesNotWaitForExplicitImport(t *testing.T) {
 		t.Fatalf("the drain waited for the explicit import (%s, %+v): the gap is fixed; update this test", took, rep)
 	}
 }
+
+// KNOWN GAP: the drain starts what is due before it checks its deadline, so
+// a pass that runs once the deadline has passed still starts exports: here,
+// a drain whose deadline passed before it began starts the quiet session's
+// export, and returns "deadline" with it in flight. The stop that follows
+// cancels such an export, and it publishes nothing, but it is engine and S3
+// work started after the deadline, and the report counts it. Tracked in
+// https://github.com/zerobull-consulting/dagger/issues/73.
+func TestKnownGapDrainStartsExportsPastItsDeadline(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	release := h.cache.Hold()
+	defer release()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	rep := h.svc.Drain(ctx)
+	if rep.Outcome != metrics.DrainDeadline {
+		t.Fatalf("report %+v", rep)
+	}
+	waitUntil(t, 5*time.Second, "the export started past the deadline to reach the engine", func() bool { return h.cache.InFlight() == 1 })
+	if len(rep.Left) != 1 || rep.Left[0].InFlight != 2 {
+		t.Fatalf("the drain started nothing past its deadline (report %+v): the gap is fixed; update this test, the README and the issue", rep)
+	}
+}

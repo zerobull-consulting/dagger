@@ -1478,10 +1478,10 @@ SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops:
 It ends when nothing is left that it could export, or `-drain-timeout`
 (30s) passes. The service then does what it did before drains existed: it
 cuts off what is still in flight (exports, import syncs, GC runs), closes the
-engine connections, shuts down its HTTP servers, and exits 0. With
-`-drain-timeout 0` it does that at once, as before. A second signal ends the drain at once.
-`-drain-timeout 0` stops without a drain. A CI job sets it long, such as
-`10m`.
+engine connections, shuts down its HTTP servers, waiting up to 5s for their
+requests, and exits 0. A second signal ends the drain at once.
+`-drain-timeout 0` stops without a drain, at once, as before. A CI job sets
+it long, such as `10m`.
 
 The drain logs, when it starts, what each engine cache (by cache ID, never
 the token) has pending, in flight and waiting for a retry, and when it ends,
@@ -1497,7 +1497,9 @@ run over the engine's connection, and the engine uploads the layers itself.
 An engine stopped first takes its pending exports with it.
 
 **Process managers.** The process manager's stop timeout must be longer than
-`-drain-timeout`, or it kills the service mid-drain: `docker stop --time`
+`-drain-timeout` plus 5s, the stop after the drain (its HTTP servers' grace),
+or it can kill the service mid-drain or mid-stop: with the default 30s, give
+it more than 35s, and with `10m`, more than `10m5s`. `docker stop --time`
 (10s by default), `docker compose`'s `stop_grace_period` (10s by default) and
 Kubernetes' `terminationGracePeriodSeconds` (30s by default) all send SIGKILL
 when theirs runs out. Readiness probes and Kubernetes integration are out of
@@ -1534,6 +1536,13 @@ for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
 `TestKnownGapDrainDoesNotWaitForExplicitExport` and
 `TestKnownGapDrainDoesNotWaitForExplicitImport`
 ([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
+
+**Exports started past the deadline.** The drain starts what is due before
+it checks its deadline, so a pass that runs once the deadline has passed can
+still start an export, such as a retry whose backoff just ran out. The stop
+cancels it, and it publishes nothing. Known gap, pinned by
+`TestKnownGapDrainStartsExportsPastItsDeadline`
+([#73](https://github.com/zerobull-consulting/dagger/issues/73)).
 
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
@@ -1991,7 +2000,9 @@ stop drains first and stores it (see
 during the drain can't reconnect, and its exports are left
 ([#70](https://github.com/zerobull-consulting/dagger/issues/70)); and the
 drain doesn't wait for an explicit export or import admitted just before it
-([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
+([#72](https://github.com/zerobull-consulting/dagger/issues/72)), and can
+start an export past its deadline
+([#73](https://github.com/zerobull-consulting/dagger/issues/73)).
 
 **Fixed since: bundles of moved imports.** The first run of
 `service-restart` found that a bundle holding imports could no longer be
