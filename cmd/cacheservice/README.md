@@ -17,11 +17,11 @@ spike, and only logs what the engine does on the wire.
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
-| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. 503 while draining |
+| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. 503 while draining; 409 on a read-only instance (`-export=false`) |
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
-| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, for a scraper that shouldn't reach the debug API |
 
@@ -445,7 +445,8 @@ changed on every service restart would make engines re-key everything. So:
 **Imported entries.** An engine that had a stored entry merged into it holds
 the value on an entry of its own, and its sessions name that entry when they
 hit it. So, after each merge, the importer records the engine entry each
-stored entry landed on as the cache's import (`Index.RecordImports`):
+stored entry landed on as the cache's import (`Index.RecordImports`). A
+read-only instance doesn't (see [Read-only instances](#read-only-instances)):
 
 - `Record` gives a value whose engine entry is imported the imported entry's
   service number, whether it is a root or in another root's closure. The
@@ -581,9 +582,13 @@ don't contend.
 
 [`exporter`](exporter) pushes engines' cache entries to S3
 ([#7](https://github.com/zerobull-consulting/dagger/issues/7)). It is on when
-`CACHESERVICE_S3_BUCKET` is set; the other `CACHESERVICE_S3_*` settings are as
-for the blob store. At startup the service checks the bucket's conditional
-writes (`VerifyConditionalWrites`) and refuses to start if they fail.
+`CACHESERVICE_S3_BUCKET` is set, unless `-export=false`; the other
+`CACHESERVICE_S3_*` settings are as for the blob store. At startup the
+service checks the bucket's conditional writes (`VerifyConditionalWrites`)
+and refuses to start if they fail. `-export=false` (default true, mirroring
+`-import`) turns the export path off and makes the instance read-only: it
+only imports, and never writes to or deletes from the bucket (see
+[Read-only instances](#read-only-instances)).
 Exported entries go into the scope of the engine's namespace: its token's,
 with `-tokens-file`, or `-scope` (`default`) without (see
 [Auth and namespaces](#auth-and-namespaces)). Each namespace has its own
@@ -842,6 +847,126 @@ them. Entries an engine prunes, or answers
 `gone` for, are not merged into it again until it restarts: merging them back
 on the next poll would undo its garbage collection, which prunes them again.
 
+## Read-only instances
+
+`-export=false` is for jobs that should use the cache but never change it,
+such as pull-request jobs, while a scheduled job writes it
+([#65](https://github.com/zerobull-consulting/dagger/issues/65)). The
+promise: **a read-only instance never writes to or deletes from the
+bucket.** So it runs with a read-only key, and that is testable.
+
+What it does, and doesn't:
+
+- **No export path.** No tracker and no exporter: session spans are received
+  (200) and dropped, so nothing is recorded, exported or uploaded. `POST
+  /debug/engines/{conn}/export` and `GET /debug/engines/{conn}/entries`
+  answer 409, `the export path is off: the instance is read-only
+  (-export=false)`, distinct from a service with no store (`... no store is
+  configured`).
+- **No conditional write check at startup.** It checks the index's
+  conditional writes, which only the export path makes, and it writes. The
+  service logs that it skipped it, and why.
+- **No GC.** GC deletes, so it is forced off whatever `-gc-interval` says,
+  and `POST /debug/gc` answers 409, `gc is off: the instance is read-only
+  (-export=false), and never deletes from the bucket`. This goes beyond
+  [#65](https://github.com/zerobull-consulting/dagger/issues/65)'s "GC
+  unchanged": a read-only key couldn't delete anyway, and a GC that fails
+  every delete is noise, not retention. Run GC from a writer.
+- **Imports, offers and renewals as usual**, with one difference: the import
+  path records no imports in the index. A writer records, after each merge,
+  which engine entry each stored value landed on, so that a later export of
+  that entry reuses the stored one instead of storing it again (see
+  [Imported entries](#imported-entries)); a read-only instance never exports,
+  so it skips that index write, and a wiped cache's imports have nothing to
+  drop. The cost: if the same engine cache later exports through a writer,
+  it stores copies of what it imported, under new numbers, rather than
+  reusing them. Nothing is lost; a fresh engine per job never hits it.
+- **The drain has nothing to flush,** and returns at once
+  (`drain: nothing to export (read-only: -export=false)`).
+
+Three combinations are refused at startup, with exit code 2 and an error
+naming both settings, before anything connects to the bucket:
+
+- `-export=false -import=false`: with both paths off, the service has
+  nothing to do.
+- `-export=false` without `CACHESERVICE_S3_BUCKET`: a read-only instance
+  only imports from the bucket, so it would have nothing to do either, and a
+  typo in the variable would otherwise go unnoticed.
+- `-export=false` with an explicit nonzero `-gc-interval` (even `1h`, the
+  default, when it's set on the command line): it asks for GC, which a
+  read-only instance never runs. The default alone is fine; `-gc-interval=0`
+  too.
+
+The startup log has one line of the mode, `msg=mode export=off import=on
+gc=off readOnly=true`, and `cacheservice_export_enabled` is 0, so a
+dashboard can tell a read-only sidecar from a writer that is broken.
+
+### A read-only key
+
+**The flag is trust hygiene; the read-only key is the boundary.** A job that
+holds a key that can write can still write, whatever flag it passes the
+service. Give pull-request jobs a key that can only read.
+
+The import path needs, on the objects under the prefix (`<prefix>/*`):
+
+- `s3:GetObject`: the index, bundles and resolutions it reads, the
+  `HeadObject` that checks a layer is stored before a renewal, and the
+  presigned GETs it hands engines, which are signed with this key;
+- `s3:ListBucket` on the bucket, for the prefix: the import path never
+  lists, but without it S3 answers 403 instead of 404 for a missing key,
+  such as the index of a namespace nothing was stored in yet.
+
+That is all: no `s3:PutObject`, `s3:DeleteObject` or bucket configuration.
+`TestMinIOBinaryReadOnlyKey` runs a read-only instance with a MinIO user
+that has only these (as below, for the test prefix): it merges a writer's
+entries into a fresh engine, the engine pulls their layers and renews their
+addresses, and the bucket's listing is unchanged. With the export path on,
+the same key fails at startup on the conditional write check, `AccessDenied`,
+exit 1 (`TestMinIOBinaryReadOnlyKeyRefusedAsWriter`): that is what stops a
+pull-request job that forgot `-export=false` from running as a writer whose
+every export fails. MinIO answers 404 for a missing key even without
+`s3:ListBucket` (checked with a `GetObject`-only user); AWS S3 documents the
+403, which hasn't been run here.
+
+**MinIO** (what `hack/remote-cache/compose.yaml`'s `create-readonly-user`
+does), with `dagger-cache` and `cache` for your bucket and prefix:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::dagger-cache/cache/*"]},
+    {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::dagger-cache"],
+     "Condition": {"StringLike": {"s3:prefix": ["cache/*"]}}}
+  ]
+}
+```
+
+```bash
+mc admin policy create local cacheservice-readonly readonly.json
+mc admin user add local cacheservice-pr '<secret>'
+mc admin policy attach local cacheservice-readonly --user cacheservice-pr
+```
+
+**AWS S3:** the same document is an IAM policy: attach it to the IAM user
+or role the pull-request jobs use (`aws iam put-user-policy --user-name
+cacheservice-pr --policy-name cacheservice-readonly --policy-document
+file://readonly.json`), and give the writer its own credentials. A bucket
+policy that grants a write to everyone in the account would still apply:
+check the bucket policy grants nothing wider.
+
+**DigitalOcean Spaces:** Spaces has no IAM policies; it has per-bucket
+[limited access keys](https://docs.digitalocean.com/products/spaces/how-to/manage-access/),
+each bucket with `Read` or `Read/Write/Delete`. Create one with `Read` on the
+cache's bucket only. What is confirmed: Spaces documents those two levels,
+per bucket. What isn't: this repository's CI runs on Spaces with a
+read/write key, and a `Read` key hasn't been run against the service, so
+which S3 calls it allows (and whether a missing key answers 404) is
+unchecked. It is per bucket, not per prefix: it reads every prefix of the
+bucket, other namespaces' included, so give the cache a bucket of its own.
+Spaces also refuses a limited access key on a bucket with a bucket policy
+(`PutBucketPolicy`).
+
 ## Auth and namespaces
 
 [#10](https://github.com/zerobull-consulting/dagger/issues/10). A **token**
@@ -1091,7 +1216,9 @@ signals describe one engine's cache, not the stored copy (see
 
 It runs every `-gc-interval` (1h, jittered by ±25%, so replicas spread out;
 0 runs it only on `POST /debug/gc`), with the S3 stores
-(`CACHESERVICE_S3_BUCKET`). Without limits (`-max-age` and `-max-bytes` are 0
+(`CACHESERVICE_S3_BUCKET`). It is off on a read-only instance
+(`-export=false`), whatever `-gc-interval` says; an explicit nonzero one is
+refused at startup (see [Read-only instances](#read-only-instances)). Without limits (`-max-age` and `-max-bytes` are 0
 by default, and no namespaces file), it expires only what engines gave an
 expiry, and deletes only what nothing names: bundles and blobs of exports
 that were never recorded or were superseded, and staged uploads. So an
@@ -1430,7 +1557,7 @@ first.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0) |
+| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0). GC is off with `-export=false`, which refuses an explicit nonzero value |
 | `-gc-dry-run` | false | Log and report what a run would do; change nothing |
 | `-gc-grace` | `2h` | How old an unreferenced bundle, resolution or blob must be to be deleted |
 | `-gc-staging-age` | `2h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |
@@ -1449,7 +1576,10 @@ prefix, and, to report namespaces without a staging rule,
 The service runs as a sidecar on an ephemeral CI runner, and the end of the
 job is its only chance to store what the job built
 ([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
-SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops:
+SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops.
+A read-only instance (`-export=false`) has nothing to flush: its drain
+returns at once, and logs `drain: nothing to export (read-only:
+-export=false)`.
 
 1. **It takes no new work.** A new engine WebSocket gets 503 with
    `Retry-After: 10` before the upgrade, and one upgraded but not yet
@@ -1605,6 +1735,7 @@ paths record into them through their metadata store. All are prefixed
 | `gc_entries_expired_total` | `scope`, `reason` | Index entries GC dropped: `expired` (their own expiry, or the max age) or `size` (the max size) |
 | `gc_staging_rule_missing` | `scope` | 1 when no lifecycle rule expires the namespace's staging prefix (GC expires it itself), 0 when one does; absent when the rules can't be read |
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
+| `export_enabled` | | 1 when the export path is on, 0 when it is off: a read-only instance (`-export=false`), or no bucket |
 | `draining` | | 1 once the service started draining (SIGTERM), 0 before |
 | `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed) or `canceled` (a second signal) |
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
@@ -1695,7 +1826,9 @@ with backoff. To try it, unauthenticated and with no store (export path off):
 docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache
 ```
 
-Running it as a sidecar next to an engine in CI is
+With a bucket, a pull-request job's instance adds `-export=false` and a
+read-only key (see [Read-only instances](#read-only-instances)). Running it
+as a sidecar next to an engine in CI is
 [#75](https://github.com/zerobull-consulting/dagger/issues/75).
 
 ## Running it against a local engine

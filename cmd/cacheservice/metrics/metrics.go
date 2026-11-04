@@ -110,6 +110,7 @@ type Metrics struct {
 	gcStagingRule       *prometheus.GaugeVec
 	exportCollected     *prometheus.CounterVec
 	draining            prometheus.Gauge
+	exportEnabled       prometheus.Gauge
 	drains              *prometheus.HistogramVec
 	drainStoredRoots    prometheus.Counter
 	drainLeftRoots      prometheus.Counter
@@ -316,6 +317,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "draining",
 			Help: "1 while the service drains its exports before it stops (SIGTERM), 0 otherwise.",
 		}),
+		exportEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns, Name: "export_enabled",
+			Help: "1 when the export path is on, 0 when it is off: read-only (-export=false), or no bucket. A read-only instance never writes to or deletes from the bucket.",
+		}),
 		drains: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "drain_duration_seconds",
 			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal).",
@@ -349,7 +354,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule,
 		m.exportCollected,
-		m.draining, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
+		m.draining, m.exportEnabled, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
 	}
 	if reg != nil {
 		reg.MustRegister(m.collectors...)
@@ -721,6 +726,18 @@ const (
 	DrainRefusedConnection = "connection"
 	DrainRefusedSpan       = "span"
 )
+
+// ExportEnabled records whether the export path is on.
+func (m *Metrics) ExportEnabled(on bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if on {
+		v = 1
+	}
+	m.exportEnabled.Set(v)
+}
 
 // DrainStarted records that the service started draining.
 func (m *Metrics) DrainStarted() {

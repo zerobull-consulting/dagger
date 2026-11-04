@@ -46,9 +46,13 @@ type ImportConfig struct {
 // without a trigger.
 const DefaultImportPoll = 30 * time.Second
 
-// EnableImport turns on the import path until ctx ends. Turn on the export
-// path first: the import path tells each namespace's tracker what each merge
-// left in an engine cache, so an unchanged import isn't exported back. Each
+// EnableImport turns on the import path until ctx ends. With the export
+// path on, turn it on first: the import path tells each namespace's tracker
+// what each merge left in an engine cache, so an unchanged import isn't
+// exported back. Without it, as on a read-only service (SetReadOnly,
+// S3Options.NoExport), the import path runs alone, with no tracker to tell;
+// a read-only service also records no imports in the index
+// (importer.Config.NoRecordImports). Each
 // namespace gets an importer of cfg.Importer, with the namespace as its scope
 // and its own view of the blob store; cfg.Importer.Scope is the namespace of
 // a service without tokens. Call it before the service serves engines.
@@ -61,6 +65,11 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	}
 	if cfg.Importer.Metrics == nil {
 		cfg.Importer.Metrics = s.metrics
+	}
+	// A read-only service writes nothing to the bucket, the import path's
+	// index records included (importer.Config.NoRecordImports).
+	if s.readOnly {
+		cfg.Importer.NoRecordImports = true
 	}
 	// Checked now, so a bad config fails here rather than on a connection.
 	if _, err := importer.New(cfg.Importer); err != nil {
@@ -179,6 +188,10 @@ func (s *Service) triggerImports(ns *namespace, except string) {
 func (s *Service) forgetWiped(ns *namespace, cacheID string) {
 	p := s.imports
 	ns.importer.Forget(cacheID)
+	// A read-only service records no imports, so it has none to drop.
+	if s.readOnly {
+		return
+	}
 	p.mu.Lock()
 	if p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()

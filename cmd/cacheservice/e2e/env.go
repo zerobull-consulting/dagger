@@ -116,6 +116,8 @@ type Env struct {
 	Meta     *metastore.Store
 	// Proxy is between MinIO and the services and engines.
 	Proxy *S3Proxy
+	// proxyOpts are Proxy's options, for NewProxy.
+	proxyOpts ProxyOptions
 
 	bin string
 	// deleted are the blobs scenarios deleted from MinIO on purpose.
@@ -201,6 +203,7 @@ func New(t *testing.T) *Env {
 		opts.Upstream = newUpstream(cfg, e.S3)
 		t.Logf("the S3 proxy signs requests again for the store (HTTPS or virtual-hosted endpoint)")
 	}
+	e.proxyOpts = opts
 	e.Proxy = StartS3ProxyWith(t, e.Gateway, cfg.Endpoint, opts)
 	t.Cleanup(func() {
 		for _, r := range append(guard.Refused(), direct.Refused()...) {
@@ -392,6 +395,23 @@ func (e *Env) BundleIDsIn(ns string) []string {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+// NewProxy starts another S3 proxy like Proxy, to the same store, under the
+// same guard: a service on it, and the engines it hands presigned URLs to,
+// send every request through it, so its record is theirs alone.
+func (e *Env) NewProxy() *S3Proxy {
+	e.T.Helper()
+	return StartS3ProxyWith(e.T, e.Gateway, e.S3Config.Endpoint, e.proxyOpts)
+}
+
+// ReadOnlyKey is the key of the store's read-only user, from
+// CACHESERVICE_TEST_READONLY_ACCESS_KEY_ID and _SECRET_ACCESS_KEY, which
+// dev.sh sets for MinIO. ok is false without them, or when the proxy signs
+// requests again (it checks every signature with the run's own key).
+func (e *Env) ReadOnlyKey() (id, secret string, ok bool) {
+	id, secret = os.Getenv("CACHESERVICE_TEST_READONLY_ACCESS_KEY_ID"), os.Getenv("CACHESERVICE_TEST_READONLY_SECRET_ACCESS_KEY")
+	return id, secret, id != "" && secret != "" && e.proxyOpts.Upstream == nil
 }
 
 func (e *Env) listKeys(prefix string) []string {

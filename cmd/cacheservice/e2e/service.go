@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/credentials"
+
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
@@ -56,6 +58,15 @@ type ServiceOptions struct {
 	// GCGrace is GC's grace period (0: its default). GC runs only when a
 	// scenario calls CollectGarbage.
 	GCGrace time.Duration
+	// ReadOnly runs it as -export=false does: the import path alone, no GC,
+	// and nothing written to or deleted from the bucket.
+	ReadOnly bool
+	// Proxy is the S3 proxy it, and the engines it hands presigned URLs to,
+	// reach the store through (nil: the run's, Env.Proxy).
+	Proxy *S3Proxy
+	// AccessKey and SecretKey are its store credentials (empty: the
+	// run's).
+	AccessKey, SecretKey string
 }
 
 // noEngineWait is how long an export waits for its engine to reconnect:
@@ -76,6 +87,12 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 
 	cfg := e.S3Config
 	cfg.Endpoint = e.Proxy.URL
+	if opts.Proxy != nil {
+		cfg.Endpoint = opts.Proxy.URL
+	}
+	if opts.AccessKey != "" {
+		cfg.Credentials = credentials.NewStaticCredentialsProvider(opts.AccessKey, opts.SecretKey, "")
+	}
 	// The proxy forwards in the store's addressing; a proxy's address has no
 	// bucket subdomains.
 	cfg.PathStyle = true
@@ -91,14 +108,18 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := server.New(logger, "")
-	if err := svc.EnableS3(ctx, cfg, server.S3Options{
+	s3opts := server.S3Options{
 		Scope:        e.Scope,
 		Tracker:      exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},
+		NoExport:     opts.ReadOnly,
 		ImportPoll:   poll,
 		NoEngineWait: noEngineWait,
+	}
+	if !opts.ReadOnly {
 		// Only when a scenario asks (CollectGarbage).
-		GC: &server.GCConfig{Collector: gc.Config{Grace: opts.GCGrace}},
-	}); err != nil {
+		s3opts.GC = &server.GCConfig{Collector: gc.Config{Grace: opts.GCGrace}}
+	}
+	if err := svc.EnableS3(ctx, cfg, s3opts); err != nil {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
 	}

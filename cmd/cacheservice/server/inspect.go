@@ -22,7 +22,21 @@ var (
 	// store is configured.
 	ErrExportOff = errors.New("the export path is off: no store is configured")
 	ErrImportOff = errors.New("the import path is off: no store is configured")
+	// ErrReadOnly is returned for an export asked of a read-only service
+	// (SetReadOnly, -export=false): it has a store, and exports nothing to
+	// it. It is distinct from ErrExportOff, so an operator can tell a
+	// read-only instance from one with no store.
+	ErrReadOnly = errors.New("the export path is off: the instance is read-only (-export=false)")
 )
+
+// exportOff is the error of an export asked of a service whose export path
+// is off: ErrReadOnly or ErrExportOff.
+func (s *Service) exportOff() error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+	return ErrExportOff
+}
 
 // ExportConflictError is returned by Export when the requested roots can't
 // be claimed, such as when an export of them is already in flight.
@@ -67,7 +81,7 @@ func (s *Service) conn(id uint64) (*engineConn, error) {
 func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 	p := s.export
 	if p == nil {
-		return nil, ErrExportOff
+		return nil, s.exportOff()
 	}
 	c, err := s.conn(conn)
 	if err != nil {
@@ -86,7 +100,7 @@ func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request) (exporter.Result, error) {
 	p := s.export
 	if p == nil {
-		return exporter.Result{}, ErrExportOff
+		return exporter.Result{}, s.exportOff()
 	}
 	// New work: the drain runs what is pending itself.
 	if s.draining.Load() {
@@ -170,7 +184,7 @@ func writeDebugError(w http.ResponseWriter, err error) {
 		http.Error(w, "no such engine", http.StatusNotFound)
 	case errors.Is(err, ErrDraining):
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-	case errors.Is(err, ErrExportOff), errors.Is(err, ErrImportOff), errors.As(err, &conflict):
+	case errors.Is(err, ErrExportOff), errors.Is(err, ErrReadOnly), errors.Is(err, ErrImportOff), errors.Is(err, ErrGCReadOnly), errors.As(err, &conflict):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:
 		http.Error(w, err.Error(), http.StatusBadGateway)

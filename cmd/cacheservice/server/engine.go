@@ -64,6 +64,9 @@ type Service struct {
 
 	// export is the export path, nil when it is off.
 	export *exportPath
+	// readOnly is set by SetReadOnly: the export path is off, and stays
+	// off, and nothing writes to or deletes from the bucket.
+	readOnly bool
 	// imports is the import path, nil when it is off.
 	imports *importPath
 	// gc is garbage collection, nil when it is off; limits are every
@@ -96,8 +99,16 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 		namespaces: map[string]*namespace{},
 		defaultNS:  DefaultNamespace,
 		registry:   reg,
-		metrics:    metrics.New(reg),
+		metrics:    newMetrics(reg),
 	}
+}
+
+// newMetrics are a new service's metrics: its export path is off until
+// EnableExport.
+func newMetrics(reg prometheus.Registerer) *metrics.Metrics {
+	m := metrics.New(reg)
+	m.ExportEnabled(false)
+	return m
 }
 
 // Metrics returns what the service records its storage costs into. The
