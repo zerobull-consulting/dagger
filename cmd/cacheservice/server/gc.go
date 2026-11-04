@@ -27,8 +27,9 @@ type GCConfig struct {
 type gcPath struct {
 	cfg       gc.Config
 	collector *gc.Collector
-	// stop ends the scheduled runs, and cancels one under way, when the
-	// service starts draining.
+	// ctx runs every GC run, scheduled or asked for; stop ends it, and
+	// with it the run under way, when the service starts draining.
+	ctx  context.Context
 	stop context.CancelFunc
 	wg   sync.WaitGroup
 }
@@ -126,7 +127,7 @@ func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 		return err
 	}
 	ctx, stop := context.WithCancel(ctx)
-	p := &gcPath{cfg: c, collector: collector, stop: stop}
+	p := &gcPath{cfg: c, collector: collector, ctx: ctx, stop: stop}
 	s.gc = p
 	if cfg.Interval > 0 {
 		p.wg.Add(1)
@@ -151,6 +152,13 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 		return nil, ErrGCOff
 	}
 	if s.draining.Load() {
+		return nil, ErrDraining
+	}
+	// A drain cancels a run asked for too, not only the scheduled ones.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(p.ctx, cancel)()
+	if p.ctx.Err() != nil {
 		return nil, ErrDraining
 	}
 	c := p.collector

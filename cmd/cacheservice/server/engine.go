@@ -241,7 +241,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// Upgraded before the drain started, but not welcomed yet: a new
 	// engine all the same.
 	if c.svc.draining.Load() {
-		c.svc.metrics.DrainRefused(metrics.DrainRefusedConnection)
+		c.svc.countRefused(metrics.DrainRefusedConnection)
 		_ = c.conn.Close(websocket.StatusTryAgainLater, "service draining")
 		return errors.New("service draining: refused before welcome")
 	}

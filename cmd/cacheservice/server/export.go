@@ -240,6 +240,12 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 	}
 	tracker := ns.tracker
 	now := p.now()
+	// A namespace created, or a request taken, as the drain starts drains
+	// before it takes a span: what isn't tracked yet is new work.
+	draining := s.draining.Load()
+	if draining {
+		tracker.StartDrain(now)
+	}
 	for _, rs := range req.ResourceSpans {
 		res := rs.GetResource().GetAttributes()
 		cacheID, generation, ok := parseEngineCache(stringAttr(res, telemetryattrs.EngineCacheAttr))
@@ -252,7 +258,7 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 				attrs := span.Attributes
 				if n, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr); ok {
 					count, err := strconv.Atoi(n.GetStringValue())
-					if err == nil && !tracker.SessionEnded(cacheID, generation, session, count, now) && s.draining.Load() {
+					if err == nil && !tracker.SessionEnded(cacheID, generation, session, count, now) && draining {
 						s.refusedSpan()
 					}
 				}
@@ -282,7 +288,7 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 						}
 					}
 				}
-				if !tracker.Observe(o, now) && s.draining.Load() {
+				if !tracker.Observe(o, now) && draining {
 					s.refusedSpan()
 				}
 			}

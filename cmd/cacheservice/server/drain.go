@@ -103,17 +103,21 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 // Call it once, before CloseEngines and Wait; a second call returns at once.
 // The goroutines it starts are exports, which Wait waits for.
 func (s *Service) Drain(ctx context.Context) DrainReport {
-	if !s.draining.CompareAndSwap(false, true) {
-		return DrainReport{Outcome: metrics.DrainCanceled}
-	}
 	start := time.Now()
 	deadline, _ := ctx.Deadline()
+	// The drain's state is ready before anything sees s.draining, so an
+	// export that ends as the drain starts is counted.
 	s.drain.mu.Lock()
+	if s.draining.Load() {
+		s.drain.mu.Unlock()
+		return DrainReport{Outcome: metrics.DrainCanceled}
+	}
 	s.drain.started, s.drain.deadline = start, deadline
 	s.drain.stored = map[string]int{}
 	if s.drain.refused == nil {
 		s.drain.refused = map[string]int{}
 	}
+	s.draining.Store(true)
 	s.drain.mu.Unlock()
 	s.metrics.DrainStarted()
 
@@ -130,6 +134,8 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		s.logger.Info("drain: nothing to export (the export path is off)")
 		return s.endDrain(start, metrics.DrainComplete, nil)
 	}
+	// Namespaces created from now on drain from their first span
+	// (trackSpans).
 	now := p.now()
 	for _, ns := range s.namespacesNow() {
 		ns.tracker.StartDrain(now)

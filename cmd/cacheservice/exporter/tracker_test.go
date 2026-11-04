@@ -601,3 +601,18 @@ func TestTrackerDrainRetries(t *testing.T) {
 		t.Fatalf("drain status in flight: %+v", st)
 	}
 }
+
+// StartDrain pulls retries forward once, when the drain starts: the service
+// calls it again for every span request while draining, and a later call
+// must not cut a retry's backoff short.
+func TestTrackerStartDrainOnce(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.StartDrain(t0)
+	b := tr.DrainDue(t0)
+	tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1}}}, t0)
+	tr.StartDrain(t0.Add(100 * time.Millisecond))
+	if got := roots(tr.DrainDue(t0.Add(100 * time.Millisecond))); len(got) != 0 {
+		t.Fatalf("a second StartDrain cut the retry's backoff short: %v", got)
+	}
+}

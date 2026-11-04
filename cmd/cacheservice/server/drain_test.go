@@ -13,8 +13,11 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
@@ -559,4 +562,115 @@ func debugDrain(t *testing.T, h *exportHarness) DrainStatus {
 		t.Fatal(err)
 	}
 	return st
+}
+
+// A namespace the service hasn't seen until a span of it arrives during the
+// drain drains from that span: the span, a new session's, is dropped, and
+// the drain doesn't export it. Without tokens, the default namespace is
+// created the same way, by its first request.
+func TestDrainNewNamespaceTakesNoNewSession(t *testing.T) {
+	h := newAuthHarness(t)
+	a := fakeengine.New("cache-a", 1)
+	authBuild(a, "a")
+	conn := h.connect(a, "tok-a")
+	release := a.Hold()
+	defer release()
+	h.postSpans("tok-a", a, "session-a", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitUntil(t, 5*time.Second, "A's export to be held", func() bool { return a.InFlight() == 1 })
+	h.svc.nsMu.Lock()
+	_, seen := h.svc.namespaces["team-b"]
+	h.svc.nsMu.Unlock()
+	if seen {
+		t.Fatal("team-b exists before the drain: the test can't create it during it")
+	}
+	done := startDrain(t, h.svc, time.Minute)
+
+	b := fakeengine.New("cache-b", 1)
+	if code := h.postSpans("tok-b", b, "session-b", cacheSpan(20), carrierSpan(1)); code != http.StatusOK {
+		t.Fatalf("spans of a new namespace while draining: %d", code)
+	}
+	if got := h.ns("team-b").tracker.Entries(b.ID); len(got) != 0 {
+		t.Fatalf("the new namespace's tracker took a new session while draining: %+v", got)
+	}
+	if n := countRefused(h.svc, metrics.DrainRefusedSpan); n != 2 {
+		t.Fatalf("%d spans and ends refused, want 2", n)
+	}
+	release()
+	rep := waitDrain(t, done, 10*time.Second)
+	if rep.Outcome != metrics.DrainComplete || rep.Stored[a.ID] != 2 || rep.Stored[b.ID] != 0 {
+		t.Fatalf("report %+v", rep)
+	}
+	if !h.svc.connected(conn) {
+		t.Fatal("the drain closed A's connection")
+	}
+}
+
+// A connection upgraded before the drain started, which says hello during
+// it, is closed with 1013 (try again later), and counted as refused.
+func TestDrainRefusesHelloOfLateConnection(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	raw, code := dialAs(t, h.srv, "engine-token")
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("dial before the drain: %d", code)
+	}
+	drainFor(h.svc, time.Minute)
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "late", Generation: 1, EngineName: "late"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.send(env)
+	if status := raw.closed(); status != websocket.StatusTryAgainLater {
+		t.Fatalf("a hello while draining was closed with %d, want %d", status, websocket.StatusTryAgainLater)
+	}
+	if n := countRefused(h.svc, metrics.DrainRefusedConnection); n != 1 {
+		t.Fatalf("%d connections counted refused, want 1", n)
+	}
+	if h.svc.engineFor(h.ns(), "late") != nil {
+		t.Fatal("the late connection was welcomed")
+	}
+}
+
+// blockingBucket holds GC's first listing until its context ends, as a GC
+// run that takes long would.
+type blockingBucket struct {
+	gc.Bucket
+	blocked chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingBucket) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+	b.once.Do(func() { close(b.blocked) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A GC run asked for (POST /debug/gc) and under way when the drain starts is
+// canceled, as a scheduled one is: GC is idempotent, and the next run
+// finishes it.
+func TestDrainCancelsGCRunAskedFor(t *testing.T) {
+	st := newGCStores(t, nil)
+	h := newExportHarness(t, st.blobs, st.meta, nil)
+	bucket := &blockingBucket{Bucket: st.bucket, blocked: make(chan struct{})}
+	if err := h.svc.EnableGC(h.ctx, GCConfig{Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+		t.Fatal(err)
+	}
+	ran := make(chan error, 1)
+	go func() {
+		_, err := h.svc.CollectGarbage(context.Background(), false)
+		ran <- err
+	}()
+	select {
+	case <-bucket.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the GC run didn't start")
+	}
+	drainFor(h.svc, time.Minute)
+	select {
+	case err := <-ran:
+		if err == nil {
+			t.Fatal("the canceled GC run reported no error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the GC run asked for before the drain still runs after it")
+	}
 }

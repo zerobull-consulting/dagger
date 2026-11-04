@@ -728,10 +728,13 @@ func (t *Tracker) Requeue(b Batch, at time.Time) {
 // now on it takes spans and session ends only for the sessions it tracks
 // (Observe, SessionEnded), and every root waiting for another try is due at
 // once. Retries after this one wait their normal backoff. It can't be undone:
-// a drained service stops.
+// a drained service stops. Calls after the first do nothing.
 func (t *Tracker) StartDrain(now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.draining {
+		return
+	}
 	t.draining = true
 	for _, c := range t.caches {
 		for _, e := range c.entries {
