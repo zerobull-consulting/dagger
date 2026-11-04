@@ -22,6 +22,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
@@ -710,5 +711,94 @@ func TestDrainRefusesExplicitExportAndImport(t *testing.T) {
 	}
 	if _, err := h.svc.Export(context.Background(), h.engine.id, exporter.Request{Roots: []uint64{99}}); !errors.Is(err, ErrDraining) {
 		t.Fatalf("Export while draining: %v", err)
+	}
+}
+
+// holdKey marks the context of a call whose index reads holdReads holds.
+type holdKey struct{}
+
+// holdReads holds the index reads made with a context marked by holdKey,
+// until released.
+type holdReads struct {
+	metastore.Objects
+	held     chan struct{}
+	released chan struct{}
+	once     sync.Once
+}
+
+func (o *holdReads) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if ctx.Value(holdKey{}) != nil {
+		o.once.Do(func() { close(o.held) })
+		<-o.released
+	}
+	return o.Objects.Get(ctx, key)
+}
+
+// KNOWN GAP: the drain doesn't wait for an explicit export (POST
+// /debug/engines/{conn}/export) admitted just before it started. Once it
+// started, the hook is refused (503), but one that got past that check runs
+// on: of roots the tracker doesn't know, it has no in-flight state the
+// drain waits on, so the drain can report it complete, and the stop that
+// follows cuts it off. Cut off, it publishes nothing. It needs a local,
+// unauthenticated debug request racing the signal. Tracked in
+// https://github.com/zerobull-consulting/dagger/issues/72.
+func TestKnownGapDrainDoesNotWaitForExplicitExport(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.cache.Add(fakeengine.Entry{Number: 99, Layers: [][]byte{testLayer("explicit")}})
+	release := h.cache.Hold()
+	defer release()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Export(context.Background(), h.engine.id, exporter.Request{
+			Roots:   []uint64{99},
+			Outputs: []protocol.ExportOutput{{Number: 99, Address: fakeengine.FSPart}},
+		})
+		done <- err
+	}()
+	waitUntil(t, 5*time.Second, "the explicit export to be held", func() bool { return h.cache.InFlight() == 1 })
+	rep := drainFor(h.svc, 10*time.Second)
+	if h.cache.InFlight() != 1 || rep.Outcome != metrics.DrainComplete || rep.LeftRoots() != 0 {
+		t.Fatalf("the drain waited for, or counted, the explicit export (in flight %d, report %+v): the gap is fixed; update this test, the README and the issue",
+			h.cache.InFlight(), rep)
+	}
+	release()
+	<-done
+}
+
+// KNOWN GAP: as TestKnownGapDrainDoesNotWaitForExplicitExport, for the
+// explicit import (POST /debug/engines/{conn}/import): one admitted just
+// before the drain runs on its caller's context, which the drain doesn't
+// cancel or wait for. Tracked in
+// https://github.com/zerobull-consulting/dagger/issues/72.
+func TestKnownGapDrainDoesNotWaitForExplicitImport(t *testing.T) {
+	var hold *holdReads
+	blobs, _ := newMemStores(t)
+	objs := metastore.NewMemObjects()
+	hold = &holdReads{Objects: objs, held: make(chan struct{}), released: make(chan struct{})}
+	meta, err := metastore.New(metastore.Config{Objects: hold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newExportHarness(t, blobs, meta, nil)
+	defer close(hold.released)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Import(context.WithValue(context.Background(), holdKey{}, true), h.engine.id)
+		done <- err
+	}()
+	select {
+	case <-hold.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the explicit import didn't reach its index read")
+	}
+	start := time.Now()
+	rep := drainFor(h.svc, 10*time.Second)
+	select {
+	case <-done:
+		t.Fatal("the explicit import ended with the drain: the gap is fixed; update this test, the README and the issue")
+	default:
+	}
+	if took := time.Since(start); took > 5*time.Second || rep.Outcome != metrics.DrainComplete {
+		t.Fatalf("the drain waited for the explicit import (%s, %+v): the gap is fixed; update this test", took, rep)
 	}
 }

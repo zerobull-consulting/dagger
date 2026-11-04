@@ -1527,6 +1527,13 @@ doesn't wait for it, and logs its roots as left (`connected=false`). Known
 gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
 ([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
 
+**An explicit export or import admitted just before the drain.** One that
+passed the 503 check as the drain started runs on, and the drain doesn't wait
+for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
+`TestKnownGapDrainDoesNotWaitForExplicitExport` and
+`TestKnownGapDrainDoesNotWaitForExplicitImport`
+([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
+
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight
@@ -1981,7 +1988,9 @@ later session names its entries
 stop drains first and stores it (see
 [Stopping and draining](#stopping-and-draining)); an engine that disconnects
 during the drain can't reconnect, and its exports are left
-([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)); and the
+drain doesn't wait for an explicit export or import admitted just before it
+([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
 
 **Fixed since: bundles of moved imports.** The first run of
 `service-restart` found that a bundle holding imports could no longer be
