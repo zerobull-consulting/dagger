@@ -86,6 +86,9 @@ func TestRealEngines(t *testing.T) {
 	env.Run("renew", st.renew)
 	env.Run("prune", st.prune)
 	env.Run("superseded", st.superseded)
+	// A read-only service (-export=false, #65): its own service and engine,
+	// and nothing written.
+	env.Run("readonly", st.readonly)
 	// Auth and namespaces (#10): its own service, with tokens, and engines.
 	env.Run("namespaces", st.namespaces)
 	// Upload verification (#23): A's uploads corrupted on their way to S3.

@@ -31,6 +31,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
@@ -47,6 +49,11 @@ type S3Options struct {
 	// Tracker configures how the export path learns entries and when it
 	// exports them.
 	Tracker exporter.TrackerConfig
+	// NoExport leaves the export path off, and makes the service read-only
+	// (see SetReadOnly): it only imports, and never writes to or deletes
+	// from the bucket, so it runs with a read-only key. GC must be nil, and
+	// NoImport unset.
+	NoExport bool
 	// NoImport leaves the import path off.
 	NoImport bool
 	// ImportPoll is how often the import path looks for stored entries a
@@ -61,11 +68,32 @@ type S3Options struct {
 	GC *GCConfig
 }
 
-// EnableS3 turns on the export path, and the import path unless
-// opts.NoImport is set, with the S3 blob and metadata stores of cfg, until
-// ctx ends. It refuses a store that ignores conditional writes, which would
-// let index updates overwrite each other.
+// SetReadOnly makes the service read-only, as -export=false does: it never
+// writes to or deletes from its store. The export path stays off:
+// EnableExport and EnableGC refuse, spans are received and dropped, the
+// debug export hook answers ErrReadOnly and POST /debug/gc ErrGCReadOnly
+// (409 both), and a drain has nothing to flush. The import path merges,
+// offers and renews as before, but records no imports in the index
+// (importer.Config.NoRecordImports): they exist only for this engine's
+// later exports. Call it before the Enable methods.
+func (s *Service) SetReadOnly() error {
+	if s.export != nil || s.imports != nil || s.gc != nil {
+		return errors.New("read-only: call SetReadOnly before the Enable methods")
+	}
+	s.readOnly = true
+	return nil
+}
+
+// EnableS3 turns on the export path, unless opts.NoExport is set, and the
+// import path, unless opts.NoImport is, with the S3 blob and metadata stores
+// of cfg, until ctx ends. With the export path on, it refuses a store that
+// ignores conditional writes, which would let index updates overwrite each
+// other; that check writes, so it also refuses a read-only key.
 func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3Options) error {
+	// Before the stores are built: a refused combination touches nothing.
+	if err := s.checkS3Options(opts); err != nil {
+		return err
+	}
 	blobs, err := blobstore.NewS3(ctx, cfg)
 	if err != nil {
 		return err
@@ -74,23 +102,86 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	if err != nil {
 		return err
 	}
-	if err := meta.VerifyConditionalWrites(ctx, opts.Scope); err != nil {
+	return s.enableStores(ctx, storeSet{
+		Blobs: blobs,
+		Meta:  meta,
+		GCBucket: func() (gc.Bucket, error) {
+			client, err := blobstore.NewS3Client(ctx, cfg)
+			if err != nil {
+				return nil, err
+			}
+			// A custom endpoint is an S3-compatible store, which may list
+			// multipart uploads only by exact key (MinIO); AWS S3 lists them
+			// by prefix.
+			return &gc.S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: cfg.Endpoint != ""}, nil
+		},
+		LogAttrs: []any{"bucket", cfg.Bucket, "prefix", cfg.Prefix},
+	}, opts)
+}
+
+// storeSet is the stores the paths EnableS3 turns on run with.
+type storeSet struct {
+	Blobs blobstore.Store
+	Meta  *metastore.Store
+	// GCBucket returns the bucket GC lists and deletes, when GC is on.
+	GCBucket func() (gc.Bucket, error)
+	// LogAttrs say where the stores are, in the startup log.
+	LogAttrs []any
+}
+
+// checkS3Options refuses the options that can't go together, or with the
+// service's state: a read-only service (SetReadOnly) takes only NoExport,
+// since the export path's conditional write check would write.
+func (s *Service) checkS3Options(opts S3Options) error {
+	if !opts.NoExport {
+		if s.readOnly {
+			return errors.New("the service is read-only (SetReadOnly): set NoExport")
+		}
+		return nil
+	}
+	if opts.NoImport {
+		return errors.New("both paths off (NoExport and NoImport): the service would have nothing to do")
+	}
+	if opts.GC != nil {
+		return errors.New("gc with NoExport: a read-only service never deletes from the bucket")
+	}
+	return nil
+}
+
+// enableStores is EnableS3 on stores of the caller's choosing: tests run it on
+// in-memory stores, with the same options.
+func (s *Service) enableStores(ctx context.Context, st storeSet, opts S3Options) error {
+	if err := s.checkS3Options(opts); err != nil {
 		return err
 	}
-	s.logger.Info("export path on", "bucket", cfg.Bucket, "prefix", cfg.Prefix, "scope", opts.Scope)
-	if err := s.EnableExport(ctx, ExportConfig{
-		Exporter:     exporter.Config{Blobs: blobs, Meta: meta, Scope: opts.Scope},
-		Tracker:      opts.Tracker,
-		NoEngineWait: opts.NoEngineWait,
-	}); err != nil {
-		return err
+	where := append(slices.Clip(st.LogAttrs), "scope", opts.Scope)
+	if opts.NoExport {
+		if err := s.SetReadOnly(); err != nil {
+			return err
+		}
+		// The check is of the index's conditional writes, which only the
+		// export path makes; and it writes, which a read-only key can't.
+		s.logger.Info("conditional write check skipped: the instance is read-only (-export=false), and never writes the index")
+		s.logger.Info("export path off: read-only (-export=false); spans are received and dropped", where...)
+	} else {
+		if err := st.Meta.VerifyConditionalWrites(ctx, opts.Scope); err != nil {
+			return err
+		}
+		s.logger.Info("export path on", where...)
+		if err := s.EnableExport(ctx, ExportConfig{
+			Exporter:     exporter.Config{Blobs: st.Blobs, Meta: st.Meta, Scope: opts.Scope},
+			Tracker:      opts.Tracker,
+			NoEngineWait: opts.NoEngineWait,
+		}); err != nil {
+			return err
+		}
 	}
 	if opts.NoImport {
 		s.logger.Info("import path off")
 	} else {
-		s.logger.Info("import path on", "scope", opts.Scope, "poll", opts.ImportPoll)
+		s.logger.Info("import path on", "scope", opts.Scope, "poll", opts.ImportPoll, "recordImports", !opts.NoExport)
 		if err := s.EnableImport(ctx, ImportConfig{
-			Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: opts.Scope},
+			Importer: importer.Config{Blobs: st.Blobs, Meta: st.Meta, Scope: opts.Scope},
 			Poll:     opts.ImportPoll,
 		}); err != nil {
 			return err
@@ -100,15 +191,13 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 		s.logger.Info("gc off")
 		return nil
 	}
-	client, err := blobstore.NewS3Client(ctx, cfg)
+	bucket, err := st.GCBucket()
 	if err != nil {
 		return err
 	}
 	g := *opts.GC
-	// A custom endpoint is an S3-compatible store, which may list multipart
-	// uploads only by exact key (MinIO); AWS S3 lists them by prefix.
-	g.Collector.Bucket = &gc.S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: cfg.Endpoint != ""}
-	g.Collector.Meta = meta
+	g.Collector.Bucket = bucket
+	g.Collector.Meta = st.Meta
 	return s.EnableGC(ctx, g)
 }
 

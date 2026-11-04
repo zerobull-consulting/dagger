@@ -92,6 +92,11 @@ use_store() {
 	eval "$(print_env)"
 	export CACHESERVICE_S3_PREFIX=test
 	export CACHESERVICE_TEST_DISPOSABLE_BUCKET=1
+	# A user that can only read under the prefix, for the tests of a
+	# read-only instance (-export=false).
+	READONLY_PREFIX=test compose run --rm create-readonly-user >/dev/null
+	export CACHESERVICE_TEST_READONLY_ACCESS_KEY_ID="${READONLY_USER:-dagger-readonly}"
+	export CACHESERVICE_TEST_READONLY_SECRET_ACCESS_KEY="${READONLY_PASSWORD:-dagger-readonly-secret}"
 }
 
 case "${1:-}" in
@@ -111,9 +116,9 @@ e2e)
 	scenarios="${E2E_SCENARIOS:-}"
 	for sc in $scenarios; do
 		case "$sc" in
-		reexport | renew | prune | superseded | namespaces | verify | gc | disconnect | engine-restart | s3-faults | service-restart | drain) ;;
+		reexport | renew | prune | superseded | readonly | namespaces | verify | gc | disconnect | engine-restart | s3-faults | service-restart | drain) ;;
 		*)
-			echo "dev.sh e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: reexport renew prune superseded namespaces verify gc disconnect engine-restart s3-faults service-restart drain)" >&2
+			echo "dev.sh e2e: unknown scenario '$sc' in E2E_SCENARIOS (known: reexport renew prune superseded readonly namespaces verify gc disconnect engine-restart s3-faults service-restart drain)" >&2
 			exit 2
 			;;
 		esac

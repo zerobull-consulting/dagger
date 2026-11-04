@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,7 @@ import (
 // own prefix, with a fake engine connected.
 type binaryTest struct {
 	t     *testing.T
+	scope *s3test.Scope
 	cmd   *exec.Cmd
 	logs  *syncBuffer
 	url   string
@@ -106,16 +108,30 @@ func envOr(name, def string) string {
 // prefix, and connects a fake engine to it.
 func startBinary(t *testing.T, args ...string) *binaryTest {
 	t.Helper()
-	endpoint := os.Getenv(blobstore.EnvEndpoint)
-	if endpoint == "" {
-		t.Skip("CACHESERVICE_S3_ENDPOINT is not set; start MinIO with hack/remote-cache/dev.sh up")
-	}
-	bin := buildBinary(t)
-	bucket := envOr(blobstore.EnvBucket, "dagger-cache")
-	scope := s3test.NewScope(t, bucket)
-	client := s3.New(s3.Options{
-		HTTPClient:   scope.Guard,
-		BaseEndpoint: aws.String(endpoint),
+	return startBinaryWith(t, binaryOpts{}, args...)
+}
+
+// binaryOpts change what startBinaryWith runs.
+type binaryOpts struct {
+	// scope is the prefix to run under, such as another run's; nil: the
+	// test's own, deleted when it ends.
+	scope *s3test.Scope
+	// accessKey and secretKey are the service's credentials; empty: the
+	// environment's (MinIO's root user).
+	accessKey, secretKey string
+	// gcDefault leaves -gc-interval at its default, instead of 0.
+	gcDefault bool
+	// cache is the fake engine to connect; nil: cache-a. noEngine
+	// connects none, and doesn't wait for the service to listen.
+	cache    *fakeengine.Cache
+	noEngine bool
+}
+
+// rootClient is an S3 client of MinIO's root user, through guard.
+func rootClient(guard *s3test.Guard) *s3.Client {
+	return s3.New(s3.Options{
+		HTTPClient:   guard,
+		BaseEndpoint: aws.String(os.Getenv(blobstore.EnvEndpoint)),
 		Region:       envOr(blobstore.EnvRegion, "us-east-1"),
 		Credentials: credentials.NewStaticCredentialsProvider(
 			envOr("CACHESERVICE_S3_ACCESS_KEY_ID", "dagger-dev"),
@@ -123,19 +139,40 @@ func startBinary(t *testing.T, args ...string) *binaryTest {
 		UsePathStyle:               envOr(blobstore.EnvPathStyle, "true") == "true",
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 	})
-	scope.DeleteOnCleanup(t, client)
+}
+
+// startBinaryWith is startBinary, changed by opts.
+func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest {
+	t.Helper()
+	endpoint := os.Getenv(blobstore.EnvEndpoint)
+	if endpoint == "" {
+		t.Skip("CACHESERVICE_S3_ENDPOINT is not set; start MinIO with hack/remote-cache/dev.sh up")
+	}
+	bin := buildBinary(t)
+	bucket := envOr(blobstore.EnvBucket, "dagger-cache")
+	scope := opts.scope
+	if scope == nil {
+		scope = s3test.NewScope(t, bucket)
+		scope.DeleteOnCleanup(t, rootClient(scope.Guard))
+	}
+	accessKey := cmp.Or(opts.accessKey, envOr("CACHESERVICE_S3_ACCESS_KEY_ID", "dagger-dev"))
+	secretKey := cmp.Or(opts.secretKey, envOr("CACHESERVICE_S3_SECRET_ACCESS_KEY", "dagger-dev-secret"))
 
 	listen, debug := freeAddr(t), freeAddr(t)
-	cmd := exec.Command(bin, append([]string{"-listen", listen, "-debug-listen", debug, "-gc-interval", "0"}, args...)...)
+	base := []string{"-listen", listen, "-debug-listen", debug}
+	if !opts.gcDefault {
+		base = append(base, "-gc-interval", "0")
+	}
+	cmd := exec.Command(bin, append(base, args...)...)
 	cmd.Env = append(os.Environ(),
 		blobstore.EnvBucket+"="+bucket,
 		blobstore.EnvPrefix+"="+scope.Prefix,
 		blobstore.EnvRegion+"="+envOr(blobstore.EnvRegion, "us-east-1"),
 		blobstore.EnvPathStyle+"="+envOr(blobstore.EnvPathStyle, "true"),
-		"CACHESERVICE_S3_ACCESS_KEY_ID="+envOr("CACHESERVICE_S3_ACCESS_KEY_ID", "dagger-dev"),
-		"CACHESERVICE_S3_SECRET_ACCESS_KEY="+envOr("CACHESERVICE_S3_SECRET_ACCESS_KEY", "dagger-dev-secret"),
+		"CACHESERVICE_S3_ACCESS_KEY_ID="+accessKey,
+		"CACHESERVICE_S3_SECRET_ACCESS_KEY="+secretKey,
 	)
-	b := &binaryTest{t: t, cmd: cmd, logs: &syncBuffer{}, url: "http://" + listen, debug: "http://" + debug, exited: make(chan struct{})}
+	b := &binaryTest{t: t, scope: scope, cmd: cmd, logs: &syncBuffer{}, url: "http://" + listen, debug: "http://" + debug, exited: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = b.logs, b.logs
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -171,12 +208,18 @@ func startBinary(t *testing.T, args ...string) *binaryTest {
 		t.Fatal(err)
 	}
 
+	if opts.noEngine {
+		return b
+	}
 	b.waitLog(30*time.Second, `msg=listening addr=`+listen)
-	b.cache = fakeengine.New("cache-a", 1)
+	b.cache = opts.cache
+	if b.cache == nil {
+		b.cache = fakeengine.New("cache-a", 1)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: b.cache}, remotecache.Config{URL: b.url, Token: "engine-token", EngineName: "engine-a"})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: b.cache}, remotecache.Config{URL: b.url, Token: "engine-token", EngineName: b.cache.ID})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -217,8 +260,8 @@ func (b *binaryTest) getJSON(path string, v any) bool {
 // build adds a base image (10) and an exec on it (11) to the engine.
 func (b *binaryTest) build() {
 	base, exec := bytes.Repeat([]byte("base"), 512), bytes.Repeat([]byte("exec"), 512)
-	b.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{base}})
-	b.cache.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Layers: [][]byte{base, exec}})
+	b.cache.Add(fakeengine.Entry{Number: 10, Recipe: "from(alpine)", Layers: [][]byte{base}})
+	b.cache.Add(fakeengine.Entry{Number: 11, Recipe: "withExec(make)", Deps: []uint64{10}, Layers: [][]byte{base, exec}})
 }
 
 // postSpans posts a session's cache spans of 10 and 11, with its end when
