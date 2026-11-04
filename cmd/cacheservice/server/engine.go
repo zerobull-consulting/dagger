@@ -74,6 +74,9 @@ type Service struct {
 	// draining is set once Drain starts: the service takes no new work.
 	draining atomic.Bool
 	drain    drainState
+	// testHookExportRecorded, set by tests only, runs after an export's
+	// result reached the tracker.
+	testHookExportRecorded func()
 
 	// registry holds metrics, which records the storage costs.
 	registry *prometheus.Registry

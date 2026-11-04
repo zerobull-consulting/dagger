@@ -17,9 +17,9 @@ spike, and only logs what the engine does on the wire.
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
-| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored |
+| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
-| `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered |
+| `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
 | `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
@@ -1461,7 +1461,9 @@ SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops:
    (`TestDrainTakesLateSpansOfEndedSession`). The connected engines stay
    connected, since exports run over them. The import sync loops and
    scheduled GC stop; a GC run under way is canceled (GC is idempotent, and
-   the next run finishes it), and `POST /debug/gc` answers 503. Engine events
+   the next run finishes it), whether scheduled or asked for. `POST
+   /debug/gc`, and the explicit export and import hooks, answer 503: the
+   drain runs what is pending itself. Engine events
    (`engine.start`, `engine.prune`) are still taken: a prune makes an entry
    no longer worth exporting.
 2. **It flushes.** Every tracked session is due now. One whose end isn't seen

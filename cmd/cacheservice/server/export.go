@@ -150,9 +150,14 @@ func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch)
 func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.Batch) (exporter.Result, error) {
 	start := time.Now()
 	res, err := eng.ns.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
-	outcome := s.recordExport(ctx, eng, b, res, err)
+	// Counted before the tracker hears of it: once it does, the drain may
+	// see nothing in flight and end its report.
 	if len(res.Stored) > 0 && s.draining.Load() {
 		s.drainStored(eng.CacheID(), len(res.Stored))
+	}
+	outcome := s.recordExport(ctx, eng, b, res, err)
+	if s.testHookExportRecorded != nil {
+		s.testHookExportRecorded()
 	}
 	s.metrics.ExportBatch(metrics.ExportBatch{
 		Scope:    eng.ns.name,

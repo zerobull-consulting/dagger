@@ -19,6 +19,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -672,5 +673,42 @@ func TestDrainCancelsGCRunAskedFor(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the GC run asked for before the drain still runs after it")
+	}
+}
+
+// The roots an export stored are in the drain's report even when the drain
+// ends the moment the tracker hears of the export: the export goroutine is
+// held here right after, and without counting first the report would miss
+// them.
+func TestDrainCountsStoredBeforeItEnds(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	hold := make(chan struct{})
+	h.svc.testHookExportRecorded = func() {
+		if h.svc.Draining() {
+			<-hold
+		}
+	}
+	defer close(hold)
+	h.build()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+	rep := drainFor(h.svc, 10*time.Second)
+	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 {
+		t.Fatalf("the drain's report misses the roots its export stored: %+v", rep)
+	}
+}
+
+// The explicit export and import hooks are new work: refused (503) while the
+// service drains, as a GC run is.
+func TestDrainRefusesExplicitExportAndImport(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	drainFor(h.svc, time.Minute)
+	if code, _ := h.debugExport(""); code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /debug/engines/{conn}/export while draining: %d", code)
+	}
+	if code, _ := h.debugImport(h.engine); code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /debug/engines/{conn}/import while draining: %d", code)
+	}
+	if _, err := h.svc.Export(context.Background(), h.engine.id, exporter.Request{Roots: []uint64{99}}); !errors.Is(err, ErrDraining) {
+		t.Fatalf("Export while draining: %v", err)
 	}
 }
