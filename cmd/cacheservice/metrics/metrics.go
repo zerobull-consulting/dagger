@@ -109,6 +109,11 @@ type Metrics struct {
 	gcEntriesExpired    *prometheus.CounterVec
 	gcStagingRule       *prometheus.GaugeVec
 	exportCollected     *prometheus.CounterVec
+	draining            prometheus.Gauge
+	drains              *prometheus.HistogramVec
+	drainStoredRoots    prometheus.Counter
+	drainLeftRoots      prometheus.Counter
+	drainRefused        *prometheus.CounterVec
 	collectors          []prometheus.Collector
 }
 
@@ -307,6 +312,27 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "export_collected_total",
 			Help: "Export tries refused because GC deleted, or was deleting, an object they named; each is tried again.",
 		}, []string{"scope"}),
+		draining: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns, Name: "draining",
+			Help: "1 while the service drains its exports before it stops (SIGTERM), 0 otherwise.",
+		}),
+		drains: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "drain_duration_seconds",
+			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal).",
+			Buckets: promotionBuckets,
+		}, []string{"outcome"}),
+		drainStoredRoots: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "drain_stored_roots_total",
+			Help: "Roots stored by exports that ended while the service drained.",
+		}),
+		drainLeftRoots: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "drain_unexported_roots_total",
+			Help: "Roots left unexported when a drain ended: pending, in flight, waiting for a retry, or of an engine no longer connected.",
+		}),
+		drainRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "drain_refused_total",
+			Help: "New work refused while draining, by kind: connection (an engine WebSocket, 503) or span (a cache span or session end of a session the service doesn't track).",
+		}, []string{"kind"}),
 	}
 	m.collectors = []prometheus.Collector{
 		m.indexReads, m.indexReadBytes, m.indexReadDuration,
@@ -323,6 +349,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule,
 		m.exportCollected,
+		m.draining, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
 	}
 	if reg != nil {
 		reg.MustRegister(m.collectors...)
@@ -676,4 +703,56 @@ func (m *Metrics) ExportCollected(scope string) {
 		return
 	}
 	m.exportCollected.WithLabelValues(scope).Inc()
+}
+
+// Drain outcomes.
+const (
+	// DrainComplete left nothing it could export.
+	DrainComplete = "complete"
+	// DrainDeadline ended at its deadline (-drain-timeout).
+	DrainDeadline = "deadline"
+	// DrainCanceled ended because its context was canceled (a second
+	// signal).
+	DrainCanceled = "canceled"
+)
+
+// Kinds of work refused while draining.
+const (
+	DrainRefusedConnection = "connection"
+	DrainRefusedSpan       = "span"
+)
+
+// DrainStarted records that the service started draining.
+func (m *Metrics) DrainStarted() {
+	if m == nil {
+		return
+	}
+	m.draining.Set(1)
+}
+
+// DrainEnded records a drain's end: its outcome, how long it took, and how
+// many roots it left unexported. The service is still draining (it stops).
+func (m *Metrics) DrainEnded(outcome string, d time.Duration, left int) {
+	if m == nil {
+		return
+	}
+	m.drains.WithLabelValues(outcome).Observe(d.Seconds())
+	m.drainLeftRoots.Add(float64(left))
+}
+
+// DrainStored records roots stored by an export that ended while draining.
+func (m *Metrics) DrainStored(roots int) {
+	if m == nil {
+		return
+	}
+	m.drainStoredRoots.Add(float64(roots))
+}
+
+// DrainRefused records new work refused while draining, of kind
+// DrainRefusedConnection or DrainRefusedSpan.
+func (m *Metrics) DrainRefused(kind string) {
+	if m == nil {
+		return
+	}
+	m.drainRefused.WithLabelValues(kind).Inc()
 }

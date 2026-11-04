@@ -88,6 +88,10 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 	if p == nil {
 		return exporter.Result{}, ErrExportOff
 	}
+	// New work: the drain runs what is pending itself.
+	if s.draining.Load() {
+		return exporter.Result{}, ErrDraining
+	}
 	c, err := s.conn(conn)
 	if err != nil {
 		return exporter.Result{}, err
@@ -137,6 +141,9 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 	if s.imports == nil {
 		return importer.Result{}, ErrImportOff
 	}
+	if s.draining.Load() {
+		return importer.Result{}, ErrDraining
+	}
 	c, err := s.conn(conn)
 	if err != nil {
 		return importer.Result{}, err
@@ -161,6 +168,8 @@ func writeDebugError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrNoEngine):
 		http.Error(w, "no such engine", http.StatusNotFound)
+	case errors.Is(err, ErrDraining):
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, ErrExportOff), errors.Is(err, ErrImportOff), errors.As(err, &conflict):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:

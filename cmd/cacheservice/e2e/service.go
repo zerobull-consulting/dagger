@@ -154,10 +154,20 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 	return s
 }
 
-// Stop stops the service, as its process ending would: it closes its
-// listener and its engines' connections, and ends what it runs. Its
-// in-memory state goes with it.
+// Stop stops the service at once, as its process ending without a drain
+// would (a crash, SIGKILL, or -drain-timeout 0): it closes its listener and
+// its engines' connections, and ends what it runs. Its in-memory state goes
+// with it. For a clean stop, DrainFor first.
 func (s *Service) Stop() { s.stop() }
+
+// DrainFor drains the service with a deadline of timeout from now, while it
+// still serves, as the command does on SIGTERM before it stops (see
+// server.Service.Drain). Stop it after.
+func (s *Service) DrainFor(timeout time.Duration) server.DrainReport {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return s.Drain(ctx)
+}
 
 // Services are every service the run started, stopped ones included, in
 // the order they started.

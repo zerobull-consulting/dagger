@@ -98,6 +98,9 @@ func TestRealEngines(t *testing.T) {
 	env.Run("engine-restart", st.engineRestart)
 	env.Run("s3-faults", st.s3Faults)
 	env.Run("service-restart", st.serviceRestart)
+	// A clean stop (#63): the service drains with an export in flight, and
+	// replaces the main service once more.
+	env.Run("drain", st.drain)
 }
 
 // retainedStored reports whether every retained entry the service tracks

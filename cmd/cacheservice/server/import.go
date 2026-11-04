@@ -23,8 +23,10 @@ type importPath struct {
 	cfg importer.Config
 	// poll is how often each engine is synced without a trigger (0: never).
 	poll time.Duration
-	// ctx ends every sync loop when the service stops.
-	ctx context.Context
+	// ctx ends every sync loop when the service stops, or stop does, when
+	// the service starts draining.
+	ctx  context.Context
+	stop context.CancelFunc
 
 	mu       sync.Mutex
 	triggers map[*engineConn]chan struct{}
@@ -70,7 +72,8 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	if err := s.setDefaultNamespace(cfg.Importer.Scope); err != nil {
 		return err
 	}
-	s.imports = &importPath{cfg: cfg.Importer, poll: cfg.Poll, ctx: ctx, triggers: map[*engineConn]chan struct{}{}}
+	ctx, stop := context.WithCancel(ctx)
+	s.imports = &importPath{cfg: cfg.Importer, poll: cfg.Poll, ctx: ctx, stop: stop, triggers: map[*engineConn]chan struct{}{}}
 	return nil
 }
 

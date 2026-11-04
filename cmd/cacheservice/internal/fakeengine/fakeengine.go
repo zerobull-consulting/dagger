@@ -72,6 +72,10 @@ type Cache struct {
 	inFlight, peak int
 	// hold, when set, blocks each export until it is closed.
 	hold chan struct{}
+	// stall, when set, blocks each upload halfway through its body until
+	// it is closed; stalled counts the uploads it blocked.
+	stall   chan struct{}
+	stalled int
 	// next is the next number a merge hands out.
 	next uint64
 	// merges counts the merges committed.
@@ -148,6 +152,35 @@ func (c *Cache) Hold() (release func()) {
 	c.mu.Unlock()
 	var once sync.Once
 	return func() { once.Do(func() { close(ch) }) }
+}
+
+// StallUploads makes each upload from now on send half its body, then wait,
+// as an upload to a store that stopped reading would, until the returned
+// function is called or the upload is given up. It stalls the upload in the
+// engine, so it works against any store, a real bucket included.
+func (c *Cache) StallUploads() (release func()) {
+	ch := make(chan struct{})
+	c.mu.Lock()
+	c.stall = ch
+	c.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			if c.stall == ch {
+				c.stall = nil
+			}
+			c.mu.Unlock()
+			close(ch)
+		})
+	}
+}
+
+// StalledUploads is how many uploads StallUploads has blocked so far.
+func (c *Cache) StalledUploads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stalled
 }
 
 // Capture is one export's bundle and the blobs it can upload.
@@ -358,13 +391,41 @@ type blobSource struct {
 	blobs map[digest.Digest][]byte
 }
 
-func (b blobSource) ReadBlob(_ context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+func (b blobSource) ReadBlob(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
 	data, ok := b.blobs[d]
 	if !ok {
 		return nil, 0, fmt.Errorf("blob %s is not in the export's chains", d)
 	}
 	data = b.cache.UploadBody(d, data)
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	b.cache.mu.Lock()
+	stall := b.cache.stall
+	b.cache.mu.Unlock()
+	if stall == nil || len(data) < 2 {
+		return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	}
+	half := len(data) / 2
+	body := io.MultiReader(bytes.NewReader(data[:half]), &stallReader{ctx: ctx, cache: b.cache, release: stall}, bytes.NewReader(data[half:]))
+	return io.NopCloser(body), int64(len(data)), nil
+}
+
+// stallReader blocks its first read until release is closed or ctx ends,
+// then reads nothing more.
+type stallReader struct {
+	ctx     context.Context
+	cache   *Cache
+	release chan struct{}
+}
+
+func (r *stallReader) Read([]byte) (int, error) {
+	r.cache.mu.Lock()
+	r.cache.stalled++
+	r.cache.mu.Unlock()
+	select {
+	case <-r.release:
+		return 0, io.EOF
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	}
 }
 
 // CorruptUploads makes the next n uploads of blob d send a body of the

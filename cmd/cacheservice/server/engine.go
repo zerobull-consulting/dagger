@@ -71,6 +71,13 @@ type Service struct {
 	gc     *gcPath
 	limits limitsState
 
+	// draining is set once Drain starts: the service takes no new work.
+	draining atomic.Bool
+	drain    drainState
+	// testHookExportRecorded, set by tests only, runs after an export's
+	// result reached the tracker.
+	testHookExportRecorded func()
+
 	// registry holds metrics, which records the storage costs.
 	registry *prometheus.Registry
 	metrics  *metrics.Metrics
@@ -152,6 +159,12 @@ type engineConn struct {
 }
 
 func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
+	// A draining service takes no new engine: the engine retries with its
+	// backoff, and finds the next service on this address.
+	if s.draining.Load() {
+		s.refuseDraining(w, r)
+		return
+	}
 	token, _, ok := r.BasicAuth()
 	if !ok || token == "" {
 		s.reject(w, r, endpointEngine, "")
@@ -227,6 +240,13 @@ func (c *engineConn) serve(ctx context.Context) error {
 	if err := env.Decode(&c.hello); err != nil {
 		_ = c.replyError(ctx, env, err.Error())
 		return err
+	}
+	// Upgraded before the drain started, but not welcomed yet: a new
+	// engine all the same.
+	if c.svc.draining.Load() {
+		c.svc.countRefused(metrics.DrainRefusedConnection)
+		_ = c.conn.Close(websocket.StatusTryAgainLater, "service draining")
+		return errors.New("service draining: refused before welcome")
 	}
 	if !c.svc.register(c) {
 		c.markRevoked()
@@ -523,6 +543,7 @@ func (s *Service) DebugHandler() http.Handler {
 	mux.HandleFunc("POST /debug/engines/{conn}/import", s.serveImport)
 	mux.HandleFunc("GET /debug/engines/{conn}/imports", s.serveImports)
 	mux.HandleFunc("POST /debug/gc", s.serveGC)
+	mux.HandleFunc("GET /debug/drain", s.serveDrain)
 	mux.Handle("GET /metrics", s.MetricsHandler())
 	return mux
 }
