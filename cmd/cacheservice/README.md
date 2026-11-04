@@ -1651,6 +1651,53 @@ What to watch:
   sizes, and `blob_hashed_bytes_total{by="service"}`, which is read through
   the service (blobs over 5 GiB, or a store that doesn't hash).
 
+## Image
+
+CI publishes the service as `ghcr.io/zerobull-consulting/cacheservice`
+([`cacheservice-image.yml`](../../.github/workflows/cacheservice-image.yml)),
+`linux/amd64` only:
+
+- `:<commit SHA>` (the full SHA) for each push to `feature/remote-cache`;
+- `:feature-remote-cache`, which moves to the newest of those.
+
+Pull requests that touch the service build the image and smoke-test it
+([`hack/remote-cache/image-smoke.sh`](../../hack/remote-cache/image-smoke.sh)),
+and push nothing. To build it from a fresh clone, at the repository root:
+
+```bash
+docker build -f cmd/cacheservice/Dockerfile -t cacheservice .
+```
+
+The context is the repository root, since the module is the whole monorepo;
+[`Dockerfile.dockerignore`](Dockerfile.dockerignore) keeps it to the
+packages the service builds from (BuildKit is needed for that file, and is
+Docker's default builder).
+
+It is the static binary on `gcr.io/distroless/static-debian12:nonroot`: CA
+certificates and tzdata, no shell, and it runs as UID 65532. The binary is
+the entrypoint, so it is PID 1 and gets `docker stop`'s SIGTERM itself (see
+[Stopping and draining](#stopping-and-draining) for the stop timeout). It
+takes the same flags and `CACHESERVICE_S3_*` variables as the binary, with
+the same defaults:
+
+- `-listen` `:8090`: the engine WebSocket and the OTLP receivers. The image
+  exposes this port.
+- `-debug-listen` `127.0.0.1:8091`: the container's own loopback, so the
+  unauthenticated debug API can't be reached from outside the container,
+  even with `-p`. Publishing it takes `-debug-listen :8091` and a `-p` bound
+  to the host's loopback, such as `-p 127.0.0.1:8091:8091`.
+- `-metrics-listen`: off.
+
+There is no `HEALTHCHECK`: the image has no shell, and the engine reconnects
+with backoff. To try it, unauthenticated and with no store (export path off):
+
+```bash
+docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache
+```
+
+Running it as a sidecar next to an engine in CI is
+[#75](https://github.com/zerobull-consulting/dagger/issues/75).
+
 ## Running it against a local engine
 
 For a local S3-compatible store (MinIO), see

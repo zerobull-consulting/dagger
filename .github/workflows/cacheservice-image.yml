@@ -1,0 +1,148 @@
+name: Cache service image
+# Builds cmd/cacheservice/Dockerfile and smoke-tests it
+# (hack/remote-cache/image-smoke.sh). Pull requests push nothing. Pushes to
+# feature/remote-cache, and workflow_dispatch on it, push
+# ghcr.io/zerobull-consulting/cacheservice:<commit SHA> and the moving
+# :feature-remote-cache tag. See cmd/cacheservice/README.md, "Image".
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    # Everything in the image's build context (Dockerfile.dockerignore's
+    # allowlist), so a change to any package the service builds from is
+    # checked before it merges.
+    paths:
+      - cmd/cacheservice/**
+      - dagql/**
+      - engine/**
+      - internal/**
+      - sdk/go/**
+      - util/**
+      - go.mod
+      - go.sum
+      - hack/remote-cache/image-smoke.sh
+      - .github/workflows/cacheservice-image.yml
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  # Pull requests cancel their older runs. Pushes get a group per commit, so
+  # none is dropped while another waits, and each pushes its SHA tag; the
+  # moving-tag job below serializes the moving tag across them.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  IMAGE: ghcr.io/zerobull-consulting/cacheservice
+jobs:
+  # Pull requests, and workflow_dispatch on any other branch: build and
+  # smoke-test, push nothing.
+  build:
+    name: image build and smoke test
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # The Go build runs inside the Dockerfile (the builder stage), so the
+      # image builds the same from a fresh clone and here; its cache mounts
+      # start empty on each runner.
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" -t cacheservice:ci .
+          docker image inspect cacheservice:ci \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        run: ./hack/remote-cache/image-smoke.sh cacheservice:ci
+  # Pushes to feature/remote-cache, and workflow_dispatch on it: build,
+  # smoke-test, then push the SHA tag. This job and moving-tag are the only
+  # ones with packages: write; neither runs for a pull request.
+  publish:
+    name: image build, smoke test and push
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" -t "$IMAGE:$REVISION" .
+          docker image inspect "$IMAGE:$REVISION" \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        env:
+          REVISION: ${{ github.sha }}
+        run: ./hack/remote-cache/image-smoke.sh "$IMAGE:$REVISION"
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Push
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker push "$IMAGE:$REVISION"
+          echo "pushed $IMAGE:$REVISION" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+  # Moves :feature-remote-cache, after a publish pushed its SHA tag. Publishes
+  # of different commits can overlap, and this job's group runs one at a time
+  # across them, so its check and its retag can't interleave with another's.
+  # GitHub keeps only the newest pending job of a group, and jobs arrive in
+  # the order their publishes finish, not their commits' order; so it moves
+  # the tag to the branch's head at the time it runs, if that head's SHA tag
+  # is pushed, not to its own commit. The head's own publish runs a move after
+  # its push, so the tag ends on the newest head, and never moves backwards.
+  moving-tag:
+    name: image moving tag
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-moving-tag
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # A registry-side copy of the head's manifest, with the same digest:
+      # nothing is pulled or rebuilt.
+      - name: Move :feature-remote-cache to the branch head
+        run: |
+          head="$(git ls-remote origin refs/heads/feature/remote-cache | cut -f1)"
+          if ! out="$(docker buildx imagetools inspect "$IMAGE:$head" 2>&1)"; then
+            if grep -q 'not found' <<<"$out"; then
+              echo "$IMAGE:$head isn't pushed yet: its own run moves the tag" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "$out" >&2
+            exit 1
+          fi
+          docker buildx imagetools create --prefer-index=false -t "$IMAGE:feature-remote-cache" "$IMAGE:$head"
+          echo "$IMAGE:feature-remote-cache -> $head" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
