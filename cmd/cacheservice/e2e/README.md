@@ -45,7 +45,10 @@ report each check with `Check`. To break something on purpose, use
 `Env.DeleteBlob`, a short `ServiceOptions.GetExpiry`, `Engine.Restart` or
 `Engine.RestartAsync`, `Service.CloseEngine` (drops one engine's
 connection), `Env.RestartService` (a new service on the same address, scope
-and options; `Engine.Attach` the engines to it), or a `Fault` in the S3
+and options; `Engine.Attach` the engines to it; it stops the old one at once,
+as a crash would), `Service.DrainFor` (a clean stop's drain, as SIGTERM does,
+before `Stop` or `Env.RestartService`; `Service.DrainStatus` shows it while it
+runs), or a `Fault` in the S3
 proxy (`Proxy.Inject`: an S3 error such as 503 `SlowDown` for the requests
 it matches, up to a count, a stall until `Proxy.Remove`, or a `Rewrite` of
 their body, such as `SameSizeCorruption`; requests it answered or rewrote
@@ -61,7 +64,8 @@ match an engine's upload of a blob in a fault, match `/staging/` PUTs, and
 compare a retried upload by its digest (`blobDigest`), not its key.
 
 The resilience scenarios (#12) are in `resilience_test.go`; they run last,
-since `service-restart` replaces the main service. `namespaces` (#10), in
+since `service-restart` replaces the main service. `drain` (#63), in
+`drain_test.go`, runs after them, and replaces the main service once more. `namespaces` (#10), in
 `namespaces_test.go`, runs its own service with a tokens file, and its own
 engines. `verify` (#23), in `verify_test.go`, runs after `namespaces` and
 before the resilience scenarios. `gc` (#11), in `gc_test.go`, runs after

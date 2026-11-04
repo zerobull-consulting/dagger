@@ -22,6 +22,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 	"github.com/dagger/dagger/engine/telemetryattrs"
@@ -249,8 +250,23 @@ func (r *restartable) start() *Service {
 	return svc
 }
 
-// stop stops the running service: it refuses requests from now, ends what
-// it runs and drops its engines' connections.
+// stopDrained stops the running service as SIGTERM does: it drains, with a
+// deadline of d, while it still serves, then stops.
+func (r *restartable) stopDrained(d time.Duration) DrainReport {
+	r.mu.Lock()
+	svc := r.svc
+	r.mu.Unlock()
+	if svc == nil {
+		return DrainReport{}
+	}
+	rep := drainFor(svc, d)
+	r.stop()
+	return rep
+}
+
+// stop stops the running service at once, as a crash or SIGKILL would: it
+// refuses requests from now, ends what it runs and drops its engines'
+// connections.
 func (r *restartable) stop() {
 	r.mu.Lock()
 	svc, cancel := r.svc, r.cancel
@@ -371,10 +387,12 @@ func TestServiceRestartMergesPrunedEntriesAgainOnce(t *testing.T) {
 
 // KNOWN GAP (#12, case 3): the export path learns entries only from session
 // spans, and keeps them in memory. An export pending or in flight when the
-// service stops is lost: the restarted service doesn't know the entries,
-// and exports them only once a later session's spans name them again. What
-// was stored is not lost, and the restarted service resumes exporting new
-// sessions at once. Tracked in
+// service stops without a drain (a crash, SIGKILL, or -drain-timeout 0) is
+// lost: the restarted service doesn't know the entries, and exports them
+// only once a later session's spans name them again. What was stored is not
+// lost, and the restarted service resumes exporting new sessions at once. A
+// clean stop drains first, and stores it
+// (TestDrainedRestartStoresPendingExport). Tracked in
 // https://github.com/zerobull-consulting/dagger/issues/45.
 func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
 	blobs, meta := newMemStores(t)
@@ -390,7 +408,7 @@ func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
 	waitUntil(t, 5*time.Second, "A's export to be in flight", func() bool { return a.InFlight() == 1 })
 
-	t.Log("restarting the service mid-export")
+	t.Log("restarting the service mid-export, without a drain")
 	r.stop()
 	release()
 	svc = r.start()
@@ -408,6 +426,55 @@ func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
 	r.harness(svc, a).postSpans("session-2", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
 	h = r.harness(svc, a)
 	h.waitIndex(10, 11)
+}
+
+// A clean stop (SIGTERM) drains: the export in flight, and a session in its
+// quiet period, are stored before the service goes away, so the restarted
+// service has them without a later session naming them again. This is what
+// TestKnownGapServiceRestartForgetsPendingExport loses without the drain.
+func TestDrainedRestartStoresPendingExport(t *testing.T) {
+	blobs, meta := newMemStores(t)
+	r := newRestartable(t, blobs, meta)
+	svc := r.start()
+	a := fakeengine.New("cache-a", 1)
+	r.connect(a)
+	waitConn(t, svc, a.ID)
+	h := r.harness(svc, a)
+	h.buildRecipes()
+	a.Add(fakeengine.Entry{Number: 12, Recipe: "withExec(test)", Deps: []uint64{11}, Layers: [][]byte{testLayer("base"), testLayer("exec"), testLayer("test")}})
+	release := a.Hold()
+	defer release()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitUntil(t, 5*time.Second, "A's export to be in flight", func() bool { return a.InFlight() == 1 })
+	// Quiet: its end never arrives, and the quiet period is a minute.
+	h.postSpans("session-2", cacheSpan(12, "11"))
+
+	t.Log("stopping the service, drained, mid-export")
+	done := make(chan DrainReport, 1)
+	go func() { done <- r.stopDrained(time.Minute) }()
+	waitUntil(t, 5*time.Second, "the drain to start", svc.Draining)
+	release()
+	var rep DrainReport
+	select {
+	case rep = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the drained stop didn't return")
+	}
+	if rep.Outcome != metrics.DrainComplete || rep.Stored[a.ID] != 3 || rep.LeftRoots() != 0 {
+		t.Fatalf("drain report %+v", rep)
+	}
+	if n := indexEntries(t, meta); n != 3 {
+		t.Fatalf("the index has %d entries after the drained stop, want 3", n)
+	}
+
+	// The restarted service has them: the index names them, and another
+	// engine is merged them.
+	svc = r.start()
+	waitConn(t, svc, a.ID)
+	b := fakeengine.New("cache-b", 1)
+	r.connect(b)
+	waitConn(t, svc, b.ID)
+	waitLookup(t, b, "withExec(test)", hasOffer)
 }
 
 // Case 5 of #12 (its second comment): a bundle whose merge is just under the

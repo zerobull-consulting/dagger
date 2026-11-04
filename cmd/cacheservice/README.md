@@ -21,7 +21,8 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
-| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)) |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining |
+| `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, for a scraper that shouldn't reach the debug API |
 
 On the engine WebSocket, the service:
@@ -598,7 +599,12 @@ outputs are every part those spans reported. A session is exported:
   and so did every cache span it counted, or `-export-end-grace` (2s) passed;
 - or, if its end isn't seen, after `-export-quiet` (10s) without a cache span
   from it;
-- or when asked: `POST /debug/engines/{conn}/export`.
+- or when asked: `POST /debug/engines/{conn}/export`;
+- or when the service stops cleanly (SIGTERM): the drain exports a session
+  whose end isn't seen at once, without waiting out `-export-quiet`, and one
+  that ended once its spans are all in, or `-export-end-grace` passed, as
+  usual. Spans of the sessions it tracks are still taken meanwhile. See
+  [Stopping and draining](#stopping-and-draining).
 
 Entries already stored with the same replacement count and parts are left
 out, and so are entries merged into the engine by the import path that still
@@ -1438,6 +1444,104 @@ The service's credentials also need `s3:ListBucket`,
 prefix, and, to report namespaces without a staging rule,
 `s3:GetLifecycleConfiguration` on the bucket.
 
+## Stopping and draining
+
+The service runs as a sidecar on an ephemeral CI runner, and the end of the
+job is its only chance to store what the job built
+([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
+SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops:
+
+1. **It takes no new work.** A new engine WebSocket gets 503 with
+   `Retry-After: 10` before the upgrade, and one upgraded but not yet
+   welcomed is closed with 1013 (try again later). Spans and session ends of
+   sessions the export path doesn't track are dropped (answered 200, counted
+   in `drain_refused_total`). Spans and ends of the sessions it tracks are
+   still taken: a session that ended just before the signal still sends spans
+   within `-export-end-grace`, and dropping them would lose entries
+   (`TestDrainTakesLateSpansOfEndedSession`). The connected engines stay
+   connected, since exports run over them. The import sync loops and
+   scheduled GC stop; a GC run under way is canceled (GC is idempotent, and
+   the next run finishes it), and `POST /debug/gc` answers 503. Engine events
+   (`engine.start`, `engine.prune`) are still taken: a prune makes an entry
+   no longer worth exporting.
+2. **It flushes.** Every tracked session is due now. One whose end isn't seen
+   is exported at once, with the entries its spans showed so far; the
+   session is then no longer tracked, so its later spans are dropped. One that
+   ended is exported once its spans are all in, or `-export-end-grace` (2s)
+   passed, whichever comes first. Roots waiting for another try (busy,
+   failed, interrupted, or waiting for their engine) are due at once too. The
+   drain runs those exports and waits for them, their uploads, verification
+   and index writes included.
+
+It ends when nothing is left that it could export, or `-drain-timeout`
+(30s) passes. The service then does what it did before drains existed: it
+closes the engine connections, shuts down its HTTP servers, cuts off what is
+still in flight, and exits 0. A second signal ends the drain at once.
+`-drain-timeout 0` stops without a drain. A CI job sets it long, such as
+`10m`.
+
+The drain logs, when it starts, what each engine cache (by cache ID, never
+the token) has pending, in flight and waiting for a retry, and when it ends,
+the roots stored by cache ID, and what was left unexported by cache ID and
+root count (`drain: left unexported`, a warning), with its outcome:
+`complete`, `deadline` or `canceled`. `GET /debug/drain` shows the same while
+it runs, and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
+`drain_stored_roots_total`, `drain_unexported_roots_total` and
+`drain_refused_total` measure it.
+
+**Stop order.** Stop the service first, then the engine: the drain's exports
+run over the engine's connection, and the engine uploads the layers itself.
+An engine stopped first takes its pending exports with it.
+
+**Process managers.** The process manager's stop timeout must be longer than
+`-drain-timeout`, or it kills the service mid-drain: `docker stop --time`
+(10s by default), `docker compose`'s `stop_grace_period` (10s by default) and
+Kubernetes' `terminationGracePeriodSeconds` (30s by default) all send SIGKILL
+when theirs runs out. Readiness probes and Kubernetes integration are out of
+scope here.
+
+**Retries during a drain.** A root that fails or is busy during the drain is
+tried again on its normal backoff (2s doubling to 5m), while the deadline
+allows; the drain doesn't shorten it. A busy root is one the engine is still
+computing, and a failed one most often a store that refused it: trying either
+again sooner mostly adds load, and the first retries (2s, 4s, 8s) already fit
+a 30s drain. What the drain does shorten is the wait that was under way when
+it started: every root waiting for a retry is due at once, since the wait
+began before anyone knew the service would stop. A root whose next try is due
+after the deadline doesn't keep the drain waiting: the drain ends, and logs
+it as left (`retrying`).
+
+**Order.** The drain exports in the scheduler's order: by cache ID, then
+entry number, in batches of up to 1,000 roots, all started at once. It
+doesn't sort by size: an entry's size is known only once the engine answers
+`export`, and what a drain spends its time on is the layers S3 lacks, not
+how large the entries are. If the deadline turns out to cut exports off, the
+better fix is to skip exports whose missing bytes can't finish in time, not
+to reorder them.
+
+**An engine that goes away mid-drain.** Its exports are interrupted, as on
+any disconnect, and it can't reconnect to a draining service: the drain
+doesn't wait for it, and logs its roots as left (`connected=false`). Known
+gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
+
+**What a crash still loses.** The drain covers a clean stop. A crash, a
+SIGKILL (including a process manager's, past its stop timeout), or
+`-drain-timeout 0` still loses the exports pending or in flight
+([#45](https://github.com/zerobull-consulting/dagger/issues/45)): the tracker
+keeps them only in memory. What was stored is never lost, and blobs uploaded
+by an export cut off are named by nothing, and GC deletes them.
+
+**A service that doesn't export** (no `CACHESERVICE_S3_BUCKET`) has nothing
+to drain: it refuses new engines, and stops at once
+(`TestDrainExportOff`).
+
+Tests: `TestDrain*` and `TestDrainedRestartStoresPendingExport` in
+[`server`](server) (fake engine), `TestMinIODrain` (MinIO),
+`TestMinIOBinary*` in this directory (the built command, sent SIGTERM), and
+the real-engine `drain` scenario (see
+[The scenarios](#the-scenarios)).
+
 ## Metrics
 
 [`metrics`](metrics/) measures the storage costs that decide when the index
@@ -1482,6 +1586,11 @@ paths record into them through their metadata store. All are prefixed
 | `gc_entries_expired_total` | `scope`, `reason` | Index entries GC dropped: `expired` (their own expiry, or the max age) or `size` (the max size) |
 | `gc_staging_rule_missing` | `scope` | 1 when no lifecycle rule expires the namespace's staging prefix (GC expires it itself), 0 when one does; absent when the rules can't be read |
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
+| `draining` | | 1 once the service started draining (SIGTERM), 0 before |
+| `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed) or `canceled` (a second signal) |
+| `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
+| `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
+| `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
 The `gc_stored_*` and `gc_staging_rule_missing` series of a namespace gone
@@ -1844,7 +1953,8 @@ timeouts, a restart with state to compare) or would cost minutes.
 | --- | --- | --- | --- |
 | Connection lost mid-upload | both | e2e `disconnect`; `TestConnectionLostMidUpload`, `TestExportHookInterruptedNotFailed`, engine's `TestExportReleasedWhenTheConnectionDrops` | The real engine shows the release and the reconnect; the fake one checks the chains are released before the retry. |
 | Engine restart, new generation | real engines (export side) | e2e `engine-restart`; import side: `TestSyncStaleGeneration`, `TestOfferPendingStaleGeneration`, `TestTrackerGenerationFence`, `TestRecordFencesOlderGenerations` | Whether entry numbers survive a restart is the engine's: only a real one shows the cut export runs again under the same numbers. |
-| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestKnownGapServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap exactly. |
+| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestKnownGapServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap of a stop without a drain exactly. |
+| Clean stop (drain) | both, and the binary | e2e `drain`; `TestDrain*`, `TestDrainedRestartStoresPendingExport`, `TestMinIODrain`, `TestMinIOBinaryDrainsOnSIGTERM`, `TestMinIOBinarySecondSIGTERMStopsAtOnce` | The real engine shows it stays connected and finishes its upload while the service drains; the fake engine controls the timing (quiet sessions, late spans, deadlines, disconnects); only the built command shows the signal wiring. |
 | S3 throttling, 5xx, outage | real engines | e2e `s3-faults`; `TestExportRetriesFailedUploads`, `TestExportGivesUpOnFailingUploads`, `TestExportBlobStoreFailureReleases`, `TestUpdateIndexRetriesOnAFreshIndex` | Who retries what is split between the engine's PUTs and the service's AWS SDK client, which only the real pair shows. |
 | Oversized messages | fake engine, and MinIO | `TestImportBundleNearMergeLimit` (and `TestMinIO…`), `TestExportSplitsBundleTooLargeToImport`, `TestExportOneRootBundleTooLargeToImport`, `TestMergeSizeBoundsBuildMerge`; splitting: `TestExportSplitsTooLarge`, `TestSyncTooLarge`, `TestSyncSplitsLargeOffers` | A real bundle near 64 MiB would take minutes to build and move; the limit is a setting, lowered in tests. |
 | Slow or stalled uploads | fake engine and unit tests | engine's `TestStalledUploadFails`, `TestStalledHTTP2UploadFails`, `TestSlowUploadIsNotCutOff`, `TestStalledUploadFreesItsSlot`; `TestExportUploadTimeout` | The engine gives up after a minute without progress, with timeouts the unit tests shorten; a real-engine version would add that minute to every run, so there is none. |
@@ -1862,9 +1972,14 @@ live bundle again, once, pruned entries included: see
 [Import path](#import-path). The real run measured it: 8 bundles, 61 values,
 merged into B within 187ms of its `hello`.
 
-**Known gaps.** An export pending or in flight when the service stops is lost
-until a later session names its entries
-([#45](https://github.com/zerobull-consulting/dagger/issues/45)).
+**Known gaps.** An export pending or in flight when the service stops
+without a drain (a crash, SIGKILL, or `-drain-timeout 0`) is lost until a
+later session names its entries
+([#45](https://github.com/zerobull-consulting/dagger/issues/45)). A clean
+stop drains first and stores it (see
+[Stopping and draining](#stopping-and-draining)); an engine that disconnects
+during the drain can't reconnect, and its exports are left
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
 
 **Fixed since: bundles of moved imports.** The first run of
 `service-restart` found that a bundle holding imports could no longer be

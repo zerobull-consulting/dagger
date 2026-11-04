@@ -34,6 +34,8 @@ type exportPath struct {
 	tick         time.Duration
 	noEngineWait time.Duration
 	now          func() time.Time
+	// ctx runs the scheduler and every export.
+	ctx context.Context
 
 	wg sync.WaitGroup
 }
@@ -84,6 +86,7 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 		tick:         cfg.Tick,
 		noEngineWait: cfg.NoEngineWait,
 		now:          time.Now,
+		ctx:          ctx,
 	}
 	s.export = p
 	p.wg.Add(1)
@@ -106,15 +109,26 @@ func (s *Service) scheduleExports(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		for _, ns := range s.namespacesNow() {
-			for _, b := range ns.tracker.Due(p.now()) {
-				p.wg.Add(1)
-				go func() {
-					defer p.wg.Done()
-					s.runBatch(ctx, ns, b)
-				}()
-			}
+		// Drain schedules the exports while the service drains.
+		if s.draining.Load() {
+			continue
 		}
+		for _, ns := range s.namespacesNow() {
+			s.startBatches(ctx, ns, ns.tracker.Due(p.now()))
+		}
+	}
+}
+
+// startBatches runs batches of a namespace, each in its own goroutine, which
+// Wait waits for.
+func (s *Service) startBatches(ctx context.Context, ns *namespace, batches []exporter.Batch) {
+	p := s.export
+	for _, b := range batches {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			s.runBatch(ctx, ns, b)
+		}()
 	}
 }
 
@@ -137,6 +151,9 @@ func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.B
 	start := time.Now()
 	res, err := eng.ns.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
 	outcome := s.recordExport(ctx, eng, b, res, err)
+	if len(res.Stored) > 0 && s.draining.Load() {
+		s.drainStored(eng.CacheID(), len(res.Stored))
+	}
 	s.metrics.ExportBatch(metrics.ExportBatch{
 		Scope:    eng.ns.name,
 		Outcome:  outcome,
@@ -235,8 +252,8 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 				attrs := span.Attributes
 				if n, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr); ok {
 					count, err := strconv.Atoi(n.GetStringValue())
-					if err == nil {
-						tracker.SessionEnded(cacheID, generation, session, count, now)
+					if err == nil && !tracker.SessionEnded(cacheID, generation, session, count, now) && s.draining.Load() {
+						s.refusedSpan()
 					}
 				}
 				number, err := strconv.ParseUint(stringAttr(attrs, telemetryattrs.CacheResultIDAttr), 10, 64)
@@ -265,7 +282,9 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 						}
 					}
 				}
-				tracker.Observe(o, now)
+				if !tracker.Observe(o, now) && s.draining.Load() {
+					s.refusedSpan()
+				}
 			}
 		}
 	}

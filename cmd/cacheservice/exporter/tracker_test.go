@@ -483,3 +483,121 @@ func TestTrackerImportedIgnoresExpiry(t *testing.T) {
 		t.Fatalf("exported %v", got)
 	}
 }
+
+// A drain doesn't wait out the quiet period: a session that hasn't ended is
+// due at once. Due itself is unchanged.
+func TestTrackerDrainDueQuietSession(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("due within the quiet period: %v", got)
+	}
+	tr.StartDrain(t0.Add(time.Second))
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("Due changed while draining: %v", got)
+	}
+	if got := roots(tr.DrainDue(t0.Add(time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("drain due: %v", got)
+	}
+}
+
+// An ended session is due for a drain as for Due: once its spans are all in,
+// or EndGrace after its end. Its spans keep arriving meanwhile, and are
+// taken, so the drain exports them all.
+func TestTrackerDrainWaitsForEndedSessionsSpans(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 2, t0)
+	tr.StartDrain(t0)
+	if got := roots(tr.DrainDue(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("due before its spans are in, within EndGrace: %v", got)
+	}
+	if st := tr.DrainStatus(t0, time.Time{}); len(st) != 1 || st[0].Sessions != 1 || st[0].Pending != 1 {
+		t.Fatalf("drain status %+v", st)
+	}
+	if !tr.Observe(state(2, 11, fsPart), t0.Add(time.Second)) {
+		t.Fatal("a span of a tracked session was dropped while draining")
+	}
+	if got := roots(tr.DrainDue(t0.Add(time.Second))); !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("drain due once its spans were in: %v", got)
+	}
+
+	// EndGrace bounds the wait, as in Due.
+	tr = newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 5, t0)
+	tr.StartDrain(t0)
+	if got := roots(tr.DrainDue(t0.Add(2 * time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("drain due after EndGrace: %v", got)
+	}
+}
+
+// While draining, the tracker takes no new work: spans and ends of sessions
+// it doesn't track, of caches it doesn't know, or of no session.
+func TestTrackerDrainDropsNewSessions(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.StartDrain(t0)
+	other := state(2, 10, fsPart)
+	other.Session = "s2"
+	noSession := state(3, 10, fsPart)
+	noSession.Session = ""
+	newCache := state(4, 10, fsPart)
+	newCache.CacheID = "d"
+	for _, o := range []Observation{other, noSession, newCache} {
+		if tr.Observe(o, t0) {
+			t.Fatalf("took %+v while draining", o)
+		}
+	}
+	if tr.SessionEnded("c", 1, "s2", 1, t0) || tr.SessionEnded("d", 1, "s1", 1, t0) {
+		t.Fatal("took the end of an untracked session while draining")
+	}
+	if got := roots(tr.DrainDue(t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("drain due: %v", got)
+	}
+	// Exported: the session is no longer tracked, and its later spans are
+	// dropped too.
+	if tr.Observe(state(1, 11, fsPart), t0) {
+		t.Fatal("took a span of a session the drain already exported")
+	}
+}
+
+// StartDrain makes roots waiting for another try due at once; a retry after
+// that waits its normal backoff. DrainStatus tells retries due by the
+// deadline from those due after it.
+func TestTrackerDrainRetries(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Observe(state(2, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1}}, Failed: []FailedRoot{{Number: 2}}}, t0)
+	tr.Done(tr.All("c", t0.Add(time.Hour))[0], Result{Busy: []protocol.SkippedRoot{{Number: 1}}, Failed: []FailedRoot{{Number: 2}}}, t0)
+	// Both wait: 1 busy twice (2s), 2 failed twice (2s).
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("due early: %v", got)
+	}
+	tr.StartDrain(t0.Add(time.Second))
+	got := tr.DrainDue(t0.Add(time.Second))
+	if !slices.Equal(roots(got), []uint64{1, 2}) {
+		t.Fatalf("retries not due at the drain's start: %v", roots(got))
+	}
+	// A busy root during the drain waits its backoff (4s now).
+	tr.Done(got[0], Result{Busy: []protocol.SkippedRoot{{Number: 1}}, Stored: []uint64{2}}, t0.Add(time.Second))
+	if got := roots(tr.DrainDue(t0.Add(4 * time.Second))); len(got) != 0 {
+		t.Fatalf("a retry during the drain skipped its backoff: %v", got)
+	}
+	st := tr.DrainStatus(t0.Add(time.Second), t0.Add(3*time.Second))
+	if len(st) != 1 || st[0].Later != 1 || st[0].Retrying != 0 || st[0].Roots() != 1 {
+		t.Fatalf("drain status with the retry after the deadline: %+v", st)
+	}
+	st = tr.DrainStatus(t0.Add(time.Second), time.Time{})
+	if len(st) != 1 || st[0].Retrying != 1 {
+		t.Fatalf("drain status without a deadline: %+v", st)
+	}
+	if got := roots(tr.DrainDue(t0.Add(5 * time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after its backoff: %v", got)
+	}
+	if st := tr.DrainStatus(t0.Add(5*time.Second), time.Time{}); len(st) != 1 || st[0].InFlight != 1 {
+		t.Fatalf("drain status in flight: %+v", st)
+	}
+}

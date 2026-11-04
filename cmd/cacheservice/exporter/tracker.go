@@ -67,6 +67,9 @@ type Tracker struct {
 
 	mu     sync.Mutex
 	caches map[string]*trackedCache
+	// draining is set by StartDrain: the tracker takes spans only for the
+	// sessions it tracks, and DrainDue makes everything pending due.
+	draining bool
 }
 
 type trackedCache struct {
@@ -215,16 +218,21 @@ func (c *trackedCache) session(id string, generation uint64) *trackedSession {
 	return s
 }
 
-// Observe records one cache span.
-func (t *Tracker) Observe(o Observation, now time.Time) {
+// Observe records one cache span. It reports whether the span was taken:
+// while draining (StartDrain), a span of a session the tracker doesn't track,
+// or of no session, is new work, and is dropped.
+func (t *Tracker) Observe(o Observation, now time.Time) bool {
 	if o.CacheID == "" || o.Number == 0 {
-		return
+		return false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.draining && !t.tracksSessionLocked(o.CacheID, o.Generation, o.Session) {
+		return false
+	}
 	c := t.cache(o.CacheID, o.Generation)
 	if c == nil {
-		return
+		return false
 	}
 	var sess *trackedSession
 	if o.Session != "" {
@@ -241,7 +249,7 @@ func (t *Tracker) Observe(o Observation, now time.Time) {
 	switch {
 	case o.Replacements < e.replacements:
 		// An older value.
-		return
+		return true
 	case o.Replacements > e.replacements:
 		// A new value: reset what belonged to the old one.
 		e.replacements = o.Replacements
@@ -274,20 +282,37 @@ func (t *Tracker) Observe(o Observation, now time.Time) {
 	if sess != nil && e.retained {
 		sess.candidates[o.Number] = true
 	}
+	return true
+}
+
+// tracksSessionLocked reports whether a session of a cache's current
+// generation is tracked: seen, and not exported yet.
+func (t *Tracker) tracksSessionLocked(cacheID string, generation uint64, session string) bool {
+	c := t.caches[cacheID]
+	if c == nil || session == "" || generation != c.generation {
+		return false
+	}
+	s := c.sessions[session]
+	return s != nil && s.generation == c.generation
 }
 
 // SessionEnded records a session's carrier span: the session ended, and had
-// cacheSpans spans naming an entry.
-func (t *Tracker) SessionEnded(cacheID string, generation uint64, session string, cacheSpans int, now time.Time) {
+// cacheSpans spans naming an entry. It reports whether it was taken: while
+// draining, the end of a session the tracker doesn't track is dropped.
+func (t *Tracker) SessionEnded(cacheID string, generation uint64, session string, cacheSpans int, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.draining && !t.tracksSessionLocked(cacheID, generation, session) {
+		return false
+	}
 	c := t.cache(cacheID, generation)
 	if c == nil || session == "" {
-		return
+		return false
 	}
 	s := c.session(session, generation)
 	s.expectSpans = cacheSpans
 	s.endedAt = now
+	return true
 }
 
 // Drop is one retention edge an engine.prune event dropped.
@@ -377,6 +402,20 @@ type Batch struct {
 // or went quiet, and roots due for another try. Each root is in at most one
 // batch until Done is called for it.
 func (t *Tracker) Due(now time.Time) []Batch {
+	return t.due(now, false)
+}
+
+// DrainDue is Due for a service that is stopping (see StartDrain): it doesn't
+// wait out the quiet period. Every session that hasn't ended is due now. A
+// session that ended is due once its spans are all in, or EndGrace after
+// its end, as in Due: the spans it said were coming are still on their way,
+// and are taken. Roots waiting for another try are due at their retryAt, as
+// in Due; StartDrain made those waiting then due at once.
+func (t *Tracker) DrainDue(now time.Time) []Batch {
+	return t.due(now, true)
+}
+
+func (t *Tracker) due(now time.Time, drain bool) []Batch {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var batches []Batch
@@ -390,7 +429,7 @@ func (t *Tracker) Due(now time.Time) []Batch {
 			}
 			ended := !s.endedAt.IsZero()
 			ready := (ended && (s.seenSpans >= s.expectSpans || now.Sub(s.endedAt) >= t.cfg.EndGrace)) ||
-				(!ended && !s.lastSpanAt.IsZero() && now.Sub(s.lastSpanAt) >= t.cfg.QuietPeriod)
+				(!ended && (drain || (!s.lastSpanAt.IsZero() && now.Sub(s.lastSpanAt) >= t.cfg.QuietPeriod)))
 			if !ready {
 				continue
 			}
@@ -683,4 +722,85 @@ func (t *Tracker) Requeue(b Batch, at time.Time) {
 			e.retryAt = at
 		}
 	}
+}
+
+// StartDrain makes the tracker drain, for a service that is stopping: from
+// now on it takes spans and session ends only for the sessions it tracks
+// (Observe, SessionEnded), and every root waiting for another try is due at
+// once. Retries after this one wait their normal backoff. It can't be undone:
+// a drained service stops.
+func (t *Tracker) StartDrain(now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.draining = true
+	for _, c := range t.caches {
+		for _, e := range c.entries {
+			if !e.inFlight && e.retryAt.After(now) {
+				e.retryAt = now
+			}
+		}
+	}
+}
+
+// DrainState is what a cache has left to export, as a drain sees it. Each
+// root is counted once: in flight first, then waiting for a retry, then
+// pending in a session.
+type DrainState struct {
+	CacheID string `json:"cacheID"`
+	// Sessions are the sessions not exported yet: ended ones waiting for
+	// their spans, within EndGrace, and, before DrainDue runs, the others.
+	Sessions int `json:"sessions"`
+	// Pending are the roots of those sessions worth exporting.
+	Pending int `json:"pending"`
+	// InFlight are the roots an export holds now.
+	InFlight int `json:"inFlight"`
+	// Retrying are the roots waiting for another try that is due by the
+	// deadline, and Later those whose try is due after it.
+	Retrying int `json:"retrying"`
+	Later    int `json:"later"`
+}
+
+// Roots is how many roots the cache has left to export.
+func (s DrainState) Roots() int { return s.Pending + s.InFlight + s.Retrying + s.Later }
+
+// DrainStatus returns what each cache has left to export at now, for a drain
+// that ends at deadline (zero: none). Caches with nothing left are left out.
+func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []DrainState
+	for _, cacheID := range slices.Sorted(maps.Keys(t.caches)) {
+		c := t.caches[cacheID]
+		st := DrainState{CacheID: cacheID}
+		counted := map[uint64]bool{}
+		for n, e := range c.entries {
+			switch {
+			case e.inFlight:
+				st.InFlight++
+			case e.retryAt.IsZero() || !t.wantedLocked(c, n, e, now):
+				continue
+			case !deadline.IsZero() && e.retryAt.After(deadline):
+				st.Later++
+			default:
+				st.Retrying++
+			}
+			counted[n] = true
+		}
+		for _, s := range c.sessions {
+			if s.generation < c.generation {
+				continue
+			}
+			st.Sessions++
+			for n := range s.candidates {
+				if e := c.entries[n]; e != nil && !counted[n] && t.wantedLocked(c, n, e, now) {
+					st.Pending++
+					counted[n] = true
+				}
+			}
+		}
+		if st.Sessions > 0 || st.Roots() > 0 {
+			out = append(out, st)
+		}
+	}
+	return out
 }

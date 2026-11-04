@@ -27,7 +27,10 @@ type GCConfig struct {
 type gcPath struct {
 	cfg       gc.Config
 	collector *gc.Collector
-	wg        sync.WaitGroup
+	// stop ends the scheduled runs, and cancels one under way, when the
+	// service starts draining.
+	stop context.CancelFunc
+	wg   sync.WaitGroup
 }
 
 // limitsState is the service's per-namespace limits and where they come
@@ -122,7 +125,8 @@ func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 	if err != nil {
 		return err
 	}
-	p := &gcPath{cfg: c, collector: collector}
+	ctx, stop := context.WithCancel(ctx)
+	p := &gcPath{cfg: c, collector: collector, stop: stop}
 	s.gc = p
 	if cfg.Interval > 0 {
 		p.wg.Add(1)
@@ -145,6 +149,9 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 	p := s.gc
 	if p == nil {
 		return nil, ErrGCOff
+	}
+	if s.draining.Load() {
+		return nil, ErrDraining
 	}
 	c := p.collector
 	if dryRun {
@@ -174,6 +181,10 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 	reports, err := s.CollectGarbage(r.Context(), dry)
 	if errors.Is(err, ErrGCOff) {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, ErrDraining) {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	out := struct {

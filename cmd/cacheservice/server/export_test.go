@@ -44,8 +44,10 @@ type exportHarness struct {
 	blobs  blobstore.Store
 	meta   *metastore.Store
 	engine *engineConn
-	// ctx ends the harness's engines.
-	ctx context.Context
+	// ctx ends the harness's engines, and the service's paths; cancel
+	// ends it.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*ExportConfig)) *exportHarness {
@@ -57,8 +59,15 @@ func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 // configuration changed by modifyImport too.
 func newExportHarnessWith(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*ExportConfig), modifyImport func(*ImportConfig)) *exportHarness {
 	t.Helper()
+	return newExportHarnessLogged(t, blobs, meta, slog.New(slog.DiscardHandler), modify, modifyImport)
+}
+
+// newExportHarnessLogged is newExportHarnessWith, with the service logging
+// to logger.
+func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore.Store, logger *slog.Logger, modify func(*ExportConfig), modifyImport func(*ImportConfig)) *exportHarness {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	svc := New(slog.New(slog.DiscardHandler), "")
+	svc := New(logger, "")
 	cfg := ExportConfig{
 		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
 		Tracker:  exporter.TrackerConfig{QuietPeriod: time.Minute, EndGrace: 50 * time.Millisecond},
@@ -93,7 +102,7 @@ func newExportHarnessWith(t *testing.T, blobs blobstore.Store, meta *metastore.S
 		srv.Close()
 		debug.Close()
 	})
-	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: scoped(t, blobs), meta: meta, ctx: ctx}
+	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: scoped(t, blobs), meta: meta, ctx: ctx, cancel: cancel}
 	h.engine = waitEngines(t, svc, 1)[0]
 	return h
 }

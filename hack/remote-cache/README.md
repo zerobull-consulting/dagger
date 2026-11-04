@@ -349,6 +349,12 @@ prints. To run it against a dev engine by hand, see
 [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#running-it-against-a-local-engine);
 `dev.sh e2e` below does it all in one command.
 
+`dev.sh` starts and stops MinIO only; it never runs the service, so it has
+no stop path to drain. Stop a service you run by hand with SIGTERM (Ctrl-C),
+which drains its exports first (see
+[Stopping and draining](../../cmd/cacheservice/README.md#stopping-and-draining)),
+before stopping the engine.
+
 ## Real engines: `dev.sh e2e`
 
 ```bash
@@ -432,15 +438,16 @@ isn't stored, and no stored bundle names a layer blob that isn't, besides
 the one `renew` deleted), and the engines work: B runs the pipeline A built
 during the fault, and gets its exec as a cache hit with A's output. They
 inject faults with the S3 proxy (`Fault`: an S3 error for some requests, or
-a stall until removed), `Service.CloseEngine`, `Engine.RestartAsync` and
-`Env.RestartService`.
+a stall until removed), `Service.CloseEngine`, `Engine.RestartAsync`,
+`Env.RestartService` and `Service.DrainFor`.
 
 | Scenario | What it does | Passes when |
 | --- | --- | --- |
 | `disconnect` | Stalls blob PUTs (to staging keys) in the S3 proxy, runs a new pipeline on A (an exec writing 1MB), and once its export's upload is stalled, drops A's WebSocket (`Service.CloseEngine`, no close frame). Then ends the stall. | A reconnects (same cache and generation, new connection); the export on the dropped connection is logged interrupted, not failed; nothing of it was published while it was cut; it runs again on the new connection and is stored, with the layer that was in flight. |
 | `engine-restart` | As `disconnect`, but restarts A's container (`docker restart`) while the upload is stalled. | A restarted cleanly (same cache ID, generation one higher); the cut export was interrupted, not failed, and published nothing; it ran again on the new generation, under the same entry numbers, and was stored as that generation's, with the layer that was in flight. |
 | `s3-faults` | First injects, for one export of a new pipeline on A, 503 `SlowDown` for 2 blob PUTs (the engine's, to staging keys), 500 `InternalError` for 1 bundle PUT and 503 `SlowDown` for 2 index PUTs (the service's). Then answers every S3 request with 503 while A runs another pipeline, until its export has failed, and lifts it. | Each faulted request was made again and succeeded: the blob PUTs by the export path, which retries the export with backoff (1s, then 2s) under a new stage (so at another key: the same blob's), the bundle and index writes by the service's S3 client. The first export is stored, and none failed. While S3 was down, the export failed and published nothing (the index and bundles as before); once back, it was stored. |
-| `service-restart` | Stalls blob PUTs, runs a new pipeline on A, and once its upload is stalled, stops the main service and starts a new one on the same address and scope 2s later (`Env.RestartService`). Then runs the pipeline on A again. | A and B reconnect with their backoff; the new service merges into B every bundle B had that is still live and mergeable, once (none more over 3 syncs by hand), and nothing of A's own into A; A's next session is exported and stored. The export cut by the restart is not tried again by the new service: logged as `GAP` ([#45](https://github.com/zerobull-consulting/dagger/issues/45)), without failing. Bundles B had that expired since aren't expected; every other one must build a merge, and C's bundles holding its moved imports must be merged into B again ([#47](https://github.com/zerobull-consulting/dagger/issues/47)). Last, no merge in any service of the run failed with "is no longer stored". |
+| `service-restart` | Stalls blob PUTs, runs a new pipeline on A, and once its upload is stalled, stops the main service and starts a new one on the same address and scope 2s later (`Env.RestartService`). Then runs the pipeline on A again. | A and B reconnect with their backoff; the new service merges into B every bundle B had that is still live and mergeable, once (none more over 3 syncs by hand), and nothing of A's own into A; A's next session is exported and stored. The export cut by the restart, a stop without a drain, is not tried again by the new service: logged as `GAP` ([#45](https://github.com/zerobull-consulting/dagger/issues/45)), without failing (`drain` covers the clean stop). Bundles B had that expired since aren't expected; every other one must build a merge, and C's bundles holding its moved imports must be merged into B again ([#47](https://github.com/zerobull-consulting/dagger/issues/47)). Last, no merge in any service of the run failed with "is no longer stored". |
+| `drain` | Stalls blob PUTs, runs a new pipeline on A, and once its upload is stalled, drains the main service (`Service.DrainFor`, as SIGTERM does, with a 2m deadline) and ends the stall once the drain sees the export in flight. Then stops the service, starts a new one on the same address 2s later, and attaches A and B to it ([#63](https://github.com/zerobull-consulting/dagger/issues/63)). | While the drain waited, A stayed connected and nothing of the export was published; the drain completed, with A's roots stored and none left, and the export was stored before it returned, with the layer that was in flight. The new service merges that export into B without any session naming its entries again, and B gets the exec as a cache hit with A's output: the `GAP` of `service-restart` doesn't apply to a drained stop. S3 is consistent while draining, after it, and after the restart. A real engine sends its session's end at once, so the stop comes during the export, not during a quiet period; the in-process and binary tests cover the quiet period. |
 
 They add about 42s to the run: see
 [`cmd/cacheservice/README.md`](../../cmd/cacheservice/README.md#resilience)
@@ -452,12 +459,13 @@ Each check is logged as `ok` or `FAIL`; a failed check fails its scenario
 without stopping it. Run some scenarios only with
 `E2E_SCENARIOS="renew prune" ./hack/remote-cache/dev.sh e2e` (the names:
 `reexport`, `renew`, `prune`, `superseded`, `namespaces`, `verify`, `gc`, `disconnect`,
-`engine-restart`, `s3-faults`, `service-restart`), or pass `go
+`engine-restart`, `s3-faults`, `service-restart`, `drain`), or pass `go
 test` flags after `e2e`, such as `-run 'TestRealEngines/^renew$'`. The first
 part always runs.
 
 Each run's files are in `E2E_DIR/runs/<run>/`: each service's log
-(`main.log`, `replica.log`, `namespaces.log`, `gc.log`), the `namespaces` scenario's
+(`main.log`, `replica.log`, `namespaces.log`, `gc.log`, `main-2.log` and
+`main-drained.log` after the restarts), the `namespaces` scenario's
 tokens file (`tokens`), the `gc` scenario's tokens and namespaces files
 (`gc-tokens`, `gc-namespaces`), each CLI call's output and log, the index and
 importer state at each step, and, when the run failed, each engine's log.
