@@ -64,8 +64,9 @@
 //     never writes to or deletes from the bucket, so it runs with a
 //     read-only key: no export path (spans are received and dropped), no
 //     conditional write check at startup, no GC, and no import records in
-//     the index. It refuses -import=false, and an explicit nonzero
-//     -gc-interval. See README.md, "Read-only instances".
+//     the index. It refuses -import=false, no CACHESERVICE_S3_BUCKET, and
+//     an explicit nonzero -gc-interval. See README.md, "Read-only
+//     instances".
 //
 //   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
 //     -gc-interval: per namespace in the bucket, it expires entries past
@@ -142,7 +143,7 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", "", "the key of -tls-cert (PEM)")
 	flag.DurationVar(&quiet, "export-quiet", exporter.DefaultQuietPeriod, "export a session's entries after this long without a cache span from it, if its end isn't seen")
 	flag.DurationVar(&endGrace, "export-end-grace", exporter.DefaultEndGrace, "after a session ends, wait this long for the cache spans it said were coming")
-	flag.BoolVar(&exports, "export", true, "export engines' entries to the bucket, and run garbage collection (needs "+blobstore.EnvBucket+"); false: read-only, it only imports, and never writes to or deletes from the bucket, so it runs with a read-only key; can't be combined with -import=false")
+	flag.BoolVar(&exports, "export", true, "export engines' entries to the bucket, and run garbage collection (needs "+blobstore.EnvBucket+"); false: read-only, it only imports, and never writes to or deletes from the bucket, so it runs with a read-only key; can't be combined with -import=false, and needs "+blobstore.EnvBucket)
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
 	flag.StringVar(&nsFile, "namespaces-file", "", "file of per-namespace limits, one '<namespace> max-age=<duration> max-bytes=<size>' per line, '*' for the defaults; SIGHUP reloads it (empty: -max-age and -max-bytes for every namespace)")
@@ -174,7 +175,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := checkReadOnly(exports, imports, gcInterval, explicitFlags()); err != nil {
+	if err := checkReadOnly(exports, imports, os.Getenv(blobstore.EnvBucket) != "", gcInterval, explicitFlags()); err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
 	}
@@ -262,13 +263,17 @@ func main() {
 			err = svc.EnableS3(ctx, cfg, opts)
 		}
 		if err != nil {
-			logger.Error("export path", "error", err)
+			path := "export path"
+			if !exports {
+				path = "import path (read-only)"
+			}
+			logger.Error(path, "error", err)
 			os.Exit(1)
 		}
 	} else {
 		logger.Info("export path off: set " + blobstore.EnvBucket + " to store exports in S3")
 	}
-	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", store && !exports)
+	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", !exports)
 
 	servers := []*http.Server{{Addr: listen, Handler: svc.Handler()}}
 	if debugListen != "" {
@@ -361,16 +366,20 @@ func explicitFlags() map[string]bool {
 }
 
 // checkReadOnly refuses the flag combinations -export=false can't honor:
-// with -import=false too, the service would have nothing to do; and an
-// explicit nonzero -gc-interval asks for GC, which a read-only instance never
-// runs (it never deletes from the bucket). The default -gc-interval alone is
-// fine: GC is then off. set holds the flags set on the command line.
-func checkReadOnly(exports, imports bool, gcInterval time.Duration, set map[string]bool) error {
+// with -import=false too, or with no bucket (store), the service would have
+// nothing to do; and an explicit nonzero -gc-interval asks for GC, which a
+// read-only instance never runs (it never deletes from the bucket). The
+// default -gc-interval alone is fine: GC is then off. set holds the flags
+// set on the command line.
+func checkReadOnly(exports, imports, store bool, gcInterval time.Duration, set map[string]bool) error {
 	if exports {
 		return nil
 	}
 	if !imports {
 		return errors.New("-export=false and -import=false: with both paths off the service has nothing to do; drop one of them")
+	}
+	if !store {
+		return errors.New("-export=false without " + blobstore.EnvBucket + ": a read-only instance only imports from the bucket, so it would have nothing to do; set " + blobstore.EnvBucket + ", or drop -export=false")
 	}
 	if set["gc-interval"] && gcInterval != 0 {
 		return fmt.Errorf("-gc-interval=%s and -export=false: a read-only instance never runs garbage collection, which deletes from the bucket; drop -gc-interval, or set it to 0", gcInterval)

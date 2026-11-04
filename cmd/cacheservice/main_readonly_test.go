@@ -39,6 +39,7 @@ func TestCheckReadOnly(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		exports, imports bool
+		noStore          bool
 		gcInterval       time.Duration
 		set              []string
 		wantErr          []string
@@ -50,13 +51,15 @@ func TestCheckReadOnly(t *testing.T) {
 		{name: "export off, explicit gc interval", imports: true, gcInterval: time.Hour, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=1h0m0s", "-export=false"}},
 		{name: "both off", wantErr: []string{"-export=false", "-import=false"}},
 		{name: "both off, explicit gc interval", gcInterval: time.Hour, set: []string{"gc-interval"}, wantErr: []string{"-export=false", "-import=false"}},
+		{name: "export off, no bucket", imports: true, noStore: true, gcInterval: gc.DefaultInterval, wantErr: []string{"-export=false", blobstore.EnvBucket}},
+		{name: "defaults, no bucket", exports: true, imports: true, noStore: true, gcInterval: gc.DefaultInterval},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			set := map[string]bool{}
 			for _, f := range tc.set {
 				set[f] = true
 			}
-			err := checkReadOnly(tc.exports, tc.imports, tc.gcInterval, set)
+			err := checkReadOnly(tc.exports, tc.imports, !tc.noStore, tc.gcInterval, set)
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatal(err)
@@ -104,21 +107,33 @@ func countingStore(t *testing.T) (string, *atomic.Int64) {
 func TestBinaryReadOnlyStartupErrors(t *testing.T) {
 	bin := buildBinary(t)
 	for _, tc := range []struct {
-		name string
-		args []string
-		want []string
+		name     string
+		args     []string
+		want     []string
+		noBucket bool
 	}{
-		{"import off too", []string{"-export=false", "-import=false"}, []string{"-export=false", "-import=false"}},
-		{"explicit gc interval", []string{"-gc-interval=1h", "-export=false"}, []string{"-gc-interval=1h0m0s", "-export=false"}},
+		{"import off too", []string{"-export=false", "-import=false"}, []string{"-export=false", "-import=false"}, false},
+		{"explicit gc interval", []string{"-gc-interval=1h", "-export=false"}, []string{"-gc-interval=1h0m0s", "-export=false"}, false},
+		{"no bucket", []string{"-export=false"}, []string{"-export=false", blobstore.EnvBucket}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			endpoint, conns := countingStore(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, bin, append([]string{"-listen", freeAddr(t), "-debug-listen", ""}, tc.args...)...)
-			cmd.Env = append(os.Environ(),
+			var environ []string
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "CACHESERVICE_S3_") {
+					environ = append(environ, kv)
+				}
+			}
+			bucket := "dagger-cache"
+			if tc.noBucket {
+				bucket = ""
+			}
+			cmd.Env = append(environ,
 				blobstore.EnvEndpoint+"="+endpoint,
-				blobstore.EnvBucket+"=dagger-cache",
+				blobstore.EnvBucket+"="+bucket,
 				blobstore.EnvPrefix+"=test",
 				blobstore.EnvRegion+"=us-east-1",
 				"CACHESERVICE_S3_ACCESS_KEY_ID=x",

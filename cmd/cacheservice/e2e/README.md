@@ -57,9 +57,11 @@ are recorded with its name). After breaking something,
 names a missing bundle, and no stored bundle a missing layer.
 `Env.StoredDigest` hashes what a digest key holds, and `Env.StagedKeys`
 lists the scope's staged uploads.
-`ServiceOptions.ReadOnly` starts a service as `-export=false` does (#65),
-and `Env.Listing` lists every object of the run with its size and ETag, to
-show nothing was written.
+`ServiceOptions.ReadOnly` starts a service as `-export=false` does (#65);
+`ServiceOptions.Proxy`, with `Env.NewProxy`, gives a service an S3 proxy of
+its own, whose record is then that service's and its engines' alone; and
+`ServiceOptions.AccessKey`, with `Env.ReadOnlyKey`, runs it with the store's
+read-only user.
 
 Engine uploads go to staging keys, under a stage of each export try's own,
 and reach the digest key only once the service has verified them (#23): to

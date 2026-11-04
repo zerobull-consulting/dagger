@@ -144,7 +144,7 @@ func newReadOnlyHarness(t *testing.T, stores sharedStores, opts S3Options) *read
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := &logRecorder{}
 	svc := New(slog.New(logs), "")
-	err = svc.enableStores(ctx, Stores{
+	err = svc.enableStores(ctx, storeSet{
 		Blobs: stores.blobs,
 		Meta:  meta,
 		GCBucket: func() (gc.Bucket, error) {
@@ -447,13 +447,13 @@ func TestReadOnlyNoGC(t *testing.T) {
 	opts := readOnlyOptions()
 	opts.GC = &GCConfig{Interval: time.Hour}
 	svc := New(slog.New(slog.DiscardHandler), "")
-	err := svc.enableStores(context.Background(), Stores{Blobs: stores.blobs, Meta: stores.meta}, opts)
+	err := svc.enableStores(context.Background(), storeSet{Blobs: stores.blobs, Meta: stores.meta}, opts)
 	if err == nil || !strings.Contains(err.Error(), "NoExport") {
 		t.Errorf("GC with NoExport: %v", err)
 	}
 	opts = readOnlyOptions()
 	opts.NoImport = true
-	if err := New(slog.New(slog.DiscardHandler), "").enableStores(context.Background(), Stores{Blobs: stores.blobs, Meta: stores.meta}, opts); err == nil {
+	if err := New(slog.New(slog.DiscardHandler), "").enableStores(context.Background(), storeSet{Blobs: stores.blobs, Meta: stores.meta}, opts); err == nil {
 		t.Error("NoExport with NoImport was taken")
 	}
 }
@@ -469,6 +469,29 @@ func TestReadOnlyExportEnabledMetric(t *testing.T) {
 	ro := newReadOnlyHarness(t, stores, readOnlyOptions())
 	if got := metricstest.Read(t, ro.svc.registry, "cacheservice_export_enabled", nil).Value; got != 0 {
 		t.Errorf("read-only: export_enabled %v, want 0", got)
+	}
+}
+
+// A read-only service takes only NoExport: the export path's conditional
+// write check would write, so the options are refused before it runs.
+func TestReadOnlyRefusesExportOptions(t *testing.T) {
+	stores := newSharedStores(t)
+	objs := &refuseWrites{Objects: stores.objs}
+	meta, err := metastore.New(metastore.Config{Objects: objs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(slog.New(slog.DiscardHandler), "")
+	if err := svc.SetReadOnly(); err != nil {
+		t.Fatal(err)
+	}
+	opts := readOnlyOptions()
+	opts.NoExport = false
+	if err := svc.enableStores(context.Background(), storeSet{Blobs: stores.blobs, Meta: meta}, opts); err == nil {
+		t.Fatal("a read-only service took the export path's options")
+	}
+	if got := objs.attempted(); len(got) > 0 {
+		t.Fatalf("writes before the refusal: %v", got)
 	}
 }
 

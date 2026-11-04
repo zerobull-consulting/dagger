@@ -184,6 +184,10 @@ func (s *Service) triggerImports(ns *namespace, except string) {
 func (s *Service) forgetWiped(ns *namespace, cacheID string) {
 	p := s.imports
 	ns.importer.Forget(cacheID)
+	// A read-only service records no imports, so it has none to drop.
+	if s.readOnly {
+		return
+	}
 	p.mu.Lock()
 	if p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()

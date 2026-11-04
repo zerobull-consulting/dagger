@@ -84,16 +84,14 @@ func (s *Service) SetReadOnly() error {
 	return nil
 }
 
-// ReadOnly reports whether the service is read-only (SetReadOnly).
-func (s *Service) ReadOnly() bool { return s.readOnly }
-
 // EnableS3 turns on the export path, unless opts.NoExport is set, and the
 // import path, unless opts.NoImport is, with the S3 blob and metadata stores
 // of cfg, until ctx ends. With the export path on, it refuses a store that
 // ignores conditional writes, which would let index updates overwrite each
 // other; that check writes, so it also refuses a read-only key.
 func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3Options) error {
-	if err := checkS3Options(opts); err != nil {
+	// Before the stores are built: a refused combination touches nothing.
+	if err := s.checkS3Options(opts); err != nil {
 		return err
 	}
 	blobs, err := blobstore.NewS3(ctx, cfg)
@@ -104,7 +102,7 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	if err != nil {
 		return err
 	}
-	return s.enableStores(ctx, Stores{
+	return s.enableStores(ctx, storeSet{
 		Blobs: blobs,
 		Meta:  meta,
 		GCBucket: func() (gc.Bucket, error) {
@@ -121,8 +119,8 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	}, opts)
 }
 
-// Stores are the stores the paths EnableS3 turns on run with.
-type Stores struct {
+// storeSet is the stores the paths EnableS3 turns on run with.
+type storeSet struct {
 	Blobs blobstore.Store
 	Meta  *metastore.Store
 	// GCBucket returns the bucket GC lists and deletes, when GC is on.
@@ -131,9 +129,14 @@ type Stores struct {
 	LogAttrs []any
 }
 
-// checkS3Options refuses the options that can't go together.
-func checkS3Options(opts S3Options) error {
+// checkS3Options refuses the options that can't go together, or with the
+// service's state: a read-only service (SetReadOnly) takes only NoExport,
+// since the export path's conditional write check would write.
+func (s *Service) checkS3Options(opts S3Options) error {
 	if !opts.NoExport {
+		if s.readOnly {
+			return errors.New("the service is read-only (SetReadOnly): set NoExport")
+		}
 		return nil
 	}
 	if opts.NoImport {
@@ -147,8 +150,8 @@ func checkS3Options(opts S3Options) error {
 
 // enableStores is EnableS3 on stores of the caller's choosing: tests run it on
 // in-memory stores, with the same options.
-func (s *Service) enableStores(ctx context.Context, st Stores, opts S3Options) error {
-	if err := checkS3Options(opts); err != nil {
+func (s *Service) enableStores(ctx context.Context, st storeSet, opts S3Options) error {
+	if err := s.checkS3Options(opts); err != nil {
 		return err
 	}
 	where := append(slices.Clip(st.LogAttrs), "scope", opts.Scope)

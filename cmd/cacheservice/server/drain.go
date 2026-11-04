@@ -130,12 +130,12 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 
 	p := s.export
-	if p == nil && s.readOnly {
-		s.logger.Info("drain: nothing to export (read-only: -export=false)")
-		return s.endDrain(start, metrics.DrainComplete, nil)
-	}
 	if p == nil || p.ctx.Err() != nil {
-		s.logger.Info("drain: nothing to export (the export path is off)")
+		why := "the export path is off"
+		if s.readOnly {
+			why = "read-only: -export=false"
+		}
+		s.logger.Info("drain: nothing to export (" + why + ")")
 		return s.endDrain(start, metrics.DrainComplete, nil)
 	}
 	// Namespaces created from now on drain from their first span

@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/credentials"
+
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
@@ -59,6 +61,12 @@ type ServiceOptions struct {
 	// ReadOnly runs it as -export=false does: the import path alone, no GC,
 	// and nothing written to or deleted from the bucket.
 	ReadOnly bool
+	// Proxy is the S3 proxy it, and the engines it hands presigned URLs to,
+	// reach the store through (nil: the run's, Env.Proxy).
+	Proxy *S3Proxy
+	// AccessKey and SecretKey are its store credentials (empty: the
+	// run's).
+	AccessKey, SecretKey string
 }
 
 // noEngineWait is how long an export waits for its engine to reconnect:
@@ -79,6 +87,12 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 
 	cfg := e.S3Config
 	cfg.Endpoint = e.Proxy.URL
+	if opts.Proxy != nil {
+		cfg.Endpoint = opts.Proxy.URL
+	}
+	if opts.AccessKey != "" {
+		cfg.Credentials = credentials.NewStaticCredentialsProvider(opts.AccessKey, opts.SecretKey, "")
+	}
 	// The proxy forwards in the store's addressing; a proxy's address has no
 	// bucket subdomains.
 	cfg.PathStyle = true

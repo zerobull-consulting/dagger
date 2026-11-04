@@ -884,11 +884,14 @@ What it does, and doesn't:
 - **The drain has nothing to flush,** and returns at once
   (`drain: nothing to export (read-only: -export=false)`).
 
-Two combinations are refused at startup, with exit code 2 and an error
-naming both flags, before anything connects to the bucket:
+Three combinations are refused at startup, with exit code 2 and an error
+naming both settings, before anything connects to the bucket:
 
 - `-export=false -import=false`: with both paths off, the service has
   nothing to do.
+- `-export=false` without `CACHESERVICE_S3_BUCKET`: a read-only instance
+  only imports from the bucket, so it would have nothing to do either, and a
+  typo in the variable would otherwise go unnoticed.
 - `-export=false` with an explicit nonzero `-gc-interval` (even `1h`, the
   default, when it's set on the command line): it asks for GC, which a
   read-only instance never runs. The default alone is fine; `-gc-interval=0`
