@@ -22,8 +22,11 @@
 // session spans and stores them when their session ends, and the import path,
 // which merges stored entries into the engines that lack them.
 //
-// To stop a service: cancel the context passed to the Enable methods, call
-// CloseEngines, then Wait.
+// To stop a service cleanly: Drain, while it still serves, with the drain's
+// deadline in its context; then cancel the context passed to the Enable
+// methods, CloseEngines, stop serving, and Wait. Without Drain, the exports
+// pending or in flight are lost (cmd/cacheservice's README, "Stopping and
+// draining").
 package server
 
 import (
@@ -109,8 +112,8 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	return s.EnableGC(ctx, g)
 }
 
-// Wait waits for the exports in flight and the import sync loops, after the
-// context that runs them has ended.
+// Wait waits for the exports in flight, those a drain started included, the
+// import sync loops and GC, after the context that runs them has ended.
 func (s *Service) Wait() {
 	s.waitExports()
 	s.waitImports()
