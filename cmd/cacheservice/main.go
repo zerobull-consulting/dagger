@@ -50,6 +50,16 @@
 //   - with -metrics-listen set, /metrics alone on that address, for a
 //     scraper that shouldn't reach the debug API;
 //
+//   - on SIGTERM or an interrupt, a drain before it stops: it takes no new
+//     engine or session, exports what its tracked sessions retained, without
+//     waiting out their quiet period, and waits for those exports and their
+//     uploads, up to -drain-timeout (30s; 0: no drain). The engines stay
+//     connected meanwhile, since exports run over them: stop the service
+//     before its engines, and give the process manager a stop timeout longer
+//     than -drain-timeout plus 5s (the HTTP servers' grace in the stop that
+//     follows). A second signal stops it at once. GET
+//     /debug/drain shows the drain. See README.md, "Stopping and draining".
+//
 //   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
 //     -gc-interval: per namespace in the bucket, it expires entries past
 //     their expiry, -max-age or -max-bytes (per namespace with
@@ -111,6 +121,7 @@ func main() {
 		gcGrace       time.Duration
 		gcStagingAge  time.Duration
 		gcMaxDeletes  int
+		drainTimeout  time.Duration
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
 	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the unauthenticated debug API (empty: off)")
@@ -132,6 +143,7 @@ func main() {
 	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
+	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once); the process manager's stop timeout must be longer than this plus 5s")
 	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
@@ -148,12 +160,23 @@ func main() {
 		}
 	}
 
+	if drainTimeout < 0 {
+		logger.Error("-drain-timeout must not be negative (0: no drain)")
+		os.Exit(2)
+	}
+
 	if (tlsCert == "") != (tlsKey == "") {
 		logger.Error("set both -tls-cert and -tls-key, or neither")
 		os.Exit(2)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first SIGTERM or interrupt drains, the second ends the drain.
+	// ctx runs the export, import and GC paths: it ends once the drain is
+	// done (shutdown), so the exports the drain waits for aren't cut off,
+	// or at once with -drain-timeout 0.
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 
 	svc := server.New(logger, dumpDir)
@@ -253,19 +276,58 @@ func main() {
 	}
 
 	select {
-	case <-ctx.Done():
+	case sig := <-sigs:
+		logger.Info("stopping", "signal", sig.String(), "drainTimeout", drainTimeout)
+		if drainTimeout > 0 {
+			drain(svc, logger, sigs, drainTimeout)
+		}
 	case err := <-errs:
 		logger.Error("serve", "error", err)
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	shutdown(svc, servers, stop, shutdownGrace)
+}
+
+// shutdownGrace bounds the wait for the HTTP servers' requests to end.
+const shutdownGrace = 5 * time.Second
+
+// shutdown stops svc after its drain, or without one: it ends what is still
+// in flight (exports, import syncs, GC runs) by canceling the context the
+// service's paths run on, closes the engine connections, shuts the servers
+// down, waiting up to grace for their requests, and waits for the paths.
+// The cancel comes first, as when the signal itself canceled that context:
+// a request tied to it, such as POST /debug/gc, then ends at once rather
+// than holding the shutdown for grace.
+func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, grace time.Duration) {
+	cancelPaths()
 	svc.CloseEngines()
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
 	for _, srv := range servers {
-		_ = srv.Shutdown(shutdownCtx)
+		_ = srv.Shutdown(ctx)
 	}
-	// End the exports in flight, and wait for them.
-	stop()
 	svc.Wait()
+}
+
+// DefaultDrainTimeout is -drain-timeout's default.
+const DefaultDrainTimeout = 30 * time.Second
+
+// drain runs svc's drain for at most timeout, while the servers still serve:
+// the engines stay connected, and the spans of the sessions it tracks still
+// arrive. A signal ends it at once.
+func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case sig := <-sigs:
+			logger.Warn("second signal: stopping without finishing the drain", "signal", sig.String())
+			cancel()
+		case <-done:
+		}
+	}()
+	svc.Drain(ctx)
 }
 
 // parseLimits reads -max-age and -max-bytes.
