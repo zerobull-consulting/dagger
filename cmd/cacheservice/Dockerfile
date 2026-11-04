@@ -34,4 +34,4 @@ USER 65532:65532
 EXPOSE 8090
 # No HEALTHCHECK: there is no shell or HTTP client in the image, and the
 # engine reconnects with backoff.
-ENTRYPOINT ["/cacheservice-wrong"]
+ENTRYPOINT ["/cacheservice"]
