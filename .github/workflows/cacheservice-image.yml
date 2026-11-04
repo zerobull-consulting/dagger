@@ -11,14 +11,16 @@ name: Cache service image
       - reopened
       - synchronize
       - ready_for_review
-    # The service's own packages and the ones that change most with it. Its
-    # other dependencies (engine/, internal/, util/) aren't listed, so a pull
-    # request touching only them isn't checked here; the push after its merge
-    # still builds the image.
+    # Everything in the image's build context (Dockerfile.dockerignore's
+    # allowlist), so a change to any package the service builds from is
+    # checked before it merges.
     paths:
       - cmd/cacheservice/**
-      - engine/remotecache/**
       - dagql/**
+      - engine/**
+      - internal/**
+      - sdk/go/**
+      - util/**
       - go.mod
       - go.sum
       - hack/remote-cache/image-smoke.sh
@@ -30,9 +32,11 @@ name: Cache service image
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Pull requests cancel their older runs. Pushes queue instead, so each
-  # merge pushes its SHA tag and the moving tag ends on the newest one.
+  # Pull requests cancel their older runs. Pushes get a group per commit, so
+  # none is dropped while another waits, and each pushes its SHA tag; the
+  # publish job moves :feature-remote-cache only while its commit is still
+  # the branch head.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   IMAGE: ghcr.io/zerobull-consulting/cacheservice
@@ -91,15 +95,23 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      # The SHA tag first: the moving tag only ever names an image that is
-      # also pushed under its commit.
+      # The SHA tag first, so the moving tag only ever names an image also
+      # pushed under its commit. Runs of different commits can overlap, so
+      # the moving tag moves only if this commit is still the branch head
+      # just before its push; a newer commit's run moves it otherwise.
       - name: Push
         env:
           REVISION: ${{ github.sha }}
         run: |
           docker push "$IMAGE:$REVISION"
+          echo "pushed $IMAGE:$REVISION" | tee -a "$GITHUB_STEP_SUMMARY"
+          head="$(git ls-remote origin refs/heads/feature/remote-cache | cut -f1)"
+          if [[ "$head" != "$REVISION" ]]; then
+            echo "feature/remote-cache is at $head now, not $REVISION: :feature-remote-cache left to its run" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           docker push "$IMAGE:feature-remote-cache"
-          echo "pushed $IMAGE:$REVISION and $IMAGE:feature-remote-cache" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "pushed $IMAGE:feature-remote-cache" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io

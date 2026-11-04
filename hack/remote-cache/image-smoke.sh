@@ -7,8 +7,10 @@
 #   1. `-h` exits 0 and prints the flags;
 #   2. started with -metrics-listen, it serves /metrics;
 #   3. `docker stop` delivers SIGTERM to the binary as PID 1, and it exits 0
-#      within STOP_LIMIT seconds (default 5), well before docker's SIGKILL.
+#      within STOP_LIMIT seconds (default 5): that is the stop's own timeout,
+#      after which docker sends SIGKILL and the exit code is 137.
 #
+# Needs only docker, curl, grep and bash (no GNU date or bc).
 # Used by .github/workflows/cacheservice-image.yml; runs the same locally.
 set -euo pipefail
 
@@ -53,14 +55,11 @@ grep -q '^cacheservice_draining 0$' <<<"$metrics" || fail "/metrics at $port did
 echo "ok: $(grep -c '^cacheservice_' <<<"$metrics") cacheservice_ samples"
 
 echo "== 3. docker stop: SIGTERM to PID 1, exit 0 within ${STOP_LIMIT}s"
-start="$(date +%s.%N)"
-docker stop --time 30 "$name" >/dev/null
-elapsed="$(echo "$(date +%s.%N) - $start" | bc)"
+docker stop --time "$STOP_LIMIT" "$name" >/dev/null
 code="$(docker inspect -f '{{.State.ExitCode}}' "$name")"
 logs="$(docker logs "$name" 2>&1)"
-[[ "$code" == 0 ]] || fail "exit code $code, not 0 (137 is SIGKILL: SIGTERM didn't stop it)"
+[[ "$code" == 0 ]] || fail "exit code $code, not 0 (137: still running after ${STOP_LIMIT}s, so docker sent SIGKILL)"
 grep -q 'msg=stopping signal=terminated' <<<"$logs" || fail "the binary didn't log that it got SIGTERM"
-(($(echo "$elapsed < $STOP_LIMIT" | bc))) || fail "it took ${elapsed}s to stop, over ${STOP_LIMIT}s"
-printf 'ok: exit 0 in %.2fs\n' "$elapsed"
+echo "ok: exit 0 on SIGTERM"
 
 echo "PASS: $image"
