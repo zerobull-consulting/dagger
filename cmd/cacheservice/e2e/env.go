@@ -394,6 +394,28 @@ func (e *Env) BundleIDsIn(ns string) []string {
 	return ids
 }
 
+// Listing is every object under the run's prefix, as "<key> <size> <ETag>",
+// sorted: two listings are equal only if nothing was written or deleted in
+// between.
+func (e *Env) Listing() []string {
+	e.T.Helper()
+	ctx, cancel := e.ctx()
+	defer cancel()
+	var out []string
+	pages := s3.NewListObjectsV2Paginator(e.S3, &s3.ListObjectsV2Input{Bucket: aws.String(e.S3Config.Bucket), Prefix: aws.String(e.S3Config.Prefix + "/")})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			e.T.Fatalf("list %s: %v", e.S3Config.Prefix, err)
+		}
+		for _, o := range page.Contents {
+			out = append(out, fmt.Sprintf("%s %d %s", aws.ToString(o.Key), aws.ToInt64(o.Size), aws.ToString(o.ETag)))
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (e *Env) listKeys(prefix string) []string {
 	e.T.Helper()
 	ctx, cancel := e.ctx()

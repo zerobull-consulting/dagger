@@ -56,6 +56,9 @@ type ServiceOptions struct {
 	// GCGrace is GC's grace period (0: its default). GC runs only when a
 	// scenario calls CollectGarbage.
 	GCGrace time.Duration
+	// ReadOnly runs it as -export=false does: the import path alone, no GC,
+	// and nothing written to or deleted from the bucket.
+	ReadOnly bool
 }
 
 // noEngineWait is how long an export waits for its engine to reconnect:
@@ -91,14 +94,18 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := server.New(logger, "")
-	if err := svc.EnableS3(ctx, cfg, server.S3Options{
+	s3opts := server.S3Options{
 		Scope:        e.Scope,
 		Tracker:      exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},
+		NoExport:     opts.ReadOnly,
 		ImportPoll:   poll,
 		NoEngineWait: noEngineWait,
+	}
+	if !opts.ReadOnly {
 		// Only when a scenario asks (CollectGarbage).
-		GC: &server.GCConfig{Collector: gc.Config{Grace: opts.GCGrace}},
-	}); err != nil {
+		s3opts.GC = &server.GCConfig{Collector: gc.Config{Grace: opts.GCGrace}}
+	}
+	if err := svc.EnableS3(ctx, cfg, s3opts); err != nil {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
 	}

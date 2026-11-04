@@ -57,6 +57,9 @@ are recorded with its name). After breaking something,
 names a missing bundle, and no stored bundle a missing layer.
 `Env.StoredDigest` hashes what a digest key holds, and `Env.StagedKeys`
 lists the scope's staged uploads.
+`ServiceOptions.ReadOnly` starts a service as `-export=false` does (#65),
+and `Env.Listing` lists every object of the run with its size and ETag, to
+show nothing was written.
 
 Engine uploads go to staging keys, under a stage of each export try's own,
 and reach the digest key only once the service has verified them (#23): to
