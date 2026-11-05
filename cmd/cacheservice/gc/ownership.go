@@ -150,9 +150,14 @@ func (c *Collector) survey(ctx context.Context) (*survey, error) {
 var errSampled = errors.New("sampled")
 
 // sampleUnder adds the keys under an unexpected prefix to u: its first page
-// only, so a large foreign tree costs one request. The count is then a
-// lower bound.
+// only, so a large foreign tree costs one request, and once u holds
+// MaxUnexpectedLogged keys, none: the prefix itself is counted as one
+// (the run stops anyway). The count is then a lower bound.
 func (c *Collector) sampleUnder(ctx context.Context, prefix string, u *unexpected) error {
+	if len(u.keys) >= MaxUnexpectedLogged {
+		u.add(prefix)
+		return nil
+	}
 	err := c.cfg.Bucket.List(ctx, prefix, func(objs []Object) error {
 		for _, o := range objs {
 			u.add(o.Key)

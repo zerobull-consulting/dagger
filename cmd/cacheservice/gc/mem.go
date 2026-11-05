@@ -9,8 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencontainers/go-digest"
-
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -197,16 +195,6 @@ func (b *MemBucket) Delete(ctx context.Context, keys []string) ([]string, error)
 		}
 	}
 	return failed, nil
-}
-
-// relDigest parses <alg>/<hex>.
-func relDigest(p string) (digest.Digest, error) {
-	alg, hex, _ := strings.Cut(p, "/")
-	d := digest.NewDigestFromEncoded(digest.Algorithm(alg), hex)
-	if err := d.Validate(); err != nil {
-		return "", err
-	}
-	return d, nil
 }
 
 // ListUploads returns the uploads added under prefix.

@@ -150,6 +150,11 @@ checks the prefix:
   purpose: there is no migration, and reading the old layout to recognize
   it would be one (see [Changing layouts](#changing-layouts);
   `TestNonEmptyPrefixRefused`, `TestMinIOBinaryRefusesPrefixNotOwned`).
+- **A folder placeholder counts as a key.** The zero-byte `cache/` object
+  that the AWS and Spaces consoles create with "Create folder" makes the
+  prefix not empty, and a writer refuses it, listing `cache/`. Intended:
+  empty means no key at all. Delete the placeholder; the service needs no
+  folder (`TestFolderPlaceholderRefused`).
 - Refusals write and delete nothing (the tests compare full listings), and
   exit 1, the code for a store error; flag errors exit 2. They are an exit
   code and an `ERROR` line (`msg="export path"` or `msg="import path
@@ -2136,7 +2141,7 @@ paths record into them through their metadata store. All are prefixed
 | `gc_run_duration_seconds` | `scope` | Time of one namespace's GC run |
 | `gc_entries_expired_total` | `scope`, `reason` | Index entries GC dropped: `expired` (their own expiry, or the max age) or `size` (the max size) |
 | `gc_staging_rule_missing` | `scope` | 1 when no lifecycle rule expires the namespace's staging prefix (GC expires it itself), 0 when one does; absent when the rules can't be read |
-| `gc_unexpected_keys` | `scope` | Keys and multipart uploads of no known shape GC's last run found in the namespace, or for `scope="_root"` outside the namespaces (a lower bound there: one listing page per unexpected prefix). Above 0 is an ownership violation: GC changed nothing in that namespace, or, for `_root`, anywhere (see [Bucket ownership](#bucket-ownership)) |
+| `gc_unexpected_keys` | `scope` | Keys and multipart uploads of no known shape GC's last run found in the namespace, or for `scope="_root"` outside the namespaces (a lower bound there: one listing page per unexpected prefix, and once 10 keys are known, each further prefix counts once, unlisted: `TestUnexpectedPrefixesSampledBounded`). Above 0 is an ownership violation: GC changed nothing in that namespace, or, for `_root`, anywhere (see [Bucket ownership](#bucket-ownership)) |
 | `gc_refused_total` | `reason` | GC runs that did nothing at all: `no_marker`, `other_layout`, `marker_unreadable`, `root_violation` (keys of no known shape outside the namespaces), `uploads_unlisted` (the multipart upload listing failed) |
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
 | `export_enabled` | | 1 when the export path is on, 0 when it is off: a read-only instance (`-export=false`), or no bucket |
@@ -2188,6 +2193,11 @@ What to watch:
 - **Ownership:** any `gc_unexpected_keys` above 0, or any
   `gc_refused_total`, is GC stopped: something else wrote under the
   service's prefix, or the marker is gone. The log lists up to 10 keys.
+  Alert on `gc_refused_total` and on `gc_unexpected_keys{scope="_root"}`
+  too, not only per namespace: a run that stops for the whole prefix
+  leaves the namespaces' series as the last run left them. A namespace
+  skipped for a violation still updates its `gc_stored_*`
+  (`TestSkippedNamespaceGaugesCurrent`).
 - A rising
   `export_collected_total` means exports keep naming what GC deletes: a
   grace period too short for the exports' duration.

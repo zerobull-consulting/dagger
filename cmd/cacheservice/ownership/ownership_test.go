@@ -309,3 +309,19 @@ func TestBadMarker(t *testing.T) {
 		t.Fatalf("requests %v", c)
 	}
 }
+
+// A folder placeholder at the prefix itself (the zero-byte "p/" that the
+// AWS and Spaces consoles create with "Create folder") is a key like any
+// other, so the prefix isn't empty and a writer refuses it. Intended: the
+// service owns everything under its prefix, and an empty prefix means no
+// key at all. Delete the placeholder, or don't create the folder: the
+// service needs none.
+func TestFolderPlaceholderRefused(t *testing.T) {
+	st := newCounting()
+	put(t, st, "p/", "")
+	_, _, err := Check(context.Background(), st, "p", true, now)
+	var not *ErrNotOwned
+	if !errors.As(err, &not) || !slices.Equal(not.Keys, []string{"p/"}) {
+		t.Fatalf("%v; want ErrNotOwned listing p/", err)
+	}
+}

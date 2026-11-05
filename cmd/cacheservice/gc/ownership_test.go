@@ -416,3 +416,52 @@ func TestUploadListingFailureDoesNothing(t *testing.T) {
 		t.Fatalf("after: %+v", r)
 	}
 }
+
+// listCounting counts List calls.
+type listCounting struct {
+	Bucket
+	lists int
+}
+
+func (b *listCounting) List(ctx context.Context, p string, fn func([]Object) error) error {
+	b.lists++
+	return b.Bucket.List(ctx, p, fn)
+}
+
+// A prefix holding another application's tree of many top-level prefixes
+// costs a bounded number of listings: once 10 keys are known, each further
+// unexpected prefix is counted as one, without listing it.
+func TestUnexpectedPrefixesSampledBounded(t *testing.T) {
+	e := newEnv(t)
+	e.collectable("team")
+	for i := range 40 {
+		e.put(fmt.Sprintf("cache/app-%02d/file", i), "x")
+	}
+	b := &listCounting{Bucket: e.bucket}
+	c := e.collector(func(cfg *Config) { cfg.Bucket = b })
+	reps, err := c.Run(context.Background())
+	if !errors.Is(err, ErrNotOwned) || reps[0].UnexpectedCount != 40 || len(reps[0].Unexpected) != MaxUnexpectedLogged {
+		t.Fatalf("%+v, %v", reps, err)
+	}
+	if b.lists != MaxUnexpectedLogged {
+		t.Fatalf("%d listings, want %d", b.lists, MaxUnexpectedLogged)
+	}
+}
+
+// A namespace skipped for a violation still reports what it holds of known
+// shapes: its gc_stored_bytes don't freeze at the last clean run's.
+func TestSkippedNamespaceGaugesCurrent(t *testing.T) {
+	e := newEnv(t)
+	e.collectable("team")
+	reg := prometheus.NewRegistry()
+	c := e.collector(func(cfg *Config) { cfg.Metrics = metrics.New(reg) })
+	e.run(c)
+	labels := map[string]string{"scope": "team", "kind": "blob"}
+	first := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels).Value
+	e.put(nsPrefix("team")+"notes.txt", "x")
+	e.view("team").Put(layer("more", 5000))
+	_, _ = c.Run(context.Background())
+	if got := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels).Value; got != first+5000 {
+		t.Fatalf("stored blob bytes %v, want %v", got, first+5000)
+	}
+}

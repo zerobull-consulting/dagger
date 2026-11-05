@@ -362,6 +362,11 @@ func TestMinIOStoreExpiry(t *testing.T) {
 	ctx := context.Background()
 	blob, d := randomBlob(t, 128)
 	stage := NewStage()
+	// SigV4 truncates X-Amz-Date to the second: a 1s URL signed late in a
+	// second has only what is left of it to live, which made the fresh PUT
+	// below fail now and then. Signed just after a second starts, both
+	// URLs get nearly the whole second.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
 	put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
 	if err != nil {
 		t.Fatal(err)

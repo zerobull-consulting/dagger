@@ -266,20 +266,14 @@ func (c *Collector) Loop(ctx context.Context, interval time.Duration) {
 // Namespaces lists the namespaces in the bucket: the valid names under
 // <prefix>/ns/, the only place namespaces live. It reads the bucket, not the
 // tokens, so namespaces whose tokens were all removed are collected too.
+//
+// It is what a run finds (survey), without the run.
 func (c *Collector) Namespaces(ctx context.Context) ([]string, error) {
-	nsTop := layout.NamespacesPrefix(c.cfg.Meta.Prefix())
-	dirs, _, err := c.cfg.Bucket.ListLevel(ctx, nsTop)
+	s, err := c.survey(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []string
-	for _, d := range dirs {
-		if name := strings.TrimSuffix(strings.TrimPrefix(d, nsTop), "/"); layout.ValidateNamespace(name) == nil {
-			out = append(out, name)
-		}
-	}
-	sort.Strings(out)
-	return out, nil
+	return s.namespaces, nil
 }
 
 // Run collects every namespace in the bucket, one after the other, and
@@ -578,6 +572,12 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 		return rep
 	}
 
+	// What the listing found of known shapes, whatever happens next: a
+	// namespace skipped for a violation or a missing index still reports
+	// what it holds.
+	rep.StoredBytes, rep.StoredObjects = l.bytes, l.objects
+	c.cfg.Metrics.GCStored(ns, l.bytes, l.objects)
+
 	// 3. Ownership: every key and upload must be of a known shape.
 	u := l.unexpected
 	if badUploads != nil {
@@ -598,8 +598,6 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 		log.Info("gc: a namespace without an index; left alone")
 		return rep
 	}
-	rep.StoredBytes, rep.StoredObjects = l.bytes, l.objects
-	c.cfg.Metrics.GCStored(ns, l.bytes, l.objects)
 
 	// 4. Expire by expiry and max age; stamp roots with no recording time.
 	var prev, idx *metastore.Index

@@ -172,14 +172,12 @@ func Classify(rel string) (Kind, string) {
 			return KindResolution, m[1]
 		}
 	case strings.HasPrefix(rel, BlobsDir):
-		if d, ok := parseDigestPath(strings.TrimPrefix(rel, BlobsDir)); ok && BlobRel(d) == rel {
+		if _, ok := ParseBlobRel(rel); ok {
 			return KindBlob, ""
 		}
 	case strings.HasPrefix(rel, StagingDir):
-		if m := stagingPattern.FindStringSubmatch(rel); m != nil {
-			if d, ok := parseDigestPath(m[2]); ok && StagingRel(m[1], d) == rel {
-				return KindStaging, ""
-			}
+		if _, _, ok := ParseStagingRel(rel); ok {
+			return KindStaging, ""
 		}
 	case probePattern.MatchString(rel):
 		return KindProbe, ""
@@ -197,11 +195,15 @@ func IsUploadRel(rel string) bool {
 
 // ParseBlobRel returns the digest of a blob key relative to a namespace.
 func ParseBlobRel(rel string) (digest.Digest, bool) {
-	if k, _ := Classify(rel); k != KindBlob {
+	enc, ok := strings.CutPrefix(rel, BlobsDir)
+	if !ok {
 		return "", false
 	}
-	d, ok := parseDigestPath(strings.TrimPrefix(rel, BlobsDir))
-	return d, ok
+	d, ok := parseDigestPath(enc)
+	if !ok || BlobRel(d) != rel {
+		return "", false
+	}
+	return d, true
 }
 
 // ParseStagingRel returns the stage and digest of a staged key relative to

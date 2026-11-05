@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 )
 
@@ -110,16 +108,16 @@ func TestMinIOBinaryWriterClaimsEmptyPrefix(t *testing.T) {
 // marker between them.
 func TestMinIOBinaryWritersRaceOnEmptyPrefix(t *testing.T) {
 	scope := newScope(t)
-	var wg sync.WaitGroup
+	// Started back to back without waiting (noEngine), so their startup
+	// checks overlap; then each is waited for on the test's goroutine,
+	// since startBinaryWith and waitLog may fail the test.
 	bins := make([]*binaryTest, 3)
 	for i := range bins {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			bins[i] = startBinaryWith(t, binaryOpts{scope: scope, cache: fakeengine.New(fmt.Sprintf("cache-%d", i), 1)})
-		}()
+		bins[i] = startBinaryWith(t, binaryOpts{scope: scope, noEngine: true})
 	}
-	wg.Wait()
+	for _, b := range bins {
+		b.waitLog(30*time.Second, "msg=listening")
+	}
 	claimed := 0
 	for _, b := range bins {
 		if strings.Contains(b.logs.String(), "prefix claimed") {
