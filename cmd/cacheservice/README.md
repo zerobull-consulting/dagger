@@ -983,9 +983,9 @@ service out of memory, with no token in unauthenticated mode. With tokens,
 the token is checked first, and a request without a known one is refused
 with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
 
-| Route | Limit, as received and decoded | Largest request in two e2e runs | Margin |
+| Route | Limit, as received and decoded | Largest request in three e2e runs | Margin |
 | --- | --- | --- | --- |
-| `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 18,285 bytes | 3,670x |
+| `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 18,783 bytes | 3,573x |
 | `POST /v1/logs` | 64 MiB (`server.MaxOTLPLogsBytes`) | 9,466 bytes | 7,089x |
 | `POST /v1/metrics` | 16 MiB (`server.MaxOTLPMetricsBytes`) | 1,437 bytes | 11,675x |
 
@@ -1027,9 +1027,9 @@ with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
 
 **How they were chosen.** The e2e run (`./hack/remote-cache/dev.sh e2e`,
 every scenario) logs every request taken, and its `otlp-sizes` scenario
-reports the largest per route (above, the larger of two runs). The engines
-sent protobuf, not gzipped, and at most 18,285 bytes of the budget were in
-use at once. The limits don't follow from those alone: the engine's Cloud
+reports the largest per route (above, the largest of three runs). The
+engines sent protobuf, not gzipped, and at most 18,783 bytes of the budget
+were in use at once. The limits don't follow from those alone: the engine's Cloud
 forwarder, which sends session spans and logs, keeps each request to 4 MiB
 of protobuf, and sends larger only for a single span or log record larger
 than that (`cloudForwardMaxPayloadSize` in
