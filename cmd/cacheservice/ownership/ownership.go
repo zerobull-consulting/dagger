@@ -175,9 +175,10 @@ func ReadMarker(ctx context.Context, st interface {
 // prefix; a read-only instance (writer false) writes nothing.
 //
 // It costs one GET when the marker is there. Otherwise, one bounded list
-// (MaxListed+1 keys), and for a writer on an empty prefix one listing of
-// multipart uploads and one conditional PUT, plus one GET if another writer
-// created the marker first. A listing
+// (MaxListed+1 keys); on an empty prefix one GET per ancestor prefix (the
+// bucket's top included), and for a writer one listing of multipart
+// uploads and one conditional PUT, plus one GET if another writer created
+// the marker first. A listing
 // that finds keys is followed by one more GET of the marker: it may be a
 // writer that claimed the prefix since the first one.
 func Check(ctx context.Context, st Store, prefix string, writer bool, now time.Time) (State, Marker, error) {
@@ -207,6 +208,11 @@ func Check(ctx context.Context, st Store, prefix string, writer bool, now time.T
 		}
 		return 0, Marker{}, e
 	}
+	// Not empty, if an ancestor prefix is a store's: everything under it
+	// is that service's, this prefix included.
+	if err := checkAncestors(ctx, st, prefix); err != nil {
+		return 0, Marker{}, err
+	}
 	if !writer {
 		return Empty, Marker{}, nil
 	}
@@ -218,6 +224,14 @@ func Check(ctx context.Context, st Store, prefix string, writer bool, now time.T
 		return 0, Marker{}, fmt.Errorf("list multipart uploads under %s: %w", where(prefix), err)
 	}
 	if len(ups) > 0 {
+		// A writer racing this one may have claimed the prefix since the
+		// listing, and started a promotion's upload under it.
+		if m, err := ReadMarker(ctx, st, prefix); !errors.Is(err, ErrNoMarker) {
+			if err != nil {
+				return 0, m, err
+			}
+			return Owned, m, nil
+		}
 		e := &ErrNotOwned{Prefix: strings.Trim(prefix, "/")}
 		for _, k := range ups[:min(len(ups), MaxListed)] {
 			e.Keys = append(e.Keys, "upload:"+k)
@@ -243,6 +257,43 @@ func Check(ctx context.Context, st Store, prefix string, writer bool, now time.T
 		return 0, Marker{}, fmt.Errorf("create ownership marker: %w", err)
 	}
 	return Claimed, m, nil
+}
+
+// ErrNestedPrefix is a prefix under another that holds a marker: the
+// service there owns this prefix too.
+type ErrNestedPrefix struct {
+	Prefix, Ancestor string
+}
+
+func (e *ErrNestedPrefix) Error() string {
+	anc := "the bucket's top"
+	if e.Ancestor != "" {
+		anc = "prefix " + e.Ancestor + "/"
+	}
+	return fmt.Sprintf("prefix %s/ is inside %s, which holds an ownership marker (%s): the service there owns everything under it. "+
+		"Set a CACHESERVICE_S3_PREFIX outside it (see the README, \"Bucket ownership\")", e.Prefix, anc, layout.MarkerKey(e.Ancestor))
+}
+
+// checkAncestors refuses a prefix whose ancestors hold a marker, of any
+// content: one GET per ancestor, made only when the prefix has none of its
+// own. It is best effort: an ancestor whose marker can't be read (a key
+// allowed only its own prefix gets 403 there) is skipped, since a nested
+// claim costs no data, only the ancestor's GC, which then stops on this
+// prefix's keys.
+func checkAncestors(ctx context.Context, st Store, prefix string) error {
+	p := strings.Trim(prefix, "/")
+	if p == "" {
+		return nil
+	}
+	segs := strings.Split(p, "/")
+	for i := range segs {
+		anc := strings.Join(segs[:i], "/")
+		_, _, err := st.Get(ctx, layout.MarkerKey(anc))
+		if err == nil {
+			return &ErrNestedPrefix{Prefix: p, Ancestor: anc}
+		}
+	}
+	return nil
 }
 
 func where(prefix string) string {

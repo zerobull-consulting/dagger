@@ -97,7 +97,9 @@ var now = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 // costs are pinned: they are what the README says a startup costs.
 func TestWriterClaimsEmptyPrefix(t *testing.T) {
 	ctx := context.Background()
-	for _, prefix := range []string{"", "cache", "/a/b/"} {
+	// The marker's GET, then one per ancestor prefix ("" for the bucket's
+	// top), only because there was no marker.
+	for prefix, gets := range map[string]int{"": 1, "cache": 2, "/a/b/": 3} {
 		st := newCounting()
 		if prefix != "" {
 			// An empty prefix needs only its own keys absent.
@@ -107,7 +109,7 @@ func TestWriterClaimsEmptyPrefix(t *testing.T) {
 		if err != nil || state != Claimed {
 			t.Fatalf("prefix %q: %v, %v; want claimed", prefix, state, err)
 		}
-		if got := st.snapshot(); fmt.Sprint(got) != fmt.Sprint(map[string]int{"get": 1, "list": 1, "put": 1, "uploads": 1}) {
+		if got := st.snapshot(); fmt.Sprint(got) != fmt.Sprint(map[string]int{"get": gets, "list": 1, "put": 1, "uploads": 1}) {
 			t.Fatalf("prefix %q: requests %v", prefix, got)
 		}
 		body, _, err := st.MemObjects.Get(ctx, layout.MarkerKey(prefix))
@@ -287,7 +289,7 @@ func TestReadOnlyEmptyPrefix(t *testing.T) {
 	if err != nil || state != Empty {
 		t.Fatalf("%v, %v; want empty", state, err)
 	}
-	if c := st.snapshot(); fmt.Sprint(c) != fmt.Sprint(map[string]int{"get": 1, "list": 1}) {
+	if c := st.snapshot(); fmt.Sprint(c) != fmt.Sprint(map[string]int{"get": 2, "list": 1}) {
 		t.Fatalf("requests %v", c)
 	}
 	if keys := keysOf(st); len(keys) != 0 {
@@ -372,4 +374,88 @@ func TestWriterRefusesPrefixWithUpload(t *testing.T) {
 	if c := st.snapshot(); c["uploads"] != 1 {
 		t.Fatalf("the read-only check listed uploads: %v", c)
 	}
+}
+
+// denyGets answers GETs of some keys with an error other than not found, as
+// a key allowed only its own prefix gets 403 above it.
+type denyGets struct {
+	*counting
+	deny map[string]bool
+}
+
+func (d *denyGets) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if d.deny[key] {
+		return nil, "", errors.New("AccessDenied")
+	}
+	return d.counting.Get(ctx, key)
+}
+
+// A prefix inside one that holds a marker belongs to the service there:
+// both kinds of instance refuse it, naming the ancestor, and write nothing.
+// So does one under a marker at the bucket's top. A marker of any content
+// counts. An ancestor whose marker can't be read is skipped: the check is
+// best effort, and a nested claim costs no data, only the ancestor's GC,
+// which stops on it.
+func TestNestedPrefixRefused(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ marker, prefix, ancestor string }{
+		{"cache/cacheservice.json", "cache/team", "cache"},
+		{"cache/cacheservice.json", "cache/ns/team/x", "cache"},
+		{"cacheservice.json", "team", ""},
+		{"a/b/cacheservice.json", "/a/b/c/d/", "a/b"},
+	} {
+		for _, writer := range []bool{true, false} {
+			st := newCounting()
+			put(t, st, tc.marker, `{"layout":1}`)
+			_, _, err := Check(ctx, st, tc.prefix, writer, now)
+			var nested *ErrNestedPrefix
+			if !errors.As(err, &nested) || nested.Ancestor != tc.ancestor {
+				t.Fatalf("%s under %s, writer %v: %v; want ErrNestedPrefix of %q", tc.prefix, tc.marker, writer, err, tc.ancestor)
+			}
+			if c := st.snapshot(); c["put"] != 0 {
+				t.Fatalf("requests %v", c)
+			}
+		}
+	}
+	// An ancestor's marker the key can't read: skipped.
+	st := &denyGets{counting: newCounting(), deny: map[string]bool{"cacheservice.json": true}}
+	if state, _, err := Check(ctx, st, "cache", true, now); err != nil || state != Claimed {
+		t.Fatalf("an unreadable ancestor: %v, %v; want claimed", state, err)
+	}
+	// A sibling's marker isn't an ancestor's.
+	st2 := newCounting()
+	put(t, st2, "cachex/cacheservice.json", `{"layout":2}`)
+	if state, _, err := Check(ctx, st2, "cache", true, now); err != nil || state != Claimed {
+		t.Fatalf("a sibling's marker: %v, %v; want claimed", state, err)
+	}
+}
+
+// A writer whose upload listing finds an upload because another writer
+// claimed the prefix since the object listing, and started a promotion
+// under it, starts: it reads the marker again before refusing.
+func TestWriterUploadListingAfterAnotherClaimed(t *testing.T) {
+	ctx := context.Background()
+	st := &claimBeforeUploads{counting: newCounting()}
+	state, _, err := Check(ctx, st, "p", true, now)
+	if err != nil || state != Owned {
+		t.Fatalf("%v, %v; want owned", state, err)
+	}
+}
+
+// claimBeforeUploads lets another writer claim the prefix, and start an
+// upload, just before the upload listing.
+type claimBeforeUploads struct {
+	*counting
+	done bool
+}
+
+func (c *claimBeforeUploads) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	if !c.done {
+		c.done = true
+		if _, _, err := Check(ctx, c.MemObjects, "p", true, now); err != nil {
+			return nil, err
+		}
+		c.AddUpload("p/ns/default/blobs/sha256/" + strings.Repeat("0", 64))
+	}
+	return c.counting.ListUploadKeys(ctx, prefix, max)
 }

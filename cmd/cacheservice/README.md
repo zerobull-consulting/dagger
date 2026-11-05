@@ -150,9 +150,19 @@ checks the prefix:
   purpose: there is no migration, and reading the old layout to recognize
   it would be one (see [Changing layouts](#changing-layouts);
   `TestNonEmptyPrefixRefused`, `TestMinIOBinaryRefusesPrefixNotOwned`).
+- **A prefix nested in another service's** is refused by both kinds of
+  instance: with no marker of its own, an instance also reads the marker
+  position of each ancestor prefix (`cache/` for `cache/team`, and the
+  bucket's top), and refuses if any holds one, of any content: that
+  service owns everything under it (`TestNestedPrefixRefused`). Best
+  effort: an ancestor the key can't read (403, for a key allowed only its
+  own prefix) is skipped. A nested claim it misses costs no data, only the
+  ancestor's GC, which stops on the nested prefix's keys.
 - **An upload in progress counts too.** An object listing doesn't show
   multipart uploads, so a writer about to claim an empty prefix also lists
-  them, and refuses one with any (`upload:<key>` in the error;
+  them, and refuses one with any, after reading the marker once more, since a
+  writer racing it may have claimed the prefix and started a promotion
+  since (`upload:<key>` in the error; `TestWriterUploadListingAfterAnotherClaimed`;
   `TestWriterRefusesPrefixWithUpload`,
   `TestMinIOBinaryWriterRefusesPrefixWithUpload`). A read-only instance
   claims nothing and doesn't list them, so its key needn't be allowed to.
@@ -176,8 +186,8 @@ keys), and for a writer about to claim it, the multipart upload listing. What a 
 | Case | Ownership check | Then |
 | --- | --- | --- |
 | marker there (every start after the first) | 1 GET | writer: the conditional write probe, 4 PUTs and 1 DELETE |
-| empty prefix, writer | 1 GET, 1 LIST, 1 upload listing (2 on MinIO, `FilterAllUploads`), 1 PUT (+1 GET if another writer won) | the probe |
-| empty prefix, read-only | 1 GET, 1 LIST | nothing |
+| empty prefix, writer | 1 GET, 1 LIST, 1 GET per ancestor prefix, 1 upload listing (2 on MinIO, `FilterAllUploads`), 1 PUT (+1 GET if another writer won) | the probe |
+| empty prefix, read-only | 1 GET, 1 LIST, 1 GET per ancestor prefix | nothing |
 | refused | 1 GET, 1 LIST, 1 GET | nothing |
 
 The ownership check and the conditional write probe stay separate: the probe
