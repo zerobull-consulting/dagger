@@ -148,7 +148,7 @@ read_only() {
 		fail "the service merged nothing into the engine within ${timeout_s}s: did the writer store an export, under the same prefix and namespace?"
 
 	step "$service" build 1
-	[[ "$caches" != "$writer_cache" ]] && ok "the engine is fresh: cache $caches, the writer's was $writer_cache" ||
+	[[ "$caches" != - && ",$caches," != *",$writer_cache,"* ]] && ok "the engine is fresh: cache $caches, the writer's was $writer_cache" ||
 		fail "the engine isn't fresh: it has the writer's cache ($caches), so its hits aren't the remote cache's"
 	((executed == 0 && hit >= 1)) && ok "the cacheable step is a hit: $hit hit, 0 executed" ||
 		fail "the cacheable step isn't a hit: $hit hit, $executed executed"

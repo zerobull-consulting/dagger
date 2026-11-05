@@ -218,6 +218,7 @@ jobs:
         timeout-minutes: 10
         env:
           SERVICE: ${{ steps.writer.outputs.service-container }}
+          DAGGER: ${{ steps.writer.outputs.dagger }}
         run: ./hack/remote-cache/demo/check.sh writer "$SERVICE" "$RUNNER_TEMP/demo/writer"
       - name: "Writer: stop the sidecar"
         id: writer-stop
@@ -253,6 +254,7 @@ jobs:
         timeout-minutes: 10
         env:
           SERVICE: ${{ steps.reader.outputs.service-container }}
+          DAGGER: ${{ steps.reader.outputs.dagger }}
         run: ./hack/remote-cache/demo/check.sh read-only "$SERVICE" "$RUNNER_TEMP/demo/read-only" "$RUNNER_TEMP/demo/writer"
       - name: "Read-only: stop the sidecar"
         if: always()

@@ -220,6 +220,8 @@ start() {
 	timeout 120 docker run -d --name "$service" --network "$network" \
 		--label remote-cache-sidecar="$name" "${publish[@]}" "${s3env[@]}" \
 		"$service_image" "${flags[@]}" >/dev/null || die "starting the service failed"
+	# From here on the stop expects a service, and fails without one.
+	: >"$dir/started"
 	local hostport
 	hostport="$(timeout 30 docker port "$service" 8090/tcp | head -n1)"
 	[[ "$hostport" =~ ^[0-9.]+:[0-9]+$ ]] || { show_log "$service"; die "the service's port isn't published ('$hostport')"; }
@@ -340,7 +342,8 @@ stop() {
 	fi
 	local failed=""
 
-	local was_running=false code=""
+	local was_running=false code="" started=false
+	[[ -f "$(dirname "$state")/started" ]] && started=true
 	if running "$st_service"; then
 		was_running=true
 		echo "remote-cache-sidecar: stopping the service; it drains for up to $((st_stop_seconds - 10))s, and docker stop waits ${st_stop_seconds}s"
@@ -364,14 +367,18 @@ stop() {
 	timeout 60 docker rm -f "$st_service" "$st_engine" >/dev/null 2>&1 || true
 	timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || true
 	timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || true
-	rm -f "$state"
+	rm -f "$state" "$(dirname "$state")/started"
 	[[ -n "${GITHUB_OUTPUT:-}" ]] && echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
 
 	if [[ -f "$st_logs/service.log" ]]; then
 		echo "remote-cache-sidecar: the drain, from the service's log:"
 		grep -E 'msg="?(stopping|drain|stopped|export stored)' "$st_logs/service.log" | tail -n 20 || true
 	fi
-	if [[ -z "$code" ]]; then
+	if [[ -z "$code" && "$started" != true ]]; then
+		# The start failed before it ran the service; its step said why.
+		echo "remote-cache-sidecar: the start didn't get as far as the service; cleaned up what it left"
+		return 0
+	elif [[ -z "$code" ]]; then
 		failed="the service's container is gone, so its exit code is unknown"
 	elif [[ "$was_running" != true ]]; then
 		failed="the service exited during the job, with code $code, before the stop"
