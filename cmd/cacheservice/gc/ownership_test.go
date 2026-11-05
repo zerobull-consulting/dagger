@@ -522,3 +522,29 @@ func TestIndexAppearingDuringRunLeftAlone(t *testing.T) {
 		t.Fatalf("next run: %+v", r)
 	}
 }
+
+// A namespace whose only content is a multipart upload of no known shape (no
+// object, so no index) is a violation for RunNamespace as for Run: reported,
+// counted, an error, and never aborted.
+func TestUploadOnlyNamespaceViolationBothEntryPoints(t *testing.T) {
+	e := newEnv(t)
+	e.collectable("team")
+	e.bucket.AddUpload(Upload{Key: nsPrefix("lonely") + "backups/db.tar", ID: "foreign", Initiated: e.clock.Now()})
+	e.clock.Add(1000 * time.Hour)
+	reg := prometheus.NewRegistry()
+	c := e.collector(func(cfg *Config) { cfg.Metrics = metrics.New(reg) })
+	reps, err := c.Run(context.Background())
+	if r := reportOf(reps, "lonely"); err == nil || r.UnexpectedCount != 1 {
+		t.Fatalf("Run: %+v, %v", r, err)
+	}
+	r, err := c.RunNamespace(context.Background(), "lonely")
+	if err == nil || r.UnexpectedCount != 1 || r.Unexpected[0] != "upload:"+nsPrefix("lonely")+"backups/db.tar" {
+		t.Fatalf("RunNamespace: %+v, %v", r, err)
+	}
+	if s := metricstest.Read(t, reg, "cacheservice_gc_unexpected_keys", map[string]string{"scope": "lonely"}); s.Value != 1 {
+		t.Fatalf("gauge: %+v", s)
+	}
+	if !slices.ContainsFunc(e.bucket.Uploads(), func(u Upload) bool { return u.ID == "foreign" }) {
+		t.Fatal("the foreign upload was aborted")
+	}
+}

@@ -320,12 +320,9 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 		if slices.Contains(s.namespaces, ns) {
 			continue
 		}
-		bad := s.badUploads[ns]
-		c.cfg.Metrics.GCUnexpected(ns, bad.n)
-		c.log.Error("gc: multipart uploads of no known shape in a namespace with no index; never aborted. "+
-			"Nothing else may write under the service's prefix (see README, Bucket ownership)", "namespace", ns, "count", bad.n, "keys", bad.keys)
-		reports = append(reports, Report{Namespace: ns, DryRun: c.cfg.DryRun, Unexpected: bad.keys, UnexpectedCount: bad.n, Skipped: "no index"})
-		errs = append(errs, fmt.Errorf("namespace %s: %d multipart uploads of no known shape, such as %s", ns, bad.n, bad.keys[0]))
+		rep, err := c.badUploadsOnly(ns, s.badUploads[ns])
+		reports = append(reports, rep)
+		errs = append(errs, fmt.Errorf("namespace %s: %w", ns, err))
 		found[ns] = true
 	}
 	// The gauges of namespaces gone from the bucket go too.
@@ -336,6 +333,19 @@ func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 	}
 	c.listed = found
 	return reports, errors.Join(errs...)
+}
+
+// badUploadsOnly reports a namespace with no objects whose uploads include
+// some of no known shape: a violation, as in a namespace with objects. They
+// are never aborted, and nor is anything else there (it has no index).
+func (c *Collector) badUploadsOnly(ns string, bad *unexpected) (Report, error) {
+	c.cfg.Metrics.GCUnexpected(ns, bad.n)
+	c.log.Error("gc: multipart uploads of no known shape in a namespace with no index; never aborted. "+
+		"Nothing else may write under the service's prefix (see README, Bucket ownership)", "namespace", ns, "count", bad.n, "keys", bad.keys)
+	rep := Report{Namespace: ns, DryRun: c.cfg.DryRun, Unexpected: bad.keys, UnexpectedCount: bad.n, Skipped: "no index"}
+	err := fmt.Errorf("%d multipart uploads of no known shape, such as %s", bad.n, bad.keys[0])
+	rep.fail(err)
+	return rep, err
 }
 
 // prepare is what every run does before collecting: it checks the marker,
@@ -377,6 +387,9 @@ func (c *Collector) RunNamespace(ctx context.Context, ns string) (Report, error)
 		return c.refuseRoot(s)
 	}
 	if !slices.Contains(s.namespaces, ns) {
+		if bad := s.badUploads[ns]; bad != nil {
+			return c.badUploadsOnly(ns, bad)
+		}
 		return Report{Namespace: ns, DryRun: c.cfg.DryRun, Skipped: "no index"}, nil
 	}
 	rep := c.collect(ctx, ns, rules, rerr == nil, s.uploads[ns], s.badUploads[ns])

@@ -1618,7 +1618,9 @@ mean "delete". In each namespace, in order:
    (`skipped: the index appeared during the run`): the read found none, so
    it can't tell what the new index names; the next run collects it
    (`TestIndexAppearingDuringRunLeftAlone`). Uploads in a
-   namespace with no objects at all are left too, and logged.
+   namespace with no objects at all are left too, and logged; those of no
+   known shape are violations there too, for a run of every namespace and
+   for `POST /debug/gc` of that one (`TestUploadOnlyNamespaceViolationBothEntryPoints`).
 1. **Expire.** One conditional index update (only when something changes):
    roots past their own expiry or their max age, and entries past their
    own expiry, are dropped, with what only they keep alive
