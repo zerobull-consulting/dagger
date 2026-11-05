@@ -1,5 +1,7 @@
 # Remote cache prompt template
 
+**Version:** [zerobull-consulting/dagger#99](https://github.com/zerobull-consulting/dagger/pull/99)
+
 Every work item's prompt for the remote cache work
 ([zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1))
 is generated from this file. It holds the template, the conventions for the
@@ -275,15 +277,16 @@ Observable outcomes, each shown by a test or a run.
 - End the prompt with a line naming the template version it was generated
   from:
 
-  > Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` at `<commit>`
+  > Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
+  > `zerobull-consulting/dagger#<N>`
 
-  where `<commit>` is the commit of `feature/remote-cache` that last changed
-  this file:
+  where `<N>` is the PR in the file's **Version** line, at the top, as the file
+  is on `feature/remote-cache`.
 
-  ```bash
-  git fetch origin feature/remote-cache &&
-    git log -1 --format=%h origin/feature/remote-cache -- hack/remote-cache/PROMPT_TEMPLATE.md
-  ```
+  The version is a PR, not a commit: before the branch's own review into
+  `main`, `feature/remote-cache` will be flattened into new commits, so its
+  commit hashes don't last. A PR number does, and the PR says why the process
+  changed.
 
 ## Starting a session
 
@@ -305,9 +308,10 @@ renders.
 ## Changing this file
 
 - The template changes by PR, like any other file, into `feature/remote-cache`.
-- The PR says what changed in the process and why.
-- The next prompt generated names the new commit (see the last convention
-  above), so every prompt shows which version of the process it followed.
+- The PR says what changed in the process and why, and sets the **Version**
+  line to its own number.
+- The next prompt generated names that PR (see the last convention above),
+  so every prompt shows which version of the process it followed.
 - The draft in zerobull-consulting/dagger#95's body and the working
   agreement's comments on zerobull-consulting/dagger#1 are history; this file
   supersedes them.
