@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -37,7 +36,7 @@ type exportPath struct {
 	// ctx runs the scheduler and every export.
 	ctx context.Context
 
-	wg sync.WaitGroup
+	wg workGroup
 }
 
 // ExportConfig configures the export path.
@@ -46,6 +45,9 @@ type ExportConfig struct {
 	Tracker      exporter.TrackerConfig
 	Tick         time.Duration
 	NoEngineWait time.Duration
+	// Now is the export path's clock, which the trackers and the drain
+	// run on; nil: time.Now. Tests set it.
+	Now func() time.Time
 }
 
 // EnableExport turns on the export path, and runs its scheduler until ctx
@@ -83,17 +85,20 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	if cfg.NoEngineWait <= 0 {
 		cfg.NoEngineWait = 10 * time.Second
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	p := &exportPath{
 		cfg:          cfg.Exporter,
 		trackerCfg:   cfg.Tracker,
 		tick:         cfg.Tick,
 		noEngineWait: cfg.NoEngineWait,
-		now:          time.Now,
+		now:          cfg.Now,
 		ctx:          ctx,
 	}
 	s.export = p
 	s.metrics.ExportEnabled(true)
-	p.wg.Add(1)
+	p.wg.Add()
 	go func() {
 		defer p.wg.Done()
 		s.scheduleExports(ctx)
@@ -128,7 +133,7 @@ func (s *Service) scheduleExports(ctx context.Context) {
 func (s *Service) startBatches(ctx context.Context, ns *namespace, batches []exporter.Batch) {
 	p := s.export
 	for _, b := range batches {
-		p.wg.Add(1)
+		p.wg.Add()
 		go func() {
 			defer p.wg.Done()
 			s.runBatch(ctx, ns, b)

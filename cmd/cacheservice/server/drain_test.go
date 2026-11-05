@@ -803,14 +803,10 @@ func TestKnownGapDrainDoesNotWaitForExplicitImport(t *testing.T) {
 	}
 }
 
-// KNOWN GAP: the drain starts what is due before it checks its deadline, so
-// a pass that runs once the deadline has passed still starts exports: here,
-// a drain whose deadline passed before it began starts the quiet session's
-// export, and returns "deadline" with it in flight. The stop that follows
-// cancels such an export, and it publishes nothing, but it is engine and S3
-// work started after the deadline, and the report counts it. Tracked in
-// https://github.com/zerobull-consulting/dagger/issues/73.
-func TestKnownGapDrainStartsExportsPastItsDeadline(t *testing.T) {
+// A drain whose deadline passed before it began starts nothing: what it
+// would have exported is reported left, pending, not in flight.
+// (zerobull-consulting/dagger#73, the known gap this test pinned before.)
+func TestDrainStartsNothingPastItsDeadline(t *testing.T) {
 	h, _ := newDrainHarness(t, nil)
 	h.build()
 	release := h.cache.Hold()
@@ -822,8 +818,13 @@ func TestKnownGapDrainStartsExportsPastItsDeadline(t *testing.T) {
 	if rep.Outcome != metrics.DrainDeadline {
 		t.Fatalf("report %+v", rep)
 	}
-	waitUntil(t, 5*time.Second, "the export started past the deadline to reach the engine", func() bool { return h.cache.InFlight() == 1 })
-	if len(rep.Left) != 1 || rep.Left[0].InFlight != 2 {
-		t.Fatalf("the drain started nothing past its deadline (report %+v): the gap is fixed; update this test, the README and the issue", rep)
+	if len(rep.Left) != 1 || rep.Left[0].InFlight != 0 || rep.Left[0].Pending != 2 || !rep.Left[0].Connected {
+		t.Fatalf("the drain past its deadline didn't leave its roots pending: %+v", rep)
+	}
+	// Shows nothing happens: the harness's scheduler ticks every 10ms, and
+	// an export started would reach the held engine within a few ticks.
+	time.Sleep(200 * time.Millisecond)
+	if n := h.cache.Exports(); n != 0 || h.cache.InFlight() != 0 {
+		t.Fatalf("%d exports reached the engine after a drain past its deadline", n)
 	}
 }

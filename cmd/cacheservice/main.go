@@ -55,10 +55,16 @@
 //     waiting out their quiet period, and waits for those exports and their
 //     uploads, up to -drain-timeout (30s; 0: no drain). The engines stay
 //     connected meanwhile, since exports run over them: stop the service
-//     before its engines, and give the process manager a stop timeout longer
-//     than -drain-timeout plus 5s (the HTTP servers' grace in the stop that
-//     follows). A second signal stops it at once. GET
-//     /debug/drain shows the drain. See README.md, "Stopping and draining".
+//     before its engines. The drain starts no export past its deadline. A
+//     shutdown follows, bounded at 5s: it closes the engine connections
+//     (within 2s), shuts the HTTP servers down and waits for what is still
+//     running. So the whole stop takes at most -drain-timeout plus 5s: give
+//     the process manager a stop timeout longer than that. A second signal
+//     ends the drain at once; a signal during the shutdown exits at once.
+//     The process exits 0 only when everything ended within the bound, and
+//     1 when a signal or the bound cut the shutdown off, logging what was
+//     still running. GET /debug/drain shows the drain. See README.md,
+//     "Stopping and draining".
 //
 //   - with -export=false, a read-only instance: the import path alone. It
 //     never writes to or deletes from the bucket, so it runs with a
@@ -153,7 +159,7 @@ func main() {
 	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
-	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once); the process manager's stop timeout must be longer than this plus 5s")
+	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once); a shutdown of at most 5s follows, so the process manager's stop timeout must be longer than this plus 5s")
 	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
@@ -185,7 +191,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	// The first SIGTERM or interrupt drains, the second ends the drain.
+	// The first SIGTERM or interrupt drains, the second ends the drain, and
+	// one during the shutdown that follows exits at once (stopService).
 	// ctx runs the export, import and GC paths: it ends once the drain is
 	// done (shutdown), so the exports the drain waits for aren't cut off,
 	// or at once with -drain-timeout 0.
@@ -303,37 +310,131 @@ func main() {
 		}()
 	}
 
+	code := 0
 	select {
 	case sig := <-sigs:
-		logger.Info("stopping", "signal", sig.String(), "drainTimeout", drainTimeout)
+		logger.Info("stopping", "signal", sig.String(), "drainTimeout", drainTimeout, "shutdownGrace", shutdownGrace)
 		if drainTimeout > 0 {
 			drain(svc, logger, sigs, drainTimeout)
 		}
 	case err := <-errs:
 		logger.Error("serve", "error", err)
+		code = 1
 	}
-	shutdown(svc, servers, stop, shutdownGrace)
+	clean := stopService(svc, servers, stop, sigs, logger, shutdownGrace)
+	os.Exit(exitCode(clean && code == 0, errs, logger))
 }
 
-// shutdownGrace bounds the wait for the HTTP servers' requests to end.
+// exitCode is the process's exit code after the stop: 0 when the stop was
+// clean (clean) and no HTTP server failed, 1 otherwise. A server that failed
+// after the first signal, during the drain or the shutdown, left its error in
+// errs, which nothing read then: it is logged here, and makes the stop
+// unclean too.
+func exitCode(clean bool, errs <-chan error, logger *slog.Logger) int {
+	for {
+		select {
+		case err := <-errs:
+			logger.Error("serve", "error", err)
+			clean = false
+			continue
+		default:
+		}
+		break
+	}
+	if clean {
+		return 0
+	}
+	return 1
+}
+
+// shutdownGrace bounds the shutdown that follows the drain, or the first
+// signal with -drain-timeout 0: closing the engine connections, shutting
+// the HTTP servers down and waiting for the service's paths. The stop as a
+// whole takes at most -drain-timeout plus this, which the process manager's
+// stop timeout must be longer than.
 const shutdownGrace = 5 * time.Second
 
-// shutdown stops svc after its drain, or without one: it ends what is still
-// in flight (exports, import syncs, GC runs) by canceling the context the
-// service's paths run on, closes the engine connections, shuts the servers
-// down, waiting up to grace for their requests, and waits for the paths.
-// The cancel comes first, as when the signal itself canceled that context:
-// a request tied to it, such as POST /debug/gc, then ends at once rather
-// than holding the shutdown for grace.
-func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, grace time.Duration) {
-	cancelPaths()
-	svc.CloseEngines()
-	ctx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
-	for _, srv := range servers {
-		_ = srv.Shutdown(ctx)
+// stopTestHoldEnv, set to 1 in a binary built with the cacheservice_testhooks
+// tag (main_testhooks.go), makes the stop wait for work that ignores
+// cancellation and never ends, so the tests can check the stop's bound on the
+// built binary. A binary built without the tag ignores it.
+const stopTestHoldEnv = "_CACHESERVICE_TEST_HOLD_STOP"
+
+// testHookStop, set only in a binary built with the cacheservice_testhooks
+// tag, runs as the shutdown begins.
+var testHookStop func(*server.Service, *slog.Logger)
+
+// stopService runs shutdown, bounded by grace, and reports whether the
+// service stopped cleanly: everything ended within grace, and no signal cut
+// the shutdown off. A signal during the shutdown ends it at once: it logs
+// what was still running, and returns false. So does the bound, should
+// shutdown itself overrun it. A false stop exits 1, so a process manager,
+// and the tests, can tell it from a clean one (0).
+func stopService(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, sigs <-chan os.Signal, logger *slog.Logger, grace time.Duration) bool {
+	if testHookStop != nil {
+		testHookStop(svc, logger)
 	}
-	svc.Wait()
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- shutdown(svc, servers, cancelPaths, grace-shutdownMargin) }()
+	// shutdown's steps are bounded by grace less the margin; this backstop,
+	// at grace, is for a step that overruns its own bound.
+	bound := time.NewTimer(grace)
+	defer bound.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			logger.Error("stopped: the shutdown's bound passed with work still running; exiting without waiting for it",
+				append([]any{"bound", grace, "error", err}, svc.Running().LogAttrs()...)...)
+			return false
+		}
+		logger.Info("stopped", "took", time.Since(start).Round(time.Millisecond))
+		return true
+	case sig := <-sigs:
+		logger.Error("signal during the shutdown: exiting at once",
+			append([]any{"signal", sig.String()}, svc.Running().LogAttrs()...)...)
+		return false
+	case <-bound.C:
+		logger.Error("stopped: the shutdown overran its bound; exiting without waiting for it",
+			append([]any{"bound", grace}, svc.Running().LogAttrs()...)...)
+		return false
+	}
+}
+
+// shutdownMargin is how much of stopService's grace shutdown leaves unused,
+// so that the backstop at grace, for a step that overruns its bound, is
+// still within the documented bound.
+const shutdownMargin = 500 * time.Millisecond
+
+// shutdown stops svc after its drain, or without one, within grace: it ends
+// what is still in flight (exports, import syncs, GC runs) by canceling the
+// context the service's paths run on, closes the engine connections (within
+// server.CloseEnginesTimeout), shuts the servers down, and waits for their
+// requests and the service's paths, until grace has passed since it began.
+// It returns an error when that bound cut the wait off, with work still
+// running: the service's paths, or an HTTP request. The cancel comes first, as when the signal itself canceled that
+// context: a request tied to it, such as POST /debug/gc, then ends at once
+// rather than holding the shutdown for grace.
+func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, grace time.Duration) error {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), grace, errors.New("shutdown grace passed"))
+	defer cancel()
+	cancelPaths()
+	closeCtx, cancelClose := context.WithTimeout(ctx, server.CloseEnginesTimeout)
+	var errs []error
+	if err := svc.CloseEnginesContext(closeCtx); err != nil {
+		errs = append(errs, err)
+	}
+	cancelClose()
+	for _, srv := range servers {
+		// A request still running when ctx ends: the stop isn't clean.
+		if err := srv.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("http server %s: requests still running: %w", srv.Addr, err))
+		}
+	}
+	if err := svc.WaitContext(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // DefaultDrainTimeout is -drain-timeout's default.
@@ -341,21 +442,25 @@ const DefaultDrainTimeout = 30 * time.Second
 
 // drain runs svc's drain for at most timeout, while the servers still serve:
 // the engines stay connected, and the spans of the sessions it tracks still
-// arrive. A signal ends it at once.
+// arrive. A second signal cancels it: it returns once the drain did, which
+// is at once. Only this goroutine reads sigs meanwhile, so a further signal
+// stays queued for the shutdown that follows, which exits on it.
 func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	done := make(chan struct{})
-	defer close(done)
 	go func() {
-		select {
-		case sig := <-sigs:
-			logger.Warn("second signal: stopping without finishing the drain", "signal", sig.String())
-			cancel()
-		case <-done:
-		}
+		defer close(done)
+		svc.Drain(ctx)
 	}()
-	svc.Drain(ctx)
+	select {
+	case <-done:
+		return
+	case sig := <-sigs:
+		logger.Warn("second signal: stopping without finishing the drain", "signal", sig.String())
+		cancel()
+	}
+	<-done
 }
 
 // explicitFlags returns the flags set on the command line, by name.
