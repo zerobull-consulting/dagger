@@ -125,11 +125,12 @@ Only the ones relevant to this task.
 
 ### 12. Review and merge
 
-The prompt states the points of the working agreement below that the work
-needs:
+In the prompt, the working agreement's points; the agent follows the
+agreement's full text below:
 
 - open as a draft, and get CI green;
-- run `/code-review high`, then mark the PR ready;
+- run `/code-review high` against `origin/feature/remote-cache` and fix the
+  real findings, then mark the PR ready;
 - one push per round, at most four rounds;
 - then known-gap tests and issues for confirmed findings, one issue of
   unverified leads for the rest, one final push, then auto-merge;
@@ -166,7 +167,8 @@ keeps the rounds productive.
 
 **The limit:**
 
-- Every PR gets at most **four** fix rounds, whatever its size.
+- Every PR gets at most **four** review rounds (reviews 1 to 4), whatever its
+  size.
 - A PR over about 2,500 lines added should be split before it's marked ready.
   If it isn't, say why in the PR description.
 - Split large work into smaller PRs where it splits naturally. That cuts
@@ -204,9 +206,10 @@ keeps the rounds productive.
      publishes an unverified blob or bundle, or exposes a token. If that fix
      needs a design decision, don't merge: stop and report.
 5. **Merge:** push those known-gap tests and fixes as one final push. **Then**
-   enable auto-merge (squash). Enabling it before the push could merge the old
-   head the moment its checks are green. The required checks gate the merge;
-   Copilot's review of that push doesn't.
+   enable auto-merge (squash), with the commit message set as in section 4.
+   Enabling it before the push could merge the old head the moment its checks
+   are green. The required checks gate the merge; Copilot's review of that
+   push doesn't.
 6. **CI red at any point:** fix it at the root cause; never retry or loosen a
    check. After the last round, the reviews these pushes start are handled
    like the final push's.
@@ -249,7 +252,8 @@ Observable outcomes, each shown by a test or a run.
   this file:
 
   ```bash
-  git log -1 --format=%h origin/feature/remote-cache -- hack/remote-cache/PROMPT_TEMPLATE.md
+  git fetch origin feature/remote-cache &&
+    git log -1 --format=%h origin/feature/remote-cache -- hack/remote-cache/PROMPT_TEMPLATE.md
   ```
 
 ## Starting a session
