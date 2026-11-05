@@ -12,7 +12,9 @@
 # with the writer's stamp, while the second reruns its work.
 set -euo pipefail
 
-dagger="${DAGGER:-dagger}"
+# By its full path: the CLI runs from another directory (see run).
+dagger="$(command -v "${DAGGER:-dagger}")" || { echo "demo.sh: no dagger CLI: ${DAGGER:-dagger}" >&2; exit 1; }
+[[ "$dagger" == /* ]] || dagger="$PWD/$dagger"
 
 # The cacheable step. It stands in for an expensive build: it writes 4 MiB
 # of random bytes and a stamp with a random ID, then sleeps 20s. Random
@@ -67,8 +69,14 @@ run() {
 	# The CLI's progress goes to stderr, or to DEMO_LOG_DIR/<step>.log.
 	local err=/dev/stderr
 	[[ -n "${DEMO_LOG_DIR:-}" ]] && err="$DEMO_LOG_DIR/${what%%:*}.log"
-	"$dagger" --progress=plain --no-load-module -c "$pipeline" 2>"$err" ||
-		{ echo "== $what failed${DEMO_LOG_DIR:+ (see $err)}" >&2; return 1; }
+	# From an empty directory, outside any workspace: the CLI would
+	# otherwise load the workspace it's in, and pin the demo's image in its
+	# dagger.lock.
+	local work
+	work="$(mktemp -d)"
+	(cd "$work" && "$dagger" --progress=plain --no-load-module -c "$pipeline") 2>"$err" ||
+		{ rmdir "$work"; echo "== $what failed${DEMO_LOG_DIR:+ (see $err)}" >&2; return 1; }
+	rmdir "$work"
 	echo "== $what took $((SECONDS - start))s" >&2
 }
 
