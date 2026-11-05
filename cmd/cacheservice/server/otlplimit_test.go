@@ -240,7 +240,8 @@ func TestOTLPBodyAtAndOverLimit(t *testing.T) {
 	}
 }
 
-// countingReadCloser counts the bytes read through it.
+// countingReadCloser counts the bytes read through it: a decompressed stream,
+// or a request body.
 type countingReadCloser struct {
 	io.ReadCloser
 	mu sync.Mutex
@@ -384,23 +385,6 @@ func TestOTLPOverLimitTracksNothing(t *testing.T) {
 	})
 }
 
-// readCounter is a request body that counts what is read from it.
-type readCounter struct {
-	r  io.Reader
-	mu sync.Mutex
-	n  int
-}
-
-func (c *readCounter) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.mu.Lock()
-	c.n += n
-	c.mu.Unlock()
-	return n, err
-}
-
-func (c *readCounter) Close() error { return nil }
-
 // With tokens, a request with no token, or an unknown one, is refused with
 // 401 before any of its body is read: an unauthenticated client can't make
 // the service read, decompress or hold anything.
@@ -414,7 +398,7 @@ func TestOTLPUnauthenticatedBodyNotRead(t *testing.T) {
 				if gz {
 					data = gzipped(t, data)
 				}
-				body := &readCounter{r: bytes.NewReader(data)}
+				body := &countingReadCloser{ReadCloser: io.NopCloser(bytes.NewReader(data))}
 				req := httptest.NewRequest(http.MethodPost, c.path, body)
 				req.Header.Set("Content-Type", "application/x-protobuf")
 				if gz {
@@ -428,8 +412,8 @@ func TestOTLPUnauthenticatedBodyNotRead(t *testing.T) {
 				if w.Code != http.StatusUnauthorized {
 					t.Fatalf("%s, token %q: status %d", c.path, token, w.Code)
 				}
-				if body.n != 0 {
-					t.Fatalf("%s, token %q: %d bytes of the body read", c.path, token, body.n)
+				if n := body.count(); n != 0 {
+					t.Fatalf("%s, token %q: %d bytes of the body read", c.path, token, n)
 				}
 			}
 		}
@@ -598,5 +582,99 @@ func TestSlowHeadersCutOff(t *testing.T) {
 	_, err = io.Copy(io.Discard, conn)
 	if err != nil {
 		t.Fatalf("the connection wasn't closed: %v", err)
+	}
+}
+
+// Refusals are logged at warning level at most once a minute per route and
+// reason, so a client sending over-limit or malformed requests by the
+// thousand can't flood the log; the metrics count every one.
+func TestOTLPRefusalWarningsRateLimited(t *testing.T) {
+	svc, rec, srv := limitedService(t, 4*testOTLPLimit)
+	c := otlpCases()[0]
+	over := sized(t, c.build, false, testOTLPLimit+1)
+	for range 20 {
+		if resp := postBody(t, srv.URL+c.path, over, false, false, ""); resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		if resp := postBody(t, srv.URL+c.path, []byte("\xff\xff\xff"), false, false, ""); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	}
+	warned := map[string]int{}
+	for _, msg := range []string{"otlp request refused", "undecodable otlp request"} {
+		for _, r := range rec.findRecords(msg) {
+			if r.Level == slog.LevelWarn {
+				warned[msg]++
+			}
+		}
+		if n := len(rec.find(msg)); n != 20 {
+			t.Fatalf("%d %q logged, want 20 at some level", n, msg)
+		}
+	}
+	if warned["otlp request refused"] != 1 || warned["undecodable otlp request"] != 1 {
+		t.Fatalf("warnings %v, want one of each", warned)
+	}
+	if got := refusedCount(t, svc, c.route, metrics.OTLPRefusedTooLarge); got != 20 {
+		t.Fatalf("refused %v", got)
+	}
+}
+
+// The budget's peak is the most reserved at once, which the e2e run reads
+// from the log (budgetPeak) to check the budget against real traffic.
+func TestOTLPBudgetPeak(t *testing.T) {
+	b := newByteBudget(100)
+	if !b.reserve(60) || !b.reserve(30) || b.reserve(20) {
+		t.Fatal("reservations past the size")
+	}
+	b.release(90)
+	if !b.reserve(10) || b.inUse() != 10 || b.peakUse() != 90 {
+		t.Fatalf("in use %d, peak %d", b.inUse(), b.peakUse())
+	}
+}
+
+// findRecords returns the records with message msg.
+func (h *logRecorder) findRecords(msg string) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var found []slog.Record
+	for _, r := range h.records {
+		if r.Message == msg {
+			found = append(found, r)
+		}
+	}
+	return found
+}
+
+// Known gap, zerobull-consulting/dagger#83: a keep-alive connection between
+// requests has no bound. The listeners set no IdleTimeout (nor ReadTimeout,
+// which would cut off the engine WebSocket), so net/http waits for the next
+// request indefinitely; ReadHeaderTimeout starts only once its first bytes
+// arrive. A connection idle well past the header timeout still takes a
+// request. It holds no part of the decode budget, but costs a goroutine and
+// a file descriptor. When #83 adds a bound, this test changes with it.
+func TestIdleKeepAliveConnectionsUnbounded(t *testing.T) {
+	svc := New(slog.New(slog.DiscardHandler), "")
+	const timeout = 200 * time.Millisecond
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config = NewHTTPServer("", svc.Handler())
+	srv.Config.ReadHeaderTimeout = timeout
+	srv.Start()
+	t.Cleanup(srv.Close)
+	body := encodeOTLP(t, otlpCases()[2].build(""), false)
+	conn, br := slowPost(t, srv, "/v1/metrics", len(body), body)
+	if resp := readResponse(t, br); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request: %d", resp.StatusCode)
+	}
+	// Five times the header timeout: a bound on idle connections at or
+	// below it would have closed this one by now. The sleep only shows that
+	// nothing happens.
+	time.Sleep(5 * timeout)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-protobuf\r\nContent-Length: %d\r\n\r\n", len(body))
+	if _, err := conn.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if resp := readResponse(t, br); resp.StatusCode != http.StatusOK {
+		t.Fatalf("after idling: %d", resp.StatusCode)
 	}
 }

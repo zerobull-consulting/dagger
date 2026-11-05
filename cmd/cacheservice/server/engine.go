@@ -96,8 +96,10 @@ type Service struct {
 	registry *prometheus.Registry
 	metrics  *metrics.Metrics
 
-	// otlp bounds the OTLP bodies (otlplimit.go).
-	otlp otlpLimits
+	// otlp bounds the OTLP bodies (otlplimit.go); otlpRefusals rate-limits
+	// the warnings of the requests it refuses, by route and reason.
+	otlp         otlpLimits
+	otlpRefusals rejectionLog
 }
 
 // New returns a service with no engines, and with the export and import

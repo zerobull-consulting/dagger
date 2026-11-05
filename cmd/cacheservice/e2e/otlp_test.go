@@ -16,7 +16,8 @@ const otlpMargin = 10
 
 // otlpSizes runs last, over what every service of the run logged: the largest
 // OTLP request taken on each route, as received and decoded, and the most of
-// the decode budget in use at once. It fails if any real-engine request was
+// the decode budget in use at once (its peak, as each service last logged
+// it). It fails if any real-engine request was
 // refused, or came within otlpMargin of its route's limit, or of the budget.
 func (s *state) otlpSizes(t *testing.T) {
 	limits := map[string]int64{
@@ -39,7 +40,7 @@ func (s *state) otlpSizes(t *testing.T) {
 			sz.n++
 			sz.received = max(sz.received, attrInt(rec, "receivedBytes"))
 			sz.decoded = max(sz.decoded, attrInt(rec, "decodedBytes"))
-			budget = max(budget, attrInt(rec, "budgetInUse"))
+			budget = max(budget, attrInt(rec, "budgetPeak"))
 		}
 		for _, rec := range svc.Logs.Since(0, "otlp request refused", nil) {
 			refused++

@@ -185,7 +185,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "budgetInUse", lim.budget.inUse())
+		"decodedBytes", len(data), "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 

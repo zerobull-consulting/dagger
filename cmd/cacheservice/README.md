@@ -983,10 +983,10 @@ service out of memory, with no token in unauthenticated mode. With tokens,
 the token is checked first, and a request without a known one is refused
 with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
 
-| Route | Limit, as received and decoded | Largest request in the e2e run | Margin |
+| Route | Limit, as received and decoded | Largest request in two e2e runs | Margin |
 | --- | --- | --- | --- |
 | `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 18,285 bytes | 3,670x |
-| `POST /v1/logs` | 64 MiB (`server.MaxOTLPLogsBytes`) | 5,168 bytes | 12,985x |
+| `POST /v1/logs` | 64 MiB (`server.MaxOTLPLogsBytes`) | 9,466 bytes | 7,089x |
 | `POST /v1/metrics` | 16 MiB (`server.MaxOTLPMetricsBytes`) | 1,437 bytes | 11,675x |
 
 - **Two limits per request.** The body as received is limited
@@ -997,12 +997,12 @@ with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
   tracked, no log record, no partial decode, since a body is decoded only
   once read whole (`TestOTLPOverLimitTracksNothing`).
 - **A shared budget.** The bodies being read at once hold at most 128 MiB
-  (`server.OTLPDecodeBudget`, two requests at the largest limit) across the
-  three routes, reserved as their bytes arrive, so a client holds only what
-  it sent. A request that doesn't fit in what is left: **503** with
+  (`server.OTLPDecodeBudget`, twice the largest limit) across the three
+  routes, reserved as their bytes arrive, so a client holds only what it
+  sent. Two at-limit requests fit only when nothing else holds any of it; an
+  at-limit request always fits beside the engines' usual ones. A request that doesn't fit in what is left: **503** with
   `Retry-After: 1`, and nothing recorded (`TestOTLPDecodeBudget`). Only
-  bytes count, so any number of the engines' usual requests fit: at most
-  18,285 bytes were in use at once in the e2e run. The heap the requests take
+  bytes count, so any number of the engines' usual requests fit. The heap the requests take
   is a small multiple of the budget: the bytes read, and the message decoded
   from them. Without the budget, N requests at the limit would hold N times
   the limit.
@@ -1015,16 +1015,21 @@ with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
   applies to the engine WebSocket on the same listener, which stays
   connected past both (same test): the server sets no `ReadTimeout`, which
   would cut it off. Idle keep-alive connections aren't bounded, as before;
-  they hold no part of the budget.
+  they hold no part of the budget
+  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
+  `TestIdleKeepAliveConnectionsUnbounded`).
 - **Every refusal is counted**, by route and reason, in
-  `cacheservice_otlp_refused_total`, and logged at warning level; the sizes
+  `cacheservice_otlp_refused_total`, and logged: at warning level at most
+  once a minute per route and reason, as refused tokens are, the rest at
+  debug level, so a flood of them can't flood the log; the sizes
   of the requests taken are in `cacheservice_otlp_request_bytes` (see
   [Metrics](#metrics)), to check the limits against real traffic.
 
 **How they were chosen.** The e2e run (`./hack/remote-cache/dev.sh e2e`,
 every scenario) logs every request taken, and its `otlp-sizes` scenario
-reports the largest per route (above). The engines sent protobuf, not
-gzipped. The limits don't follow from those alone: the engine's Cloud
+reports the largest per route (above, the larger of two runs). The engines
+sent protobuf, not gzipped, and at most 18,285 bytes of the budget were in
+use at once. The limits don't follow from those alone: the engine's Cloud
 forwarder, which sends session spans and logs, keeps each request to 4 MiB
 of protobuf, and sends larger only for a single span or log record larger
 than that (`cloudForwardMaxPayloadSize` in
@@ -1056,9 +1061,11 @@ A refused batch of engine events loses up to 128 of them; a lost prune event
 leaves the service tracking entries the engine dropped, which an export then
 reports `gone`. For real engines this is practically impossible: their
 requests are thousands of times under the limits, and the forwarder's own
-4 MiB bound keeps them there. A 503 loses nothing: the exporters retry it
-after `Retry-After`, and the forwarder retries from where it was, however
-long the refusals last. A 408 is retried by the forwarder too, and only a
+4 MiB bound keeps them there. A 503 costs session telemetry nothing: the
+exporters retry it after `Retry-After`, and the forwarder retries from where
+it was, however long the refusals last. The engine's cache events are
+retried by their exporter alone, for up to a minute by default: a budget
+kept full longer than that, by a flood, drops their batches as a 413 does. A 408 is retried by the forwarder too, and only a
 client that takes 30s to send a body gets one.
 
 ## Auth and namespaces
@@ -1271,8 +1278,9 @@ service read and hold is bounded all the same: a body over its route's
 limit, gzipped or not, is refused with 413, the bodies read at once share a
 128 MiB budget, and a body must arrive within 30s (see
 [OTLP limits](#otlp-limits)). So an unauthenticated client can't run the
-service out of memory with OTLP; it can still fill the budget, which delays
-the engines' telemetry (503, retried) but loses none of it.
+service out of memory with OTLP. It can still keep the budget full, which
+delays the engines' telemetry (503, retried): session telemetry loses
+nothing, but the engine's cache events are dropped after a minute of it.
 
 ### TLS
 

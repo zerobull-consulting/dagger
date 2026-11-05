@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -34,11 +35,13 @@ const (
 	MaxOTLPMetricsBytes = 16 << 20
 
 	// OTLPDecodeBudget bounds the body bytes every OTLP request being read
-	// at once holds, across the three routes: two requests at the largest
-	// limit, or any number of the engines' usual ones, which are tens of
-	// kilobytes. A request that would take it past the budget is answered
-	// 503 with Retry-After, which OTLP exporters retry. The heap the
-	// requests take is a small multiple of it: the bytes read, and the
+	// at once holds, across the three routes: twice the largest limit, so
+	// an at-limit request fits beside another, or beside any number of the
+	// engines' usual ones, which are tens of kilobytes. Requests reserve it
+	// as their bytes arrive, so two at-limit requests fit only when nothing
+	// else holds any of it. A request that would take it past the budget is
+	// answered 503 with Retry-After, which OTLP exporters retry. The heap
+	// the requests take is a small multiple of it: the bytes read, and the
 	// message decoded from them.
 	OTLPDecodeBudget = 2 * MaxOTLPTracesBytes
 
@@ -133,6 +136,13 @@ func (b *byteBudget) inUse() int64 {
 	return b.used
 }
 
+// peakUse returns the most bytes reserved at once so far.
+func (b *byteBudget) peakUse() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.peak
+}
+
 var (
 	// errOTLPTooLarge is a body that decodes to more than its route's
 	// limit.
@@ -142,7 +152,7 @@ var (
 	errOTLPBusy = errors.New("too many OTLP bytes being read at once")
 )
 
-// otlpChunk is how much of a body is read, and reserved, at a time.
+// otlpChunk bounds how much of a body is read, and reserved, at a time.
 const otlpChunk = 32 << 10
 
 // readOTLPBody reads body, the decoded stream, up to limit bytes, reserving
@@ -151,14 +161,16 @@ const otlpChunk = 32 << 10
 // body is too large. It returns the bytes reserved, which the caller
 // releases, whatever the error.
 func readOTLPBody(body io.Reader, limit int64, budget *byteBudget) ([]byte, int64, error) {
-	var (
-		data     []byte
-		reserved int64
-	)
-	chunk := make([]byte, otlpChunk)
+	var reserved int64
+	// Read straight into data's spare capacity, grown as io.ReadAll grows
+	// it: a small body allocates only what it needs.
+	data := make([]byte, 0, 512)
 	for {
-		want := min(int64(len(chunk)), limit+1-int64(len(data)))
-		n, err := body.Read(chunk[:want])
+		if len(data) == cap(data) {
+			data = append(data, 0)[:len(data)]
+		}
+		want := min(int64(cap(data)-len(data)), otlpChunk, limit+1-int64(len(data)))
+		n, err := body.Read(data[len(data) : len(data)+int(want)])
 		if n > 0 {
 			if int64(len(data)+n) > limit {
 				return nil, reserved, errOTLPTooLarge
@@ -167,7 +179,7 @@ func readOTLPBody(body io.Reader, limit int64, budget *byteBudget) ([]byte, int6
 				return nil, reserved, errOTLPBusy
 			}
 			reserved += int64(n)
-			data = append(data, chunk[:n]...)
+			data = data[:len(data)+n]
 		}
 		if errors.Is(err, io.EOF) {
 			return data, reserved, nil
@@ -197,18 +209,29 @@ func otlpRefusal(err error) (int, string) {
 
 // refuseOTLP answers a request whose body wasn't read whole: it records
 // nothing from it, and the connection closes after the answer, so the server
-// doesn't read on what the client is still sending.
+// doesn't read on what the client is still sending. Refusals are logged at
+// warning level at most once a minute per route and reason, as refused tokens
+// are (rejectionLog), so a client sending them by the thousand can't flood
+// the log; the others at debug level. The metrics count every one.
 func (s *Service) refuseOTLP(w http.ResponseWriter, r *http.Request, route otlpRoute, status int, reason string, err error) {
 	w.Header().Set("Connection", "close")
 	if status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", strconv.Itoa(otlpRetryAfter))
 	}
+	key := reason
+	if key == "" {
+		key = "undecodable"
+	}
+	level := slog.LevelDebug
+	if s.otlpRefusals.allow(route.name+" "+key, time.Now()) {
+		level = slog.LevelWarn
+	}
 	if reason != "" {
 		s.metrics.OTLPRefused(route.name, reason)
-		s.logger.Warn("otlp request refused", "route", route.name, "reason", reason, "status", status,
+		s.logger.Log(r.Context(), level, "otlp request refused", "route", route.name, "reason", reason, "status", status,
 			"limit", route.limit, "remote", r.RemoteAddr, "contentLength", r.ContentLength, "error", err)
 	} else {
-		s.logger.Warn("undecodable otlp request", "path", r.URL.Path, "error", err)
+		s.logger.Log(r.Context(), level, "undecodable otlp request", "path", r.URL.Path, "error", err)
 	}
 	http.Error(w, err.Error(), status)
 	_ = r.Body.Close()
