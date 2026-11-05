@@ -282,12 +282,14 @@ start() {
 	# TRACEPARENT records no spans, and the service learns of no entry and
 	# exports nothing (cmd/cacheservice/README.md, "Real-engine run"). The
 	# CLI also stops early, with the service's log, if the service is gone.
+	local q_service q_dagger
+	q_service="$(printf %q "$service")" q_dagger="$(printf %q "$dir/dagger")"
 	cat >"$bin/dagger" <<EOF
 #!/usr/bin/env bash
 # Written by remote-cache-sidecar (.github/actions/remote-cache-sidecar).
-if [[ "\$(docker inspect -f '{{.State.Running}}' $service 2>/dev/null)" != true ]]; then
-	echo "remote-cache-sidecar: the cache service $service isn't running" >&2
-	docker logs --tail 100 $service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2
+if [[ "\$(docker inspect -f '{{.State.Running}}' $q_service 2>/dev/null)" != true ]]; then
+	echo "remote-cache-sidecar: the cache service $q_service isn't running" >&2
+	docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2
 	exit 1
 fi
 for v in \$(compgen -e); do
@@ -297,7 +299,7 @@ export _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://$engine
 export DAGGER_CLOUD_URL=$url
 export DAGGER_CLOUD_TOKEN=sidecar-cli
 export DAGGER_NO_NAG=1
-exec $dir/dagger "\$@"
+exec $q_dagger "\$@"
 EOF
 	chmod +x "$bin/dagger"
 	"$bin/dagger" version || die "the CLI doesn't run"
@@ -352,7 +354,10 @@ stop() {
 	fi
 	if docker container inspect "$st_engine" >/dev/null 2>&1; then
 		# After the service: the drain's exports run over the engine's
-		# connection, and the engine uploads the layers itself.
+		# connection, and the engine uploads the layers itself. The engine's
+		# own stop then waits to send its last cache event to the service,
+		# which is gone, so docker stop usually kills it at 30s; its state
+		# is thrown away with the job, so that costs only the time.
 		timeout 90 docker stop --time 30 "$st_engine" >/dev/null 2>&1 || true
 		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
 	fi

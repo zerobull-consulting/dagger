@@ -123,10 +123,12 @@ action, the stop, the demo's local run and the README all run one script,
 It stops the service first, with `docker stop --time` at `drain-timeout`
 plus 10s: the service's whole stop takes at most `drain-timeout` plus 5s
 (see [Stopping and draining](../../../cmd/cacheservice/README.md#stopping-and-draining)).
-Then it stops the engine, keeps both logs (with presigned URLs' credentials
+Then it stops the engine (within 30s: the engine's own stop waits to send
+its last cache event to the service, which is gone by then, so it is
+usually killed at 30s; its state goes with the job), keeps both logs (with presigned URLs' credentials
 and signatures redacted), and removes the containers, the engine's state
 volume and the network. Give the step a `timeout-minutes` above
-`drain-timeout` plus 5s, with room for the engine's stop: 12 for `10m`.
+`drain-timeout` plus 5s, with room for the engine's 30s: 12 for `10m`.
 
 **Exit codes**, the service's:
 

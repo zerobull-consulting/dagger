@@ -2442,6 +2442,11 @@ docker inspect -f '{{.State.ExitCode}}' remote-cache-service
 docker stop remote-cache-engine
 ```
 
+The engine's stop then waits to send its last cache event (`engine.stop`) to
+the service, which is gone, so `docker stop` kills it after its timeout
+(10s by default; the action gives it 30s). Its state is thrown away with the
+runner, so this costs only the time.
+
 - **The bound:** the service's whole stop, from SIGTERM to exit, takes at
   most `-drain-timeout` plus 5s (see
   [Stopping and draining](#stopping-and-draining)). `docker stop --time`, and
