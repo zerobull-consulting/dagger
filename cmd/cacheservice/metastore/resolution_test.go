@@ -50,7 +50,7 @@ func TestRecordStoresResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkResolution(t, s, "s1", r1, "cache-a")
-	if _, _, err := objects.Get(ctx, "team/s1/resolutions/"+r1.ResolutionID+".json"); err != nil {
+	if _, _, err := objects.Get(ctx, "team/ns/s1/resolutions/"+r1.ResolutionID+".json"); err != nil {
 		t.Fatalf("resolution not at its key: %v", err)
 	}
 
@@ -178,7 +178,7 @@ func TestRecordWritesResolutionBeforeIndex(t *testing.T) {
 	// two index writes: Record's numbers change each time, and so does
 	// its resolution.
 	ordered.log = nil
-	f := &interfere{Objects: ordered, key: "team/s1/index.json"}
+	f := &interfere{Objects: ordered, key: "team/ns/s1/index.json"}
 	f.n.Store(2)
 	f.other = func(idx *Index) { idx.allocate() }
 	s2 := newTestStore(t, f)
@@ -245,7 +245,7 @@ func TestRecordResolutionWriteFails(t *testing.T) {
 	if _, err := s.Record(ctx, "s1", chain(10), "cache-a", 1); err == nil || !strings.Contains(err.Error(), "service stopped") {
 		t.Fatalf("record: %v", err)
 	}
-	if _, _, err := objects.Get(ctx, "team/s1/index.json"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := objects.Get(ctx, "team/ns/s1/index.json"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an index was written: %v", err)
 	}
 }
@@ -268,7 +268,7 @@ func TestIndexBeforeResolutions(t *testing.T) {
 	if strings.Contains(legacy, "resolution") || !strings.HasPrefix(legacy, `{"version":1,`) {
 		t.Fatalf("legacy index %s", legacy)
 	}
-	if _, err := objects.Put(ctx, "team/s1/index.json", []byte(legacy), Condition{}); err != nil {
+	if _, err := objects.Put(ctx, "team/ns/s1/index.json", []byte(legacy), Condition{}); err != nil {
 		t.Fatal(err)
 	}
 	idx := mustIndex(t, s, "s1")
@@ -286,7 +286,7 @@ func TestIndexBeforeResolutions(t *testing.T) {
 	// And it was written back as the current version (3, since #11), which
 	// a service that reads only version 1 refuses rather than rewrite
 	// without the resolutions.
-	raw, _, err := objects.Get(ctx, "team/s1/index.json")
+	raw, _, err := objects.Get(ctx, "team/ns/s1/index.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestResolutionRefuses(t *testing.T) {
 		t.Fatal("bad ID: no error")
 	}
 	// Corrupt content at its key.
-	if _, err := objects.Put(ctx, "team/s1/resolutions/"+rid+".json", []byte(`{"version":1}`), Condition{}); err != nil {
+	if _, err := objects.Put(ctx, "team/ns/s1/resolutions/"+rid+".json", []byte(`{"version":1}`), Condition{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.GetResolution(ctx, "s1", rid); !errors.Is(err, ErrCorruptBundle) {

@@ -71,7 +71,7 @@ func TestMetricsIndexShape(t *testing.T) {
 
 // An update that loses to other writers counts each conflict and attempt.
 func TestMetricsIndexConflicts(t *testing.T) {
-	f := &interfere{Objects: NewMemObjects(), key: "s1/index.json", other: func(idx *Index) { idx.allocate() }}
+	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json", other: func(idx *Index) { idx.allocate() }}
 	f.n.Store(2)
 	s, reg := newMetricsStore(t, f, 0)
 	ctx := metrics.WithCaller(context.Background(), metrics.CallerImport)
@@ -95,7 +95,7 @@ func TestMetricsIndexConflicts(t *testing.T) {
 }
 
 func TestMetricsIndexContention(t *testing.T) {
-	f := &interfere{Objects: NewMemObjects(), key: "s1/index.json", other: func(*Index) {}}
+	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json", other: func(*Index) {}}
 	f.n.Store(1 << 30)
 	s, reg := newMetricsStore(t, f, 4)
 	_, err := s.UpdateIndex(context.Background(), "s1", func(*Index) error { return nil })
@@ -121,7 +121,7 @@ func TestMetricsIndexAbortedAndError(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	f := &interfere{Objects: NewMemObjects(), key: "s1/index.json", other: func(*Index) {}}
+	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json", other: func(*Index) {}}
 	f.n.Store(1)
 	s2, reg2 := newMetricsStore(t, f, 0)
 	s2.sleep = sleepCtx

@@ -16,9 +16,11 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -47,6 +49,10 @@ func newEnv(t *testing.T) *env {
 	objs.SetClock(clock.Now)
 	meta, err := metastore.New(metastore.Config{Objects: objs, Prefix: prefix, Now: clock.Now})
 	if err != nil {
+		t.Fatal(err)
+	}
+	// The prefix is the service's: a writer claimed it.
+	if _, _, err := ownership.Check(context.Background(), objs, prefix, true, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
 	return &env{
@@ -129,12 +135,20 @@ func (e *env) export(ns, cacheID string, entries []fakeengine.Entry, roots ...ui
 	return rec
 }
 
+// uploadKey is the key of an incomplete multipart upload a promotion left
+// in a namespace: a blob key.
+func uploadKey(ns, name string) string { return nsPrefix(ns) + layout.BlobRel(digest.FromString(name)) }
+
+// nsPrefix is a namespace's prefix: cache/ns/<ns>/.
+func nsPrefix(ns string) string { return prefix + "/ns/" + ns + "/" }
+
 // keys returns the namespace's keys, relative to it, sorted.
 func (e *env) keys(ns string) []string {
 	var out []string
-	_ = e.bucket.List(context.Background(), prefix+"/"+ns+"/", func(objs []Object) error {
+	p := nsPrefix(ns)
+	_ = e.bucket.List(context.Background(), p, func(objs []Object) error {
 		for _, o := range objs {
-			out = append(out, strings.TrimPrefix(o.Key, prefix+"/"+ns+"/"))
+			out = append(out, strings.TrimPrefix(o.Key, p))
 		}
 		return nil
 	})
@@ -410,11 +424,11 @@ func TestDryRunDeletesNothing(t *testing.T) {
 	e := newEnv(t)
 	e.export("team", "a", buildX("x"), 2)
 	e.view("team").PutStaged(blobstore.NewStage(), layer("staged", 100))
-	e.bucket.AddUpload(Upload{Key: prefix + "/team/blobs/sha256/x", ID: "u", Initiated: e.clock.Now()})
+	e.bucket.AddUpload(Upload{Key: uploadKey("team", "x"), ID: "u", Initiated: e.clock.Now()})
 	e.setLimits("team", Limits{MaxAge: time.Minute})
 	e.clock.Add(24 * time.Hour)
 	body := func() string {
-		b, _, err := e.objs.Get(context.Background(), prefix+"/team/index.json")
+		b, _, err := e.objs.Get(context.Background(), prefix+"/ns/team/index.json")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -457,11 +471,11 @@ func TestStagingAndUploads(t *testing.T) {
 	e.export("team-b", "b", buildX("y"), 2)
 	oldA := e.view("team-a").PutStaged(blobstore.NewStage(), layer("old", 100))
 	oldB := e.view("team-b").PutStaged(blobstore.NewStage(), layer("old", 100))
-	e.bucket.AddUpload(Upload{Key: prefix + "/team-a/blobs/sha256/old", ID: "1", Initiated: e.clock.Now()})
+	e.bucket.AddUpload(Upload{Key: uploadKey("team-a", "old"), ID: "1", Initiated: e.clock.Now()})
 	e.clock.Add(3 * time.Hour)
 	young := e.view("team-a").PutStaged(blobstore.NewStage(), layer("young", 100))
-	e.bucket.AddUpload(Upload{Key: prefix + "/team-a/blobs/sha256/young", ID: "2", Initiated: e.clock.Now()})
-	e.bucket.SetRules([]string{prefix + "/team-b/staging/"}, nil)
+	e.bucket.AddUpload(Upload{Key: uploadKey("team-a", "young"), ID: "2", Initiated: e.clock.Now()})
+	e.bucket.SetRules([]string{prefix + "/ns/team-b/staging/"}, nil)
 
 	reps := e.run(e.collector(nil))
 	a, b := reportOf(reps, "team-a"), reportOf(reps, "team-b")
@@ -490,42 +504,6 @@ func TestStagingAndUploads(t *testing.T) {
 	}
 }
 
-// Keys that aren't a namespace's are never touched: the pre-namespace
-// <prefix>/blobs/, and a namespace's objects of no kind GC knows. A
-// namespace with no index has its bundles and blobs kept: without one, GC
-// can't tell what is in use.
-func TestLeavesWhatItDoesNotKnow(t *testing.T) {
-	e := newEnv(t)
-	ctx := context.Background()
-	for _, k := range []string{prefix + "/blobs/sha256/" + strings.Repeat("a", 64), prefix + "/team/conditional-write-check/0", prefix + "/team/notes.txt"} {
-		if _, err := e.objs.Put(ctx, k, []byte("x"), metastore.Condition{}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	noIndex := e.view("fresh").Put(layer("first", 100))
-	e.export("team", "a", buildX("x"), 2)
-	e.clock.Add(1000 * time.Hour)
-	before := e.objs.List("")
-	reps := e.run(e.collector(nil))
-	if r := reportOf(reps, "fresh"); r.Skipped != "no index" || len(r.Deleted) != 0 {
-		t.Fatalf("namespace without an index: %+v", r)
-	}
-	if _, ok := e.view("fresh").Get(noIndex); !ok {
-		t.Fatal("a blob of a namespace without an index was deleted")
-	}
-	if names, _ := e.collector(nil).Namespaces(ctx); slices.Contains(names, "blobs") {
-		t.Fatalf("namespaces %v", names)
-	}
-	after := e.objs.List("")
-	for _, o := range before {
-		if !strings.Contains(o.Key, "/bundles/") && !strings.Contains(o.Key, "/resolutions/") && !strings.HasSuffix(o.Key, "index.json") {
-			if !slices.ContainsFunc(after, func(a metastore.ObjectInfo) bool { return a.Key == o.Key }) {
-				t.Fatalf("%s deleted", o.Key)
-			}
-		}
-	}
-}
-
 // An index that names a bundle GC can't read stops the namespace's
 // reachability sweep: it can't know that bundle's blobs.
 func TestMissingBundleStopsSweep(t *testing.T) {
@@ -533,7 +511,7 @@ func TestMissingBundleStopsSweep(t *testing.T) {
 	ctx := context.Background()
 	rec := e.export("team", "a", buildX("x"), 2)
 	orphan := e.view("team").Put(layer("orphan", 100))
-	if err := e.objs.Delete(ctx, prefix+"/team/"+metastore.BundleRelKey(rec.BundleID)); err != nil {
+	if err := e.objs.Delete(ctx, prefix+"/ns/team/"+metastore.BundleRelKey(rec.BundleID)); err != nil {
 		t.Fatal(err)
 	}
 	e.clock.Add(1000 * time.Hour)
@@ -857,24 +835,6 @@ func TestClaimRechecksIndex(t *testing.T) {
 	e.checkConsistent("team")
 }
 
-// A namespace whose only leftover is an incomplete multipart upload (a
-// promotion cut short, its staged source since expired) has no object to
-// list it by: GC finds it by its upload, and aborts it.
-func TestNamespaceOfOnlyAnUpload(t *testing.T) {
-	e := newEnv(t)
-	e.bucket.AddUpload(Upload{Key: prefix + "/lonely/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
-	e.bucket.AddUpload(Upload{Key: prefix + "/blobs/sha256/" + strings.Repeat("1", 64), ID: "2", Initiated: e.clock.Now()})
-	e.clock.Add(3 * time.Hour)
-	reps := e.run(e.collector(nil))
-	if r := reportOf(reps, "lonely"); r.Deleted["upload"] != 1 {
-		t.Fatalf("lonely: %+v", r)
-	}
-	// The pre-namespace layout's isn't a namespace's: left alone.
-	if u := e.bucket.Uploads(); len(u) != 1 || u[0].ID != "2" {
-		t.Fatalf("uploads %v", u)
-	}
-}
-
 // Claims taken over from stopped runs count against MaxDeletes, with new
 // candidates: one run never deletes more, however many stopped runs left
 // claims. The rest stay claimed for later runs.
@@ -975,7 +935,7 @@ func TestStagingRuleMetricUnknown(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
 	c := e.collector(func(cfg *Config) { cfg.Metrics = m })
-	e.bucket.SetRules([]string{prefix + "/team/staging/"}, nil)
+	e.bucket.SetRules([]string{prefix + "/ns/team/staging/"}, nil)
 	e.run(c)
 	if s := metricstest.Read(t, reg, "cacheservice_gc_staging_rule_missing", map[string]string{"scope": "team"}); !s.Found || s.Value != 0 {
 		t.Fatalf("with a rule: %+v", s)
@@ -1007,23 +967,6 @@ func TestKnownGapHoldIsPerReplica(t *testing.T) {
 		t.Fatalf("replica B: %+v; if it held the objects, the gap is fixed: update #57 and this test", r)
 	}
 	e.checkConsistent("team")
-}
-
-// A failed listing of multipart uploads fails the run, even when no
-// namespace with objects reports it: the namespaces with only an upload,
-// which only that listing finds, were skipped.
-func TestUploadListingFailureFailsRun(t *testing.T) {
-	e := newEnv(t)
-	e.bucket.AddUpload(Upload{Key: prefix + "/lonely/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
-	e.bucket.FailUploadListings(errors.New("injected"))
-	e.clock.Add(3 * time.Hour)
-	if _, err := e.collector(nil).Run(context.Background()); err == nil || !strings.Contains(err.Error(), "list multipart uploads") {
-		t.Fatalf("run: %v", err)
-	}
-	e.bucket.FailUploadListings(nil)
-	if r := reportOf(e.run(e.collector(nil)), "lonely"); r.Deleted["upload"] != 1 {
-		t.Fatalf("after: %+v", r)
-	}
 }
 
 // sameRecord compares every field that decides what an entry keeps alive and
@@ -1105,11 +1048,11 @@ func TestUnreadableIndexStillCollectsUploads(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	e.export("team", "a", buildX("x"), 2)
-	if _, err := e.objs.Put(ctx, prefix+"/team/index.json", []byte(`{"version":99,"nextNumber":1}`), metastore.Condition{}); err != nil {
+	if _, err := e.objs.Put(ctx, prefix+"/ns/team/index.json", []byte(`{"version":99,"nextNumber":1}`), metastore.Condition{}); err != nil {
 		t.Fatal(err)
 	}
 	staged := e.view("team").PutStaged(blobstore.NewStage(), layer("staged", 100))
-	e.bucket.AddUpload(Upload{Key: prefix + "/team/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
+	e.bucket.AddUpload(Upload{Key: prefix + "/ns/team/blobs/sha256/" + strings.Repeat("0", 64), ID: "1", Initiated: e.clock.Now()})
 	blobs := e.view("team").Len()
 	e.clock.Add(1000 * time.Hour)
 	reps, err := e.collector(nil).Run(ctx)
@@ -1195,7 +1138,7 @@ func TestPartialDeleteFailure(t *testing.T) {
 	e.export("team", "a", buildX("x"), 2)
 	bad := e.view("team").Put(layer("bad", 100))
 	good := e.view("team").Put(layer("good", 100))
-	e.bucket.FailDeletes(prefix + "/team/" + metastore.BlobRelKey(bad))
+	e.bucket.FailDeletes(prefix + "/ns/team/" + metastore.BlobRelKey(bad))
 	e.clock.Add(3 * time.Hour)
 	reps, err := e.collector(nil).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "1 of 2 keys failed") {
@@ -1319,17 +1262,32 @@ func TestDeleteDeadlineFromClaimStamp(t *testing.T) {
 // report its last listing forever.
 func TestGaugesOfGoneNamespaceRemoved(t *testing.T) {
 	e := newEnv(t)
-	e.view("gone").Put(layer("x", 10))
+	e.export("gone", "g", buildX("g"), 2)
 	e.export("team", "a", buildX("x"), 2)
 	reg := prometheus.NewRegistry()
 	c := e.collector(func(cfg *Config) { cfg.Metrics = metrics.New(reg) })
 	e.run(c)
 	labels := map[string]string{"scope": "gone", "kind": "blob"}
-	if s := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels); !s.Found || s.Value != 10 {
+	if s := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels); !s.Found || s.Value != 3000 {
 		t.Fatalf("gone, listed: %+v", s)
 	}
-	e.view("gone").DeleteObject("gone", "", digest.FromBytes(layer("x", 10)))
+	if s := metricstest.Read(t, reg, "cacheservice_gc_unexpected_keys", map[string]string{"scope": "gone"}); !s.Found || s.Value != 0 {
+		t.Fatalf("gone, unexpected keys: %+v", s)
+	}
+	var keys []string
+	_ = e.bucket.List(context.Background(), nsPrefix("gone"), func(objs []Object) error {
+		for _, o := range objs {
+			keys = append(keys, o.Key)
+		}
+		return nil
+	})
+	if _, err := e.bucket.Delete(context.Background(), keys); err != nil {
+		t.Fatal(err)
+	}
 	e.run(c)
+	if s := metricstest.Read(t, reg, "cacheservice_gc_unexpected_keys", map[string]string{"scope": "gone"}); s.Found {
+		t.Fatalf("a namespace gone from the bucket still reports %v unexpected keys", s.Value)
+	}
 	if s := metricstest.Read(t, reg, "cacheservice_gc_stored_bytes", labels); s.Found {
 		t.Fatalf("a namespace gone from the bucket still reports %v bytes", s.Value)
 	}
@@ -1371,7 +1329,7 @@ func TestMissingBundleStopsSweepWarmCache(t *testing.T) {
 	c := e.collector(nil)
 	e.run(c) // caches the bundle's blobs
 	orphan := e.view("team").Put(layer("orphan", 100))
-	if err := e.objs.Delete(ctx, prefix+"/team/"+metastore.BundleRelKey(rec.BundleID)); err != nil {
+	if err := e.objs.Delete(ctx, prefix+"/ns/team/"+metastore.BundleRelKey(rec.BundleID)); err != nil {
 		t.Fatal(err)
 	}
 	e.clock.Add(1000 * time.Hour)
@@ -1404,7 +1362,7 @@ func TestBroadLifecycleRule(t *testing.T) {
 	if !slices.Equal(r.LiveRules, []string{prefix + "/"}) {
 		t.Fatalf("live rules %v", r.LiveRules)
 	}
-	e.bucket.SetRules([]string{prefix + "/team/staging/"}, nil)
+	e.bucket.SetRules([]string{prefix + "/ns/team/staging/"}, nil)
 	if r := reportOf(e.run(e.collector(nil)), "team"); r.StagingRule != "present" || len(r.LiveRules) != 0 {
 		t.Fatalf("the staging rule: %+v", r)
 	}

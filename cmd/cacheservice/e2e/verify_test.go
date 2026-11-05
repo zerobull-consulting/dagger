@@ -136,5 +136,5 @@ func (e *Env) StoredDigest(d digest.Digest) digest.Digest {
 // lifecycle rule expires.
 func (e *Env) StagedKeys() []string {
 	e.T.Helper()
-	return e.listKeys(e.S3Config.Prefix + "/" + e.Scope + "/staging/")
+	return e.listKeys(e.StagingPrefixIn(e.Scope))
 }

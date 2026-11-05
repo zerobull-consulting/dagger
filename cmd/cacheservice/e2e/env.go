@@ -26,7 +26,9 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/dagql"
 )
 
@@ -388,7 +390,7 @@ func (e *Env) BundleIDs() []string {
 // BundleIDsIn lists a namespace's stored bundles, sorted.
 func (e *Env) BundleIDsIn(ns string) []string {
 	e.T.Helper()
-	prefix := e.S3Config.Prefix + "/" + ns + "/bundles/"
+	prefix := e.nsPrefix(ns) + layout.BundlesDir
 	var ids []string
 	for _, key := range e.listKeys(prefix) {
 		ids = append(ids, strings.TrimSuffix(strings.TrimPrefix(key, prefix), ".json"))
@@ -440,8 +442,20 @@ func (e *Env) BlobKey(d digest.Digest) string {
 
 // BlobKeyIn is the object key of a layer blob of a namespace.
 func (e *Env) BlobKeyIn(ns string, d digest.Digest) string {
-	return e.S3Config.Prefix + "/" + ns + "/blobs/" + d.Algorithm().String() + "/" + d.Encoded()
+	return e.nsPrefix(ns) + layout.BlobRel(d)
 }
+
+// nsPrefix is a namespace's prefix: <prefix>/ns/<ns>/.
+func (e *Env) nsPrefix(ns string) string {
+	p, err := layout.NamespacePrefix(e.S3Config.Prefix, ns)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return p
+}
+
+// StagingPrefixIn is a namespace's staging prefix.
+func (e *Env) StagingPrefixIn(ns string) string { return e.nsPrefix(ns) + layout.StagingDir }
 
 // HasKey reports whether an object is stored.
 func (e *Env) HasKey(key string) bool {
@@ -465,25 +479,46 @@ func (e *Env) DeleteBlob(d digest.Digest) {
 }
 
 // CheckConsistent checks, reading MinIO directly, that what the store
-// publishes is whole (#12): the index names no bundle or resolution that
-// isn't stored, and no stored bundle names a layer blob that isn't, besides
-// those a scenario deleted on purpose (DeleteBlob). Each failure says what
-// is missing.
+// publishes is whole (zerobull-consulting/dagger#12): the index names no
+// bundle or resolution that isn't stored, and no stored bundle names a layer
+// blob that isn't, besides those a scenario deleted on purpose
+// (DeleteBlob). Each failure says what is missing. It also checks the
+// prefix's ownership: the marker is there, and every key under the prefix is
+// of a shape of the service's (package layout).
 func (e *Env) CheckConsistent(t *testing.T, when string) {
 	t.Helper()
 	e.CheckConsistentIn(t, e.Scope, when)
 }
 
+// CheckOwned checks that the run's prefix holds the ownership marker, of
+// this layout, and nothing of a shape that isn't the service's.
+func (e *Env) CheckOwned(t *testing.T, when string) {
+	t.Helper()
+	ctx, cancel := e.ctx()
+	defer cancel()
+	_, err := ownership.ReadMarker(ctx, e.Meta.Objects(), e.S3Config.Prefix)
+	Check(t, err == nil, "S3 owned %s: the ownership marker %s is there, of layout %d (%v)", when, layout.MarkerKey(e.S3Config.Prefix), layout.Version, err)
+	var unknown []string
+	keys := e.listKeys(layout.Root(e.S3Config.Prefix))
+	for _, k := range keys {
+		if !layout.Known(e.S3Config.Prefix, k) {
+			unknown = append(unknown, k)
+		}
+	}
+	Check(t, len(unknown) == 0, "S3 owned %s: the prefix's %d keys are all of the service's shapes (others: %v)", when, len(keys), unknown[:min(len(unknown), 10)])
+}
+
 // CheckConsistentIn is CheckConsistent for a namespace's objects.
 func (e *Env) CheckConsistentIn(t *testing.T, ns, when string) {
 	t.Helper()
+	e.CheckOwned(t, when)
 	idx := e.IndexOf(ns)
 	stored := map[string]bool{}
 	ids := e.BundleIDsIn(ns)
 	for _, id := range ids {
 		stored[id] = true
 	}
-	resPrefix := e.S3Config.Prefix + "/" + ns + "/resolutions/"
+	resPrefix := e.nsPrefix(ns) + layout.ResolutionsDir
 	resolutions := map[string]bool{}
 	for _, key := range e.listKeys(resPrefix) {
 		resolutions[strings.TrimSuffix(strings.TrimPrefix(key, resPrefix), ".json")] = true
@@ -504,7 +539,7 @@ func (e *Env) CheckConsistentIn(t *testing.T, ns, when string) {
 	slices.Sort(missingBundles)
 	slices.Sort(missingResolutions)
 	blobs := map[string]bool{}
-	for _, key := range e.listKeys(e.S3Config.Prefix + "/" + ns + "/blobs/") {
+	for _, key := range e.listKeys(e.nsPrefix(ns) + layout.BlobsDir) {
 		blobs[key] = true
 	}
 	named := map[digest.Digest]bool{}

@@ -110,6 +110,8 @@ type Metrics struct {
 	gcRunDuration       *prometheus.HistogramVec
 	gcEntriesExpired    *prometheus.CounterVec
 	gcStagingRule       *prometheus.GaugeVec
+	gcUnexpectedKeys    *prometheus.GaugeVec
+	gcRefused           *prometheus.CounterVec
 	exportCollected     *prometheus.CounterVec
 	draining            prometheus.Gauge
 	exportEnabled       prometheus.Gauge
@@ -313,6 +315,14 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "gc_staging_rule_missing",
 			Help: "1 when the bucket's lifecycle rules don't expire the scope's staging/ prefix (GC expires it itself), 0 when they do; absent when the rules can't be read.",
 		}, []string{"scope"}),
+		gcUnexpectedKeys: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "gc_unexpected_keys",
+			Help: "Keys and multipart uploads of no known shape GC's last run found: per namespace, or scope _root outside the namespaces (a lower bound there: one page per unexpected prefix). Any is an ownership violation, and GC changed nothing in that namespace, or for _root anywhere.",
+		}, []string{"scope"}),
+		gcRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gc_refused_total",
+			Help: "GC runs that did nothing at all because the prefix's ownership couldn't be confirmed, by reason: no_marker, other_layout, marker_unreadable, root_violation, uploads_unlisted.",
+		}, []string{"reason"}),
 		exportCollected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_collected_total",
 			Help: "Export tries refused because GC deleted, or was deleting, an object they named; each is tried again.",
@@ -365,7 +375,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.authRejected, m.tokensRevoked, m.eventsIgnored,
 		m.blobPromotions, m.blobHashedBytes, m.blobPromoteDuration,
 		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
-		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule,
+		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule, m.gcUnexpectedKeys, m.gcRefused,
 		m.exportCollected,
 		m.draining, m.exportEnabled, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
 		m.otlpRefused, m.otlpRequestBytes,
@@ -703,6 +713,33 @@ func (m *Metrics) GCStagingRuleUnknown(scope string) {
 	m.gcStagingRule.DeleteLabelValues(scope)
 }
 
+// Reasons a GC run did nothing at all.
+const (
+	GCRefusedNoMarker         = "no_marker"
+	GCRefusedOtherLayout      = "other_layout"
+	GCRefusedMarkerUnreadable = "marker_unreadable"
+	GCRefusedRootViolation    = "root_violation"
+	GCRefusedUploadsUnlisted  = "uploads_unlisted"
+)
+
+// GCUnexpected records how many keys of no known shape GC found in a scope:
+// a validated namespace, or gc.RootScope. No label comes from the bucket.
+func (m *Metrics) GCUnexpected(scope string, n int) {
+	if m == nil {
+		return
+	}
+	m.gcUnexpectedKeys.WithLabelValues(scope).Set(float64(n))
+}
+
+// GCRefused records a GC run that did nothing, for reason (a GCRefused*
+// constant).
+func (m *Metrics) GCRefused(reason string) {
+	if m == nil {
+		return
+	}
+	m.gcRefused.WithLabelValues(reason).Inc()
+}
+
 // GCForget removes a scope's GC gauges, for a namespace no longer in the
 // bucket: they would otherwise report its last listing forever.
 func (m *Metrics) GCForget(scope string) {
@@ -714,6 +751,7 @@ func (m *Metrics) GCForget(scope string) {
 		m.gcStoredObjects.DeleteLabelValues(scope, k)
 	}
 	m.gcStagingRule.DeleteLabelValues(scope)
+	m.gcUnexpectedKeys.DeleteLabelValues(scope)
 }
 
 // ExportCollected records an export try refused by GC's fence.

@@ -26,6 +26,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
@@ -68,6 +69,10 @@ func newMinIOEnv(t *testing.T) *minioEnv {
 		t.Fatal(err)
 	}
 	scope.DeleteOnCleanup(t, client)
+	// A writer claimed the prefix: GC runs only under the marker.
+	if _, _, err := ownership.Check(ctx, meta.Objects().(ownership.Store), cfg.Prefix, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	return &minioEnv{t: t, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, meta: meta, gcb: &S3Bucket{Client: client, Bucket: cfg.Bucket, FilterAllUploads: true}}
 }
 
@@ -81,9 +86,10 @@ func (e *minioEnv) put(key string, body []byte) {
 func (e *minioEnv) keys(ns string) []string {
 	e.t.Helper()
 	var out []string
-	if err := e.gcb.List(context.Background(), e.prefix+"/"+ns+"/", func(objs []Object) error {
+	p := e.prefix + "/ns/" + ns + "/"
+	if err := e.gcb.List(context.Background(), p, func(objs []Object) error {
 		for _, o := range objs {
-			out = append(out, strings.TrimPrefix(o.Key, e.prefix+"/"+ns+"/"))
+			out = append(out, strings.TrimPrefix(o.Key, p))
 		}
 		return nil
 	}); err != nil {
@@ -107,7 +113,7 @@ func (e *minioEnv) export(ns, cacheID string, entries []fakeengine.Entry, roots 
 		e.t.Fatal(err)
 	}
 	for d, data := range capt.Blobs {
-		e.put(ns+"/"+metastore.BlobRelKey(d), data)
+		e.put("ns/"+ns+"/"+metastore.BlobRelKey(d), data)
 	}
 	rec, err := e.meta.Record(context.Background(), ns, capt.Bundle, cacheID, 1)
 	if err != nil {
@@ -127,12 +133,10 @@ func TestMinIOGC(t *testing.T) {
 	live := e.export("team-a", "a", buildX("live"), 2)
 	e.export("team-b", "b", buildX("b"), 2)
 	orphan := digest.FromBytes([]byte("orphan"))
-	e.put("team-a/"+metastore.BlobRelKey(orphan), []byte("orphan"))
+	e.put("ns/team-a/"+metastore.BlobRelKey(orphan), []byte("orphan"))
 	stage := blobstore.NewStage()
-	e.put("team-a/staging/"+string(stage)+"/sha256/"+orphan.Encoded(), []byte("orphan"))
-	e.put("team-a/notes.txt", []byte("not GC's"))
-	e.put("blobs/sha256/"+orphan.Encoded(), []byte("pre-namespace"))
-	up, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &e.bucket, Key: aws.String(e.prefix + "/team-a/blobs/sha256/" + strings.Repeat("0", 64))})
+	e.put("ns/team-a/staging/"+string(stage)+"/sha256/"+orphan.Encoded(), []byte("orphan"))
+	up, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &e.bucket, Key: aws.String(e.prefix + "/ns/team-a/blobs/sha256/" + strings.Repeat("0", 64))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +147,7 @@ func TestMinIOGC(t *testing.T) {
 	wantRuleB := "missing"
 	if s3test.Disposable() {
 		wantRuleB = "present"
-		rule := e.prefix + "/team-b/staging/"
+		rule := e.prefix + "/ns/team-b/staging/"
 		rules := []types.LifecycleRule{{
 			ID: aws.String("gc-test"), Status: types.ExpirationStatusEnabled,
 			Filter:     &types.LifecycleRuleFilter{Prefix: aws.String(rule)},
@@ -207,15 +211,12 @@ func TestMinIOGC(t *testing.T) {
 		metastore.BlobRelKey(digest.FromBytes(layer("livebase", 1000))),
 		metastore.BlobRelKey(digest.FromBytes(layer("liveexec", 2000))),
 		metastore.BundleRelKey(live.BundleID),
-		"gc-epoch.json", "index.json", "notes.txt",
+		"gc-epoch.json", "index.json",
 		metastore.ResolutionRelKey(live.ResolutionID),
 	}
 	slices.Sort(want)
 	if !slices.Equal(keys, want) {
 		t.Fatalf("team-a keys %v, want %v", keys, want)
-	}
-	if _, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &e.bucket, Key: aws.String(e.prefix + "/blobs/sha256/" + orphan.Encoded())}); err != nil {
-		t.Fatalf("the pre-namespace blob: %v", err)
 	}
 	if ups, _ := e.gcb.ListUploads(ctx, e.prefix+"/"); slices.ContainsFunc(ups, func(u Upload) bool { return u.ID == aws.ToString(up.UploadId) }) {
 		t.Fatal("the stale multipart upload wasn't aborted")
@@ -238,7 +239,7 @@ func TestMinIOGC(t *testing.T) {
 	if _, err := c.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if keys := e.keys("team-a"); !slices.Equal(keys, []string{"gc-epoch.json", "index.json", "notes.txt"}) {
+	if keys := e.keys("team-a"); !slices.Equal(keys, []string{"gc-epoch.json", "index.json"}) {
 		t.Fatalf("team-a after expiry: %v", keys)
 	}
 	if n := len(e.keys("team-b")); n != 5 {
@@ -288,7 +289,7 @@ func TestMinIOGCScale(t *testing.T) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			body := []byte("garbage-" + strconv.Itoa(i))
-			e.put("team/"+metastore.BlobRelKey(digest.FromBytes(body)), body)
+			e.put("ns/team/"+metastore.BlobRelKey(digest.FromBytes(body)), body)
 		}()
 	}
 	wg.Wait()

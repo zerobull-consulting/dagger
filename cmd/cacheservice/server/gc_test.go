@@ -29,6 +29,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
@@ -57,6 +58,10 @@ func newGCStores(t *testing.T, wrap func(metastore.Objects) metastore.Objects) *
 	}
 	meta, err := metastore.New(metastore.Config{Objects: objects, Now: clock.Now})
 	if err != nil {
+		t.Fatal(err)
+	}
+	// A writer claimed the prefix: GC runs only under the marker.
+	if _, _, err := ownership.Check(context.Background(), objs, "", true, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
 	return &gcStores{clock: clock, blobs: blobs, objs: objs, meta: meta, bucket: &gc.MemBucket{Blobs: blobs, Objects: objs}}
@@ -464,7 +469,7 @@ func TestDebugGC(t *testing.T) {
 	// A bundle the index names, gone: the run fails.
 	idx := h.waitIndex(10, 11)
 	for _, e := range idx.Entries {
-		if err := st.objs.Delete(context.Background(), testScope+"/bundles/"+e.Bundle+".json"); err != nil {
+		if err := st.objs.Delete(context.Background(), "ns/"+testScope+"/bundles/"+e.Bundle+".json"); err != nil {
 			t.Fatal(err)
 		}
 	}

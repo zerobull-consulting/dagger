@@ -54,6 +54,14 @@ tests read: `ENDPOINT`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`,
 `PREFIX`, `PUT_EXPIRY`, `GET_EXPIRY`, `MAX_PROMOTIONS` and
 `HASH_IN_SERVICE`.
 
+The service owns everything under its prefix (the whole bucket when
+`PREFIX` is empty), and refuses at startup a prefix that holds anything but
+its own store (see
+[Bucket ownership](../../cmd/cacheservice/README.md#bucket-ownership)). Run
+a service against the dev bucket under a prefix of its own, such as
+`CACHESERVICE_S3_PREFIX=dev`, and wipe it (`mc rm --recursive --force
+local/dagger-cache/dev/`) to start over, or after a change of layout.
+
 The dev bucket has no lifecycle rule: staged uploads that were never
 promoted (an export cut short) stay until `dev.sh reset`, and are never read.
 To try the rule the service's README recommends
@@ -61,7 +69,7 @@ To try the rule the service's README recommends
 once per namespace:
 
 ```bash
-docker compose -f hack/remote-cache/compose.yaml exec minio sh -c 'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc ilm rule add --prefix <prefix>/<namespace>/staging/ --expire-days 1 local/dagger-cache'
+docker compose -f hack/remote-cache/compose.yaml exec minio sh -c 'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc ilm rule add --prefix <prefix>/ns/<namespace>/staging/ --expire-days 1 local/dagger-cache'
 ```
 
 Configure an AWS SDK client for MinIO with a base endpoint, a static
@@ -279,6 +287,10 @@ engine-style PUT over HTTPS.
 
 ### What each store does
 
+These are the S3 calls the service makes. Layout version 2 moved every key
+under `ns/<namespace>/`, but made no call behave differently, so every row
+holds as it was measured.
+
 The checks of
 [zerobull-consulting/dagger#55](https://github.com/zerobull-consulting/dagger/issues/55),
 from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
@@ -462,7 +474,11 @@ cache volume. It:
    engine makes to the store is recorded, with its time and status. MinIO
    itself can stay on loopback. The main service has no tokens file: it is
    unauthenticated, so only the bridge reaches it, and every engine is in the
-   run's scope (`e2e`), whose blobs are at `test/e2e/<run>/e2e/blobs/`;
+   run's scope (`e2e`), whose blobs are at `test/e2e/<run>/ns/e2e/blobs/`.
+   The run's prefix is new, so the service's startup check finds it empty
+   and claims it (`test/e2e/<run>/cacheservice.json`); every check of the
+   store (`Env.CheckConsistent`) also checks that the marker is there and
+   that every key under the prefix is of the service's shapes;
 3. starts engines A and B in containers, each with
    `_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL`, `DAGGER_CLOUD_TOKEN` and
    `DAGGER_CLOUD_URL` pointing at the service;
@@ -503,7 +519,7 @@ the main service's exports by polling the index.
 | `reexport` | [#30](https://github.com/zerobull-consulting/dagger/issues/30) | Exports A's stored entries again with `Service.Export`, with every root and part the tracker knows of. Then runs a second pipeline on A over the same `alpine` (one exec writing 2MB). | The repeat stores every root, uploads no blob, finds every blob present, leaves the index as it was (numbers and bundles) and writes no bundle object. The second pipeline uploads only its own layers: `alpine`'s is in its bundle, and not among the blob PUTs. |
 | `renew` | [#31](https://github.com/zerobull-consulting/dagger/issues/31) | Starts the replica, with GETs that last `E2E_GET_EXPIRY` seconds and an import poll of `E2E_IMPORT_POLL` seconds, and engines C and D on it, empty. Once both have A's entries merged, waits for the GETs to expire, and runs the verify exec on C. Then deletes the last exec's layer from MinIO, and runs it on D. | C sends `renew`, the replica answers with fresh GETs, the store serves C every layer of A's chain, with no blob GET before the renew and none refused, and C's files are A's. D's `renew` of the chain with the deleted layer answers `unavailable`; D's query still succeeds, with exec1's files A's and exec2's new (it ran again). |
 | `prune` | [#32](https://github.com/zerobull-consulting/dagger/issues/32) | Prunes C's cache with `{ engine { localCache { prune } } }` (with no arguments, it drops every releasable entry), waits 5 import polls, syncs C 3 times by hand (`Service.Import`), then restarts C on the same volume. Starts the replica and C if `renew` didn't run. | The prune reaches the replica (`engine.prune`) and the importer forgets the pruned values; nothing is merged or offered to C over the polls and syncs; after the restart (a new generation), the replica merges the entries into C again. [#47](https://github.com/zerobull-consulting/dagger/issues/47): C's bundles that hold entries it imported (its `renew` verify exec) still build a merge once those imports moved to C's new entries, though resolving them through C's current mappings would fail; and no merge so far failed with "is no longer stored". |
-| `namespaces` | [#10](https://github.com/zerobull-consulting/dagger/issues/10) | Starts its own service, with a tokens file (`ServiceOptions.TokensFile`) of two tokens in namespaces `team-a` and `team-b`, and engines NA and NB on them, empty (`StartEnginesWithTokens`; each runs its CLI with its engine's token, since session spans come under the CLI's). Runs a pipeline of its own on NA (one exec writing 1MB, with a nonce), then on NB once NA's entries are stored. Starts engine NC on NA's token, waits for NA's entries to be merged into it, and runs the pipeline on NC. Then removes team B's token from the file and reloads it (`Service.ReloadTokens`, as on `SIGHUP`). | Each engine is in its token's namespace. Nothing is merged into NB, whose exec runs itself (no hit, its own stamp); neither namespace's index maps the other's engine; NA's exec layer is stored under `team-a/blobs/` only, and `alpine`'s layer under both namespaces' prefixes. NC gets only NA's bundles, and hits NA's exec with NA's stamp. After the reload, NB's connection is closed (logged revoked), NB's engine logs the close with status 4001, its reconnection is refused (401), the service lists NA and NC only, and it logged nothing at error level. |
+| `namespaces` | [#10](https://github.com/zerobull-consulting/dagger/issues/10) | Starts its own service, with a tokens file (`ServiceOptions.TokensFile`) of two tokens in namespaces `team-a` and `team-b`, and engines NA and NB on them, empty (`StartEnginesWithTokens`; each runs its CLI with its engine's token, since session spans come under the CLI's). Runs a pipeline of its own on NA (one exec writing 1MB, with a nonce), then on NB once NA's entries are stored. Starts engine NC on NA's token, waits for NA's entries to be merged into it, and runs the pipeline on NC. Then removes team B's token from the file and reloads it (`Service.ReloadTokens`, as on `SIGHUP`). | Each engine is in its token's namespace. Nothing is merged into NB, whose exec runs itself (no hit, its own stamp); neither namespace's index maps the other's engine; NA's exec layer is stored under `ns/team-a/blobs/` only, and `alpine`'s layer under both namespaces' prefixes. NC gets only NA's bundles, and hits NA's exec with NA's stamp. After the reload, NB's connection is closed (logged revoked), NB's engine logs the close with status 4001, its reconnection is refused (401), the service lists NA and NC only, and it logged nothing at error level. |
 | `verify` | [#23](https://github.com/zerobull-consulting/dagger/issues/23) | Rewrites every blob A uploads to other content of the same length in the S3 proxy (`SameSizeCorruption`, on `/staging/` PUTs), runs a new pipeline on A (an exec writing 1MB), and once its export has failed, lifts the rewrite. | S3 took each rewritten upload, and the service rejected each as a mismatch; none reached its digest key; nothing of A's was published while the uploads were corrupted. Once lifted, the tracker's retry asked for each rejected blob again and stored the right content (read back from MinIO and hashed), the export was stored, S3 is consistent, and B gets the pipeline's exec as a cache hit with A's output. |
 | `gc` | [#11](https://github.com/zerobull-consulting/dagger/issues/11) | Starts its own service with a tokens file (two tokens in namespace `gc`), a namespaces file giving `gc` a max age of 10s (`ServiceOptions.NamespacesFile`), and a GC grace period of 5s (`GCGrace`); GC runs only when the scenario asks (`Service.CollectGarbage`). Runs a pipeline of its own on engine GA (one exec writing 1MB, with a nonce), waits past the max age and the grace period, and runs GC twice. Then starts engine GB, empty, raises the max age to 10m and reloads the file (`Service.ReloadLimits`, as on `SIGHUP`), and runs a build on top of the first on GA, then on GB. | GC expired GA's entries (the index has none) and deleted their bundles, resolutions and every layer blob from MinIO; the run's scope still has A's chain; nothing is merged into GB. The build on top uploaded every deleted layer again and was stored; GB got it merged with each root's expiry capped at its recording time plus the max age, and hit it with GA's stamp. S3 is consistent throughout (`Env.CheckConsistentIn`), in namespace `gc` and in the others GC also collected: the run's scope and the `namespaces` scenario's. It adds about 25s to the run, most of it waiting out the max age and grace period. |
 | `superseded` | [#32](https://github.com/zerobull-consulting/dagger/issues/32), [#27](https://github.com/zerobull-consulting/dagger/issues/27) | Writes a Dang module (`ttlmod` in the run's directory) whose function `stamp2` has a cache TTL of `E2E_TTL` seconds, runs it on A, waits for it to expire, and runs it again. Then starts engine F, empty, waits until both bundles are merged into it, and reads the value on it. | A replaced the value in place, the index kept its service number and moved it to a newer bundle, and F's call resolved to the imported entry (its `withExec` hit; a function with a TTL is evaluated on every call). It reports which record F got by the layer it read: the newer one passes; the older one is logged as `GAP` (#27), without failing; neither fails. F, the first engine started after `prune` moved C's imports, gets C's bundles holding them merged, with their roots and the imported entries (#47). |

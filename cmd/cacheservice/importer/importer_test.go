@@ -433,7 +433,7 @@ func TestNewRefuses(t *testing.T) {
 		t.Fatal("no stores accepted")
 	}
 	meta, _ := metastore.New(metastore.Config{Objects: metastore.NewMemObjects()})
-	if _, err := New(Config{Blobs: blobstore.NewMemStore(""), Meta: meta, Scope: "blobs"}); err == nil {
+	if _, err := New(Config{Blobs: blobstore.NewMemStore(""), Meta: meta, Scope: "a/b"}); err == nil {
 		t.Fatal("bad scope accepted")
 	}
 }

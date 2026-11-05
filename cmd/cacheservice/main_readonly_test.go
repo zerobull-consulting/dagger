@@ -320,27 +320,25 @@ func TestMinIOBinaryReadOnlyKey(t *testing.T) {
 }
 
 // The same read-only key with the export path on (the default) fails at
-// startup, with the conditional write check's AccessDenied, and exits 1.
-// Intended: it's what stops a pull-request job holding a read-only key, but
-// missing -export=false, from silently running as a writer whose every
-// export fails.
+// startup, with AccessDenied, and exits 1: on an empty prefix at the
+// ownership check (its listing of multipart uploads, before it would
+// create the marker), and on a prefix a writer claimed at the conditional
+// write check. Intended: it's what stops a pull-request job
+// holding a read-only key, but missing -export=false, from silently running
+// as a writer whose every export fails.
 func TestMinIOBinaryReadOnlyKeyRefusedAsWriter(t *testing.T) {
 	id, secret := readOnlyKey(t)
 	b := startBinaryWith(t, binaryOpts{accessKey: id, secretKey: secret, noEngine: true})
-	select {
-	case <-b.exited:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the service didn't exit")
-	}
-	var exit *exec.ExitError
-	if !errors.As(b.err, &exit) || exit.ExitCode() != 1 {
-		t.Fatalf("exit %v, want 1", b.err)
-	}
-	logs := b.logs.String()
-	for _, want := range []string{"level=ERROR msg=\"export path\"", "conditional write check", "AccessDenied"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("the log has no %q", want)
-		}
+	b.waitExit1("level=ERROR msg=\"export path\"", "ownership check: list multipart uploads", "AccessDenied")
+
+	writer := startBinary(t)
+	writer.signal()
+	writer.waitExit(30 * time.Second)
+	before := writer.listing()
+	b = startBinaryWith(t, binaryOpts{scope: writer.scope, accessKey: id, secretKey: secret, noEngine: true})
+	b.waitExit1("level=ERROR msg=\"export path\"", "conditional write check", "AccessDenied")
+	if after := writer.listing(); !slices.Equal(before, after) {
+		t.Fatalf("the bucket changed:\nbefore %v\nafter  %v", before, after)
 	}
 }
 

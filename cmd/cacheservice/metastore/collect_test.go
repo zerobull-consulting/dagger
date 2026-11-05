@@ -288,7 +288,7 @@ func TestEpochObject(t *testing.T) {
 	if e, err := s.ReadEpoch(ctx, "s1"); err != nil || e != 7 {
 		t.Fatalf("epoch %d, %v", e, err)
 	}
-	if _, _, err := objects.Get(ctx, "team/s1/gc-epoch.json"); err != nil {
+	if _, _, err := objects.Get(ctx, "team/ns/s1/gc-epoch.json"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -319,7 +319,7 @@ func TestIndexVersion2Reads(t *testing.T) {
 	if _, err := s.Record(ctx, "s1", chain(10), "c", 1); err != nil {
 		t.Fatal(err)
 	}
-	body, _, _ := objects.Get(ctx, "team/s1/index.json")
+	body, _, _ := objects.Get(ctx, "team/ns/s1/index.json")
 	var raw map[string]any
 	if err := jsonUnmarshal(body, &raw); err != nil {
 		t.Fatal(err)
@@ -328,7 +328,7 @@ func TestIndexVersion2Reads(t *testing.T) {
 	for _, r := range raw["roots"].(map[string]any) {
 		delete(r.(map[string]any), "recordedAtUnix")
 	}
-	if _, err := objects.Put(ctx, "team/s1/index.json", jsonMarshal(t, raw), Condition{}); err != nil {
+	if _, err := objects.Put(ctx, "team/ns/s1/index.json", jsonMarshal(t, raw), Condition{}); err != nil {
 		t.Fatal(err)
 	}
 	idx := mustIndex(t, s, "s1")

@@ -6,6 +6,7 @@ import (
 	"crypto/md5" //nolint:gosec // compared with the store's ETags, which are MD5s
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -155,10 +156,15 @@ func (s *S3Store) promoteStoreHashed(ctx context.Context, src, dst, etag string,
 		abort()
 		return Promotion{}, false, fmt.Errorf("copy %s: %w", src, err)
 	}
-	var sum string
-	if part.CopyPartResult != nil {
-		sum = aws.ToString(part.CopyPartResult.ChecksumSHA256)
+	if part.CopyPartResult == nil {
+		// A part copy the store answered without its result: no ETag to
+		// complete with, and no checksum. That is a malformed answer, not
+		// a store that doesn't hash, so it fails this promotion rather
+		// than switch every later one to hashing in the service.
+		abort()
+		return Promotion{}, false, fmt.Errorf("copy %s: %w", src, errNoCopyResult)
 	}
+	sum := aws.ToString(part.CopyPartResult.ChecksumSHA256)
 	if sum == "" {
 		abort()
 		return Promotion{}, false, nil
@@ -236,6 +242,10 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 			abort()
 			return p, fmt.Errorf("copy %s, part %d: %w", src, num, err)
 		}
+		if part.CopyPartResult == nil {
+			abort()
+			return p, fmt.Errorf("copy %s, part %d: %w", src, num, errNoCopyResult)
+		}
 		if etagsAreMD5 && unquoteETag(aws.ToString(part.CopyPartResult.ETag)) != wantParts[num-1] {
 			// What the store copied isn't what the service hashed.
 			abort()
@@ -247,6 +257,10 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 	p.Outcome, err = s.complete(ctx, dst, up.UploadId, parts, dgst)
 	return p, err
 }
+
+// errNoCopyResult is an UploadPartCopy answered without a CopyPartResult:
+// the part's ETag, which completing the upload needs, is missing.
+var errNoCopyResult = errors.New("the store answered the part copy without a CopyPartResult")
 
 // partMD5s is a writer that takes the MD5 of each size bytes written.
 type partMD5s struct {

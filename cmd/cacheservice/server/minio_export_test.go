@@ -79,7 +79,7 @@ func TestMinIOExportBuild(t *testing.T) {
 	// The layers, at their content-addressed keys under the scope (the
 	// namespace of a service without tokens), with their sizes.
 	for i, d := range layers {
-		ok, size := env.exists(ctx, t, env.key(testScope+"/blobs/sha256/"+d.Encoded()))
+		ok, size := env.exists(ctx, t, env.key("ns/"+testScope+"/blobs/sha256/"+d.Encoded()))
 		want := int64(len(testLayer([]string{"base", "exec"}[i])))
 		if !ok || size != want {
 			t.Fatalf("layer %s: exists %v, size %d, want %d", d, ok, size, want)
@@ -87,10 +87,10 @@ func TestMinIOExportBuild(t *testing.T) {
 	}
 	// The bundle and the index.
 	entry := idx.Entries[idx.Caches[h.cache.ID].Numbers[11].Number]
-	if ok, _ := env.exists(ctx, t, env.key(testScope+"/bundles/"+entry.Bundle+".json")); !ok {
+	if ok, _ := env.exists(ctx, t, env.key("ns/"+testScope+"/bundles/"+entry.Bundle+".json")); !ok {
 		t.Fatal("bundle not in S3")
 	}
-	if ok, _ := env.exists(ctx, t, env.key(testScope+"/index.json")); !ok {
+	if ok, _ := env.exists(ctx, t, env.key("ns/"+testScope+"/index.json")); !ok {
 		t.Fatal("index not in S3")
 	}
 	bundle, err := h.meta.GetBundle(ctx, testScope, entry.Bundle)
@@ -189,7 +189,7 @@ func TestMinIOEnableS3(t *testing.T) {
 }
 
 // On MinIO, two namespaces exporting the same build store everything under
-// their own prefix: <prefix>/<ns>/blobs/sha256/<hex> for every blob, the
+// their own prefix: <prefix>/ns/<ns>/blobs/sha256/<hex> for every blob, the
 // shared base layer once in each, and their bundles and indexes under
 // <prefix>/<ns>/; nothing lands at <prefix>/blobs. Team B's engine can't
 // renew team A's layers, and an address of team B's for A's exec layer
@@ -209,15 +209,15 @@ func TestMinIONamespaceKeys(t *testing.T) {
 		key  string
 		want bool
 	}{
-		{"team-a/blobs/sha256/" + digest.FromBytes(layersA[0]).Encoded(), true},
-		{"team-b/blobs/sha256/" + digest.FromBytes(layersB[0]).Encoded(), true},
-		{"team-a/blobs/sha256/" + digest.FromBytes(layersA[1]).Encoded(), true},
-		{"team-b/blobs/sha256/" + digest.FromBytes(layersB[1]).Encoded(), true},
-		{"team-b/blobs/sha256/" + digest.FromBytes(layersA[1]).Encoded(), false},
-		{"team-a/blobs/sha256/" + digest.FromBytes(layersB[1]).Encoded(), false},
+		{"ns/team-a/blobs/sha256/" + digest.FromBytes(layersA[0]).Encoded(), true},
+		{"ns/team-b/blobs/sha256/" + digest.FromBytes(layersB[0]).Encoded(), true},
+		{"ns/team-a/blobs/sha256/" + digest.FromBytes(layersA[1]).Encoded(), true},
+		{"ns/team-b/blobs/sha256/" + digest.FromBytes(layersB[1]).Encoded(), true},
+		{"ns/team-b/blobs/sha256/" + digest.FromBytes(layersA[1]).Encoded(), false},
+		{"ns/team-a/blobs/sha256/" + digest.FromBytes(layersB[1]).Encoded(), false},
 		{"blobs/sha256/" + digest.FromBytes(layersA[0]).Encoded(), false},
-		{"team-a/index.json", true},
-		{"team-b/index.json", true},
+		{"ns/team-a/index.json", true},
+		{"ns/team-b/index.json", true},
 	} {
 		if ok, _ := env.exists(ctx, t, env.key(tc.key)); ok != tc.want {
 			t.Errorf("%s: exists %v, want %v", tc.key, ok, tc.want)

@@ -30,7 +30,14 @@ func testConfig() S3Config {
 	}
 }
 
+// newTestStore returns the view of namespace "default" of a store for cfg:
+// the store itself names no keys.
 func newTestStore(t *testing.T, cfg S3Config) *S3Store {
+	t.Helper()
+	return nsView(t, newRootStore(t, cfg), "default")
+}
+
+func newRootStore(t *testing.T, cfg S3Config) *S3Store {
 	t.Helper()
 	s, err := NewS3(context.Background(), cfg)
 	if err != nil {
@@ -39,58 +46,32 @@ func newTestStore(t *testing.T, cfg S3Config) *S3Store {
 	return s
 }
 
-func TestBlobKey(t *testing.T) {
-	hex := testDigest.Encoded()
-	for _, tc := range []struct {
-		prefix string
-		want   string
-	}{
-		{"", "blobs/sha256/" + hex},
-		{"team", "team/blobs/sha256/" + hex},
-		{"/team/a/", "team/a/blobs/sha256/" + hex},
-	} {
-		cfg := testConfig()
-		cfg.Prefix = tc.prefix
-		got, err := newTestStore(t, cfg).Key(testDigest)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != tc.want {
-			t.Errorf("prefix %q: key %q, want %q", tc.prefix, got, tc.want)
-		}
-	}
-
-	sha512 := digest.SHA512.FromString("layer")
-	got, err := blobKey("", sha512)
+func nsView(t *testing.T, s *S3Store, ns string) *S3Store {
+	t.Helper()
+	v, err := s.Namespace(ns)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "blobs/sha512/" + sha512.Encoded(); got != want {
-		t.Errorf("sha512 key %q, want %q", got, want)
-	}
+	return v.(*S3Store)
 }
 
-// A namespace's store keeps its blobs under <prefix>/<ns>/blobs, next to the
-// namespace's metadata (<prefix>/<ns>/index.json and the rest), and signs
-// URLs for those keys only.
+// A namespace's store keeps its blobs under <prefix>/ns/<ns>/blobs, next to
+// the namespace's metadata (<prefix>/ns/<ns>/index.json and the rest), and
+// signs URLs for those keys only.
 func TestNamespaceKeys(t *testing.T) {
 	hex := testDigest.Encoded()
 	for _, tc := range []struct {
 		prefix string
 		want   string
 	}{
-		{"", "team-a/blobs/sha256/" + hex},
-		{"cache", "cache/team-a/blobs/sha256/" + hex},
-		{"/cache/x/", "cache/x/team-a/blobs/sha256/" + hex},
+		{"", "ns/team-a/blobs/sha256/" + hex},
+		{"cache", "cache/ns/team-a/blobs/sha256/" + hex},
+		{"/cache/x/", "cache/x/ns/team-a/blobs/sha256/" + hex},
 	} {
 		cfg := testConfig()
 		cfg.Prefix = tc.prefix
-		root := newTestStore(t, cfg)
-		ns, err := root.Namespace("team-a")
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := ns.(*S3Store).Key(testDigest)
+		ns := nsView(t, newRootStore(t, cfg), "team-a")
+		got, err := ns.Key(testDigest)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,19 +85,52 @@ func TestNamespaceKeys(t *testing.T) {
 		if !strings.Contains(get.URL, "/"+tc.want+"?") {
 			t.Errorf("prefix %q: GET %s is not of %s", tc.prefix, get.URL, tc.want)
 		}
-		// The store itself is unchanged.
-		if k, _ := root.Key(testDigest); strings.Contains(k, "team-a") {
-			t.Errorf("prefix %q: the store's own key moved to %s", tc.prefix, k)
-		}
 	}
-	for _, bad := range []string{"", "a/b", "..", `a\b`} {
-		if _, err := newTestStore(t, testConfig()).Namespace(bad); err == nil {
+	sha512 := digest.SHA512.FromString("layer")
+	got, err := newTestStore(t, testConfig()).Key(sha512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "team/ns/default/blobs/sha512/" + sha512.Encoded(); got != want {
+		t.Errorf("sha512 key %q, want %q", got, want)
+	}
+	for _, bad := range []string{"", "a/b", "..", `a\b`, "-a", "a..b"} {
+		if _, err := newRootStore(t, testConfig()).Namespace(bad); err == nil {
 			t.Errorf("namespace %q accepted", bad)
 		}
+	}
+	// "blobs" was reserved by the layout before ns/; it is a name like any
+	// other now.
+	if _, err := newRootStore(t, testConfig()).Namespace("blobs"); err != nil {
+		t.Errorf("namespace blobs: %v", err)
+	}
+}
+
+// The store itself names no keys: blobs are only kept per namespace, so
+// nothing reaches the layout's top level, where the pre-namespace layout
+// kept blobs/.
+func TestRootStoreNamesNoKeys(t *testing.T) {
+	ctx := context.Background()
+	root := newRootStore(t, testConfig())
+	if k, err := root.Key(testDigest); !errors.Is(err, errNoNamespace) {
+		t.Errorf("key %q, %v; want errNoNamespace", k, err)
+	}
+	if k, err := root.StagingKey(testStage, testDigest); !errors.Is(err, errNoNamespace) {
+		t.Errorf("staging key %q, %v; want errNoNamespace", k, err)
+	}
+	if _, err := root.PresignGet(ctx, testDigest); !errors.Is(err, errNoNamespace) {
+		t.Errorf("presign GET: %v; want errNoNamespace", err)
+	}
+	if _, err := root.PresignPut(ctx, testStage, testDigest, 3); !errors.Is(err, errNoNamespace) {
+		t.Errorf("presign PUT: %v; want errNoNamespace", err)
+	}
+	if p := root.StagingPrefix(); p != "" {
+		t.Errorf("staging prefix %q", p)
 	}
 }
 
 func TestBlobKeyRejectsBadDigests(t *testing.T) {
+	s := newTestStore(t, testConfig())
 	for _, d := range []digest.Digest{
 		"",
 		"sha256:short",
@@ -124,7 +138,7 @@ func TestBlobKeyRejectsBadDigests(t *testing.T) {
 		"md5:d41d8cd98f00b204e9800998ecf8427e",
 		digest.Digest("sha256:" + strings.Repeat("A", 64)),
 	} {
-		if key, err := blobKey("p", d); err == nil {
+		if key, err := s.Key(d); err == nil {
 			t.Errorf("digest %q: key %q, want an error", d, key)
 		}
 	}
@@ -214,7 +228,7 @@ func TestPresignPut(t *testing.T) {
 		t.Errorf("host %q, want the endpoint's", u.Host)
 	}
 	// Uploads go to the stage's staging key, never the digest key.
-	if want := "/cache/team/staging/" + string(testStage) + "/sha256/" + testDigest.Encoded(); u.Path != want {
+	if want := "/cache/team/ns/default/staging/" + string(testStage) + "/sha256/" + testDigest.Encoded(); u.Path != want {
 		t.Errorf("path %q, want %q", u.Path, want)
 	}
 	if got := q.Get("X-Amz-Expires"); got != strconv.Itoa(int(DefaultPutExpiry.Seconds())) {
@@ -271,7 +285,7 @@ func TestPresignGet(t *testing.T) {
 		t.Fatal(err)
 	}
 	u, q := parseURL(t, addr.URL)
-	if want := "/cache/team/blobs/sha256/" + testDigest.Encoded(); u.Path != want {
+	if want := "/cache/team/ns/default/blobs/sha256/" + testDigest.Encoded(); u.Path != want {
 		t.Errorf("path %q, want %q", u.Path, want)
 	}
 	if got := q.Get("X-Amz-Expires"); got != "5400" {
@@ -299,7 +313,7 @@ func TestPresignVirtualHostedStyle(t *testing.T) {
 	if u.Host != "cache.s3.eu-west-1.amazonaws.com" {
 		t.Errorf("host %q, want the bucket's virtual host", u.Host)
 	}
-	if want := "/team/blobs/sha256/" + testDigest.Encoded(); u.Path != want {
+	if want := "/team/ns/default/blobs/sha256/" + testDigest.Encoded(); u.Path != want {
 		t.Errorf("path %q, want %q", u.Path, want)
 	}
 	if cred := q.Get("X-Amz-Credential"); !strings.Contains(cred, "/eu-west-1/s3/") {
@@ -343,7 +357,7 @@ func newFakeS3Store(t *testing.T, f *fakeS3) *S3Store {
 }
 
 func TestHas(t *testing.T) {
-	f := &fakeS3{objects: map[string]bool{"/cache/team/blobs/sha256/" + testDigest.Encoded(): true}}
+	f := &fakeS3{objects: map[string]bool{"/cache/team/ns/default/blobs/sha256/" + testDigest.Encoded(): true}}
 	s := newFakeS3Store(t, f)
 	ctx := context.Background()
 
@@ -500,30 +514,26 @@ func TestHasOnlyNotFoundIsMissing(t *testing.T) {
 	}
 }
 
-// Staging keys sit under the store's (or namespace's) own prefix, next to
-// its blobs, and a namespace's staging never overlaps another's.
+// Staging keys sit under the namespace's own prefix, next to its blobs, and
+// a namespace's staging never overlaps another's.
 func TestStagingKeys(t *testing.T) {
 	s := newTestStore(t, testConfig())
 	key, err := s.StagingKey(testStage, testDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "team/staging/" + string(testStage) + "/sha256/" + testDigest.Encoded(); key != want {
+	if want := "team/ns/default/staging/" + string(testStage) + "/sha256/" + testDigest.Encoded(); key != want {
 		t.Fatalf("staging key %s, want %s", key, want)
 	}
-	if s.StagingPrefix() != "team/staging/" {
+	if s.StagingPrefix() != "team/ns/default/staging/" {
 		t.Fatalf("staging prefix %s", s.StagingPrefix())
 	}
-	view, err := s.Namespace("team-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := view.(*S3Store).StagingPrefix(); got != "team/team-a/staging/" {
+	if got := nsView(t, newRootStore(t, testConfig()), "team-a").StagingPrefix(); got != "team/ns/team-a/staging/" {
 		t.Fatalf("namespace staging prefix %s", got)
 	}
 	cfg := testConfig()
 	cfg.Prefix = ""
-	if got := newTestStore(t, cfg).StagingPrefix(); got != "staging/" {
+	if got := newTestStore(t, cfg).StagingPrefix(); got != "ns/default/staging/" {
 		t.Fatalf("staging prefix without a prefix: %s", got)
 	}
 }

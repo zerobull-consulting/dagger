@@ -194,6 +194,12 @@ jobs:
           else
             echo "configured=false" >>"$GITHUB_OUTPUT"
           fi
+  # Both Spaces jobs work under fresh prefixes below SPACES_PREFIX
+  # (<prefix>/<run>/ for each test, <prefix>/e2e/<run>/ for the e2e), so the
+  # service's startup ownership check always finds an empty prefix and claims
+  # it. Leftovers of earlier runs, of any layout, sit in other runs'
+  # prefixes, which nothing here reads or deletes; a run whose prefix wasn't
+  # empty would fail at the check, not clean it up.
   spaces-store:
     name: S3 tests against Spaces
     needs: spaces-config

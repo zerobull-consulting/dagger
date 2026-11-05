@@ -52,7 +52,6 @@ func TestParseLimitsRefuses(t *testing.T) {
 		{"team max-bytes=-5", "positive"},
 		{"team max-bytes=1.5GiB", "positive"},
 		{"team max-bytes=99999999999TiB", "too large"},
-		{"blobs max-age=1h", "invalid scope"},
 		{"../x max-age=1h", "invalid scope"},
 	} {
 		if _, err := ParseLimits([]byte(tc.body), Limits{}); err == nil || !strings.Contains(err.Error(), tc.want) {

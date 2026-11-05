@@ -14,6 +14,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
@@ -25,10 +26,10 @@ type heldBucket struct {
 	once sync.Once
 }
 
-func (b *heldBucket) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+func (b *heldBucket) ListLevel(ctx context.Context, prefix string) ([]string, []gc.Object, error) {
 	b.once.Do(func() { close(b.held) })
 	<-ctx.Done()
-	return nil, ctx.Err()
+	return nil, nil, ctx.Err()
 }
 
 // The stop ends the service's paths before it waits for the HTTP servers'
@@ -39,11 +40,16 @@ func TestShutdownCancelsBeforeWaitingForRequests(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc := server.New(slog.New(slog.DiscardHandler), "")
-	meta, err := metastore.New(metastore.Config{Objects: metastore.NewMemObjects()})
+	objs := metastore.NewMemObjects()
+	meta, err := metastore.New(metastore.Config{Objects: objs})
 	if err != nil {
 		t.Fatal(err)
 	}
-	bucket := &heldBucket{Bucket: &gc.MemBucket{Blobs: blobstore.NewMemStore(""), Objects: metastore.NewMemObjects()}, held: make(chan struct{})}
+	// GC runs only under the ownership marker.
+	if _, _, err := ownership.Check(ctx, objs, "", true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &heldBucket{Bucket: &gc.MemBucket{Blobs: blobstore.NewMemStore(""), Objects: objs}, held: make(chan struct{})}
 	if err := svc.EnableGC(ctx, server.GCConfig{Collector: gc.Config{Bucket: bucket, Meta: meta}}); err != nil {
 		t.Fatal(err)
 	}

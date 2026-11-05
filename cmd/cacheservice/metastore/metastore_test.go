@@ -86,9 +86,9 @@ func TestKeys(t *testing.T) {
 	for _, tc := range []struct {
 		prefix, wantIndex, wantBundle string
 	}{
-		{"", "s1/index.json", "s1/bundles/" + id + ".json"},
-		{"team", "team/s1/index.json", "team/s1/bundles/" + id + ".json"},
-		{"/a/b/", "a/b/s1/index.json", "a/b/s1/bundles/" + id + ".json"},
+		{"", "ns/s1/index.json", "ns/s1/bundles/" + id + ".json"},
+		{"team", "team/ns/s1/index.json", "team/ns/s1/bundles/" + id + ".json"},
+		{"/a/b/", "a/b/ns/s1/index.json", "a/b/ns/s1/bundles/" + id + ".json"},
 	} {
 		s, err := New(Config{Objects: NewMemObjects(), Prefix: tc.prefix})
 		if err != nil {
@@ -105,7 +105,7 @@ func TestKeys(t *testing.T) {
 
 func TestKeysRejectBadInput(t *testing.T) {
 	s := newTestStore(t, NewMemObjects())
-	for _, scope := range []string{"", ".", "..", "a/b", "a..b", "-a", "blobs", "a b", strings.Repeat("a", 129), "é"} {
+	for _, scope := range []string{"", ".", "..", "a/b", "a..b", "-a", "a b", strings.Repeat("a", 129), "é"} {
 		if key, err := s.IndexKey(scope); err == nil {
 			t.Errorf("scope %q: index key %q, want an error", scope, key)
 		}
@@ -115,7 +115,7 @@ func TestKeysRejectBadInput(t *testing.T) {
 			t.Errorf("bundle ID %q: key %q, want an error", id, key)
 		}
 	}
-	for _, scope := range []string{"a", "team-1", "Org_2.prod", strings.Repeat("a", 128)} {
+	for _, scope := range []string{"a", "team-1", "Org_2.prod", "blobs", strings.Repeat("a", 128)} {
 		if err := ValidateScope(scope); err != nil {
 			t.Errorf("scope %q: %v", scope, err)
 		}
@@ -154,7 +154,7 @@ func TestBundleRoundTrip(t *testing.T) {
 	if err != nil || again != id {
 		t.Fatalf("second put: %s, %v; want %s", again, err, id)
 	}
-	if keys := mem.Keys(); len(keys) != 1 || keys[0] != "team/s1/bundles/"+id+".json" {
+	if keys := mem.Keys(); len(keys) != 1 || keys[0] != "team/ns/s1/bundles/"+id+".json" {
 		t.Fatalf("keys %v", keys)
 	}
 
@@ -574,7 +574,7 @@ func (f *interfere) Put(ctx context.Context, key string, body []byte, cond Condi
 
 func TestUpdateIndexRetriesOnAFreshIndex(t *testing.T) {
 	ctx := context.Background()
-	f := &interfere{Objects: NewMemObjects(), key: "s1/index.json"}
+	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json"}
 	f.n.Store(3)
 	f.other = func(idx *Index) { idx.allocate() }
 	s, err := New(Config{Objects: f})
@@ -604,7 +604,7 @@ func TestUpdateIndexRetriesOnAFreshIndex(t *testing.T) {
 
 func TestUpdateIndexContention(t *testing.T) {
 	ctx := context.Background()
-	f := &interfere{Objects: NewMemObjects(), key: "s1/index.json", other: func(*Index) {}}
+	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json", other: func(*Index) {}}
 	f.n.Store(1 << 30)
 	s, err := New(Config{Objects: f, MaxAttempts: 5})
 	if err != nil {
@@ -638,7 +638,7 @@ func TestBackoffIsBounded(t *testing.T) {
 }
 
 func TestUpdateIndexCanceled(t *testing.T) {
-	f := &interfere{Objects: NewMemObjects(), key: "s1/index.json", other: func(*Index) {}}
+	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json", other: func(*Index) {}}
 	f.n.Store(1 << 30)
 	s, err := New(Config{Objects: f})
 	if err != nil {
@@ -700,7 +700,7 @@ func TestReadIndexRefuses(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mem := NewMemObjects()
-			if _, err := mem.Put(ctx, "team/s1/index.json", []byte(tc.body), Condition{}); err != nil {
+			if _, err := mem.Put(ctx, "team/ns/s1/index.json", []byte(tc.body), Condition{}); err != nil {
 				t.Fatal(err)
 			}
 			s := newTestStore(t, mem)

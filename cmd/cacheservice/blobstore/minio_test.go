@@ -62,7 +62,8 @@ func newMinIOStore(t *testing.T, modify func(*S3Config)) *S3Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s
+	// Blobs are kept only per namespace.
+	return nsView(t, s, "default")
 }
 
 // enginePut uploads body the way the engine does (engine/remotecache's
@@ -241,7 +242,7 @@ func TestMinIOStoreNamespaces(t *testing.T) {
 		t.Fatalf("presigned PUT: status %d", status)
 	}
 	staged, _ := a.StagingKey(stage, d)
-	if want := s.prefix + "/team-a/staging/" + string(stage) + "/sha256/" + d.Encoded(); staged != want {
+	if want := s.prefix + "/ns/team-a/staging/" + string(stage) + "/sha256/" + d.Encoded(); staged != want {
 		t.Fatalf("staging key %s, want %s", staged, want)
 	}
 	// Promotion never crosses namespaces: team-b finds nothing staged.
@@ -252,7 +253,7 @@ func TestMinIOStoreNamespaces(t *testing.T) {
 		t.Fatalf("promote: %+v, %v", p, err)
 	}
 	key, _ := a.Key(d)
-	if want := s.prefix + "/team-a/blobs/sha256/" + d.Encoded(); key != want {
+	if want := s.prefix + "/ns/team-a/blobs/sha256/" + d.Encoded(); key != want {
 		t.Fatalf("key %s, want %s", key, want)
 	}
 	if !mustHas(t, a, d) || mustHas(t, b, d) || mustHas(t, s, d) {
@@ -361,6 +362,11 @@ func TestMinIOStoreExpiry(t *testing.T) {
 	ctx := context.Background()
 	blob, d := randomBlob(t, 128)
 	stage := NewStage()
+	// SigV4 truncates X-Amz-Date to the second: a 1s URL signed late in a
+	// second has only what is left of it to live, which made the fresh PUT
+	// below fail now and then. Signed just after a second starts, both
+	// URLs get nearly the whole second.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
 	put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
 	if err != nil {
 		t.Fatal(err)

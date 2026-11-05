@@ -47,7 +47,6 @@ import (
 	"log/slog"
 	"maps"
 	mrand "math/rand/v2"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -55,6 +54,7 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 )
@@ -218,8 +218,14 @@ type Report struct {
 	// live data (blobs, bundles, resolutions, index) by age: a
 	// misconfiguration that deletes what the index names.
 	LiveRules []string `json:"liveRules,omitempty"`
+	// Unexpected are some of the keys of no known shape GC found (at most
+	// MaxUnexpectedLogged; uploads prefixed "upload:"), and
+	// UnexpectedCount how many there were: ownership violations, for which
+	// GC changed nothing in the namespace, or, for RootScope, anywhere.
+	Unexpected      []string `json:"unexpected,omitempty"`
+	UnexpectedCount int      `json:"unexpectedCount,omitempty"`
 	// Skipped says why the reachability sweep (bundles, resolutions,
-	// blobs) didn't run, if it didn't.
+	// blobs), or the whole namespace, wasn't collected, if it wasn't.
 	Skipped string `json:"skipped,omitempty"`
 	// Errors are what failed; the run went on where it safely could.
 	Errors []string `json:"errors,omitempty"`
@@ -257,126 +263,136 @@ func (c *Collector) Loop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Namespaces lists the namespaces in the bucket: the prefixes under the
-// store's prefix that are valid scopes. It skips `blobs` (where blobs were
-// kept before namespaces) and anything else that isn't a namespace's name.
-// It reads the bucket, not the tokens, so namespaces whose tokens were all
-// removed are collected too.
+// Namespaces lists the namespaces in the bucket: the valid names under
+// <prefix>/ns/, the only place namespaces live. It reads the bucket, not the
+// tokens, so namespaces whose tokens were all removed are collected too.
+//
+// It is what a run finds (survey), without the run.
 func (c *Collector) Namespaces(ctx context.Context) ([]string, error) {
-	top := c.top()
-	prefixes, err := c.cfg.Bucket.ListPrefixes(ctx, top)
+	s, err := c.survey(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []string
-	for _, p := range prefixes {
-		name := strings.TrimSuffix(strings.TrimPrefix(p, top), "/")
-		if metastore.ValidateScope(name) != nil {
-			c.log.Debug("gc: not a namespace; skipped", "prefix", p)
-			continue
-		}
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-// uploadsByNamespace lists the incomplete multipart uploads under the
-// store's prefix, by the namespace their key is under; keys under no valid
-// namespace name (such as the pre-namespace blobs/) are left out.
-func (c *Collector) uploadsByNamespace(ctx context.Context) (map[string][]Upload, error) {
-	top := c.top()
-	uploads, err := c.cfg.Bucket.ListUploads(ctx, top)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string][]Upload{}
-	for _, u := range uploads {
-		ns, _, found := strings.Cut(strings.TrimPrefix(u.Key, top), "/")
-		if !found || metastore.ValidateScope(ns) != nil {
-			continue
-		}
-		out[ns] = append(out[ns], u)
-	}
-	return out, nil
-}
-
-func (c *Collector) top() string {
-	if p := c.cfg.Meta.Prefix(); p != "" {
-		return p + "/"
-	}
-	return ""
+	return s.namespaces, nil
 }
 
 // Run collects every namespace in the bucket, one after the other, and
-// returns their reports. A namespace that fails doesn't stop the others;
-// the error joins their failures.
+// returns their reports. It runs only under an ownership marker of this
+// layout, and only when nothing outside the namespaces is of an unknown
+// shape (see survey); otherwise it does nothing, and returns ErrNotOwned.
+// A namespace that fails doesn't stop the others; the error joins their
+// failures.
 func (c *Collector) Run(ctx context.Context) ([]Report, error) {
 	c.run.Lock()
 	defer c.run.Unlock()
-	names, err := c.Namespaces(ctx)
+	s, rules, rerr, err := c.prepare(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("gc: list namespaces: %w", err)
+		return nil, err
 	}
-	// Incomplete multipart uploads, listed once for every namespace. A
-	// namespace whose only leftover is one (a promotion cut short, whose
-	// staged source has since expired) has no object to list it by, so
-	// their namespaces join the set.
-	byNS, uerr := c.uploadsByNamespace(ctx)
-	if uerr != nil {
-		// Each namespace's run reports it too; this one also covers the
-		// namespaces it can't find without the listing (those with only
-		// an upload), whatever else there is.
-		uerr = fmt.Errorf("gc: list multipart uploads: %w", uerr)
-	}
-	for ns := range byNS {
-		if !slices.Contains(names, ns) {
-			names = append(names, ns)
-		}
-	}
-	slices.Sort(names)
-	rules, rerr := c.cfg.Bucket.ExpirationPrefixes(ctx)
-	if rerr != nil {
-		c.log.Info("gc: can't read the bucket's lifecycle rules, so it expires every namespace's staged uploads itself", "error", rerr)
-		rules = nil
+	if s.root.n > 0 {
+		rep, err := c.refuseRoot(s)
+		return []Report{rep}, err
 	}
 	var reports []Report
 	var errs []error
-	for _, ns := range names {
+	found := make(map[string]bool, len(s.namespaces))
+	for _, ns := range s.namespaces {
+		found[ns] = true
+	}
+	for _, ns := range s.namespaces {
 		if ctx.Err() != nil {
 			return reports, context.Cause(ctx)
 		}
-		rep := c.collect(ctx, ns, rules, rerr == nil, byNS[ns], uerr)
+		rep := c.collect(ctx, ns, rules, rerr == nil, s.uploads[ns], s.badUploads[ns])
 		reports = append(reports, rep)
 		if len(rep.Errors) > 0 {
 			errs = append(errs, fmt.Errorf("namespace %s: %s", ns, strings.Join(rep.Errors, "; ")))
 		}
 	}
-	// The gauges of namespaces gone from the bucket go too.
-	found := make(map[string]bool, len(names))
-	for _, ns := range names {
+	// Uploads in a namespace with no objects: it has no index, and is
+	// left alone. Those of no known shape are still violations.
+	for _, ns := range slices.Sorted(maps.Keys(s.uploads)) {
+		if !slices.Contains(s.namespaces, ns) {
+			c.log.Info("gc: incomplete multipart uploads in a namespace with no index; left alone", "namespace", ns, "uploads", len(s.uploads[ns]))
+		}
+	}
+	for _, ns := range slices.Sorted(maps.Keys(s.badUploads)) {
+		if slices.Contains(s.namespaces, ns) {
+			continue
+		}
+		rep, err := c.badUploadsOnly(ns, s.badUploads[ns])
+		reports = append(reports, rep)
+		errs = append(errs, fmt.Errorf("namespace %s: %w", ns, err))
 		found[ns] = true
 	}
+	// The gauges of namespaces gone from the bucket go too.
 	for ns := range c.listed {
 		if !found[ns] {
 			c.cfg.Metrics.GCForget(ns)
 		}
 	}
 	c.listed = found
-	return reports, errors.Join(append([]error{uerr}, errs...)...)
+	return reports, errors.Join(errs...)
 }
 
-// RunNamespace collects one namespace.
+// badUploadsOnly reports a namespace with no objects whose uploads include
+// some of no known shape: a violation, as in a namespace with objects. They
+// are never aborted, and nor is anything else there (it has no index).
+func (c *Collector) badUploadsOnly(ns string, bad *unexpected) (Report, error) {
+	c.cfg.Metrics.GCUnexpected(ns, bad.n)
+	c.log.Error("gc: multipart uploads of no known shape in a namespace with no index; never aborted. "+
+		"Nothing else may write under the service's prefix (see README, Bucket ownership)", "namespace", ns, "count", bad.n, "keys", bad.keys)
+	rep := Report{Namespace: ns, DryRun: c.cfg.DryRun, Unexpected: bad.keys, UnexpectedCount: bad.n, Skipped: "no index"}
+	err := fmt.Errorf("%d multipart uploads of no known shape, such as %s", bad.n, bad.keys[0])
+	rep.fail(err)
+	return rep, err
+}
+
+// prepare is what every run does before collecting: it checks the marker,
+// surveys the prefix, and reads the lifecycle rules.
+func (c *Collector) prepare(ctx context.Context) (*survey, []string, error, error) {
+	if err := c.checkMarker(ctx); err != nil {
+		c.log.Error("gc: does nothing", "error", err)
+		return nil, nil, nil, err
+	}
+	s, err := c.survey(ctx)
+	if err != nil {
+		c.log.Error("gc: does nothing", "error", err)
+		return nil, nil, nil, fmt.Errorf("gc: %w", err)
+	}
+	if s.root.n == 0 {
+		c.cfg.Metrics.GCUnexpected(RootScope, 0)
+	}
+	rules, rerr := c.cfg.Bucket.ExpirationPrefixes(ctx)
+	if rerr != nil {
+		c.log.Info("gc: can't read the bucket's lifecycle rules, so it expires every namespace's staged uploads itself", "error", rerr)
+		rules = nil
+	}
+	return s, rules, rerr, nil
+}
+
+// RunNamespace collects one namespace, under the same checks as Run: the
+// marker, and nothing of unknown shape outside the namespaces.
 func (c *Collector) RunNamespace(ctx context.Context, ns string) (Report, error) {
 	if err := metastore.ValidateScope(ns); err != nil {
 		return Report{}, err
 	}
 	c.run.Lock()
 	defer c.run.Unlock()
-	rules, rerr := c.cfg.Bucket.ExpirationPrefixes(ctx)
-	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
-	uploads, uerr := c.cfg.Bucket.ListUploads(ctx, prefix)
-	rep := c.collect(ctx, ns, rules, rerr == nil, uploads, uerr)
+	s, rules, rerr, err := c.prepare(ctx)
+	if err != nil {
+		return Report{}, err
+	}
+	if s.root.n > 0 {
+		return c.refuseRoot(s)
+	}
+	if !slices.Contains(s.namespaces, ns) {
+		if bad := s.badUploads[ns]; bad != nil {
+			return c.badUploadsOnly(ns, bad)
+		}
+		return Report{Namespace: ns, DryRun: c.cfg.DryRun, Skipped: "no index"}, nil
+	}
+	rep := c.collect(ctx, ns, rules, rerr == nil, s.uploads[ns], s.badUploads[ns])
 	if len(rep.Errors) > 0 {
 		return rep, errors.New(strings.Join(rep.Errors, "; "))
 	}
@@ -392,15 +408,24 @@ type listing struct {
 	staging     []Object          // full keys
 	hasIndex    bool
 	indexBytes  int64
-	bytes       map[string]int64
-	objects     map[string]int64
+	// bytes and objects count the keys of known shapes, by kind.
+	bytes   map[string]int64
+	objects map[string]int64
+	// unexpected are the keys of no known shape: ownership violations.
+	unexpected unexpected
 }
 
-var (
-	bundleRel     = regexp.MustCompile(`^bundles/([0-9a-f]{64})\.json$`)
-	resolutionRel = regexp.MustCompile(`^resolutions/([0-9a-f]{64})\.json$`)
-	stagingRel    = regexp.MustCompile(`^staging/[0-9a-f]{32}/`)
-)
+// metricKinds are the metrics' kinds of the layout's shapes. The epoch
+// object and the conditional-write probe are "other".
+var metricKinds = map[layout.Kind]string{
+	layout.KindIndex:      metrics.KindIndex,
+	layout.KindBundle:     metrics.KindBundle,
+	layout.KindResolution: metrics.KindResolution,
+	layout.KindBlob:       metrics.KindBlob,
+	layout.KindStaging:    metrics.KindStaging,
+	layout.KindEpoch:      metrics.KindOther,
+	layout.KindProbe:      metrics.KindOther,
+}
 
 func (c *Collector) list(ctx context.Context, ns string) (*listing, error) {
 	prefix, err := c.cfg.Meta.ScopePrefix(ns)
@@ -417,28 +442,24 @@ func (c *Collector) list(ctx context.Context, ns string) (*listing, error) {
 			if !ok {
 				continue
 			}
-			kind := metrics.KindOther
-			switch {
-			case rel == "index.json":
-				kind = metrics.KindIndex
+			k, id := layout.Classify(rel)
+			switch k {
+			case layout.KindUnknown:
+				l.unexpected.add(o.Key)
+				continue
+			case layout.KindIndex:
 				l.hasIndex, l.indexBytes = true, o.Size
-			case bundleRel.MatchString(rel):
-				kind = metrics.KindBundle
-				l.bundles[bundleRel.FindStringSubmatch(rel)[1]] = o
-			case resolutionRel.MatchString(rel):
-				kind = metrics.KindResolution
-				l.resolutions[resolutionRel.FindStringSubmatch(rel)[1]] = o
-			case strings.HasPrefix(rel, "blobs/"):
-				if d, err := relDigest(strings.TrimPrefix(rel, "blobs/")); err == nil && metastore.BlobRelKey(d) == rel {
-					kind = metrics.KindBlob
-					l.blobs[rel] = o
-				}
-			case stagingRel.MatchString(rel):
-				kind = metrics.KindStaging
+			case layout.KindBundle:
+				l.bundles[id] = o
+			case layout.KindResolution:
+				l.resolutions[id] = o
+			case layout.KindBlob:
+				l.blobs[rel] = o
+			case layout.KindStaging:
 				l.staging = append(l.staging, o)
 			}
-			l.bytes[kind] += o.Size
-			l.objects[kind]++
+			l.bytes[metricKinds[k]] += o.Size
+			l.objects[metricKinds[k]]++
 		}
 		return nil
 	})
@@ -459,11 +480,11 @@ type refs struct {
 
 // has reports whether a relative key is named.
 func (r *refs) has(key string) bool {
-	switch {
-	case bundleRel.MatchString(key):
-		return r.bundles[bundleRel.FindStringSubmatch(key)[1]]
-	case resolutionRel.MatchString(key):
-		return r.resolutions[resolutionRel.FindStringSubmatch(key)[1]]
+	switch k, id := layout.Classify(key); k {
+	case layout.KindBundle:
+		return r.bundles[id]
+	case layout.KindResolution:
+		return r.resolutions[id]
 	default:
 		return r.blobs[key]
 	}
@@ -524,8 +545,14 @@ func (c *Collector) bundleBlobs(ctx context.Context, ns, id string) ([]string, e
 	return keys, nil
 }
 
-// collect runs one namespace: expire, list, size, sweep, staging, uploads.
-func (c *Collector) collect(ctx context.Context, ns string, rules []string, rulesKnown bool, uploads []Upload, uploadsErr error) Report {
+// collect runs one namespace: read the index, list, check ownership,
+// expire, size, sweep, staging, uploads.
+//
+// The namespace is left alone, with nothing written, deleted or aborted in
+// it, when it has no index (an export that never recorded, or a prefix
+// under ns/ that isn't the service's), or when any of its keys or uploads is
+// of no known shape: an ownership violation.
+func (c *Collector) collect(ctx context.Context, ns string, rules []string, rulesKnown bool, uploads []Upload, badUploads *unexpected) Report {
 	start := time.Now()
 	ctx = metrics.WithCaller(ctx, metrics.CallerGC)
 	rep := Report{Namespace: ns, DryRun: c.cfg.DryRun}
@@ -540,13 +567,66 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 		c.cfg.Metrics.GCRun(ns, outcome, time.Since(start))
 		log.Info("gc run", "dryRun", c.cfg.DryRun, "expired", rep.Expired, "sizeRoots", rep.SizeRoots, "sizeExpired", rep.SizeExpired,
 			"liveBytes", rep.LiveBytes, "deleted", rep.Deleted, "deletedBytes", rep.DeletedBytes, "wouldDelete", len(rep.WouldDelete),
-			"stagingRule", rep.StagingRule, "skipped", rep.Skipped, "errors", len(rep.Errors), "duration", time.Since(start).Round(time.Millisecond))
+			"stagingRule", rep.StagingRule, "unexpected", rep.UnexpectedCount, "skipped", rep.Skipped, "errors", len(rep.Errors),
+			"duration", time.Since(start).Round(time.Millisecond))
 	}()
 	lim := c.cfg.Limits(ns)
 	now := c.cfg.Now()
 
-	// 1. Expire by expiry and max age; stamp roots with no recording time.
-	prev, idx, err := c.expire(ctx, ns, lim, now, &rep)
+	// 1. Read the index, before the listing: everything it names was
+	// stored before the listing began, so must be in it (see sweep).
+	snap, existed, ierr := c.cfg.Meta.IndexSnapshot(ctx, ns)
+
+	// 2. List what is stored.
+	l, err := c.list(ctx, ns)
+	if err != nil {
+		rep.fail(fmt.Errorf("list: %w", err))
+		rep.Skipped = "the namespace couldn't be listed"
+		return rep
+	}
+
+	// What the listing found of known shapes, whatever happens next: a
+	// namespace skipped for a violation or a missing index still reports
+	// what it holds.
+	rep.StoredBytes, rep.StoredObjects = l.bytes, l.objects
+	c.cfg.Metrics.GCStored(ns, l.bytes, l.objects)
+
+	// 3. Ownership: every key and upload must be of a known shape.
+	u := l.unexpected
+	if badUploads != nil {
+		u.n += badUploads.n
+		u.keys = append(u.keys, badUploads.keys...)[:min(len(u.keys)+len(badUploads.keys), MaxUnexpectedLogged)]
+	}
+	c.cfg.Metrics.GCUnexpected(ns, u.n)
+	if u.n > 0 {
+		rep.Unexpected, rep.UnexpectedCount = u.keys, u.n
+		rep.Skipped = "keys of no known shape in the namespace"
+		rep.fail(fmt.Errorf("%d keys of no known shape, such as %s: the namespace isn't the service's alone; nothing in it is changed this run", u.n, u.keys[0]))
+		log.Error("gc: keys of no known shape in the namespace: nothing in it is deleted, aborted or changed this run. "+
+			"Nothing else may write under the service's prefix (see README, Bucket ownership)", "count", u.n, "keys", u.keys)
+		return rep
+	}
+	if !l.hasIndex {
+		rep.Skipped = "no index"
+		log.Info("gc: a namespace without an index; left alone")
+		return rep
+	}
+	if ierr == nil && !existed {
+		// The first index was written between the read and the listing:
+		// the snapshot, empty, names nothing the new index does. The next
+		// run collects the namespace.
+		rep.Skipped = "the index appeared during the run"
+		log.Info("gc: the namespace's first index was written during the run; left alone until the next")
+		return rep
+	}
+
+	// 4. Expire by expiry and max age; stamp roots with no recording time.
+	var prev, idx *metastore.Index
+	if ierr == nil {
+		prev, idx, err = c.expire(ctx, ns, snap, lim, now, &rep)
+	} else {
+		err = ierr
+	}
 	if err != nil {
 		// The bundles, resolutions and blobs need the index; staged and
 		// multipart uploads don't, and are still collected.
@@ -560,31 +640,16 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 		c.publishEpoch(ctx, ns, idx, &rep)
 	}
 
-	// 2. List what is stored.
-	l, err := c.list(ctx, ns)
-	if err != nil {
-		rep.fail(fmt.Errorf("list: %w", err))
-		rep.Skipped = "the namespace couldn't be listed"
-		return rep
-	}
-	rep.StoredBytes, rep.StoredObjects = l.bytes, l.objects
-	c.cfg.Metrics.GCStored(ns, l.bytes, l.objects)
-
-	// 3. Bundles, resolutions and blobs, only where an index is, and was
-	// read: without one, GC can't tell an object in use from one that
-	// isn't.
-	switch {
-	case idx == nil:
-	case !l.hasIndex:
-		rep.Skipped = "no index"
-	default:
+	// 5. Bundles, resolutions and blobs, only where the index was read:
+	// without it, GC can't tell an object in use from one that isn't.
+	if idx != nil {
 		c.sweep(ctx, ns, prev, idx, l, lim, now, &rep, log)
 	}
 
-	// 4. Staged uploads, unless a lifecycle rule expires them.
+	// 6. Staged uploads, unless a lifecycle rule expires them.
 	c.sweepStaging(ctx, ns, l, rules, rulesKnown, now, &rep, log)
-	// 5. Incomplete multipart uploads.
-	c.abortUploads(ctx, ns, uploads, uploadsErr, now, &rep, log)
+	// 7. Incomplete multipart uploads.
+	c.abortUploads(ctx, ns, uploads, now, &rep, log)
 	return rep
 }
 
@@ -592,12 +657,9 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 // update, and only when there is something to change: GC writes no index
 // that didn't need it, and never creates one. It also drops finished
 // deletions older than metastore.DeletionRetention. A dry run changes a
-// copy. It returns the index it read, and the index after.
-func (c *Collector) expire(ctx context.Context, ns string, lim Limits, now time.Time, rep *Report) (*metastore.Index, *metastore.Index, error) {
-	snap, err := c.cfg.Meta.Index(ctx, ns)
-	if err != nil {
-		return nil, nil, err
-	}
+// copy. It returns snap, the index read before the listing, and the index
+// after.
+func (c *Collector) expire(ctx context.Context, ns string, snap *metastore.Index, lim Limits, now time.Time, rep *Report) (*metastore.Index, *metastore.Index, error) {
 	nowUnix := now.Unix()
 	apply := func(idx *metastore.Index) (stamped, dropped, pruned int) {
 		stamped = idx.StampRoots(nowUnix)
@@ -672,11 +734,21 @@ func (c *Collector) sweep(ctx context.Context, ns string, prev, idx *metastore.I
 		rep.Skipped = "a bundle the index names couldn't be read"
 		return
 	}
-	// Every bundle and resolution the index names must be in the listing,
-	// which came after the index was read: the blob lists are cached
-	// across runs, so a bundle gone since (deleted by hand, say) would
-	// otherwise go unnoticed, and its blobs be swept.
-	if missing := missingNamed(r, l); missing != "" {
+	// Every bundle and resolution the index read before the listing (prev)
+	// names must be in the listing: the blob lists are cached across runs,
+	// so a bundle gone since (deleted by hand, say) would otherwise go
+	// unnoticed, and its blobs be swept. The index after expiry may name
+	// more, recorded since the listing; those aren't in it, and aren't
+	// candidates either.
+	named := r
+	if prev != idx {
+		if named, err = c.references(ctx, ns, prev); err != nil {
+			rep.fail(err)
+			rep.Skipped = "a bundle the index names couldn't be read"
+			return
+		}
+	}
+	if missing := missingNamed(named, l); missing != "" {
 		rep.fail(fmt.Errorf("%s, which the index names, is not in the listing", missing))
 		rep.Skipped = "an object the index names is missing"
 		return
@@ -992,11 +1064,11 @@ func sameRecord(a, b metastore.Entry) bool {
 
 // kindSize is a relative key's kind and listed size.
 func (l *listing) kindSize(k string) (string, int64) {
-	switch {
-	case bundleRel.MatchString(k):
-		return metrics.KindBundle, l.bundles[bundleRel.FindStringSubmatch(k)[1]].Size
-	case resolutionRel.MatchString(k):
-		return metrics.KindResolution, l.resolutions[resolutionRel.FindStringSubmatch(k)[1]].Size
+	switch kind, id := layout.Classify(k); kind {
+	case layout.KindBundle:
+		return metrics.KindBundle, l.bundles[id].Size
+	case layout.KindResolution:
+		return metrics.KindResolution, l.resolutions[id].Size
 	default:
 		return metrics.KindBlob, l.blobs[k].Size
 	}
@@ -1230,12 +1302,11 @@ func (c *Collector) sweepStaging(ctx context.Context, ns string, l *listing, rul
 
 // abortUploads aborts the namespace's incomplete multipart uploads older than
 // StagingAge: promotions that a stopped service left.
-func (c *Collector) abortUploads(ctx context.Context, ns string, uploads []Upload, err error, now time.Time, rep *Report, log *slog.Logger) {
+//
+// Every upload here is at a blob key of the namespace (survey): one of
+// another shape is a violation, and its namespace isn't collected.
+func (c *Collector) abortUploads(ctx context.Context, ns string, uploads []Upload, now time.Time, rep *Report, log *slog.Logger) {
 	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
-	if err != nil {
-		rep.fail(fmt.Errorf("list uploads: %w", err))
-		return
-	}
 	cutoff := now.Add(-c.cfg.StagingAge)
 	n := 0
 	for _, u := range uploads {

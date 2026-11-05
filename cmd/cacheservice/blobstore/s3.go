@@ -17,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/opencontainers/go-digest"
+
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 )
 
 const (
@@ -48,8 +50,10 @@ type S3Config struct {
 	Region string
 	// Bucket holds the blobs.
 	Bucket string
-	// Prefix is prepended to every key, with a slash: blobs are stored at
-	// <Prefix>/blobs/<algorithm>/<hex>. Empty stores them at the bucket's top.
+	// Prefix is the service's prefix: a namespace's blobs are stored at
+	// <Prefix>/ns/<namespace>/blobs/<algorithm>/<hex> (see package layout).
+	// Empty puts ns/ at the bucket's top. The service owns everything under
+	// it (see the README, "Bucket ownership").
 	Prefix string
 	// PathStyle addresses the bucket in the URL's path, not its host name.
 	// MinIO and most other S3-compatible stores need it.
@@ -150,10 +154,13 @@ var ErrNotPositiveSize = errors.New("a presigned PUT needs a positive size")
 
 // S3Store is a Store in an S3 bucket.
 type S3Store struct {
-	client    *s3.Client
-	presign   *s3.PresignClient
-	bucket    string
-	prefix    string
+	client  *s3.Client
+	presign *s3.PresignClient
+	bucket  string
+	prefix  string
+	// ns is the namespace of a view (Namespace). The store itself, with
+	// none, names no keys: every blob is a namespace's.
+	ns        string
 	putExpiry time.Duration
 	getExpiry time.Duration
 	now       func() time.Time
@@ -260,27 +267,43 @@ func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 }
 
 // Namespace returns the store of one namespace's blobs: the same bucket and
-// expiries, with keys under <prefix>/<ns>, so its blobs are at
-// <prefix>/<ns>/blobs/<algorithm>/<hex>, next to the namespace's metadata.
+// expiries, with keys under <prefix>/ns/<ns>/, so its blobs are at
+// <prefix>/ns/<ns>/blobs/<algorithm>/<hex>, next to the namespace's metadata.
 func (s *S3Store) Namespace(ns string) (Store, error) {
-	if err := ValidateNamespace(ns); err != nil {
+	if err := layout.ValidateNamespace(ns); err != nil {
 		return nil, err
 	}
 	c := *s
-	c.prefix = ns
-	if s.prefix != "" {
-		c.prefix = s.prefix + "/" + ns
-	}
+	c.ns = ns
 	return &c, nil
 }
 
-// Key returns the object key of a blob: <prefix>/blobs/<algorithm>/<hex>.
+// errNoNamespace is a key asked of the store itself, not of a namespace's
+// view: blobs are kept only per namespace.
+var errNoNamespace = errors.New("s3 blob store: no namespace; blobs are kept per namespace (Namespace)")
+
+// nsPrefix is the prefix of the view's namespace: <prefix>/ns/<ns>/.
+func (s *S3Store) nsPrefix() (string, error) {
+	if s.ns == "" {
+		return "", errNoNamespace
+	}
+	return layout.NamespacePrefix(s.prefix, s.ns)
+}
+
+// Key returns the object key of a blob: <prefix>/ns/<ns>/blobs/<algorithm>/<hex>.
 func (s *S3Store) Key(dgst digest.Digest) (string, error) {
-	return blobKey(s.prefix, dgst)
+	if err := dgst.Validate(); err != nil {
+		return "", fmt.Errorf("blob key: %w", err)
+	}
+	p, err := s.nsPrefix()
+	if err != nil {
+		return "", err
+	}
+	return p + layout.BlobRel(dgst), nil
 }
 
 // StagingKey returns the object key a blob is uploaded to under stage:
-// <prefix>/staging/<stage>/<algorithm>/<hex>.
+// <prefix>/ns/<ns>/staging/<stage>/<algorithm>/<hex>.
 func (s *S3Store) StagingKey(stage Stage, dgst digest.Digest) (string, error) {
 	if err := stage.Validate(); err != nil {
 		return "", err
@@ -288,28 +311,22 @@ func (s *S3Store) StagingKey(stage Stage, dgst digest.Digest) (string, error) {
 	if err := dgst.Validate(); err != nil {
 		return "", fmt.Errorf("staging key: %w", err)
 	}
-	return s.StagingPrefix() + string(stage) + "/" + dgst.Algorithm().String() + "/" + dgst.Encoded(), nil
+	p, err := s.nsPrefix()
+	if err != nil {
+		return "", err
+	}
+	return p + layout.StagingRel(string(stage), dgst), nil
 }
 
-// StagingPrefix is the prefix of every staged upload of the store (or of
-// the namespace, for a namespace's view): <prefix>/staging/. The bucket's
-// lifecycle rule expires what is under it.
+// StagingPrefix is the prefix of every staged upload of the namespace's
+// view: <prefix>/ns/<ns>/staging/. The bucket's lifecycle rule expires
+// what is under it. It is "" for the store itself, which has none.
 func (s *S3Store) StagingPrefix() string {
-	if s.prefix == "" {
-		return "staging/"
+	p, err := s.nsPrefix()
+	if err != nil {
+		return ""
 	}
-	return s.prefix + "/staging/"
-}
-
-func blobKey(prefix string, dgst digest.Digest) (string, error) {
-	if err := dgst.Validate(); err != nil {
-		return "", fmt.Errorf("blob key: %w", err)
-	}
-	key := "blobs/" + dgst.Algorithm().String() + "/" + dgst.Encoded()
-	if prefix != "" {
-		key = prefix + "/" + key
-	}
-	return key, nil
+	return p + layout.StagingDir
 }
 
 // Has reports whether the blob is stored, with HeadObject.
