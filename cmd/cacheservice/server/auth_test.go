@@ -900,7 +900,7 @@ func TestParseTokens(t *testing.T) {
 		"tok-a team-a extra\n",         // three fields
 		"tok-a team/a\n",               // not one key segment
 		"tok-a ..\n",                   // not a namespace
-		"tok-a blobs\n",                // reserved
+		"tok-a -x\n",                   // not a namespace
 		"tok-a team-a\ntok-a team-b\n", // twice
 		"tok:a team-a\n",               // HTTP Basic ends the username at ':'
 	} {

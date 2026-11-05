@@ -3,7 +3,10 @@ package blobstore
 import (
 	"context"
 	"crypto/md5" //nolint:gosec // what the fake's ETags are
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +31,11 @@ type copyStore struct {
 	completed int
 	aborted   int
 	copies    int
+	// noCopyResult answers part copies with 200 and no CopyPartResult.
+	noCopyResult bool
+	// checksum answers part copies with the data's SHA-256, as a store
+	// that hashes does.
+	checksum bool
 }
 
 func (c *copyStore) etagOf(data []byte) string {
@@ -66,6 +74,14 @@ func (c *copyStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			data = c.body[from : to+1]
+		}
+		if c.noCopyResult {
+			return
+		}
+		if c.checksum {
+			sum := sha256.Sum256(data)
+			_, _ = fmt.Fprintf(w, `<CopyPartResult><ETag>"%s"</ETag><ChecksumSHA256>%s</ChecksumSHA256></CopyPartResult>`, c.etagOf(data), base64.StdEncoding.EncodeToString(sum[:]))
+			return
 		}
 		_, _ = fmt.Fprintf(w, `<CopyPartResult><ETag>"%s"</ETag></CopyPartResult>`, c.etagOf(data))
 	case r.Method == http.MethodPost && q.Has("uploadId"):
@@ -130,6 +146,60 @@ func TestPromoteChecksCopiedParts(t *testing.T) {
 				t.Fatalf("%d uploads completed, %d aborted; want %d and %d", f.completed, f.aborted, tc.wantCompleted, tc.wantAborted)
 			}
 		})
+	}
+}
+
+// A store answering UploadPartCopy without a CopyPartResult
+// (zerobull-consulting/dagger#77, item 6) fails the promotion with an error,
+// in both paths, instead of panicking on the missing ETag; the upload is
+// aborted and nothing is completed. The store path doesn't take it for a
+// store that doesn't hash: that would switch every later promotion to the
+// service.
+func TestPromoteNoCopyPartResult(t *testing.T) {
+	body := []byte(strings.Repeat("0123456789", 3))
+	d := digest.FromBytes(body)
+	for _, tc := range []struct {
+		name          string
+		hashInService bool
+		partSize      int64
+	}{
+		{name: "store hashed"},
+		{name: "service hashed", hashInService: true},
+		{name: "service hashed, many parts", hashInService: true, partSize: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &copyStore{body: body, noCopyResult: true}
+			srv := httptest.NewServer(f)
+			defer srv.Close()
+			cfg := testConfig()
+			cfg.Endpoint = srv.URL
+			cfg.HashInService = tc.hashInService
+			s := newTestStore(t, cfg)
+			if tc.partSize > 0 {
+				s.maxPartCopy, s.copyPartSize = tc.partSize, tc.partSize
+			}
+			p, err := s.Promote(context.Background(), NewStage(), d, int64(len(body)))
+			if !errors.Is(err, errNoCopyResult) {
+				t.Fatalf("promote: %+v, %v; want errNoCopyResult", p, err)
+			}
+			if f.completed != 0 || f.aborted != 1 || f.copies != 1 {
+				t.Fatalf("%d copies, %d completed, %d aborted; want 1, 0 and 1", f.copies, f.completed, f.aborted)
+			}
+			if s.noStoreHash.Load() {
+				t.Fatal("a missing CopyPartResult switched the store to hashing in the service")
+			}
+		})
+	}
+	// The fake's checksums work: the same store, answering with a result,
+	// promotes through the store path.
+	f := &copyStore{body: body, checksum: true}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	p, err := newTestStore(t, cfg).Promote(context.Background(), NewStage(), d, int64(len(body)))
+	if err != nil || p.Outcome != Promoted || p.HashedBy != HashedByStore {
+		t.Fatalf("promote with a result: %+v, %v; want promoted, hashed by the store", p, err)
 	}
 }
 

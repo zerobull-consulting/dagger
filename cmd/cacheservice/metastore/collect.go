@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/opencontainers/go-digest"
 
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/dagql"
 )
 
@@ -155,16 +155,14 @@ type Fence struct {
 // noFence is Record's fence: it refuses only objects being deleted.
 var noFence = Fence{Epoch: math.MaxUint64}
 
-// relKeyPattern is a key relative to a scope that GC may claim.
-var relKeyPattern = regexp.MustCompile(`^(blobs/[a-z0-9]+([+._-][a-z0-9]+)*/[a-zA-Z0-9=_-]+|bundles/[0-9a-f]{64}\.json|resolutions/[0-9a-f]{64}\.json)$`)
-
 // ValidateCollectable reports whether key, relative to a scope, names an
 // object GC may delete: a blob's digest key, a bundle or a resolution.
 func ValidateCollectable(key string) error {
-	if !relKeyPattern.MatchString(key) {
-		return fmt.Errorf("not a collectable key: %q", key)
+	switch k, _ := layout.Classify(key); k {
+	case layout.KindBlob, layout.KindBundle, layout.KindResolution:
+		return nil
 	}
-	return nil
+	return fmt.Errorf("not a collectable key: %q", key)
 }
 
 func (c *Collection) validate() error {
@@ -185,16 +183,14 @@ func (c *Collection) validate() error {
 // Keys of a scope's objects, relative to the scope.
 
 // BundleRelKey is a bundle's key relative to its scope.
-func BundleRelKey(id string) string { return "bundles/" + id + ".json" }
+func BundleRelKey(id string) string { return layout.BundleRel(id) }
 
 // ResolutionRelKey is a resolution's key relative to its scope.
-func ResolutionRelKey(id string) string { return "resolutions/" + id + ".json" }
+func ResolutionRelKey(id string) string { return layout.ResolutionRel(id) }
 
 // BlobRelKey is a blob's digest key relative to its namespace, as the blob
 // store lays it out: blobs/<algorithm>/<hex>.
-func BlobRelKey(d digest.Digest) string {
-	return "blobs/" + d.Algorithm().String() + "/" + d.Encoded()
-}
+func BlobRelKey(d digest.Digest) string { return layout.BlobRel(d) }
 
 // BundleBlobs returns the blobs a bundle names, each once, sorted: every
 // layer of its outputs' chains and of its records' pending offers. Those
@@ -249,9 +245,9 @@ func (idx *Index) checkFence(keys []string, fence Fence) error {
 	return nil
 }
 
-// epochKey is the scope's epoch object: <prefix>/<scope>/gc-epoch.json.
+// epochKey is the scope's epoch object: <prefix>/ns/<scope>/gc-epoch.json.
 func (s *Store) epochKey(scope string) (string, error) {
-	return s.scopeKey(scope, "gc-epoch.json")
+	return s.scopeKey(scope, layout.EpochName)
 }
 
 // EpochKey returns the key of a scope's epoch object.
@@ -328,13 +324,13 @@ func (s *Store) WriteEpoch(ctx context.Context, scope string, epoch uint64) erro
 }
 
 // ScopePrefix returns the prefix of every key of a scope:
-// <prefix>/<scope>/.
+// <prefix>/ns/<scope>/.
 func (s *Store) ScopePrefix(scope string) (string, error) {
 	return s.scopeKey(scope, "")
 }
 
-// Prefix returns the store's prefix, without slashes: "" when scopes are at
-// the top of the store.
+// Prefix returns the store's prefix, without slashes: "" when the service
+// owns the whole bucket.
 func (s *Store) Prefix() string { return s.prefix }
 
 // RelKey returns key relative to its scope's prefix, and false when key

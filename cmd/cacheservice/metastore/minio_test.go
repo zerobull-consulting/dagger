@@ -107,9 +107,9 @@ func TestMinIOMetastoreRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, key := range []string{
-		cfg.Prefix + "/s1/index.json",
-		cfg.Prefix + "/s1/bundles/" + r.BundleID + ".json",
-		cfg.Prefix + "/s1/resolutions/" + r.ResolutionID + ".json",
+		cfg.Prefix + "/ns/s1/index.json",
+		cfg.Prefix + "/ns/s1/bundles/" + r.BundleID + ".json",
+		cfg.Prefix + "/ns/s1/resolutions/" + r.ResolutionID + ".json",
 	} {
 		if _, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &cfg.Bucket, Key: aws.String(key)}); err != nil {
 			t.Errorf("%s: %v", key, err)

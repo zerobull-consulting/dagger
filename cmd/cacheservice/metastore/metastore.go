@@ -3,14 +3,16 @@
 //
 // Each scope (a team, a tenant) has:
 //
-//   - bundles: <prefix>/<scope>/bundles/<id>.json, one per exported
+// Its keys are laid out by package layout, under <prefix>/ns/<scope>/:
+//
+//   - bundles: <prefix>/ns/<scope>/bundles/<id>.json, one per exported
 //     dagql.ValueBundle. A bundle's ID is the SHA-256 of its JSON, so a bundle
 //     is written once and never changes.
-//   - resolutions: <prefix>/<scope>/resolutions/<id>.json, one per export:
+//   - resolutions: <prefix>/ns/<scope>/resolutions/<id>.json, one per export:
 //     the service number each of a bundle's values resolved to when it was
 //     recorded, which merges of the bundle send. Content-addressed like
 //     bundles. See Resolution.
-//   - an index: <prefix>/<scope>/index.json, one object naming every entry
+//   - an index: <prefix>/ns/<scope>/index.json, one object naming every entry
 //     the scope stores, its roots, expiries and dependencies, and which
 //     engine entry numbers map to which service numbers. See Index.
 //
@@ -34,6 +36,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"
 )
@@ -59,8 +62,8 @@ var ErrCorruptBundle = errors.New("bundle content doesn't match its ID")
 type Config struct {
 	// Objects holds the bundles and indexes.
 	Objects Objects
-	// Prefix is prepended to every key, with a slash. Empty stores scopes
-	// at the top of the store.
+	// Prefix is the service's prefix: scopes are under <Prefix>/ns/ (see
+	// package layout). Empty puts ns/ at the top of the store.
 	Prefix string
 	// MaxAttempts bounds the writes UpdateIndex tries. Zero means
 	// DefaultMaxAttempts.
@@ -109,6 +112,9 @@ func New(cfg Config) (*Store, error) {
 	}, nil
 }
 
+// Objects returns the object store the Store keeps its objects in.
+func (s *Store) Objects() Objects { return s.objects }
+
 // Now returns the Store's clock.
 func (s *Store) Now() time.Time { return s.now() }
 
@@ -133,49 +139,34 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// scopePattern is what a scope may be: one key segment, with nothing a path
-// could misread.
-var scopePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-
-// reservedScope is the blob store's key segment under a shared prefix.
-const reservedScope = "blobs"
-
-// ValidateScope reports whether scope can name a scope's keys.
-func ValidateScope(scope string) error {
-	if !scopePattern.MatchString(scope) || strings.Contains(scope, "..") {
-		return fmt.Errorf("invalid scope %q: want 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit, without '..'", scope)
-	}
-	if scope == reservedScope {
-		return fmt.Errorf("invalid scope %q: the blob store uses it", scope)
-	}
-	return nil
-}
+// ValidateScope reports whether scope can name a scope's keys: a namespace
+// name, as layout.ValidateNamespace has it.
+func ValidateScope(scope string) error { return layout.ValidateNamespace(scope) }
 
 // bundleIDPattern is a bundle ID: a SHA-256, in lowercase hex.
 var bundleIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// scopeKey is a key of a scope: <prefix>/ns/<scope>/<rest> (see package
+// layout).
 func (s *Store) scopeKey(scope, rest string) (string, error) {
-	if err := ValidateScope(scope); err != nil {
+	p, err := layout.NamespacePrefix(s.prefix, scope)
+	if err != nil {
 		return "", err
 	}
-	key := scope + "/" + rest
-	if s.prefix != "" {
-		key = s.prefix + "/" + key
-	}
-	return key, nil
+	return p + rest, nil
 }
 
-// IndexKey returns the key of a scope's index: <prefix>/<scope>/index.json.
+// IndexKey returns the key of a scope's index: <prefix>/ns/<scope>/index.json.
 func (s *Store) IndexKey(scope string) (string, error) {
-	return s.scopeKey(scope, "index.json")
+	return s.scopeKey(scope, layout.IndexName)
 }
 
-// BundleKey returns the key of a bundle: <prefix>/<scope>/bundles/<id>.json.
+// BundleKey returns the key of a bundle: <prefix>/ns/<scope>/bundles/<id>.json.
 func (s *Store) BundleKey(scope, id string) (string, error) {
 	if !bundleIDPattern.MatchString(id) {
 		return "", fmt.Errorf("invalid bundle ID %q", id)
 	}
-	return s.scopeKey(scope, "bundles/"+id+".json")
+	return s.scopeKey(scope, layout.BundleRel(id))
 }
 
 // BundleID returns the ID a bundle is stored under: the SHA-256 of its JSON.
@@ -385,9 +376,9 @@ func backoff(attempt int) time.Duration {
 // VerifyConditionalWrites checks that the object store honors the
 // conditional writes UpdateIndex relies on. A store that ignored them would
 // let concurrent writers overwrite each other's index updates. It writes
-// <prefix>/<scope>/conditional-write-check/<nonce>, and deletes it again.
+// <prefix>/ns/<scope>/conditional-write-check/<nonce>, and deletes it again.
 func (s *Store) VerifyConditionalWrites(ctx context.Context, scope string) (err error) {
-	key, err := s.scopeKey(scope, fmt.Sprintf("conditional-write-check/%016x", rand.Uint64()))
+	key, err := s.scopeKey(scope, layout.ProbeRel(rand.Uint64()))
 	if err != nil {
 		return err
 	}

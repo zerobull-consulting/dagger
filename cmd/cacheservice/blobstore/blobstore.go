@@ -21,12 +21,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 )
 
 // Store holds blobs keyed by digest.
@@ -131,15 +132,9 @@ type Namespacer interface {
 	Namespace(ns string) (Store, error)
 }
 
-// ValidateNamespace reports whether ns can name a namespace's keys: one key
-// segment. The service checks namespaces against metastore.ValidateScope,
-// which is stricter.
-func ValidateNamespace(ns string) error {
-	if ns == "" || ns == "." || ns == ".." || strings.ContainsAny(ns, "/\\") {
-		return fmt.Errorf("invalid blob namespace %q", ns)
-	}
-	return nil
-}
+// ValidateNamespace reports whether ns can name a namespace's keys:
+// layout.ValidateNamespace, the one rule for namespace names.
+func ValidateNamespace(ns string) error { return layout.ValidateNamespace(ns) }
 
 // Address is a presigned URL and the time it stops working.
 type Address struct {

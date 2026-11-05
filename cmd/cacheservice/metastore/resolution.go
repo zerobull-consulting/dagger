@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"
 )
@@ -30,7 +31,7 @@ const ResolutionVersion = 1
 // recorded doesn't either: Record writes it once, and the importer merges
 // with it.
 //
-// A resolution is stored as <prefix>/<scope>/resolutions/<id>.json, where id
+// A resolution is stored as <prefix>/ns/<scope>/resolutions/<id>.json, where id
 // is the SHA-256 of its JSON: written once, never changed, like a bundle. It
 // names its bundle and cache because a bundle two caches exported resolves to
 // different service numbers, so each gets a resolution of its own; two
@@ -133,12 +134,12 @@ func ResolutionID(r *Resolution) (string, []byte, error) {
 }
 
 // ResolutionKey returns the key of a resolution:
-// <prefix>/<scope>/resolutions/<id>.json.
+// <prefix>/ns/<scope>/resolutions/<id>.json.
 func (s *Store) ResolutionKey(scope, id string) (string, error) {
 	if !bundleIDPattern.MatchString(id) {
 		return "", fmt.Errorf("invalid resolution ID %q", id)
 	}
-	return s.scopeKey(scope, "resolutions/"+id+".json")
+	return s.scopeKey(scope, layout.ResolutionRel(id))
 }
 
 // PutResolution stores a resolution and returns its ID. Storing one that is

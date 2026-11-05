@@ -33,25 +33,29 @@ type S3Bucket struct {
 
 var _ Bucket = (*S3Bucket)(nil)
 
-// ListPrefixes lists with the delimiter "/": one ListObjectsV2 per 1,000
-// prefixes.
-func (b *S3Bucket) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+// ListLevel lists with the delimiter "/": one ListObjectsV2 per 1,000
+// entries.
+func (b *S3Bucket) ListLevel(ctx context.Context, prefix string) ([]string, []Object, error) {
 	pages := s3.NewListObjectsV2Paginator(b.Client, &s3.ListObjectsV2Input{
 		Bucket:    &b.Bucket,
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
 	})
-	var out []string
+	var dirs []string
+	var objs []Object
 	for pages.HasMorePages() {
 		page, err := pages.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list %s: %w", prefix, err)
+			return nil, nil, fmt.Errorf("list %s: %w", prefix, err)
 		}
 		for _, p := range page.CommonPrefixes {
-			out = append(out, aws.ToString(p.Prefix))
+			dirs = append(dirs, aws.ToString(p.Prefix))
+		}
+		for _, o := range page.Contents {
+			objs = append(objs, Object{Key: aws.ToString(o.Key), Size: aws.ToInt64(o.Size), Modified: aws.ToTime(o.LastModified)})
 		}
 	}
-	return out, nil
+	return dirs, objs, nil
 }
 
 // List lists every object under prefix: one ListObjectsV2 per 1,000 keys.

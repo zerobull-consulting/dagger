@@ -5,15 +5,18 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 )
 
 // Bucket is what garbage collection needs of the object store, beyond the
 // metadata store: listing, batch deletes, incomplete multipart uploads, and
 // the bucket's lifecycle rules.
 type Bucket interface {
-	// ListPrefixes returns the common prefixes one level under prefix
-	// (which ends with "/"), each ending with "/".
-	ListPrefixes(ctx context.Context, prefix string) ([]string, error)
+	// ListLevel returns what is one level under prefix (which ends with
+	// "/" or is empty): the common prefixes, each ending with "/", and the
+	// objects directly under it.
+	ListLevel(ctx context.Context, prefix string) (prefixes []string, objects []Object, err error)
 	// List calls fn with each page of the objects under prefix, in key
 	// order. An error from fn ends the listing with that error.
 	List(ctx context.Context, prefix string, fn func([]Object) error) error
@@ -57,9 +60,9 @@ type Upload struct {
 // within it: a broader rule, over the whole namespace or prefix, expires
 // live data too, and doesn't count (see liveRules).
 func stagingCovered(nsPrefix string, prefixes []string) bool {
-	staging := nsPrefix + "staging/"
+	staging := nsPrefix + layout.StagingDir
 	for _, r := range prefixes {
-		if strings.HasPrefix(staging, r) && strings.HasPrefix(r, nsPrefix+"staging") {
+		if strings.HasPrefix(staging, r) && strings.HasPrefix(r, nsPrefix+strings.TrimSuffix(layout.StagingDir, "/")) {
 			return true
 		}
 	}
@@ -67,12 +70,13 @@ func stagingCovered(nsPrefix string, prefixes []string) bool {
 }
 
 // liveRules returns the rules' prefixes that expire keys of a namespace's
-// live data, by age: its blobs, bundles, resolutions or index. Such a rule
-// deletes what the index names, whatever GC decides.
+// live data, by age: its blobs, bundles, resolutions, index or epoch
+// (layout.LiveRel). Such a rule deletes what the index names, whatever GC
+// decides.
 func liveRules(nsPrefix string, prefixes []string) []string {
 	var out []string
 	for _, r := range prefixes {
-		for _, live := range []string{"blobs/", "bundles/", "resolutions/", "index.json"} {
+		for _, live := range layout.LiveRel {
 			k := nsPrefix + live
 			if strings.HasPrefix(k, r) || strings.HasPrefix(r, k) {
 				out = append(out, r)

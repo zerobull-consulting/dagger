@@ -32,6 +32,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -41,7 +42,9 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
 
 // S3Options configures the paths EnableS3 turns on.
@@ -88,9 +91,12 @@ func (s *Service) SetReadOnly() error {
 
 // EnableS3 turns on the export path, unless opts.NoExport is set, and the
 // import path, unless opts.NoImport is, with the S3 blob and metadata stores
-// of cfg, until ctx ends. With the export path on, it refuses a store that
-// ignores conditional writes, which would let index updates overwrite each
-// other; that check writes, so it also refuses a read-only key.
+// of cfg, until ctx ends. First it checks that the prefix is the service's
+// (ownership.Check): a writer claims an empty prefix, and both kinds of
+// instance refuse one holding anything else, or another layout. With the
+// export path on, it then refuses a store that ignores conditional writes,
+// which would let index updates overwrite each other; that check writes, so
+// it also refuses a read-only key.
 func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3Options) error {
 	// Before the stores are built: a refused combination touches nothing.
 	if err := s.checkS3Options(opts); err != nil {
@@ -129,6 +135,9 @@ type storeSet struct {
 	GCBucket func() (gc.Bucket, error)
 	// LogAttrs say where the stores are, in the startup log.
 	LogAttrs []any
+	// Owner is where the ownership check runs; nil is Meta's objects,
+	// which must then implement ownership.Store.
+	Owner ownership.Store
 }
 
 // checkS3Options refuses the options that can't go together, or with the
@@ -157,6 +166,9 @@ func (s *Service) enableStores(ctx context.Context, st storeSet, opts S3Options)
 		return err
 	}
 	where := append(slices.Clip(st.LogAttrs), "scope", opts.Scope)
+	if err := s.checkOwnership(ctx, st, !opts.NoExport, where); err != nil {
+		return err
+	}
 	if opts.NoExport {
 		if err := s.SetReadOnly(); err != nil {
 			return err
@@ -201,6 +213,37 @@ func (s *Service) enableStores(ctx context.Context, st storeSet, opts S3Options)
 	g.Collector.Bucket = bucket
 	g.Collector.Meta = st.Meta
 	return s.EnableGC(ctx, g)
+}
+
+// checkOwnership is the startup check of the prefix (ownership.Check),
+// before anything else touches the bucket: a writer claims an empty prefix,
+// and every instance refuses a prefix that isn't the service's or is of
+// another layout, without writing or deleting anything there. The
+// conditional write check runs after it, in the scope's namespace: it
+// overwrites its object, which the marker, never rewritten, can't be.
+func (s *Service) checkOwnership(ctx context.Context, st storeSet, writer bool, where []any) error {
+	owner := st.Owner
+	if owner == nil {
+		o, ok := st.Meta.Objects().(ownership.Store)
+		if !ok {
+			return errors.New("ownership check: the metadata store's objects can't be listed")
+		}
+		owner = o
+	}
+	state, m, err := ownership.Check(ctx, owner, st.Meta.Prefix(), writer, time.Now())
+	if err != nil {
+		return fmt.Errorf("ownership check: %w", err)
+	}
+	attrs := append(slices.Clip(where), "layout", layout.Version, "state", state.String())
+	switch state {
+	case ownership.Empty:
+		s.logger.Warn("no store exists under the prefix yet: nothing to import until a writer (the cache-warming job) creates one", attrs...)
+	case ownership.Claimed:
+		s.logger.Info("prefix claimed: it was empty, and the ownership marker is created", append(attrs, "marker", layout.MarkerKey(st.Meta.Prefix()))...)
+	default:
+		s.logger.Info("prefix owned", append(attrs, "markerCreated", m.Created, "markerServiceVersion", m.ServiceVersion)...)
+	}
+	return nil
 }
 
 // Wait waits for the exports in flight, those a drain started included, the

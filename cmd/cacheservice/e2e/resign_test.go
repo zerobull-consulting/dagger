@@ -135,7 +135,7 @@ func TestMinIOProxySignsAgain(t *testing.T) {
 			}
 
 			// Presigned URLs, as the engine uses them.
-			store, err := blobstore.NewS3(ctx, cfg)
+			store, err := nsStore(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -170,7 +170,7 @@ func TestMinIOProxySignsAgain(t *testing.T) {
 			}
 			short := cfg
 			short.GetExpiry = time.Second
-			shortStore, err := blobstore.NewS3(ctx, short)
+			shortStore, err := nsStore(ctx, short)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -299,7 +299,7 @@ func TestS3ProxyForwardsToTheStore(t *testing.T) {
 					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
 				}),
 			}})
-			store, err := blobstore.NewS3(ctx, blobstore.S3Config{Endpoint: p.URL, Region: "r", Bucket: "bkt", Prefix: "pre", PathStyle: true, Credentials: creds})
+			store, err := nsStore(ctx, blobstore.S3Config{Endpoint: p.URL, Region: "r", Bucket: "bkt", Prefix: "pre", PathStyle: true, Credentials: creds})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -330,7 +330,7 @@ func TestS3ProxyForwardsToTheStore(t *testing.T) {
 			if head.URL.Path != tc.wantPath {
 				t.Errorf("path %s, want %s", head.URL.Path, tc.wantPath)
 			}
-			wantBlob := strings.Replace(tc.wantPath, "/pre/k", "/pre/blobs/sha256/"+d.Encoded(), 1)
+			wantBlob := strings.Replace(tc.wantPath, "/pre/k", "/pre/ns/default/blobs/sha256/"+d.Encoded(), 1)
 			if presigned.URL.Path != wantBlob {
 				t.Errorf("presigned path %s, want %s", presigned.URL.Path, wantBlob)
 			}
@@ -348,4 +348,14 @@ func TestS3ProxyForwardsToTheStore(t *testing.T) {
 			}
 		})
 	}
+}
+
+// nsStore is the blob store of namespace "default" for cfg: blobs are kept
+// only per namespace.
+func nsStore(ctx context.Context, cfg blobstore.S3Config) (blobstore.Store, error) {
+	s, err := blobstore.NewS3(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return s.Namespace("default")
 }

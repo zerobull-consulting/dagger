@@ -640,10 +640,10 @@ type blockingBucket struct {
 	once    sync.Once
 }
 
-func (b *blockingBucket) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+func (b *blockingBucket) ListLevel(ctx context.Context, prefix string) ([]string, []gc.Object, error) {
 	b.once.Do(func() { close(b.blocked) })
 	<-ctx.Done()
-	return nil, ctx.Err()
+	return nil, nil, ctx.Err()
 }
 
 // A GC run asked for (POST /debug/gc) and under way when the drain starts is

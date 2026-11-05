@@ -162,7 +162,7 @@ func TestS3StoreOverTheWire(t *testing.T) {
 		t.Fatal(err)
 	}
 	// AWS's 409 on the index is retried like a 412.
-	f.conflict["team/s1/index.json"] = 2
+	f.conflict["team/ns/s1/index.json"] = 2
 	r2, err := s.Record(ctx, "s1", chain(20), "cache-a", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -171,14 +171,14 @@ func TestS3StoreOverTheWire(t *testing.T) {
 		t.Fatalf("second record: numbers %v, %d entries", r2.Numbers, len(r2.Index.Entries))
 	}
 	// A bundle PUT that conflicts, and then finds its key, succeeds.
-	f.conflict["team/s1/bundles/"+r1.BundleID+".json"] = 1
+	f.conflict["team/ns/s1/bundles/"+r1.BundleID+".json"] = 1
 	if id, err := s.PutBundle(ctx, "s1", chain(10)); err != nil || id != r1.BundleID {
 		t.Fatalf("put an existing bundle: %s, %v", id, err)
 	}
 	// A bundle PUT that conflicts, and doesn't find its key, tries again.
 	b := chain(30)
 	id, _, _ := BundleID(b)
-	f.conflict["team/s1/bundles/"+id+".json"] = 2
+	f.conflict["team/ns/s1/bundles/"+id+".json"] = 2
 	if got, err := s.PutBundle(ctx, "s1", b); err != nil || got != id {
 		t.Fatalf("put a conflicting bundle: %s, %v", got, err)
 	}

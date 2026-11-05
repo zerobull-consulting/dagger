@@ -11,6 +11,9 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS build
 ARG TARGETOS
 ARG TARGETARCH
+# Recorded in the ownership marker this image creates (README, "Bucket
+# ownership").
+ARG REVISION=""
 WORKDIR /src
 COPY . .
 # The cache mounts keep modules and build results between local builds; on a
@@ -18,7 +21,8 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags='-s -w' -o /out/cacheservice ./cmd/cacheservice
+    go build -trimpath -ldflags="-s -w -X github.com/dagger/dagger/cmd/cacheservice/ownership.ServiceVersion=${REVISION}" \
+      -o /out/cacheservice ./cmd/cacheservice
 
 # CA certificates, tzdata, and user 65532 (nonroot); no shell.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab

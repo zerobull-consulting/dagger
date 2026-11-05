@@ -12,6 +12,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 )
 
@@ -76,13 +77,21 @@ func (b *MemBucket) top() string {
 	return strings.Trim(b.Prefix, "/") + "/"
 }
 
-// all returns every object, sorted by key.
+// all returns every object, sorted by key. Blobs are at the keys the S3
+// store gives a namespace's (package layout); a blob of the MemStore
+// itself, which names no namespace, is where the layout before ns/ kept
+// blobs, as a stand-in for keys of no known shape.
 func (b *MemBucket) all() []Object {
 	var out []Object
 	for _, o := range b.Blobs.Objects() {
-		key := b.top() + o.NS + "/" + metastore.BlobRelKey(o.Digest)
-		if o.Stage != "" {
-			key = b.top() + o.NS + "/staging/" + string(o.Stage) + "/" + o.Digest.Algorithm().String() + "/" + o.Digest.Encoded()
+		var key string
+		switch {
+		case o.NS == "":
+			key = b.top() + metastore.BlobRelKey(o.Digest)
+		case o.Stage != "":
+			key = layout.NamespacesPrefix(b.Prefix) + o.NS + "/" + layout.StagingRel(string(o.Stage), o.Digest)
+		default:
+			key = layout.NamespacesPrefix(b.Prefix) + o.NS + "/" + layout.BlobRel(o.Digest)
 		}
 		out = append(out, Object{Key: key, Size: o.Size, Modified: o.Modified})
 	}
@@ -93,21 +102,24 @@ func (b *MemBucket) all() []Object {
 	return out
 }
 
-// ListPrefixes returns the prefixes one level under prefix.
-func (b *MemBucket) ListPrefixes(_ context.Context, prefix string) ([]string, error) {
+// ListLevel returns the prefixes and objects one level under prefix.
+func (b *MemBucket) ListLevel(_ context.Context, prefix string) ([]string, []Object, error) {
 	seen := map[string]bool{}
-	var out []string
+	var dirs []string
+	var objs []Object
 	for _, o := range b.all() {
 		rest, ok := strings.CutPrefix(o.Key, prefix)
 		if !ok {
 			continue
 		}
-		if dir, _, found := strings.Cut(rest, "/"); found && !seen[dir] {
+		if dir, _, found := strings.Cut(rest, "/"); !found {
+			objs = append(objs, o)
+		} else if !seen[dir] {
 			seen[dir] = true
-			out = append(out, prefix+dir+"/")
+			dirs = append(dirs, prefix+dir+"/")
 		}
 	}
-	return out, nil
+	return dirs, objs, nil
 }
 
 // List lists the objects under prefix in pages of 3, so callers see pages.
@@ -166,29 +178,22 @@ func (b *MemBucket) Delete(ctx context.Context, keys []string) ([]string, error)
 			failed = append(failed, key)
 			continue
 		}
-		rest, ok := strings.CutPrefix(key, b.top())
-		if !ok {
+		place, ns, rel := layout.Locate(b.Prefix, key)
+		if place == layout.NotUnder {
 			return failed, fmt.Errorf("delete %s: not under the prefix", key)
 		}
-		ns, rel, _ := strings.Cut(rest, "/")
-		switch {
-		case strings.HasPrefix(rel, "blobs/"):
-			d, err := relDigest(strings.TrimPrefix(rel, "blobs/"))
-			if err != nil {
-				return failed, err
+		if place == layout.InNamespace {
+			if d, ok := layout.ParseBlobRel(rel); ok {
+				b.Blobs.DeleteObject(ns, "", d)
+				continue
 			}
-			b.Blobs.DeleteObject(ns, "", d)
-		case strings.HasPrefix(rel, "staging/"):
-			stage, dpath, _ := strings.Cut(strings.TrimPrefix(rel, "staging/"), "/")
-			d, err := relDigest(dpath)
-			if err != nil {
-				return failed, err
+			if stage, d, ok := layout.ParseStagingRel(rel); ok {
+				b.Blobs.DeleteObject(ns, blobstore.Stage(stage), d)
+				continue
 			}
-			b.Blobs.DeleteObject(ns, blobstore.Stage(stage), d)
-		default:
-			if err := b.Objects.Delete(ctx, key); err != nil {
-				return failed, err
-			}
+		}
+		if err := b.Objects.Delete(ctx, key); err != nil {
+			return failed, err
 		}
 	}
 	return failed, nil

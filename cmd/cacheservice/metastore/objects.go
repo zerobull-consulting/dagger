@@ -118,6 +118,25 @@ func (o *S3Objects) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// ListKeys returns up to max keys under prefix, in key order, with one
+// ListObjectsV2.
+func (o *S3Objects) ListKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	out, err := o.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  &o.Bucket,
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(int32(max)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", prefix, err)
+	}
+	keys := make([]string, 0, len(out.Contents))
+	for _, c := range out.Contents {
+		keys = append(keys, aws.ToString(c.Key))
+	}
+	// A store may return more than asked.
+	return keys[:min(len(keys), max)], nil
+}
+
 func httpStatus(err error) int {
 	var re *smithyhttp.ResponseError
 	if errors.As(err, &re) {
@@ -179,6 +198,18 @@ func (m *MemObjects) List(prefix string) []ObjectInfo {
 	}
 	slices.SortFunc(out, func(a, b ObjectInfo) int { return strings.Compare(a.Key, b.Key) })
 	return out
+}
+
+// ListKeys returns up to max keys under prefix, in key order.
+func (m *MemObjects) ListKeys(_ context.Context, prefix string, max int) ([]string, error) {
+	var keys []string
+	for _, o := range m.List(prefix) {
+		if len(keys) == max {
+			break
+		}
+		keys = append(keys, o.Key)
+	}
+	return keys, nil
 }
 
 // Get returns a copy of the object.
@@ -243,8 +274,8 @@ func NewS3Objects(ctx context.Context, cfg blobstore.S3Config) (*S3Objects, erro
 }
 
 // NewS3 returns a Store in cfg's bucket, under cfg's prefix: the same bucket
-// and prefix as the blob store's, so a scope's metadata sits next to the
-// blobs (<prefix>/blobs/...), and a scope can't be named "blobs".
+// and prefix as the blob store's, so a scope's metadata sits next to its
+// blobs, under <prefix>/ns/<scope>/ (see package layout).
 func NewS3(ctx context.Context, cfg blobstore.S3Config) (*Store, error) {
 	objects, err := NewS3Objects(ctx, cfg)
 	if err != nil {
