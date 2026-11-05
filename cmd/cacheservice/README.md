@@ -2356,9 +2356,11 @@ passed by name (`-e NAME`, so their values aren't on a command line):
 ```bash
 export CACHESERVICE_S3_ENDPOINT=... CACHESERVICE_S3_REGION=... CACHESERVICE_S3_BUCKET=...
 export CACHESERVICE_S3_PREFIX=cache CACHESERVICE_S3_ACCESS_KEY_ID=... CACHESERVICE_S3_SECRET_ACCESS_KEY=...
+export CACHESERVICE_S3_PATH_STYLE=true   # MinIO; leave it unset for Spaces or AWS
 docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::8090" \
   -e CACHESERVICE_S3_ENDPOINT -e CACHESERVICE_S3_REGION -e CACHESERVICE_S3_BUCKET \
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
+  -e CACHESERVICE_S3_PATH_STYLE \
   ghcr.io/zerobull-consulting/cacheservice:<commit SHA> \
   -scope default -drain-timeout 10m -gc-interval=0
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
