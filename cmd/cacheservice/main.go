@@ -392,7 +392,7 @@ const shutdownMargin = 500 * time.Millisecond
 // server.CloseEnginesTimeout), shuts the servers down, and waits for their
 // requests and the service's paths, until grace has passed since it began.
 // It returns an error when that bound cut the wait off, with work still
-// running. The cancel comes first, as when the signal itself canceled that
+// running: the service's paths, or an HTTP request. The cancel comes first, as when the signal itself canceled that
 // context: a request tied to it, such as POST /debug/gc, then ends at once
 // rather than holding the shutdown for grace.
 func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, grace time.Duration) error {
@@ -402,10 +402,17 @@ func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.C
 	closeCtx, cancelClose := context.WithTimeout(ctx, server.CloseEnginesTimeout)
 	svc.CloseEnginesContext(closeCtx)
 	cancelClose()
+	var errs []error
 	for _, srv := range servers {
-		_ = srv.Shutdown(ctx)
+		// A request still running when ctx ends: the stop isn't clean.
+		if err := srv.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("http server %s: requests still running: %w", srv.Addr, err))
+		}
 	}
-	return svc.WaitContext(ctx)
+	if err := svc.WaitContext(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // DefaultDrainTimeout is -drain-timeout's default.

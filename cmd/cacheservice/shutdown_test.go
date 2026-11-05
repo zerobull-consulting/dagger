@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -73,5 +74,43 @@ func TestShutdownCancelsBeforeWaitingForRequests(t *testing.T) {
 	shutdown(svc, []*http.Server{srv}, cancel, grace)
 	if took := time.Since(start); took >= grace/2 {
 		t.Fatalf("the stop took %s: it waited for the GC request before ending the service's paths", took)
+	}
+}
+
+// A request still running when the shutdown's bound passes makes the stop
+// unclean: shutdown reports it, so the process exits 1, not 0. The service
+// itself has nothing left to wait for here, so only the HTTP server's
+// shutdown can tell.
+func TestShutdownReportsRequestsStillRunning(t *testing.T) {
+	svc := server.New(slog.New(slog.DiscardHandler), "")
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	mux := http.NewServeMux()
+	// Ignores its request's context, as a handler stuck on a store would.
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/slow")
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request didn't reach its handler")
+	}
+	const grace = 300 * time.Millisecond
+	err = shutdown(svc, []*http.Server{srv}, func() {}, grace)
+	if err == nil || !strings.Contains(err.Error(), "requests still running") {
+		t.Fatalf("shutdown with a request still running reported %v", err)
 	}
 }

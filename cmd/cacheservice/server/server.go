@@ -237,6 +237,13 @@ func (s *Service) WaitContext(ctx context.Context) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
+		// Both may be ready, as when ctx had ended before the call: what
+		// ended in time counts.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
 		return context.Cause(ctx)
 	}
 }
@@ -258,7 +265,7 @@ type Running struct {
 	Held int
 }
 
-// LogAttrs are r as log attributes.
+// LogAttrs returns the counts of r as key-value pairs for slog.
 func (r Running) LogAttrs() []any {
 	attrs := []any{"exports", r.Exports, "imports", r.Imports, "gc", r.GC, "engines", r.Engines}
 	if r.Held > 0 {
