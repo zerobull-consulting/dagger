@@ -355,6 +355,83 @@ which drains its exports first (see
 [Stopping and draining](../../cmd/cacheservice/README.md#stopping-and-draining)),
 before stopping the engine.
 
+## Engine image
+
+The stock engine has no remote cache client. CI publishes one that has it, as
+`ghcr.io/zerobull-consulting/dagger-engine`
+([`engine-image.yml`](../../.github/workflows/engine-image.yml)),
+`linux/amd64` only, with the same tags as the
+[service's image](../../cmd/cacheservice/README.md#image):
+
+- `:<commit SHA>` (the full SHA) for each push to `feature/remote-cache`;
+- `:feature-remote-cache`, which moves to the newest of those.
+
+It is the release engine image the fork last merged from main
+(`registry.dagger.io/engine:v1.0.0-beta.24`, pinned by digest in
+[`engine.Dockerfile`](engine.Dockerfile)), with four binaries built from this
+repo copied over it: `dagger-engine`, `dagger-init`, `dagger-init-session`
+and the `dagger` CLI. Everything else (crun, CNI plugins, qemu, tini, the SDK
+manifests, `engine.json` with GC on) is the release's. The binaries report
+the repo's next version, `v1.0.0-beta.25`, with the commit. When a merge from
+main brings a new release, move `BASE_IMAGE` to it.
+
+Run it as the engine container, with the service's URL:
+
+```bash
+docker run -d --name dagger-engine-rc --privileged \
+  -e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL=https://<service> \
+  -e DAGGER_CLOUD_URL=https://<service> \
+  -e DAGGER_CLOUD_TOKEN=<engine token> \
+  -v dagger-engine-rc:/var/lib/dagger \
+  ghcr.io/zerobull-consulting/dagger-engine:feature-remote-cache
+```
+
+Then point the CLI at it, with `DAGGER_CLOUD_TOKEN` and `DAGGER_CLOUD_URL`
+set for the CLI too, and `TRACEPARENT` unset (without them, the service never
+learns the entries: see
+[Running it against a local engine](../../cmd/cacheservice/README.md#running-it-against-a-local-engine)):
+
+```bash
+export _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://dagger-engine-rc
+```
+
+Use the image's own CLI, which matches the engine:
+
+```bash
+docker run --rm --entrypoint cat ghcr.io/zerobull-consulting/dagger-engine:feature-remote-cache /usr/local/bin/dagger > dagger && chmod +x dagger
+```
+
+That CLI is stamped with its image's SHA tag as its default engine, so
+without `_EXPERIMENTAL_DAGGER_RUNNER_HOST` it provisions exactly that engine
+itself. A provisioned engine gets the CLI's `DAGGER_CLOUD_TOKEN` but not the
+service's URL, so it doesn't connect to the service: run the engine yourself,
+as above, to use the remote cache.
+
+To build it from a fresh clone, at the repository root:
+
+```bash
+docker build -f hack/remote-cache/engine.Dockerfile \
+  --build-arg ENGINE_IMAGE=dagger-engine -t dagger-engine .
+```
+
+`ENGINE_IMAGE` is the CLI's default engine: keep it the same as `-t`, so the
+CLI copied out of the image provisions the local image (the CLI uses a local
+image when there is one, and pulls only when there isn't). Without it, the
+CLI's default is `registry.dagger.io/engine:v1.0.0-beta.25`, which doesn't
+exist, and it needs `_EXPERIMENTAL_DAGGER_RUNNER_HOST`.
+`--build-arg REVISION=<sha>` stamps the commit. CI passes both.
+[`engine.Dockerfile.dockerignore`](engine.Dockerfile.dockerignore) keeps the
+context to the packages the binaries build from.
+
+[`engine-image-smoke.sh`](engine-image-smoke.sh) is CI's check, and runs the
+same locally: the CLI's version, commit and default engine; the engine
+connecting to the published service image (no store); and a container run
+through it.
+
+```bash
+RUNNER_HOST=image://dagger-engine ./hack/remote-cache/engine-image-smoke.sh dagger-engine
+```
+
 ## Real engines: `dev.sh e2e`
 
 ```bash
