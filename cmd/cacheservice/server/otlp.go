@@ -15,6 +15,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
@@ -33,7 +34,7 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("HEAD /v1/traces", func(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("otlp probe", "method", r.Method, "path", r.URL.Path, "userAgent", r.UserAgent())
 	})
-	mux.HandleFunc("POST /v1/logs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/logs", s.otlpDeadline(func(w http.ResponseWriter, r *http.Request) {
 		ns, key, ok := s.otlpAuth(w, r)
 		if !ok {
 			return
@@ -46,8 +47,8 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 		defer release()
 		s.logRecords(ns, key, &req)
 		writeOTLP(w, r, &collogspb.ExportLogsServiceResponse{})
-	})
-	mux.HandleFunc("POST /v1/traces", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("POST /v1/traces", s.otlpDeadline(func(w http.ResponseWriter, r *http.Request) {
 		ns, _, ok := s.otlpAuth(w, r)
 		if !ok {
 			return
@@ -61,8 +62,8 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 		s.logSpans(&req)
 		s.trackSpans(ns, &req)
 		writeOTLP(w, r, &coltracepb.ExportTraceServiceResponse{})
-	})
-	mux.HandleFunc("POST /v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("POST /v1/metrics", s.otlpDeadline(func(w http.ResponseWriter, r *http.Request) {
 		if _, _, ok := s.otlpAuth(w, r); !ok {
 			return
 		}
@@ -80,7 +81,23 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 		}
 		s.logger.Debug("otlp metrics", "metrics", points)
 		writeOTLP(w, r, &colmetricspb.ExportMetricsServiceResponse{})
-	})
+	}))
+}
+
+// otlpDeadline runs an OTLP POST handler with the read timeout already set on
+// its connection, before the token is checked: what is read of the request
+// after its headers, by the handler or by net/http after it, ends by then.
+// A request refused before its body is read (401) still has net/http read up
+// to 256 KiB of it after the handler, and discard it, to reuse the
+// connection; the deadline bounds how long a client can hold the handler
+// that way. The server clears the deadline before reading the next request.
+func (s *Service) otlpDeadline(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.otlp.readTimeout)); err != nil {
+			s.logger.Debug("otlp request: no read deadline", "error", err)
+		}
+		h(w, r)
+	}
 }
 
 func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportLogsServiceRequest) {
@@ -148,16 +165,23 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 		"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
 		"contentLength", r.ContentLength)
 	lim := s.otlp
-	// The connection's read deadline, for this request's body alone: the
-	// server clears it before reading the next request.
-	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(lim.readTimeout)); err != nil {
-		s.logger.Debug("otlp request: no read deadline", "error", err)
-	}
+	// The read deadline is the route's (otlpDeadline).
 	received := &countingReader{r: http.MaxBytesReader(w, r.Body, route.limit)}
-	var body io.Reader = received
+	var (
+		body       io.Reader = received
+		gzReserved int64
+	)
 	if r.Header.Get("Content-Encoding") == "gzip" {
+		// The decompressor is reserved before it is built, and released
+		// with the body's buffer.
+		if !lim.budget.reserve(otlpGzipReserve) {
+			s.refuseOTLP(w, r, route, http.StatusServiceUnavailable, metrics.OTLPRefusedBusy, errOTLPBusy)
+			return nil, false
+		}
+		gzReserved = otlpGzipReserve
 		gz, err := lim.gunzip(received)
 		if err != nil {
+			lim.budget.release(gzReserved)
 			status, reason := otlpRefusal(err)
 			s.refuseOTLP(w, r, route, status, reason, err)
 			return nil, false
@@ -166,7 +190,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 		body = gz
 	}
 	data, reserved, err := readOTLPBody(body, route.limit, lim.budget)
-	release = func() { lim.budget.release(reserved) }
+	release = func() { lim.budget.release(reserved + gzReserved) }
 	if err != nil {
 		release()
 		status, reason := otlpRefusal(err)

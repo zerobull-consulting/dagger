@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -459,11 +460,12 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // exporters retry, records nothing, and is taken once the budget frees.
 // Requests well within it are never refused, however many: only bytes count.
 //
-// Sizes: the budget is 64 KiB; a 40 KiB body needs a 64 KiB buffer, so it
-// fits alone but not beside the held 32 KiB.
+// Sizes: the budget is 96 KiB. A 40 KiB body needs a 64 KiB buffer, and
+// 96 KiB as that buffer grows from 32 KiB: it fits alone, not beside the held
+// 32 KiB.
 func TestOTLPDecodeBudget(t *testing.T) {
 	cases := otlpCases()
-	svc, rec, srv := limitedService(t, testOTLPLimit)
+	svc, rec, srv := limitedService(t, 96<<10)
 	// A request that holds half the budget while its body arrives: 20 KiB
 	// sent, into a buffer of 32 KiB reserved.
 	big := sized(t, cases[2].build, false, testOTLPLimit)
@@ -513,7 +515,7 @@ func TestOTLPDecodeBudget(t *testing.T) {
 func TestOTLPSlowBodyCutOff(t *testing.T) {
 	rec := &logRecorder{}
 	svc := New(slog.New(rec), "")
-	setOTLPLimits(svc, testOTLPLimit, testOTLPLimit)
+	setOTLPLimits(svc, testOTLPLimit, 96<<10)
 	const timeout = 200 * time.Millisecond
 	svc.otlp.readTimeout = timeout
 	srv := httptest.NewUnstartedServer(nil)
@@ -712,7 +714,8 @@ func (c *budgetCheckingReader) Read(p []byte) (int, error) {
 // refused without a buffer larger than the limit.
 func TestOTLPBodyReadOnlyIntoReservedBytes(t *testing.T) {
 	for _, size := range []int{0, 1, 511, 512, 513, 5000, testOTLPLimit - 1, testOTLPLimit} {
-		budget := newByteBudget(testOTLPLimit)
+		// 1.5 times the limit as an at-limit buffer last grows.
+		budget := newByteBudget(2 * testOTLPLimit)
 		r := &budgetCheckingReader{t: t, r: bytes.NewReader(make([]byte, size)), budget: budget}
 		data, reserved, err := readOTLPBody(r, testOTLPLimit, budget)
 		if err != nil || len(data) != size {
@@ -722,7 +725,7 @@ func TestOTLPBodyReadOnlyIntoReservedBytes(t *testing.T) {
 			t.Fatalf("%d bytes: %d reserved, buffer of %d, %d in use", size, reserved, cap(data), budget.inUse())
 		}
 	}
-	budget := newByteBudget(testOTLPLimit)
+	budget := newByteBudget(2 * testOTLPLimit)
 	r := &budgetCheckingReader{t: t, r: bytes.NewReader(make([]byte, testOTLPLimit+1)), budget: budget}
 	if _, reserved, err := readOTLPBody(r, testOTLPLimit, budget); !errors.Is(err, errOTLPTooLarge) || reserved != testOTLPLimit {
 		t.Fatalf("one byte over: %d reserved, %v", reserved, err)
@@ -731,7 +734,7 @@ func TestOTLPBodyReadOnlyIntoReservedBytes(t *testing.T) {
 	// it.
 	small := newByteBudget(4 << 10)
 	r = &budgetCheckingReader{t: t, r: bytes.NewReader(make([]byte, 6<<10)), budget: small}
-	if _, reserved, err := readOTLPBody(r, testOTLPLimit, small); !errors.Is(err, errOTLPBusy) || reserved != 4<<10 || r.read > 4<<10 {
+	if _, reserved, err := readOTLPBody(r, testOTLPLimit, small); !errors.Is(err, errOTLPBusy) || reserved != 2<<10 || r.read > 2<<10 {
 		t.Fatalf("past the budget: %d reserved, %d read, %v", reserved, r.read, err)
 	}
 }
@@ -763,4 +766,110 @@ func TestOTLPSlowBodyCutOffHTTP2(t *testing.T) {
 	if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedTimeout); got != 1 {
 		t.Fatalf("timeouts %v", got)
 	}
+}
+
+// While a buffer grows, the old one is still held as the new one is filled
+// with its copy: both are reserved until the copy is done, so the budget
+// counts the moment a request holds the most.
+func TestOTLPBufferGrowthReservesBoth(t *testing.T) {
+	// 2049 bytes grow the buffer 512, 1 KiB, 2 KiB, 4 KiB: at its last
+	// growth, 2 KiB and 4 KiB at once.
+	budget := newByteBudget(1 << 20)
+	data, reserved, err := readOTLPBody(bytes.NewReader(make([]byte, 2049)), testOTLPLimit, budget)
+	if err != nil || len(data) != 2049 || reserved != 4<<10 || budget.peakUse() != 6<<10 {
+		t.Fatalf("read %d, %d reserved, peak %d, %v", len(data), reserved, budget.peakUse(), err)
+	}
+	// A budget that holds the final buffer, but not both at its growth,
+	// refuses.
+	tight := newByteBudget(4 << 10)
+	if _, reserved, err := readOTLPBody(bytes.NewReader(make([]byte, 2049)), testOTLPLimit, tight); !errors.Is(err, errOTLPBusy) || reserved != 2<<10 {
+		t.Fatalf("tight budget: %d reserved, %v", reserved, err)
+	}
+}
+
+// A gzipped body's decompressor is reserved before it is built, and given
+// back on every path: a client that only sends gzip headers can't hold
+// decompressors the budget doesn't count.
+func TestOTLPGzipDecompressorReserved(t *testing.T) {
+	c := otlpCases()[2]
+	body := gzipped(t, encodeOTLP(t, c.build(""), false))
+
+	svc, _, srv := limitedService(t, otlpGzipReserve/2)
+	built := 0
+	svc.otlp.gunzip = func(r io.Reader) (io.ReadCloser, error) {
+		built++
+		return gunzipReader(r)
+	}
+	resp := postBody(t, srv.URL+c.path, body, false, true, "")
+	if resp.StatusCode != http.StatusServiceUnavailable || built != 0 {
+		t.Fatalf("gzipped past the budget: %d, %d decompressors built", resp.StatusCode, built)
+	}
+	if resp := postBody(t, srv.URL+c.path, encodeOTLP(t, c.build(""), false), false, false, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("plain: %d", resp.StatusCode)
+	}
+
+	svc, _, srv = limitedService(t, 4*testOTLPLimit)
+	for _, tc := range []struct {
+		data []byte
+		want int
+	}{
+		{body, http.StatusOK},
+		{[]byte("not gzip"), http.StatusBadRequest},
+		{gzipped(t, make([]byte, 16<<20)), http.StatusRequestEntityTooLarge},
+	} {
+		if resp := postBody(t, srv.URL+c.path, tc.data, false, true, ""); resp.StatusCode != tc.want {
+			t.Fatalf("status %d, want %d", resp.StatusCode, tc.want)
+		}
+		if used := svc.otlp.budget.inUse(); used != 0 {
+			t.Fatalf("after a %d: %d bytes still reserved", tc.want, used)
+		}
+	}
+	if peak := svc.otlp.budget.peakUse(); peak < otlpGzipReserve {
+		t.Fatalf("peak %d: the decompressor wasn't reserved", peak)
+	}
+}
+
+// On a real listener, a request refused for its token is answered at once,
+// before any of its body is read; net/http then reads on its body, to reuse
+// the connection, but only until the read timeout, which is set before the
+// token is checked. A client that trickles the body after a 401 can't hold the
+// connection, or the handler, longer than that.
+func TestOTLPRefusedTokenSlowBodyCutOff(t *testing.T) {
+	h := newAuthHarness(t)
+	const timeout = 200 * time.Millisecond
+	h.svc.otlp.readTimeout = timeout
+	for _, token := range []string{"", "tok-unknown"} {
+		conn, err := net.Dial("tcp", h.srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Before the harness's cleanup, which waits for the server's
+		// handlers: a connection left open would hold one.
+		t.Cleanup(func() { conn.Close() })
+		auth := ""
+		if token != "" {
+			auth = "Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(token+":")) + "\r\n"
+		}
+		// A body declared, a few bytes of it sent, and no more.
+		fmt.Fprintf(conn, "POST /v1/traces HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-protobuf\r\n%sContent-Length: 1000\r\n\r\n0123456789", auth)
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		br := bufio.NewReader(conn)
+		if resp := readResponse(t, br); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("token %q: %d", token, resp.StatusCode)
+		}
+		start := time.Now()
+		// The server closes the connection once its read of the rest of
+		// the body times out.
+		if _, err := br.ReadByte(); !errors.Is(err, io.EOF) && !isConnReset(err) {
+			t.Fatalf("token %q: the connection stayed open: %v", token, err)
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Fatalf("token %q: closed after %s", token, took)
+		}
+		conn.Close()
+	}
+}
+
+func isConnReset(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "connection reset")
 }

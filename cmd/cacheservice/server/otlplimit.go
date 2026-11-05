@@ -34,14 +34,15 @@ const (
 	// few.
 	MaxOTLPMetricsBytes = 16 << 20
 
-	// OTLPDecodeBudget bounds the body bytes every OTLP request being read
-	// at once holds, across the three routes: twice the largest limit, so
-	// an at-limit request fits beside another, or beside any number of the
-	// engines' usual ones, which are tens of kilobytes. Each request
-	// reserves its buffer's capacity before reading into it, as its body
-	// arrives (readOTLPBody): at most twice what it has sent, and exactly
-	// the limit at the limit. So two at-limit requests fit only when nothing
-	// else holds any of it. A request that would take it past the budget is
+	// OTLPDecodeBudget bounds the memory every OTLP request being read at
+	// once holds, across the three routes: twice the largest limit, so an
+	// at-limit request fits beside any number of the engines' usual ones,
+	// which are tens of kilobytes. Each request reserves its buffer before
+	// allocating it, as its body arrives (readOTLPBody): at most twice what
+	// it has sent, three times while its buffer grows, and 1.5 times the
+	// limit at the limit's last growth; and a gzipped one its decompressor
+	// too (otlpGzipReserve), before it is built. So two at-limit requests at
+	// once may be refused one of them, and retried. A request that would take it past the budget is
 	// answered 503 with Retry-After, which OTLP exporters retry. The heap
 	// the requests take is a small multiple of it: the buffers, and the
 	// messages decoded from them.
@@ -161,12 +162,21 @@ const (
 	otlpMinBuffer = 512
 )
 
+// otlpGzipReserve is what a gzipped body's decompressor is reserved for,
+// before it is built: compress/flate's 32 KiB window, its Huffman tables and
+// the gzip reader's read buffer come to about 45 KiB. Without it, clients
+// sending a valid gzip header and then stalling would each hold a
+// decompressor the budget doesn't count, until the read timeout.
+const otlpGzipReserve = 64 << 10
+
 // readOTLPBody reads body, the decoded stream, up to limit bytes, into a
 // buffer whose capacity it reserves from budget before allocating it: every
 // byte read lands in reserved space, so the bodies being read at once never
 // hold more than the budget, however many there are. The buffer doubles from
-// 512 bytes up to limit, as the body arrives, so a client holds at most twice
-// what it has sent, and an at-limit body exactly the limit. Once the buffer
+// 512 bytes up to limit, as the body arrives; while it grows, the old buffer
+// and the new are both reserved, until the copy is done. So a client holds at
+// most twice what it has sent, three times while its buffer grows, and an
+// at-limit body the limit, 1.5 times as its buffer last grows. Once the buffer
 // is full at the limit, one more byte, read alone, tells it the body is too
 // large. It returns the bytes reserved, which the caller releases, whatever
 // the error.
@@ -188,13 +198,17 @@ func readOTLPBody(body io.Reader, limit int64, budget *byteBudget) ([]byte, int6
 				}
 				return nil, reserved, err
 			}
+			// The new buffer is reserved whole, since the old one is still
+			// held while it is copied, and the old one released only after.
 			grown := min(max(2*int64(cap(data)), otlpMinBuffer), limit)
-			if !budget.reserve(grown - int64(cap(data))) {
+			if !budget.reserve(grown) {
 				return nil, reserved, errOTLPBusy
 			}
-			reserved += grown - int64(cap(data))
+			reserved += grown
 			next := make([]byte, len(data), grown)
 			copy(next, data)
+			budget.release(int64(cap(data)))
+			reserved -= int64(cap(data))
 			data = next
 		}
 		want := min(cap(data)-len(data), otlpChunk)
