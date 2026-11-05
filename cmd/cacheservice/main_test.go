@@ -125,6 +125,8 @@ type binaryOpts struct {
 	// connects none, and doesn't wait for the service to listen.
 	cache    *fakeengine.Cache
 	noEngine bool
+	// env is added to the command's environment.
+	env []string
 }
 
 // rootClient is an S3 client of MinIO's root user, through guard.
@@ -172,6 +174,7 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 		"CACHESERVICE_S3_ACCESS_KEY_ID="+accessKey,
 		"CACHESERVICE_S3_SECRET_ACCESS_KEY="+secretKey,
 	)
+	cmd.Env = append(cmd.Env, opts.env...)
 	b := &binaryTest{t: t, scope: scope, cmd: cmd, logs: &syncBuffer{}, url: "http://" + listen, debug: "http://" + debug, exited: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = b.logs, b.logs
 	if err := cmd.Start(); err != nil {

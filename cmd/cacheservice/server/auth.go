@@ -140,11 +140,25 @@ func (s *Service) tokenMaps(tokens Tokens, token, ns string) bool {
 	return ok && got == ns
 }
 
+// registerResult is what register did with a connection.
+type registerResult int
+
+const (
+	registered registerResult = iota
+	// refusedRevoked: its token no longer maps to its namespace.
+	refusedRevoked
+	// refusedDraining: the service drains, and takes no new engine.
+	refusedDraining
+)
+
 // register lists a connection that said hello as welcomed, if its token
-// still maps to its namespace. The check and the listing see the same
-// tokens: a SetTokens between them makes register check again, so no
-// connection is welcomed on tokens already replaced.
-func (s *Service) register(c *engineConn) bool {
+// still maps to its namespace and the service isn't draining. The check and
+// the listing see the same tokens: a SetTokens between them makes register
+// check again, so no connection is welcomed on tokens already replaced. The
+// drain is checked under s.mu, which Drain starts the drain under: a
+// connection is either listed before the drain starts, and counted in its
+// report (DrainReport.Engines), or refused.
+func (s *Service) register(c *engineConn) registerResult {
 	for {
 		s.mu.Lock()
 		tokens, gen := s.tokens, s.tokensGen
@@ -155,15 +169,20 @@ func (s *Service) register(c *engineConn) bool {
 			s.mu.Unlock()
 			continue
 		}
+		if s.draining.Load() {
+			s.mu.Unlock()
+			return refusedDraining
+		}
 		if ok {
 			s.conns[c.id] = c
 		}
 		s.mu.Unlock()
-		if ok {
-			c.ns.own(c.hello.CacheID, c.key)
-			c.owned.Store(true)
+		if !ok {
+			return refusedRevoked
 		}
-		return ok
+		c.ns.own(c.hello.CacheID, c.key)
+		c.owned.Store(true)
+		return registered
 	}
 }
 

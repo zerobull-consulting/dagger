@@ -34,6 +34,9 @@ type drainState struct {
 	// cache ID.
 	stored  map[string]int
 	refused map[string]int
+	// engines is how many engine connections were welcomed when the drain
+	// started; it welcomes none after.
+	engines int
 	ended   *DrainReport
 }
 
@@ -61,6 +64,10 @@ type DrainReport struct {
 	Left []DrainLeft `json:"left"`
 	// Refused counts the new work refused: engine connections and spans.
 	Refused map[string]int `json:"refused,omitempty"`
+	// Engines is how many engine connections were welcomed when the drain
+	// started. It welcomes no other: a connection that says hello from then
+	// on is refused, and counted in Refused.
+	Engines int `json:"engines"`
 }
 
 // LeftRoots is how many roots were left unexported.
@@ -79,8 +86,11 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 // clean stop (SIGTERM) does first. It returns once nothing is left that it
 // could export, or ctx ends: its deadline is the drain's.
 //
-//  1. It takes no new work from now on. New engine connections get 503, and
-//     spans of sessions the export path doesn't track are dropped. Spans and
+//  1. It takes no new work from now on. New engine connections get 503, a
+//     connection upgraded before that says hello from now on is closed with
+//     1013, and spans of sessions the export path doesn't track are dropped.
+//     An engine is either welcomed before the drain starts, and counted in
+//     its report (DrainReport.Engines), or refused. Spans and
 //     session ends of the sessions it tracks are still taken: a session that
 //     ended just before the drain still sends spans within EndGrace. The
 //     connected engines stay connected, since exports run over them. The
@@ -93,6 +103,12 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //     Drain runs those exports and waits for them, their uploads included.
 //     Roots of an engine that is no longer connected are left: it can't
 //     reconnect to a draining service.
+//  3. It starts no export past its deadline, or once ctx was canceled: each
+//     pass checks both before it schedules anything, so a drain whose
+//     deadline passed before it began starts nothing. A retry due by the
+//     deadline is waited for and started; one due after it isn't waited
+//     for, and is reported left (DrainState.Later). Exports started before
+//     the deadline run on until the stop that follows cuts them off.
 //
 // Drain deletes nothing, and publishes nothing an export didn't verify. It
 // logs what it found to do when it starts, and what it stored and left when
@@ -117,7 +133,12 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	if s.drain.refused == nil {
 		s.drain.refused = map[string]int{}
 	}
+	// Under s.mu, which register lists a connection under: an engine is
+	// either welcomed before this, and counted, or refused (register).
+	s.mu.Lock()
 	s.draining.Store(true)
+	s.drain.engines = len(s.conns)
+	s.mu.Unlock()
 	s.drain.mu.Unlock()
 	s.metrics.DrainStarted()
 
@@ -164,25 +185,44 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	defer t.Stop()
 	for {
 		now := p.now()
-		for _, ns := range s.namespacesNow() {
-			s.startBatches(p.ctx, ns, ns.tracker.DrainDue(now))
-		}
 		left := s.drainLeft(now, deadline)
 		if !drainBusy(left) {
 			return s.endDrain(start, metrics.DrainComplete, left)
 		}
+		// Before anything is scheduled: a pass that begins past the
+		// deadline, or once the drain was canceled, starts nothing, and
+		// what it would have started is reported left. The deadline is
+		// checked on the export path's clock too, which the roots'
+		// retries are due on: a retry due just before the deadline, but
+		// seen after it, isn't started either, whether ctx's timer has
+		// fired yet or not.
+		if outcome, ok := drainEnded(ctx, p.ctx, now, deadline); ok {
+			return s.endDrain(start, outcome, left)
+		}
+		for _, ns := range s.namespacesNow() {
+			s.startBatches(p.ctx, ns, ns.tracker.DrainDue(now))
+		}
 		select {
 		case <-ctx.Done():
-			outcome := metrics.DrainCanceled
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				outcome = metrics.DrainDeadline
-			}
-			return s.endDrain(start, outcome, s.drainLeft(p.now(), deadline))
 		case <-p.ctx.Done():
-			return s.endDrain(start, metrics.DrainCanceled, s.drainLeft(p.now(), deadline))
 		case <-t.C:
 		}
 	}
+}
+
+// drainEnded reports whether a drain is over before its next pass, and its
+// outcome: canceled when ctx was canceled, or the export path stopped;
+// deadline when ctx's deadline passed, or now is past deadline.
+func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bool) {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return metrics.DrainDeadline, true
+	case ctx.Err() != nil, paths.Err() != nil:
+		return metrics.DrainCanceled, true
+	case !deadline.IsZero() && !now.Before(deadline):
+		return metrics.DrainDeadline, true
+	}
+	return "", false
 }
 
 // drainBusy reports whether a drain has work left it can do: an export in
@@ -220,6 +260,7 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		Stored:  maps.Clone(s.drain.stored),
 		Left:    left,
 		Refused: maps.Clone(s.drain.refused),
+		Engines: s.drain.engines,
 	}
 	s.drain.ended = &rep
 	s.drain.mu.Unlock()
@@ -241,7 +282,8 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 	}
 	level("drain: done", "outcome", outcome, "took", took.Round(time.Millisecond),
 		"storedRoots", sum(rep.Stored), "leftRoots", rep.LeftRoots(),
-		"refusedConnections", rep.Refused[metrics.DrainRefusedConnection], "refusedSpans", rep.Refused[metrics.DrainRefusedSpan])
+		"refusedConnections", rep.Refused[metrics.DrainRefusedConnection], "refusedSpans", rep.Refused[metrics.DrainRefusedSpan],
+		"engines", rep.Engines)
 	return rep
 }
 

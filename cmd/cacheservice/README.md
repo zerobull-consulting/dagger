@@ -1583,7 +1583,11 @@ returns at once, and logs `drain: nothing to export (read-only:
 
 1. **It takes no new work.** A new engine WebSocket gets 503 with
    `Retry-After: 10` before the upgrade, and one upgraded but not yet
-   welcomed is closed with 1013 (try again later). Spans and session ends of
+   welcomed is closed with 1013 (try again later). An engine is either
+   welcomed before the drain starts, and counted in its report (`engines`
+   in `drain: done` and `GET /debug/drain`), or refused: the hello is
+   checked under the lock the drain starts under
+   (`TestDrainWelcomesOrRefusesEveryHello`). Spans and session ends of
    sessions the export path doesn't track are dropped (answered 200, counted
    in `drain_refused_total`). Spans and ends of the sessions it tracks are
    still taken: a session that ended just before the signal still sends spans
@@ -1604,14 +1608,43 @@ returns at once, and logs `drain: nothing to export (read-only:
    failed, interrupted, or waiting for their engine) are due at once too. The
    drain runs those exports and waits for them, their uploads, verification
    and index writes included.
+3. **It starts nothing past its deadline.** Each pass checks the deadline,
+   and whether the drain was canceled, before it schedules anything, so a
+   drain whose deadline passed before it began starts nothing, and a retry
+   that comes due as the deadline passes isn't started. What it would have
+   started is reported left, not in flight
+   (`TestDrainStartsNothingPastItsDeadline`,
+   `TestDrainDoesNotStartRetryPastItsDeadline`). Exports started before the
+   deadline run on until the shutdown cuts them off.
 
 It ends when nothing is left that it could export, or `-drain-timeout`
-(30s) passes. The service then does what it did before drains existed: it
-cuts off what is still in flight (exports, import syncs, GC runs), closes the
-engine connections, shuts down its HTTP servers, waiting up to 5s for their
-requests, and exits 0. A second signal ends the drain at once.
-`-drain-timeout 0` stops without a drain, at once, as before. A CI job sets
-it long, such as `10m`.
+(30s) passes. A shutdown follows, **bounded at 5s** as a whole: it cuts off
+what is still in flight (exports, import syncs, GC runs, those asked for
+with `POST /debug/gc` included) by canceling their context, closes the
+engine connections (each gets a close frame, 1001 going away, all at once;
+those that don't answer within 2s are dropped), shuts down its HTTP
+servers, and waits for their requests and for what it cut off to end. So
+the whole stop, from the first signal to the exit, takes at most
+`-drain-timeout` plus 5s, even with engines that don't answer and work that
+ignores cancellation (GC's finish update and a promotion's cleanup run on
+after a cancel, against a store that may not answer).
+
+- **Exit codes.** 0 when everything ended within the bound: a clean stop.
+  1 when the bound cut the shutdown off, with work still running, or a
+  signal did: it logs what was still running (`exports`, `imports`, `gc`,
+  `engines`), and exits without waiting for it. 1 also when an HTTP server
+  failed (such as its address in use), which stops the service too. A
+  process manager, and the tests, can tell a clean stop from a cut-off one
+  (`TestMinIOBinaryStopBoundedExitsOne`, `TestMinIOBinaryCleanStopExitsZero`).
+- **Signals.** A second signal during the drain ends the drain at once; the
+  shutdown follows, and exits 0 if it ends within its bound. A signal during
+  the shutdown (the second with `-drain-timeout 0`, or after the drain
+  ended) exits at once, with 1, logging `signal during the shutdown: exiting
+  at once` and what was still running
+  (`TestMinIOBinarySignalDuringShutdownExitsAtOnce`).
+
+`-drain-timeout 0` stops without a drain, with the same bounded shutdown. A
+CI job sets it long, such as `10m`.
 
 The drain logs, when it starts, what each engine cache (by cache ID, never
 the token) has pending, in flight and waiting for a retry, and when it ends,
@@ -1627,8 +1660,8 @@ run over the engine's connection, and the engine uploads the layers itself.
 An engine stopped first takes its pending exports with it.
 
 **Process managers.** The process manager's stop timeout must be longer than
-`-drain-timeout` plus 5s, the stop after the drain (its HTTP servers' grace),
-or it can kill the service mid-drain or mid-stop: with the default 30s, give
+`-drain-timeout` plus 5s, the shutdown's bound after the drain, or it can
+kill the service mid-drain or mid-shutdown: with the default 30s, give
 it more than 35s, and with `10m`, more than `10m5s`. `docker stop --time`
 (10s by default), `docker compose`'s `stop_grace_period` (10s by default) and
 Kubernetes' `terminationGracePeriodSeconds` (30s by default) all send SIGKILL
@@ -1643,8 +1676,11 @@ again sooner mostly adds load, and the first retries (2s, 4s, 8s) already fit
 a 30s drain. What the drain does shorten is the wait that was under way when
 it started: every root waiting for a retry is due at once, since the wait
 began before anyone knew the service would stop. A root whose next try is due
-after the deadline doesn't keep the drain waiting: the drain ends, and logs
-it as left (`retrying`).
+after the deadline doesn't keep the drain waiting, and isn't started: the
+drain ends, and logs it as left (`retrying`). A try due by the deadline is
+waited for, and started if the pass that finds it due begins before the
+deadline: the drain checks the deadline on the export path's clock, the
+one retries are due on, before every pass.
 
 **Order.** The drain exports in the scheduler's order: by cache ID, then
 entry number, in batches of up to 1,000 roots, all started at once. It
@@ -1667,13 +1703,6 @@ for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
 `TestKnownGapDrainDoesNotWaitForExplicitImport`
 ([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
 
-**Exports started past the deadline.** The drain starts what is due before
-it checks its deadline, so a pass that runs once the deadline has passed can
-still start an export, such as a retry whose backoff just ran out. The stop
-cancels it, and it publishes nothing. Known gap, pinned by
-`TestKnownGapDrainStartsExportsPastItsDeadline`
-([#73](https://github.com/zerobull-consulting/dagger/issues/73)).
-
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight
@@ -1685,7 +1714,8 @@ by an export cut off are named by nothing, and GC deletes them.
 to drain: it refuses new engines, and stops at once
 (`TestDrainExportOff`).
 
-Tests: `TestDrain*` and `TestDrainedRestartStoresPendingExport` in
+Tests: `TestDrain*`, `TestDrainedRestartStoresPendingExport`,
+`TestCloseEnginesBoundedAndOffTheLock` and `TestWaitWaitsForGCRunAskedFor` in
 [`server`](server) (fake engine), `TestMinIODrain` (MinIO),
 `TestMinIOBinary*` in this directory (the built command, sent SIGTERM), and
 the real-engine `drain` scenario (see
@@ -2180,9 +2210,10 @@ stop drains first and stores it (see
 during the drain can't reconnect, and its exports are left
 ([#70](https://github.com/zerobull-consulting/dagger/issues/70)); and the
 drain doesn't wait for an explicit export or import admitted just before it
-([#72](https://github.com/zerobull-consulting/dagger/issues/72)), and can
-start an export past its deadline
-([#73](https://github.com/zerobull-consulting/dagger/issues/73)).
+([#72](https://github.com/zerobull-consulting/dagger/issues/72)). The drain
+starting an export past its deadline
+([#73](https://github.com/zerobull-consulting/dagger/issues/73)) is fixed:
+it starts nothing past it.
 
 **Fixed since: bundles of moved imports.** The first run of
 `service-restart` found that a bundle holding imports could no longer be

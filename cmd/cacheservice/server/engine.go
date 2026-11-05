@@ -80,6 +80,11 @@ type Service struct {
 	// testHookExportRecorded, set by tests only, runs after an export's
 	// result reached the tracker.
 	testHookExportRecorded func()
+	// testHeld is the work HoldWaitForTest holds.
+	testHeld workGroup
+	// testHookHello, set by tests only, runs after a connection's hello
+	// was read, before it is registered or refused.
+	testHookHello func()
 
 	// registry holds metrics, which records the storage costs.
 	registry *prometheus.Registry
@@ -158,6 +163,10 @@ type engineConn struct {
 	conn        *websocket.Conn
 	logger      *slog.Logger
 	svc         *Service
+	// drop ends the context the connection is read on: the WebSocket
+	// library then closes the connection at once, which ends a close
+	// handshake still waiting for the engine's answer (CloseEngines).
+	drop context.CancelFunc
 
 	lastID atomic.Uint64
 	hello  protocol.Hello
@@ -215,7 +224,10 @@ func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
 	c.logger.Info("engine connected", "remote", c.remote, "token", c.token,
 		"userAgent", r.UserAgent(), "compression", r.Header.Get("Sec-WebSocket-Extensions"))
 
-	err = c.serve(r.Context())
+	ctx, drop := context.WithCancel(r.Context())
+	c.drop = drop
+	err = c.serve(ctx)
+	drop()
 	s.mu.Lock()
 	if s.conns[c.id] == c {
 		delete(s.conns, c.id)
@@ -252,14 +264,20 @@ func (c *engineConn) serve(ctx context.Context) error {
 		_ = c.replyError(ctx, env, err.Error())
 		return err
 	}
-	// Upgraded before the drain started, but not welcomed yet: a new
-	// engine all the same.
-	if c.svc.draining.Load() {
+	if h := c.svc.testHookHello; h != nil {
+		h()
+	}
+	switch c.svc.register(c) {
+	case registered:
+	case refusedDraining:
+		// Upgraded before the drain started, but not welcomed yet: a
+		// new engine all the same. register checks the drain under the
+		// lock Drain starts it under, so an engine is either welcomed
+		// before the drain starts, and counted in it, or refused here.
 		c.svc.countRefused(metrics.DrainRefusedConnection)
 		_ = c.conn.Close(websocket.StatusTryAgainLater, "service draining")
 		return errors.New("service draining: refused before welcome")
-	}
-	if !c.svc.register(c) {
+	default:
 		c.markRevoked()
 		c.closeRevoked()
 		return errors.New("token revoked before welcome")
@@ -516,14 +534,78 @@ func dumpName(name string) string {
 	return string(b)
 }
 
-// CloseEngines closes every engine connection, as the service going away.
+// CloseEnginesTimeout bounds CloseEngines: how long it waits for the engines
+// to answer its close frame before it drops the connections that haven't.
+// It is within the stop's grace (cmd/cacheservice's shutdownGrace, 5s), which
+// also covers shutting the HTTP servers down and Wait.
+const CloseEnginesTimeout = 2 * time.Second
+
+// CloseEngines closes every engine connection, as the service going away,
+// within CloseEnginesTimeout: see CloseEnginesContext.
 func (s *Service) CloseEngines() {
+	ctx, cancel := context.WithTimeout(context.Background(), CloseEnginesTimeout)
+	defer cancel()
+	s.CloseEnginesContext(ctx)
+}
+
+// CloseEnginesContext closes every engine connection, as the service going
+// away: each gets a close frame (StatusGoingAway), all at once, and the
+// engines that answer it end their connection cleanly. Once ctx ends, the
+// connections still waiting for an answer are dropped, as CloseEngine
+// does, and it returns once they are closed. It doesn't hold the service's
+// lock meanwhile.
+func (s *Service) CloseEnginesContext(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	conns := make([]*engineConn, 0, len(s.conns))
 	for _, c := range s.conns {
-		_ = c.conn.Close(websocket.StatusGoingAway, "service shutting down")
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	if len(conns) == 0 {
+		return
+	}
+	var (
+		wg     sync.WaitGroup
+		closed atomic.Int64
+	)
+	for _, c := range conns {
+		wg.Go(func() {
+			_ = c.conn.Close(websocket.StatusGoingAway, "service shutting down")
+			closed.Add(1)
+		})
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+	}
+	// Ending a connection's read context makes the WebSocket library close
+	// it at once (CloseNow would wait for the close under way), and the
+	// close handshake waiting on it then ends.
+	s.logger.Warn("engines didn't answer the close frame in time: dropping their connections",
+		"engines", len(conns)-int(closed.Load()))
+	for _, c := range conns {
+		c.drop()
+	}
+	// Bounded too: a close still under way after this is the process's
+	// to end.
+	t := time.NewTimer(closeDropWait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		s.logger.Warn("engine connections still closing after they were dropped")
 	}
 }
+
+// closeDropWait bounds CloseEnginesContext's wait for the connections it
+// dropped to close: the library closes them at once, so this is a margin.
+const closeDropWait = 500 * time.Millisecond
 
 // CloseEngine drops one engine's connection at once, with no close frame,
 // as a network failure would. The engine reconnects with backoff; requests

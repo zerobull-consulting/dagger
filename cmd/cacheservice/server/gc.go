@@ -31,7 +31,12 @@ type gcPath struct {
 	// with it the run under way, when the service starts draining.
 	ctx  context.Context
 	stop context.CancelFunc
-	wg   sync.WaitGroup
+	// wg counts the scheduled loop and every run asked for (Wait waits
+	// for them). closed is set, under mu, once the service waits: no run
+	// starts after it, so no wg.Add races wg.Wait.
+	mu     sync.Mutex
+	closed bool
+	wg     workGroup
 }
 
 // limitsState is the service's per-namespace limits and where they come
@@ -133,7 +138,7 @@ func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 	p := &gcPath{cfg: c, collector: collector, ctx: ctx, stop: stop}
 	s.gc = p
 	if cfg.Interval > 0 {
-		p.wg.Add(1)
+		p.wg.Add()
 		go func() {
 			defer p.wg.Done()
 			collector.Loop(ctx, cfg.Interval)
@@ -153,7 +158,8 @@ var (
 )
 
 // CollectGarbage runs garbage collection now, over every namespace, and
-// returns what it did. dryRun makes this run delete nothing, whatever the
+// returns what it did. Wait waits for the run; a drain or the stop cancels
+// it. dryRun makes this run delete nothing, whatever the
 // configuration.
 func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report, error) {
 	if s.readOnly {
@@ -166,13 +172,21 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 	if s.draining.Load() {
 		return nil, ErrDraining
 	}
+	// Counted, so the stop's Wait waits for the run to end, rather than
+	// leave it unwinding mid-delete; one asked for once the stop began is
+	// refused.
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return nil, ErrDraining
+	}
+	p.wg.Add()
+	p.mu.Unlock()
+	defer p.wg.Done()
 	// A drain cancels a run asked for too, not only the scheduled ones.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer context.AfterFunc(p.ctx, cancel)()
-	if p.ctx.Err() != nil {
-		return nil, ErrDraining
-	}
 	c := p.collector
 	if dryRun {
 		// Shares the collector's run lock: it waits for a run under way.
@@ -223,8 +237,13 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// waitGC waits for the scheduled loop and the runs asked for, after the
+// context that runs them has ended.
 func (s *Service) waitGC() {
-	if s.gc != nil {
-		s.gc.wg.Wait()
+	if p := s.gc; p != nil {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+		p.wg.Wait()
 	}
 }
