@@ -2015,6 +2015,10 @@ with backoff. To try it, unauthenticated and with no store (export path off):
 docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache
 ```
 
+An engine that connects to it is published next to it, as
+`ghcr.io/zerobull-consulting/dagger-engine` (see
+[Engine image](../../hack/remote-cache/README.md#engine-image)).
+
 With a bucket, a pull-request job's instance adds `-export=false` and a
 read-only key (see [Read-only instances](#read-only-instances)). Running it
 as a sidecar next to an engine in CI is
@@ -2036,8 +2040,9 @@ For a local S3-compatible store (MinIO), see
    `<token> <namespace>` for the engine's token, and for the CLI's if it
    sends spans (see [Auth and namespaces](#auth-and-namespaces)).
 
-2. Build and start a dev engine (see `hack/dev`). Then restart its container
-   with these variables set:
+2. Build and start a dev engine (see `hack/dev`), or run the published
+   [engine image](../../hack/remote-cache/README.md#engine-image). Then
+   restart its container with these variables set:
 
    ```bash
    _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL=http://<host>:8090
