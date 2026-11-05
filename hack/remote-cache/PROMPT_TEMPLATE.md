@@ -133,8 +133,8 @@ agreement's full text below:
 
 - open as a draft, and get CI green;
 - decide on splitting once, from the first diff's lines added plus deleted;
-- run `/code-review high` against `origin/<base>` and fix the real findings,
-  then mark the PR ready;
+- run `/code-review high` against `origin/feature/remote-cache` and fix the
+  real findings, then mark the PR ready;
 - one push per round, at most four review rounds;
 - then known-gap tests and issues for confirmed findings, one issue of
   unverified leads for the rest, one final push, then the squash merge with
@@ -162,24 +162,13 @@ zerobull-consulting/dagger#79 (1,238) took 5, which is four rounds plus the
 final push's review. The cap is what bounds the cost, and splitting large work
 keeps the rounds productive.
 
-**How the repositories are set up:**
+**How this repository is set up:**
 
-- In both repositories, an org ruleset has Copilot review **every push** to a
-  ready PR, and not drafts. So each push is a review round.
-- Copilot is never a required check: the merge waits on CI only, on the
-  checks the table below says.
-
-The flow is the same in each repository; these values differ. The prompt's
-header names the repository, and `<base>` below is its base branch.
-
-| | zerobull-consulting/dagger | zerobull-consulting/varsity-made |
-| --- | --- | --- |
-| Base branch | `feature/remote-cache` | `feature/android-cache` |
-| Required checks on the base | `unit tests`, `S3 tests against MinIO`, `real engines (e2e)` | None. `Code Quality`, `Build` and `Tests` run on its PRs, but are required only on `main`. |
-| Where issues are filed | Under zerobull-consulting/dagger#1 | In zerobull-consulting/varsity-made, like zerobull-consulting/varsity-made#681 |
-
-Where the base requires no check, nothing gates the merge: wait for every
-check the PR runs to pass, and don't use auto-merge (see step 5).
+- An org ruleset has Copilot review **every push** to a ready PR, and not
+  drafts. So each push is a review round.
+- `feature/remote-cache` requires `unit tests`, `S3 tests against MinIO` and
+  `real engines (e2e)`. Copilot is not a required check, so the merge waits on
+  those checks only.
 
 **The limit:**
 
@@ -189,10 +178,13 @@ check the PR runs to pass, and don't use auto-merge (see step 5).
   what the prompt asks, before `/code-review` or any other review. Its size is
   the lines added plus the lines deleted, counting every file (tests, docs and
   generated files included). A PR that adds 2,500 lines and deletes 500 counts
-  as 3,000. Commit the draft first, since the command counts commits:
+  as 3,000. The command compares the base with the committed `HEAD`, so
+  commit the draft first. A binary file shows as `-` and counts as 0:
 
   ```bash
-  git diff --numstat origin/<base>...HEAD | awk '{n += $1 + $2} END {print n}'
+  git fetch origin feature/remote-cache &&
+    git diff --numstat origin/feature/remote-cache...HEAD |
+    awk '{n += $1 + $2} END {print n}'
   ```
 
 - Over about 2,500 lines, split it before it's marked ready. Put the size in
@@ -210,8 +202,8 @@ check the PR runs to pass, and don't use auto-merge (see step 5).
    - Measure the first diff and decide on splitting, once (see the limit
      above).
    - CI is green on the draft, and the PR's tests have passed locally.
-   - Run `/code-review high` on the branch against `origin/<base>` and fix
-     the real findings.
+   - Run `/code-review high` on the branch against
+     `origin/feature/remote-cache` and fix the real findings.
    - Then mark the PR ready. That starts **review 1**.
 3. **Each fix round:**
    - Trace every finding: red, yellow, blue, and any you can read only in its
@@ -225,10 +217,11 @@ check the PR runs to pass, and don't use auto-merge (see step 5).
    that review reports (new findings, a 🔵 "Needs a closer look" with or
    without text, findings only in its session) like this:
    - **Confirmed** (you traced a real path to the failure): pin it with a
-     known-gap test whose comment links the issue, and file an issue where the
-     table above says.
-   - **Not confirmed, or text you can't read:** list them in one issue, filed
-     the same way, as unverified leads (file, lines, type), with no test.
+     known-gap test whose comment links the issue, and file an issue under
+     zerobull-consulting/dagger#1.
+   - **Not confirmed, or text you can't read:** list them in one issue under
+     zerobull-consulting/dagger#1 as unverified leads (file, lines, type),
+     with no test.
      Don't ask for Copilot's session findings.
    - Answer each thread with its issue link, and resolve it.
    - **The one exception:** fix it with a test in this same push, instead of
@@ -237,12 +230,11 @@ check the PR runs to pass, and don't use auto-merge (see step 5).
      needs a design decision, don't merge: stop and report.
 5. **Merge:** push those known-gap tests and fixes as one final push. **Then**
    squash-merge, with the title and message set as in section 4:
-   - where the base requires checks and the auto-merge tool can set the title
-     and message, enable auto-merge (squash) with them;
-   - otherwise (the tool can't set them, or the base requires no check), wait
-     for the checks on the final push to pass (the required ones, or every
-     check where none is required), then squash-merge with the explicit title
-     and message, pinned to the head commit.
+   - where the auto-merge tool can set the title and message, enable
+     auto-merge (squash) with them;
+   - where it can't, wait for the required checks on the final push to pass,
+     then squash-merge with the explicit title and message, pinned to the head
+     commit.
 
    Enabling auto-merge before the push could merge the old head the moment its
    checks are green. The checks gate the merge; Copilot's review of that push
@@ -251,8 +243,8 @@ check the PR runs to pass, and don't use auto-merge (see step 5).
    check. After the last round, the reviews these pushes start are handled
    like the final push's.
 7. **After the merge:**
-   - If Copilot reviewed the final push, file anything new in it as issues,
-     where the table above says. No new PR.
+   - If Copilot reviewed the final push, file anything new in it as issues
+     under zerobull-consulting/dagger#1. No new PR.
    - Close the PR's issue by hand, and unsubscribe.
    - Report how many review rounds were used, what was fixed, and which
      issues were filed.
