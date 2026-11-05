@@ -275,15 +275,20 @@ Observable outcomes, each shown by a test or a run.
 - End the prompt with a line naming the template version it was generated
   from:
 
-  > Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` at `<commit>`
+  > Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
+  > zerobull-consulting/dagger#<N>
 
-  where `<commit>` is the commit of `feature/remote-cache` that last changed
-  this file:
+  where zerobull-consulting/dagger#<N> is the last merged PR that changed this
+  file. Its squash commit's title ends with that reference:
 
   ```bash
   git fetch origin feature/remote-cache &&
-    git log -1 --format=%h origin/feature/remote-cache -- hack/remote-cache/PROMPT_TEMPLATE.md
+    git log -1 --format=%s origin/feature/remote-cache -- hack/remote-cache/PROMPT_TEMPLATE.md
   ```
+
+  Name the PR, not a commit: `feature/remote-cache` is flattened into new
+  commits before review, so its commit hashes don't last, and the PR also says
+  why the process changed.
 
 ## Starting a session
 
@@ -306,8 +311,8 @@ renders.
 
 - The template changes by PR, like any other file, into `feature/remote-cache`.
 - The PR says what changed in the process and why.
-- The next prompt generated names the new commit (see the last convention
-  above), so every prompt shows which version of the process it followed.
+- The next prompt generated names that PR (see the last convention above),
+  so every prompt shows which version of the process it followed.
 - The draft in zerobull-consulting/dagger#95's body and the working
   agreement's comments on zerobull-consulting/dagger#1 are history; this file
   supersedes them.
