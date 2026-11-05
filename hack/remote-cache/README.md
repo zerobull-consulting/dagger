@@ -5,6 +5,10 @@ service (`cmd/cacheservice`), so nothing needs an AWS account
 ([#2](https://github.com/zerobull-consulting/dagger/issues/2), under
 [#1](https://github.com/zerobull-consulting/dagger/issues/1)).
 
+Work items on the remote cache are run from prompts generated from
+[`PROMPT_TEMPLATE.md`](PROMPT_TEMPLATE.md), which also holds the working
+agreement for review and merge.
+
 ## Quick start
 
 ```bash
