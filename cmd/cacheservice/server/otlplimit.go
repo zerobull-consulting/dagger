@@ -37,12 +37,14 @@ const (
 	// OTLPDecodeBudget bounds the body bytes every OTLP request being read
 	// at once holds, across the three routes: twice the largest limit, so
 	// an at-limit request fits beside another, or beside any number of the
-	// engines' usual ones, which are tens of kilobytes. Requests reserve it
-	// as their bytes arrive, so two at-limit requests fit only when nothing
+	// engines' usual ones, which are tens of kilobytes. Each request
+	// reserves its buffer's capacity before reading into it, as its body
+	// arrives (readOTLPBody): at most twice what it has sent, and exactly
+	// the limit at the limit. So two at-limit requests fit only when nothing
 	// else holds any of it. A request that would take it past the budget is
 	// answered 503 with Retry-After, which OTLP exporters retry. The heap
-	// the requests take is a small multiple of it: the bytes read, and the
-	// message decoded from them.
+	// the requests take is a small multiple of it: the buffers, and the
+	// messages decoded from them.
 	OTLPDecodeBudget = 2 * MaxOTLPTracesBytes
 
 	// OTLPReadTimeout bounds reading one OTLP body, from when its handler
@@ -152,35 +154,52 @@ var (
 	errOTLPBusy = errors.New("too many OTLP bytes being read at once")
 )
 
-// otlpChunk bounds how much of a body is read, and reserved, at a time.
-const otlpChunk = 32 << 10
+// otlpChunk bounds how much of a body is read at a time, and otlpMinBuffer
+// is the first buffer a body is read into.
+const (
+	otlpChunk     = 32 << 10
+	otlpMinBuffer = 512
+)
 
-// readOTLPBody reads body, the decoded stream, up to limit bytes, reserving
-// each chunk from budget as it is read, so a client holds only what it has
-// sent. It reads at most limit+1 bytes: the one past the limit tells it the
-// body is too large. It returns the bytes reserved, which the caller
-// releases, whatever the error.
+// readOTLPBody reads body, the decoded stream, up to limit bytes, into a
+// buffer whose capacity it reserves from budget before allocating it: every
+// byte read lands in reserved space, so the bodies being read at once never
+// hold more than the budget, however many there are. The buffer doubles from
+// 512 bytes up to limit, as the body arrives, so a client holds at most twice
+// what it has sent, and an at-limit body exactly the limit. Once the buffer
+// is full at the limit, one more byte, read alone, tells it the body is too
+// large. It returns the bytes reserved, which the caller releases, whatever
+// the error.
 func readOTLPBody(body io.Reader, limit int64, budget *byteBudget) ([]byte, int64, error) {
-	var reserved int64
-	// Read straight into data's spare capacity, grown as io.ReadAll grows
-	// it: a small body allocates only what it needs.
-	data := make([]byte, 0, 512)
+	var (
+		data     []byte
+		reserved int64
+	)
 	for {
 		if len(data) == cap(data) {
-			data = append(data, 0)[:len(data)]
-		}
-		want := min(int64(cap(data)-len(data)), otlpChunk, limit+1-int64(len(data)))
-		n, err := body.Read(data[len(data) : len(data)+int(want)])
-		if n > 0 {
-			if int64(len(data)+n) > limit {
-				return nil, reserved, errOTLPTooLarge
+			if int64(len(data)) >= limit {
+				var probe [1]byte
+				n, err := io.ReadFull(body, probe[:])
+				switch {
+				case n > 0:
+					return nil, reserved, errOTLPTooLarge
+				case errors.Is(err, io.EOF):
+					return data, reserved, nil
+				}
+				return nil, reserved, err
 			}
-			if !budget.reserve(int64(n)) {
+			grown := min(max(2*int64(cap(data)), otlpMinBuffer), limit)
+			if !budget.reserve(grown - int64(cap(data))) {
 				return nil, reserved, errOTLPBusy
 			}
-			reserved += int64(n)
-			data = data[:len(data)+n]
+			reserved += grown - int64(cap(data))
+			next := make([]byte, len(data), grown)
+			copy(next, data)
+			data = next
 		}
+		want := min(cap(data)-len(data), otlpChunk)
+		n, err := body.Read(data[len(data) : len(data)+want])
+		data = data[:len(data)+n]
 		if errors.Is(err, io.EOF) {
 			return data, reserved, nil
 		}

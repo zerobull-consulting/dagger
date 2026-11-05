@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -457,17 +458,21 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // doesn't fit in what is left is answered 503 with Retry-After, which OTLP
 // exporters retry, records nothing, and is taken once the budget frees.
 // Requests well within it are never refused, however many: only bytes count.
+//
+// Sizes: the budget is 64 KiB; a 40 KiB body needs a 64 KiB buffer, so it
+// fits alone but not beside the held 32 KiB.
 func TestOTLPDecodeBudget(t *testing.T) {
 	cases := otlpCases()
 	svc, rec, srv := limitedService(t, testOTLPLimit)
-	// A request that holds most of the budget while its body arrives.
+	// A request that holds half the budget while its body arrives: 20 KiB
+	// sent, into a buffer of 32 KiB reserved.
 	big := sized(t, cases[2].build, false, testOTLPLimit)
-	held := 48 << 10
+	held := 20 << 10
 	conn, br := slowPost(t, srv, "/v1/metrics", len(big), big[:held])
-	waitUntil(t, 5*time.Second, "the first body to be reserved", func() bool { return svc.otlp.budget.inUse() >= int64(held) })
+	waitUntil(t, 5*time.Second, "the first body to be reserved", func() bool { return svc.otlp.budget.inUse() >= 32<<10 })
 
 	for _, c := range cases {
-		over := sized(t, c.build, false, 32<<10)
+		over := sized(t, c.build, false, 40<<10)
 		resp := postBody(t, srv.URL+c.path, over, false, false, "")
 		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != strconv.Itoa(otlpRetryAfter) {
 			t.Fatalf("%s past the budget: %d, Retry-After %q", c.route, resp.StatusCode, resp.Header.Get("Retry-After"))
@@ -495,7 +500,7 @@ func TestOTLPDecodeBudget(t *testing.T) {
 	}
 	waitUntil(t, 5*time.Second, "the budget to be free", func() bool { return svc.otlp.budget.inUse() == 0 })
 	for _, c := range cases {
-		if resp := postBody(t, srv.URL+c.path, sized(t, c.build, false, 32<<10), false, false, ""); resp.StatusCode != http.StatusOK {
+		if resp := postBody(t, srv.URL+c.path, sized(t, c.build, false, 40<<10), false, false, ""); resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s once the budget freed: %d", c.route, resp.StatusCode)
 		}
 	}
@@ -521,12 +526,12 @@ func TestOTLPSlowBodyCutOff(t *testing.T) {
 	eng.hello()
 
 	big := sized(t, otlpCases()[2].build, false, testOTLPLimit)
-	held := 48 << 10
+	held := 20 << 10
 	start := time.Now()
 	_, br := slowPost(t, srv, "/v1/metrics", len(big), big[:held])
-	waitUntil(t, 5*time.Second, "the body to be reserved", func() bool { return svc.otlp.budget.inUse() >= int64(held) })
+	waitUntil(t, 5*time.Second, "the body to be reserved", func() bool { return svc.otlp.budget.inUse() >= 32<<10 })
 	// While it is held, a request that doesn't fit is refused...
-	if resp := postBody(t, srv.URL+"/v1/metrics", sized(t, otlpCases()[2].build, false, 32<<10), false, false, ""); resp.StatusCode != http.StatusServiceUnavailable {
+	if resp := postBody(t, srv.URL+"/v1/metrics", sized(t, otlpCases()[2].build, false, 40<<10), false, false, ""); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("past the budget: %d", resp.StatusCode)
 	}
 	// ...until the read timeout cuts the slow one off.
@@ -541,7 +546,7 @@ func TestOTLPSlowBodyCutOff(t *testing.T) {
 		t.Fatalf("timeouts %v", got)
 	}
 	waitUntil(t, 5*time.Second, "the budget to be free", func() bool { return svc.otlp.budget.inUse() == 0 })
-	if resp := postBody(t, srv.URL+"/v1/metrics", sized(t, otlpCases()[2].build, false, 32<<10), false, false, ""); resp.StatusCode != http.StatusOK {
+	if resp := postBody(t, srv.URL+"/v1/metrics", sized(t, otlpCases()[2].build, false, 40<<10), false, false, ""); resp.StatusCode != http.StatusOK {
 		t.Fatalf("once freed: %d", resp.StatusCode)
 	}
 	if n := len(rec.find("otlp metrics")); n != 1 {
@@ -676,5 +681,86 @@ func TestIdleKeepAliveConnectionsUnbounded(t *testing.T) {
 	}
 	if resp := readResponse(t, br); resp.StatusCode != http.StatusOK {
 		t.Fatalf("after idling: %d", resp.StatusCode)
+	}
+}
+
+// budgetCheckingReader checks, at each read, that the buffer it is asked to
+// fill is reserved: what was read so far, and what it may read now, are
+// within what the budget holds.
+type budgetCheckingReader struct {
+	t      *testing.T
+	r      io.Reader
+	budget *byteBudget
+	read   int64
+}
+
+func (c *budgetCheckingReader) Read(p []byte) (int, error) {
+	// The one byte read past a full buffer, at the limit, is the probe for
+	// a body too large: a byte on the stack, not the buffer.
+	probe := len(p) == 1 && c.read == c.budget.inUse()
+	if need := c.read + int64(len(p)); c.budget.inUse() < need && !probe {
+		c.t.Errorf("asked to read into %d bytes, with %d read, while %d are reserved", len(p), c.read, c.budget.inUse())
+	}
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	return n, err
+}
+
+// The buffer a body is read into is reserved before anything is read into
+// it, so concurrent requests can't each read into memory the budget doesn't
+// count. A body at the limit reserves exactly the limit, and one past it is
+// refused without a buffer larger than the limit.
+func TestOTLPBodyReadOnlyIntoReservedBytes(t *testing.T) {
+	for _, size := range []int{0, 1, 511, 512, 513, 5000, testOTLPLimit - 1, testOTLPLimit} {
+		budget := newByteBudget(testOTLPLimit)
+		r := &budgetCheckingReader{t: t, r: bytes.NewReader(make([]byte, size)), budget: budget}
+		data, reserved, err := readOTLPBody(r, testOTLPLimit, budget)
+		if err != nil || len(data) != size {
+			t.Fatalf("%d bytes: read %d, %v", size, len(data), err)
+		}
+		if reserved != int64(cap(data)) || budget.inUse() != reserved || reserved > max(2*int64(size), otlpMinBuffer) {
+			t.Fatalf("%d bytes: %d reserved, buffer of %d, %d in use", size, reserved, cap(data), budget.inUse())
+		}
+	}
+	budget := newByteBudget(testOTLPLimit)
+	r := &budgetCheckingReader{t: t, r: bytes.NewReader(make([]byte, testOTLPLimit+1)), budget: budget}
+	if _, reserved, err := readOTLPBody(r, testOTLPLimit, budget); !errors.Is(err, errOTLPTooLarge) || reserved != testOTLPLimit {
+		t.Fatalf("one byte over: %d reserved, %v", reserved, err)
+	}
+	// A budget too small for the next buffer refuses before reading into
+	// it.
+	small := newByteBudget(4 << 10)
+	r = &budgetCheckingReader{t: t, r: bytes.NewReader(make([]byte, 6<<10)), budget: small}
+	if _, reserved, err := readOTLPBody(r, testOTLPLimit, small); !errors.Is(err, errOTLPBusy) || reserved != 4<<10 || r.read > 4<<10 {
+		t.Fatalf("past the budget: %d reserved, %d read, %v", reserved, r.read, err)
+	}
+}
+
+// Over HTTP/2 (with -tls-cert), the read timeout bounds a slow body too:
+// http.ResponseController's read deadline is per stream there.
+func TestOTLPSlowBodyCutOffHTTP2(t *testing.T) {
+	svc := New(slog.New(slog.DiscardHandler), "")
+	svc.otlp.readTimeout = 200 * time.Millisecond
+	srv := httptest.NewUnstartedServer(svc.Handler())
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	go func() { _, _ = pw.Write([]byte{0x0a}) }() // a first byte, then nothing
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/metrics", pr)
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	client := srv.Client()
+	client.Timeout = 10 * time.Second
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("%s: %d", resp.Proto, resp.StatusCode)
+	}
+	if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedTimeout); got != 1 {
+		t.Fatalf("timeouts %v", got)
 	}
 }

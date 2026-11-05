@@ -983,9 +983,9 @@ service out of memory, with no token in unauthenticated mode. With tokens,
 the token is checked first, and a request without a known one is refused
 with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
 
-| Route | Limit, as received and decoded | Largest request in three e2e runs | Margin |
+| Route | Limit, as received and decoded | Largest request in four e2e runs | Margin |
 | --- | --- | --- | --- |
-| `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 18,783 bytes | 3,573x |
+| `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 18,898 bytes | 3,551x |
 | `POST /v1/logs` | 64 MiB (`server.MaxOTLPLogsBytes`) | 9,466 bytes | 7,089x |
 | `POST /v1/metrics` | 16 MiB (`server.MaxOTLPMetricsBytes`) | 1,437 bytes | 11,675x |
 
@@ -998,8 +998,10 @@ with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
   once read whole (`TestOTLPOverLimitTracksNothing`).
 - **A shared budget.** The bodies being read at once hold at most 128 MiB
   (`server.OTLPDecodeBudget`, twice the largest limit) across the three
-  routes, reserved as their bytes arrive, so a client holds only what it
-  sent. Two at-limit requests fit only when nothing else holds any of it; an
+  routes. Each request reserves its buffer before reading into it, the
+  buffer doubling from 512 bytes up to the limit as the body arrives, so a
+  client holds at most twice what it sent, and an at-limit request exactly
+  the limit (`TestOTLPBodyReadOnlyIntoReservedBytes`). Two at-limit requests fit only when nothing else holds any of it; an
   at-limit request always fits beside the engines' usual ones. A request that doesn't fit in what is left: **503** with
   `Retry-After: 1`, and nothing recorded (`TestOTLPDecodeBudget`). Only
   bytes count, so any number of the engines' usual requests fit. The heap the requests take
@@ -1008,7 +1010,8 @@ with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
   the limit.
 - **A read timeout.** Each body must arrive within 30s of its handler
   starting (`server.OTLPReadTimeout`), a read deadline on the OTLP routes
-  alone (`http.ResponseController`): past it, **408**, and what it held of
+  alone (`http.ResponseController`, per stream over HTTP/2 with
+  `-tls-cert`): past it, **408**, and what it held of
   the budget is given back (`TestOTLPSlowBodyCutOff`). The engine's Cloud
   exporters give up on a request after 10s themselves. Every listener also
   bounds a request's headers to 10s (`server.ReadHeaderTimeout`). Neither
@@ -1027,9 +1030,9 @@ with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
 
 **How they were chosen.** The e2e run (`./hack/remote-cache/dev.sh e2e`,
 every scenario) logs every request taken, and its `otlp-sizes` scenario
-reports the largest per route (above, the largest of three runs). The
-engines sent protobuf, not gzipped, and at most 18,783 bytes of the budget
-were in use at once. The limits don't follow from those alone: the engine's Cloud
+reports the largest per route (above, the largest of four runs). The
+engines sent protobuf, not gzipped, and at most 32 KiB of the budget (the
+buffers' capacity) was in use at once. The limits don't follow from those alone: the engine's Cloud
 forwarder, which sends session spans and logs, keeps each request to 4 MiB
 of protobuf, and sends larger only for a single span or log record larger
 than that (`cloudForwardMaxPayloadSize` in
