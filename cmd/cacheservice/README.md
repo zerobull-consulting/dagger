@@ -1707,6 +1707,12 @@ for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
 `TestKnownGapDrainDoesNotWaitForExplicitImport`
 ([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
 
+**A server failing as the stop ends.** The exit code takes the errors the
+HTTP servers reported by the time the stop ended; one whose failure is
+reported a moment later is missed, and the stop can exit 0. Known gap,
+pinned by `TestKnownGapExitCodeMissesLateServerError`
+([#80](https://github.com/zerobull-consulting/dagger/issues/80)).
+
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight

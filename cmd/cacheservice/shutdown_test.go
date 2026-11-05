@@ -132,3 +132,19 @@ func TestExitCodeTakesServerErrorsDuringTheStop(t *testing.T) {
 		t.Fatalf("a clean stop after a server failed during it: exit %d, want 1", code)
 	}
 }
+
+// KNOWN GAP: exitCode reads errs without blocking, and nothing waits for the
+// servers' goroutines, so a server error sent just after that read (a Serve
+// that failed as the stop ended) is missed, and the stop exits 0. Tracked in
+// https://github.com/zerobull-consulting/dagger/issues/80.
+func TestKnownGapExitCodeMissesLateServerError(t *testing.T) {
+	errs := make(chan error, 1)
+	if code := exitCode(true, errs, slog.New(slog.DiscardHandler)); code != 0 {
+		t.Fatalf("exit %d: exitCode waited for the servers' errors; the gap is fixed, update this test, the README and https://github.com/zerobull-consulting/dagger/issues/80", code)
+	}
+	// The server's goroutine sends its error after the read.
+	errs <- errors.New("accept: too many open files")
+	if len(errs) != 1 {
+		t.Fatal("the late error was read")
+	}
+}
