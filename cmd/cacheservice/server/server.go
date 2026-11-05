@@ -33,6 +33,8 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
@@ -202,9 +204,113 @@ func (s *Service) enableStores(ctx context.Context, st storeSet, opts S3Options)
 }
 
 // Wait waits for the exports in flight, those a drain started included, the
-// import sync loops and GC, after the context that runs them has ended.
+// import sync loops and GC, runs asked for (CollectGarbage) included, after
+// the context that runs them has ended.
 func (s *Service) Wait() {
 	s.waitExports()
 	s.waitImports()
 	s.waitGC()
+	s.testHeld.Wait()
 }
+
+// HoldWaitForTest makes Wait wait for work that ignores cancellation, as
+// GC's finish update and a promotion's cleanup do against a store that
+// doesn't answer, until release is called. It is for the binary's tests of
+// the stop's bound (cmd/cacheservice): nothing else calls it.
+func (s *Service) HoldWaitForTest() (release func()) {
+	s.testHeld.Add()
+	var once sync.Once
+	return func() { once.Do(s.testHeld.Done) }
+}
+
+// WaitContext is Wait, bounded by ctx: it returns ctx's cause if ctx ends
+// first, with the work still running (see Running). The wait goes on in the
+// background until that work ends; a process that stops on the error ends
+// it with the process.
+func (s *Service) WaitContext(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Both may be ready, as when ctx had ended before the call: what
+		// ended in time counts.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		return context.Cause(ctx)
+	}
+}
+
+// Running is the work a service still runs, for a stop cut off by its bound
+// to log.
+type Running struct {
+	// Exports are the exports in flight, and the export path's scheduler.
+	Exports int
+	// Imports are the import sync loops, and the index writes of wiped
+	// caches.
+	Imports int
+	// GC are the GC runs, asked for or scheduled, and its schedule.
+	GC int
+	// Engines are the engine connections still welcomed. Wait doesn't
+	// wait for them: CloseEngines closes them.
+	Engines int
+	// Held is the work HoldWaitForTest holds.
+	Held int
+}
+
+// LogAttrs returns the counts of r as key-value pairs for slog.
+func (r Running) LogAttrs() []any {
+	attrs := []any{"exports", r.Exports, "imports", r.Imports, "gc", r.GC, "engines", r.Engines}
+	if r.Held > 0 {
+		attrs = append(attrs, "held", r.Held)
+	}
+	return attrs
+}
+
+// Running returns the work the service runs now.
+func (s *Service) Running() Running {
+	var r Running
+	if p := s.export; p != nil {
+		r.Exports = p.wg.Running()
+	}
+	if p := s.imports; p != nil {
+		r.Imports = p.wg.Running()
+	}
+	if p := s.gc; p != nil {
+		r.GC = p.wg.Running()
+	}
+	r.Held = s.testHeld.Running()
+	s.mu.Lock()
+	r.Engines = len(s.conns)
+	s.mu.Unlock()
+	return r
+}
+
+// workGroup is a sync.WaitGroup that counts what it waits for, so a stop cut
+// off by its bound can say what was still running.
+type workGroup struct {
+	wg sync.WaitGroup
+	n  atomic.Int64
+}
+
+func (g *workGroup) Add() {
+	g.n.Add(1)
+	g.wg.Add(1)
+}
+
+func (g *workGroup) Done() {
+	g.n.Add(-1)
+	g.wg.Done()
+}
+
+func (g *workGroup) Wait() { g.wg.Wait() }
+
+// Running is how many Adds aren't Done yet.
+func (g *workGroup) Running() int { return int(g.n.Load()) }

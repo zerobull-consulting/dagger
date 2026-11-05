@@ -33,7 +33,7 @@ type importPath struct {
 	// closed is set when the service waits for the loops: no loop starts
 	// after it, so no wg.Add races wg.Wait.
 	closed bool
-	wg     sync.WaitGroup
+	wg     workGroup
 }
 
 // ImportConfig configures the import path.
@@ -100,7 +100,7 @@ func (s *Service) startImports(connCtx context.Context, c *engineConn) {
 		return
 	}
 	p.triggers[c] = trigger
-	p.wg.Add(1)
+	p.wg.Add()
 	p.mu.Unlock()
 	ctx, cancel := context.WithCancel(connCtx)
 	stop := context.AfterFunc(p.ctx, cancel)
@@ -197,7 +197,7 @@ func (s *Service) forgetWiped(ns *namespace, cacheID string) {
 		p.mu.Unlock()
 		return
 	}
-	p.wg.Add(1)
+	p.wg.Add()
 	p.mu.Unlock()
 	go func() {
 		defer p.wg.Done()
