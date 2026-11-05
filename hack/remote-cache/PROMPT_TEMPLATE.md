@@ -166,7 +166,8 @@ keeps the rounds productive.
 
 - In both repositories, an org ruleset has Copilot review **every push** to a
   ready PR, and not drafts. So each push is a review round.
-- Copilot is not a required check, so the merge waits on CI only.
+- Copilot is never a required check: the merge waits on CI only, on the
+  checks the table below says.
 
 The flow is the same in each repository; these values differ. The prompt's
 header names the repository, and `<base>` below is its base branch.
@@ -178,7 +179,7 @@ header names the repository, and `<base>` below is its base branch.
 | Where issues are filed | Under zerobull-consulting/dagger#1 | In zerobull-consulting/varsity-made, like zerobull-consulting/varsity-made#681 |
 
 Where the base requires no check, nothing gates the merge: wait for every
-check the PR runs to pass.
+check the PR runs to pass, and don't use auto-merge (see step 5).
 
 **The limit:**
 
@@ -188,7 +189,7 @@ check the PR runs to pass.
   what the prompt asks, before `/code-review` or any other review. Its size is
   the lines added plus the lines deleted, counting every file (tests, docs and
   generated files included). A PR that adds 2,500 lines and deletes 500 counts
-  as 3,000:
+  as 3,000. Commit the draft first, since the command counts commits:
 
   ```bash
   git diff --numstat origin/<base>...HEAD | awk '{n += $1 + $2} END {print n}'
@@ -206,6 +207,8 @@ check the PR runs to pass.
 1. **Open the PR as a draft.** Push as often as you need; Copilot doesn't
    review drafts.
 2. **Before marking it ready:**
+   - Measure the first diff and decide on splitting, once (see the limit
+     above).
    - CI is green on the draft, and the PR's tests have passed locally.
    - Run `/code-review high` on the branch against `origin/<base>` and fix
      the real findings.
@@ -225,7 +228,8 @@ check the PR runs to pass.
      known-gap test whose comment links the issue, and file an issue where the
      table above says.
    - **Not confirmed, or text you can't read:** list them in one issue, filed
-     the same way, as unverified leads (file, lines, type), with no test. Don't ask for Copilot's session findings.
+     the same way, as unverified leads (file, lines, type), with no test.
+     Don't ask for Copilot's session findings.
    - Answer each thread with its issue link, and resolve it.
    - **The one exception:** fix it with a test in this same push, instead of
      filing it, if a confirmed finding means the PR deletes data it shouldn't,
@@ -233,11 +237,12 @@ check the PR runs to pass.
      needs a design decision, don't merge: stop and report.
 5. **Merge:** push those known-gap tests and fixes as one final push. **Then**
    squash-merge, with the title and message set as in section 4:
-   - where the auto-merge tool can set them, enable auto-merge (squash) with
-     them;
-   - where it can't, wait for the checks on the final push to pass (the
-     required ones, or every check where none is required), then squash-merge
-     with the explicit title and message, pinned to the head commit.
+   - where the base requires checks and the auto-merge tool can set the title
+     and message, enable auto-merge (squash) with them;
+   - otherwise (the tool can't set them, or the base requires no check), wait
+     for the checks on the final push to pass (the required ones, or every
+     check where none is required), then squash-merge with the explicit title
+     and message, pinned to the head commit.
 
    Enabling auto-merge before the push could merge the old head the moment its
    checks are green. The checks gate the merge; Copilot's review of that push
