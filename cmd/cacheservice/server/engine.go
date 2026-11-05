@@ -172,7 +172,7 @@ type engineConn struct {
 	// drop ends the context the connection is read on: the WebSocket
 	// library then closes the connection at once, which ends a close
 	// handshake still waiting for the engine's answer (CloseEngines).
-	drop context.CancelFunc
+	drop func()
 
 	lastID atomic.Uint64
 	hello  protocol.Hello
@@ -559,7 +559,7 @@ const CloseEnginesTimeout = 2 * time.Second
 func (s *Service) CloseEngines() {
 	ctx, cancel := context.WithTimeout(context.Background(), CloseEnginesTimeout)
 	defer cancel()
-	s.CloseEnginesContext(ctx)
+	_ = s.CloseEnginesContext(ctx)
 }
 
 // CloseEnginesContext closes every engine connection, as the service going
@@ -568,8 +568,10 @@ func (s *Service) CloseEngines() {
 // connections still waiting for an answer are dropped, as CloseEngine
 // does, and it returns once they are closed. It doesn't hold the service's
 // lock meanwhile. From its start, the service welcomes no new engine: a
-// connection gets 503 before the upgrade, or 1001 at its hello.
-func (s *Service) CloseEnginesContext(ctx context.Context) {
+// connection gets 503 before the upgrade, or 1001 at its hello. It returns
+// an error when connections it dropped were still closing closeDropWait
+// later: the stop isn't clean.
+func (s *Service) CloseEnginesContext(ctx context.Context) error {
 	s.mu.Lock()
 	// From now on no engine is welcomed (register), and none upgraded: the
 	// engines closed here reconnect within about a second, while the HTTP
@@ -581,7 +583,7 @@ func (s *Service) CloseEnginesContext(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	if len(conns) == 0 {
-		return
+		return nil
 	}
 	var (
 		wg     sync.WaitGroup
@@ -600,7 +602,7 @@ func (s *Service) CloseEnginesContext(ctx context.Context) {
 	}()
 	select {
 	case <-done:
-		return
+		return nil
 	case <-ctx.Done():
 	}
 	// Ending a connection's read context makes the WebSocket library close
@@ -617,8 +619,11 @@ func (s *Service) CloseEnginesContext(ctx context.Context) {
 	defer t.Stop()
 	select {
 	case <-done:
+		return nil
 	case <-t.C:
-		s.logger.Warn("engine connections still closing after they were dropped")
+		n := len(conns) - int(closed.Load())
+		s.logger.Warn("engine connections still closing after they were dropped", "engines", n)
+		return fmt.Errorf("%d engine connections still closing after they were dropped", n)
 	}
 }
 

@@ -420,9 +420,11 @@ func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.C
 	defer cancel()
 	cancelPaths()
 	closeCtx, cancelClose := context.WithTimeout(ctx, server.CloseEnginesTimeout)
-	svc.CloseEnginesContext(closeCtx)
-	cancelClose()
 	var errs []error
+	if err := svc.CloseEnginesContext(closeCtx); err != nil {
+		errs = append(errs, err)
+	}
+	cancelClose()
 	for _, srv := range servers {
 		// A request still running when ctx ends: the stop isn't clean.
 		if err := srv.Shutdown(ctx); err != nil {

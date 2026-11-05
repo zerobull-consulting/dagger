@@ -158,6 +158,26 @@ func TestRevokedHelloDuringDrainIsRevoked(t *testing.T) {
 	}
 }
 
+// Connections that are still closing after CloseEngines dropped them make it
+// report an error, so the stop isn't taken as clean. The drop is made to do
+// nothing here, as if the library didn't close the connection at once.
+func TestCloseEnginesReportsConnectionsStillClosing(t *testing.T) {
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+	// Never read again: the close frame is never answered.
+	welcomedRaw(t, srv, "silent")
+	c := waitEngines(t, svc, 1)[0]
+	drop := c.drop
+	c.drop = func() {}
+	defer drop()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := svc.CloseEnginesContext(ctx); err == nil || !strings.Contains(err.Error(), "still closing") {
+		t.Fatalf("CloseEngines with a connection still closing reported %v", err)
+	}
+}
+
 // An engine whose hello races the drain's start is either welcomed before
 // the drain started, and counted in its report (Engines), or refused with
 // 1013 and counted as refused: never welcomed unseen by the drain. The hook

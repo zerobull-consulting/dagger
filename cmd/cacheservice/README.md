@@ -1632,7 +1632,8 @@ ignores cancellation (GC's finish update and a promotion's cleanup run on
 after a cancel, against a store that may not answer).
 
 - **Exit codes.** 0 when everything ended within the bound: a clean stop.
-  1 when the bound cut the shutdown off, with work still running, or a
+  1 when the bound cut the shutdown off, with work still running (an HTTP
+  request, or an engine connection still closing after it was dropped), or a
   signal did: it logs what was still running (`exports`, `imports`, `gc`,
   `engines`), and exits without waiting for it. 1 also when an HTTP server
   failed (such as its address in use), which stops the service too, or
