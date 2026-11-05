@@ -71,7 +71,139 @@ svc.Wait()
 ones the unit tests use. The stores and the export and import logic are in
 [`blobstore`](blobstore/), [`metastore`](metastore/),
 [`exporter`](exporter/) and [`importer`](importer/), and garbage collection
-in [`gc`](gc/). What the service measures is in [`metrics`](metrics/).
+in [`gc`](gc/). What the service measures is in [`metrics`](metrics/). Every
+key the service writes is in [`layout`](layout/), and the ownership marker
+and its startup check in [`ownership`](ownership/).
+
+## Bucket ownership
+
+**The service owns everything under `CACHESERVICE_S3_PREFIX`**, or the whole
+bucket when the prefix is empty
+([zerobull-consulting/dagger#89](https://github.com/zerobull-consulting/dagger/issues/89)).
+Nothing else may write there: not another application, not another copy of
+the service with another prefix nested inside this one, not a person
+copying files in by hand. **Give the service a bucket of its own** where you
+can; a prefix of its own in a shared bucket works too, as long as nothing
+else writes under it.
+
+Rather than tell its keys apart from other applications', the service
+asserts that nothing else is there, and stops when that's false.
+
+**The marker.** `<prefix>/cacheservice.json` makes a prefix the service's:
+
+```json
+{"layout": 2, "created": "2026-11-05T12:00:00Z", "serviceVersion": "<revision>"}
+```
+
+`layout` is the version of everything under the prefix; `created` is when a
+writer claimed the prefix, and `serviceVersion` the build that did (the
+image's revision, stamped at build time, or the binary's VCS revision, or
+`dev`). The marker is written once, and never rewritten or deleted by the
+service.
+
+**The layout** (version 2), with every shape in [`layout`](layout/), which
+the writers and GC both use:
+
+```
+<prefix>/cacheservice.json                                the ownership marker
+<prefix>/ns/<ns>/index.json                               the namespace's index
+<prefix>/ns/<ns>/gc-epoch.json                            GC's published epoch
+<prefix>/ns/<ns>/bundles/<sha256>.json                    bundles
+<prefix>/ns/<ns>/resolutions/<sha256>.json                resolutions
+<prefix>/ns/<ns>/blobs/<alg>/<hex>                        verified blobs
+<prefix>/ns/<ns>/staging/<stage>/<alg>/<hex>              uploads not yet verified
+<prefix>/ns/<ns>/conditional-write-check/<16 hex>         the startup probe, deleted after it
+```
+
+Incomplete multipart uploads exist only at blob keys (a promotion's copy).
+Namespaces live only under `ns/`, with the names
+[the tokens file](#the-tokens-file) takes. Anything else under the prefix
+isn't the service's.
+
+### At startup
+
+Before anything else touches the bucket (`server.EnableS3`), every instance
+checks the prefix:
+
+| Marker | Under the prefix | Writer (export on) | Read-only (`-export=false`) |
+| --- | --- | --- | --- |
+| layout 2 | anything | starts | starts |
+| another layout | anything | exits 1 | exits 1 |
+| none | nothing | creates the marker (`If-None-Match: *`), starts | starts, with nothing to import; writes nothing |
+| none | keys | exits 1 | exits 1 |
+
+- **Two writers on an empty prefix** both start: both create the marker
+  with `If-None-Match: *`, one wins, and the other reads the winner's marker
+  (`TestWritersRaceOnEmptyPrefix`, `TestMinIOBinaryWritersRaceOnEmptyPrefix`).
+  A writer whose listing finds keys reads the marker again before refusing,
+  since another writer may have claimed the prefix, and written under it, in
+  between (`TestWriterListsAfterAnotherClaimed`).
+- **Another layout:** `<prefix>/cacheservice.json records layout version 3,
+  and this service uses layout 2: it can't use this store. Wipe the prefix
+  (then re-run the cache-warming job), or set another CACHESERVICE_S3_PREFIX`.
+- **Keys and no marker:** `prefix cache/ holds keys and no ownership marker
+  (cacheservice.json), so it isn't this service's: <up to 10 keys>, ... The
+  service needs a prefix of its own, which nothing else writes to: wipe it,
+  or set another CACHESERVICE_S3_PREFIX`. There's no override flag.
+- **A cache of the layout before this one** (`default/index.json`,
+  `blobs/sha256/...`) is refused like another application's files, on
+  purpose: there is no migration, and reading the old layout to recognize
+  it would be one (see [Changing layouts](#changing-layouts);
+  `TestNonEmptyPrefixRefused`, `TestMinIOBinaryRefusesPrefixNotOwned`).
+- Refusals write and delete nothing (the tests compare full listings), and
+  exit 1, the code for a store error; flag errors exit 2. They are an exit
+  code and an `ERROR` line (`msg="export path"` or `msg="import path
+  (read-only)"`, `error="ownership check: ..."`); there is no metric, since
+  the process stops before anything scrapes it.
+
+"Empty" is decided by one bounded listing (`ListObjectsV2`, at most 11
+keys). What a startup costs, in requests to the store:
+
+| Case | Ownership check | Then |
+| --- | --- | --- |
+| marker there (every start after the first) | 1 GET | writer: the conditional write probe, 4 PUTs and 1 DELETE |
+| empty prefix, writer | 1 GET, 1 LIST, 1 PUT (+1 GET if another writer won) | the probe |
+| empty prefix, read-only | 1 GET, 1 LIST | nothing |
+| refused | 1 GET, 1 LIST, 1 GET | nothing |
+
+The ownership check and the conditional write probe stay separate: the probe
+needs an object it can overwrite and delete, and the marker is never
+rewritten or deleted. The probe runs second, in the scope's namespace, so a
+refused prefix sees no write at all.
+
+### GC relies on it
+
+GC runs only under a marker of layout 2. It finds namespaces under `ns/`
+only, and on a key or upload of no known shape it changes nothing in that
+namespace, or, outside the namespaces, nothing at all: it logs up to 10 of
+the keys and raises `gc_unexpected_keys`. It never deletes or aborts what it
+didn't recognize as the service's, a violation included: whoever wrote it
+removes it. See [One run, per namespace](#one-run-per-namespace).
+
+## Changing layouts
+
+A prefix holds one layout, the marker's. A service of another layout refuses
+it at startup, and there is no migration code.
+
+**Today: wipe and rebuild.** To move to a new layout, or to another prefix,
+wipe the prefix (or point `CACHESERVICE_S3_PREFIX` at a new, empty one) and
+re-run the cache-warming job. The first writer claims the empty prefix, and
+the cache fills again. Pull-request jobs before that run start with nothing
+to import (see [Read-only instances](#read-only-instances)).
+
+```bash
+aws s3 rm --recursive s3://dagger-cache/cache/   # or: mc rm --recursive --force local/dagger-cache/cache/
+```
+
+**Later: import from one prefix, export to another.** Images are pinned by
+SHA, so an old image can still read the old prefix: run an engine with a
+sidecar of the old image on the old prefix (read-only), and a sidecar of the
+new image on the new prefix (a writer), and build through it. **The catch:**
+imports are lazy. An engine holds an imported entry's bytes only once a
+build has read them, and it can export only what it has, so this carries
+over what builds touch, not the whole cache. Not built; it is to be tried
+and documented in an issue under
+[zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1).
 
 ## Blob store
 
@@ -93,11 +225,11 @@ next to the namespace's metadata and apart from every other namespace's blobs
 (see [Auth and namespaces](#auth-and-namespaces)):
 
 ```
-<prefix>/<ns>/blobs/<alg>/<hex>                    a blob, verified: its digest key
-<prefix>/<ns>/staging/<stage>/<alg>/<hex>          an upload, not yet verified
+<prefix>/ns/<ns>/blobs/<alg>/<hex>                    a blob, verified: its digest key
+<prefix>/ns/<ns>/staging/<stage>/<alg>/<hex>          an upload, not yet verified
 ```
 
-such as `cache/team-a/blobs/sha256/4f1e...`. A **stage** is 128 random bits
+such as `cache/ns/team-a/blobs/sha256/4f1e...`. A **stage** is 128 random bits
 (32 hex digits), new for each try of each export: two exports of one blob
 never write the same staging key, and a staging key can't be guessed from a
 digest. Engine-supplied strings never name a key: digests are validated, and
@@ -250,7 +382,7 @@ day is safe for the rule: an export's uploads and promotions finish within
 its upload timeout (1h).
 
 S3 lifecycle filters match a key prefix, not a wildcard segment, so one rule
-can't match `<prefix>/*/staging/`. The options, and the choice:
+can't match `<prefix>/ns/*/staging/`. The options, and the choice:
 
 - **A tag set on staging objects** would need the engine to send
   `x-amz-tagging` with its PUT: the presigned URL signs it as a header, and a
@@ -259,7 +391,7 @@ can't match `<prefix>/*/staging/`. The options, and the choice:
 - **Staging outside the namespace** (`<prefix>/staging/<ns>/...`) would take
   one rule, but #23's comment from #52 settles staging under the namespace,
   so that promotion never crosses a namespace's prefix.
-- **One rule per namespace**, on `<prefix>/<ns>/staging/`: the choice. A
+- **One rule per namespace**, on `<prefix>/ns/<ns>/staging/`: the choice. A
   namespace is added in the tokens file, so its rule can be generated from
   the same file (below). A namespace without a rule is covered by garbage
   collection, which deletes its abandoned uploads itself and reports the
@@ -276,9 +408,9 @@ On AWS, with the service's prefix `cache` and namespaces `team-a` and
 {
   "Rules": [
     {"ID": "cacheservice-staging-team-a", "Status": "Enabled",
-     "Filter": {"Prefix": "cache/team-a/staging/"}, "Expiration": {"Days": 1}},
+     "Filter": {"Prefix": "cache/ns/team-a/staging/"}, "Expiration": {"Days": 1}},
     {"ID": "cacheservice-staging-team-b", "Status": "Enabled",
-     "Filter": {"Prefix": "cache/team-b/staging/"}, "Expiration": {"Days": 1}},
+     "Filter": {"Prefix": "cache/ns/team-b/staging/"}, "Expiration": {"Days": 1}},
     {"ID": "cacheservice-incomplete-copies", "Status": "Enabled",
      "Filter": {"Prefix": "cache/"}, "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}
   ]
@@ -296,19 +428,19 @@ file (a namespace's rule is the same whichever of its tokens names it):
 ```bash
 awk '!/^#/ && NF >= 2 {print $2}' tokens | sort -u |
   jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
-    Filter: {Prefix: ($p + "/" + . + "/staging/")}, Expiration: {Days: 1}}' |
+    Filter: {Prefix: ($p + "/ns/" + . + "/staging/")}, Expiration: {Days: 1}}' |
   jq -s --arg p cache '{Rules: (. + [{ID: "cacheservice-incomplete-copies", Status: "Enabled",
     Filter: {Prefix: ($p + "/")}, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}}])}' > lifecycle.json
 ```
 
 Without a tokens file, the one namespace is `-scope` (`default`):
-`cache/default/staging/`.
+`cache/ns/default/staging/`.
 
 On MinIO, with `mc` (the alias `local` and bucket `dagger-cache` of
 `hack/remote-cache`):
 
 ```bash
-mc ilm rule add --prefix cache/team-a/staging/ --expire-days 1 local/dagger-cache
+mc ilm rule add --prefix cache/ns/team-a/staging/ --expire-days 1 local/dagger-cache
 ```
 
 once per namespace. MinIO drops incomplete multipart uploads on its own
@@ -346,15 +478,19 @@ layer missing, as for any deleted blob.
 
 ### Configuration
 
-`S3ConfigFromEnv` reads endpoint, region, bucket, prefix, path-style
-addressing, expiries, static credentials,
+`S3ConfigFromEnv` reads endpoint, region, bucket, prefix (`CACHESERVICE_S3_PREFIX`:
+the service owns everything under it, the whole bucket when it is empty;
+see [Bucket ownership](#bucket-ownership)), path-style addressing, expiries,
+static credentials,
 `CACHESERVICE_S3_MAX_PROMOTIONS` (8) and `CACHESERVICE_S3_HASH_IN_SERVICE`
 (false) from `CACHESERVICE_S3_*`. Without static credentials it uses the AWS
 SDK's default chain. The service's credentials need `s3:GetObject` and
 `s3:DeleteObject` on staging keys (a copy reads its source), `s3:PutObject`
 and `s3:AbortMultipartUpload` on digest keys (the multipart copy), besides
 what the metadata store needs, and what garbage collection needs (see
-[Retention and garbage collection](#retention-and-garbage-collection)).
+[Retention and garbage collection](#retention-and-garbage-collection)). The
+startup's ownership check needs `s3:ListBucket` on the prefix, and, on an
+empty prefix, `s3:PutObject` on `<prefix>/cacheservice.json`.
 
 ## Metadata store
 
@@ -363,17 +499,17 @@ blobs, with no separate database
 ([#6](https://github.com/zerobull-consulting/dagger/issues/6)). The export path
 records into it. Each scope (a team, a tenant) has:
 
-- **bundles**, at `<prefix>/<scope>/bundles/<id>.json`: one per exported
+- **bundles**, at `<prefix>/ns/<scope>/bundles/<id>.json`: one per exported
   `dagql.ValueBundle`. The ID is the SHA-256 of the bundle's JSON, so a bundle
   is written once (`If-None-Match: *`) and never changes. Storing it again
   writes nothing. Reading it checks its content against the ID. Only bundles
   of the version this engine imports (`dagql.ValueBundleVersion`) are stored.
-- **resolutions**, at `<prefix>/<scope>/resolutions/<id>.json`: one per
+- **resolutions**, at `<prefix>/ns/<scope>/resolutions/<id>.json`: one per
   export, the service number each of the bundle's values resolved to when
   the export was recorded, which merges of that bundle send (see
   [Imported entries](#imported-entries)). Content-addressed and written once,
   like bundles.
-- **an index**, at `<prefix>/<scope>/index.json`: every stored entry (the
+- **an index**, at `<prefix>/ns/<scope>/index.json`: every stored entry (the
   bundle and ordinal holding its record, the resolution of the export that
   wrote it, its source engine entry, replacement
   count, expiry, and the entries it keeps alive: its dependencies and the
@@ -385,9 +521,14 @@ records into it. Each scope (a team, a tenant) has:
   into it (`imported`, see [Imported entries](#imported-entries)).
 
 A scope is a namespace (see [Auth and namespaces](#auth-and-namespaces)), and
-its blobs are under it too, at `<prefix>/<scope>/blobs/`. The scope `blobs` is
-refused, since it would clash with the blob store's own keys under the same
-prefix (`<prefix>/blobs/`, where blobs were kept before namespaces).
+its blobs are under it too, at `<prefix>/ns/<scope>/blobs/`. Every scope
+lives under `<prefix>/ns/`, so no name is reserved; `blobs` is a name like
+any other. The GC epoch object is at `<prefix>/ns/<scope>/gc-epoch.json`,
+and the startup probe (below) at
+`<prefix>/ns/<scope>/conditional-write-check/<nonce>`. All of these shapes
+are listed once, in [`layout`](layout), and the ownership marker,
+`<prefix>/cacheservice.json`, sits above them (see
+[Bucket ownership](#bucket-ownership)).
 
 **Index updates are atomic.** `UpdateIndex` reads the index and its ETag,
 applies a change, and writes it back with `If-Match` on that ETag, or
@@ -584,8 +725,9 @@ don't contend.
 ([#7](https://github.com/zerobull-consulting/dagger/issues/7)). It is on when
 `CACHESERVICE_S3_BUCKET` is set, unless `-export=false`; the other
 `CACHESERVICE_S3_*` settings are as for the blob store. At startup the
-service checks the bucket's conditional writes (`VerifyConditionalWrites`)
-and refuses to start if they fail. `-export=false` (default true, mirroring
+service checks that the prefix is its own (see
+[Bucket ownership](#bucket-ownership)), then the bucket's conditional writes
+(`VerifyConditionalWrites`), and refuses to start if either fails. `-export=false` (default true, mirroring
 `-import`) turns the export path off and makes the instance read-only: it
 only imports, and never writes to or deletes from the bucket (see
 [Read-only instances](#read-only-instances)).
@@ -647,7 +789,7 @@ session's cache ID. If none is, the export waits and is tried again.
    5 times per value.
 4. Once every blob is stored (promoted, so verified), the bundle is published
    and recorded in the index (`metastore.RecordFenced`). Each try reads
-   GC's epoch (`<prefix>/<ns>/gc-epoch.json`, one small GET, at most once per 10s) before it
+   GC's epoch (`<prefix>/ns/<ns>/gc-epoch.json`, one small GET, at most once per 10s) before it
    checks any blob, and its index write is refused if it names a blob,
    bundle or resolution GC is deleting, or deleted after that read: it
    checked the object before it was deleted. The export is then tried again
@@ -907,6 +1049,17 @@ The startup log has one line of the mode, `msg=mode export=off import=on
 gc=off readOnly=true`, and `cacheservice_export_enabled` is 0, so a
 dashboard can tell a read-only sidecar from a writer that is broken.
 
+**On a prefix with no store yet** (a pull-request job before the first
+cache-warming run): a read-only instance checks ownership as a writer does
+(see [Bucket ownership](#bucket-ownership)), but never writes the marker.
+With no marker and nothing under the prefix, it starts, logs `no store
+exists under the prefix yet` at warning level, and has nothing to merge:
+the index it reads doesn't exist. It writes nothing
+(`TestReadOnlyStartsOnEmptyPrefix`, `TestMinIOBinaryReadOnlyEmptyPrefix`).
+Once a writer creates the store, the same instance merges from it as usual:
+it doesn't check the marker again. With keys under the prefix and no
+marker, or a marker of another layout, it exits 1, as a writer does.
+
 ### A read-only key
 
 **The flag is trust hygiene; the read-only key is the boundary.** A job that
@@ -918,17 +1071,24 @@ The import path needs, on the objects under the prefix (`<prefix>/*`):
 - `s3:GetObject`: the index, bundles and resolutions it reads, the
   `HeadObject` that checks a layer is stored before a renewal, and the
   presigned GETs it hands engines, which are signed with this key;
-- `s3:ListBucket` on the bucket, for the prefix: the import path never
-  lists, but without it S3 answers 403 instead of 404 for a missing key,
-  such as the index of a namespace nothing was stored in yet.
+- `s3:ListBucket` on the bucket, for the prefix: the startup's ownership
+  check lists the prefix once, for at most 11 keys, when it finds no marker
+  (see [Bucket ownership](#bucket-ownership)); and without it S3 answers
+  403 instead of 404 for a missing key, such as the marker or the index of
+  a namespace nothing was stored in yet. The condition below,
+  `s3:prefix` like `cache/*`, covers that listing (its prefix is `cache/`).
+  With an empty `CACHESERVICE_S3_PREFIX`, the listing is of the whole
+  bucket, and the condition must allow it (drop it, or use `*`).
 
 That is all: no `s3:PutObject`, `s3:DeleteObject` or bucket configuration.
 `TestMinIOBinaryReadOnlyKey` runs a read-only instance with a MinIO user
 that has only these (as below, for the test prefix): it merges a writer's
 entries into a fresh engine, the engine pulls their layers and renews their
 addresses, and the bucket's listing is unchanged. With the export path on,
-the same key fails at startup on the conditional write check, `AccessDenied`,
-exit 1 (`TestMinIOBinaryReadOnlyKeyRefusedAsWriter`): that is what stops a
+the same key fails at startup with `AccessDenied`, exit 1: on an empty
+prefix when it creates the ownership marker, and on a writer's prefix at the
+conditional write check (`TestMinIOBinaryReadOnlyKeyRefusedAsWriter`): that
+is what stops a
 pull-request job that forgot `-export=false` from running as a writer whose
 every export fails. MinIO answers 404 for a missing key even without
 `s3:ListBucket` (checked with a `GetObject`-only user); AWS S3 documents the
@@ -1147,7 +1307,7 @@ b72d41c09e...   team-a
 A token may not contain white space or `:` (HTTP Basic ends the username at
 the first colon), and may appear once. A namespace is what
 a scope may be: 1-128 letters, digits, `.`, `_` or `-`, starting with a letter
-or digit, and not `blobs`. Many tokens may share a namespace. Generate tokens
+or digit, without `..`. Many tokens may share a namespace. Generate tokens
 long and random (`openssl rand -hex 32`), and keep the file readable by the
 service only. The service keeps only the tokens' SHA-256 hashes, compares
 them in constant time, and logs only a short fingerprint (the hash's first 4
@@ -1268,7 +1428,7 @@ the defaults: neither file decides that a namespace's data goes.
 ```bash
 awk '!/^#/ && NF >= 1 && $1 != "*" {print $1}' namespaces | sort -u |
   jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
-    Filter: {Prefix: ($p + "/" + . + "/staging/")}, Expiration: {Days: 1}}' | jq -s .
+    Filter: {Prefix: ($p + "/ns/" + . + "/staging/")}, Expiration: {Days: 1}}' | jq -s .
 ```
 
 ### Blobs are kept per namespace
@@ -1284,7 +1444,7 @@ namespace has the blob (`TestNamespacesKeepExportsApart`,
 
 The trade-off is storage: a base image layer every team uses is stored once
 per namespace. Staging keys are per namespace too
-(`<prefix>/<ns>/staging/<stage>/...`), and a promotion copies within one
+(`<prefix>/ns/<ns>/staging/<stage>/...`), and a promotion copies within one
 namespace's prefix, so verification never crosses tenants
 (`TestVerifyNamespacesApart`).
 
@@ -1294,17 +1454,16 @@ others from ever uploading the right one. Now that only verified blobs are
 promoted ([#23](https://github.com/zerobull-consulting/dagger/issues/23)),
 that no longer holds, so blobs could be shared per group of namespaces that
 accept each other's uploads: the promotion target would be a group's prefix
-outside `<prefix>/<ns>/` (say `<prefix>/shared/<group>/blobs/`), and `Has`,
+outside `<prefix>/ns/<ns>/` (say `<prefix>/shared/<group>/blobs/`), and `Has`,
 GETs and `renew` would read it. Not built: sharing would still tell a tenant
 which digests the others in its group hold (an upload skipped is a blob
 someone stored), and GC would have to count references across the group's
 namespaces ([#11](https://github.com/zerobull-consulting/dagger/issues/11)).
 
 Without a tokens file, the one namespace is `-scope`, so blobs are at
-`<prefix>/<scope>/blobs/`. Blobs stored by earlier versions, at
-`<prefix>/blobs/`, are no longer read: their entries' layers are uploaded
-again on the next export, and an import of an entry whose layers are only at
-the old keys finds them missing, as for a deleted blob.
+`<prefix>/ns/<scope>/blobs/`. A prefix of an earlier layout is refused at
+startup (see [Bucket ownership](#bucket-ownership) and
+[Changing layouts](#changing-layouts)).
 
 ### Unauthenticated mode
 
@@ -1388,22 +1547,66 @@ refused (400). Neither runs for real. A run that failed somewhere answers
 
 ### One run, per namespace
 
-GC lists the top level of `<prefix>/`, and the incomplete multipart
-uploads under it: every valid namespace name with objects or uploads is
-collected, including namespaces whose tokens were all removed, namespaces
-in no file, and a namespace whose only leftover is an upload
-(`TestNamespaceOfOnlyAnUpload`). `<prefix>/blobs/` (where blobs were kept before
-namespaces) and anything that isn't a valid namespace name are skipped. In
-each namespace, in order:
+GC relies on the service owning its prefix (see
+[Bucket ownership](#bucket-ownership)). Each run, before anything else:
 
+- It reads the ownership marker. Without one of layout 2 (none, another
+  version, or one it can't read), the run does nothing: no listing of
+  namespaces, no index write, no delete, no abort. It logs why, at error
+  level, and counts it (`gc_refused_total{reason}`: `no_marker`,
+  `other_layout`, `marker_unreadable`) (`TestNoMarkerDoesNothing`).
+- It lists the top level of `<prefix>/` and of `<prefix>/ns/`, and every
+  incomplete multipart upload under `<prefix>/`. Anything outside a
+  namespace other than the marker (a key at the top, a prefix other than
+  `ns/`, a key directly under `ns/`, a name under `ns/` that isn't a valid
+  namespace, an upload anywhere but a namespace's blob key) is an
+  **ownership violation outside the namespaces**: the run does nothing at
+  all (`root_violation`). The old layout's `default/index.json` and
+  `blobs/sha256/...` are violations like any other
+  (`TestUnexpectedKeyOutsideNamespaces`, `TestMinIOGCOwnership`).
+- A failed listing of multipart uploads stops the run too
+  (`uploads_unlisted`): without it, an upload of another writer's would go
+  unseen (`TestUploadListingFailureDoesNothing`). Before layout 2, the
+  namespaces were still collected, all but their uploads.
+
+Namespaces are found under `<prefix>/ns/` only, from the bucket, not the
+tokens: namespaces whose tokens were all removed, and namespaces in no
+file, are collected too. "No tokens" and "not in the namespaces file" never
+mean "delete". In each namespace, in order:
+
+0. **Read the index, list, and check ownership.** The index is read first,
+   then every object under `<prefix>/ns/<ns>/` is listed: its sizes are
+   the namespace's stored bytes (`gc_stored_bytes`), by kind. Every key, and
+   every upload in the namespace, must be of one of the service's shapes
+   (package [`layout`](layout)). One that isn't (an **ownership
+   violation**: `notes.txt`, `blobs/sha256/<not a digest>`,
+   `staging/<stage>/<anything but a digest>`, an upload anywhere but a blob
+   key) stops the namespace for the run: nothing in it is deleted,
+   aborted, or written, the index included. Other namespaces are still
+   collected. GC logs up to 10 of the keys at error level, reports them
+   (`unexpected`, `unexpectedCount`), and sets
+   `gc_unexpected_keys{scope}` (`TestUnexpectedKeyInNamespace`,
+   `TestUnexpectedUploadNeverAborted`). Once the key is gone (removed by
+   whoever wrote it: GC never removes it), the next run collects the
+   namespace again.
+
+   **A namespace needs an index.** A prefix under `ns/` without one is
+   reported (`skipped: no index`) and left alone: its blobs, staged
+   uploads and multipart uploads included
+   (`TestNamespaceWithoutIndexLeftAlone`, `TestMinIOGCNamespaceWithoutIndex`).
+   Before layout 2, its staged and multipart uploads were collected; now
+   a tree under `ns/` is the service's to clean only once it has an index.
+   A staged upload left by an export that never recorded waits for the
+   namespace's first index, or for the lifecycle rule. Uploads in a
+   namespace with no objects at all are left too, and logged.
 1. **Expire.** One conditional index update (only when something changes):
    roots past their own expiry or their max age, and entries past their
    own expiry, are dropped, with what only they keep alive
    (`metastore.Index.Expire`, the same rules as `DropExpired`). Roots with no
    recording time (indexes before version 3) are stamped now. Finished
    deletions older than 4h are dropped from the index.
-2. **List** every object under `<prefix>/<ns>/`: its sizes are the
-   namespace's stored bytes (`gc_stored_bytes`), by kind.
+2. *(The listing is step 0, before the expiry, so a namespace with a
+   violation has nothing written.)*
 3. **Mark.** What the index names: its entries' bundles and resolutions,
    and every blob those bundles name, through their outputs' chains and
    their records' pending offers (`metastore.BundleBlobs`). Bundles are read
@@ -1412,9 +1615,10 @@ each namespace, in order:
    know its blobs (`TestMissingBundleStopsSweep`); so does one that is
    readable but missing from the run's listing, which comes after the index
    read, since bundles' blob lists are cached across runs
-   (`TestMissingBundleStopsSweepWarmCache`). A namespace with no index
-   is not swept either: GC can't tell what is in use
-   (`TestLeavesWhatItDoesNotKnow`). Nor is one whose index can't be read
+   (`TestMissingBundleStopsSweepWarmCache`). (The index read before the
+   listing is what is checked; an entry the expiry's update finds recorded
+   since names objects that aren't in the listing, and so aren't
+   candidates either.) A namespace whose index can't be read
    (corrupt, or a later version a newer replica wrote); its staged and
    multipart uploads, which don't need the index, are still collected
    (`TestUnreadableIndexStillCollectsUploads`).
@@ -1432,12 +1636,13 @@ each namespace, in order:
    (`TestKnownGapHoldIsPerReplica`). The index stays consistent; an engine
    whose merge was in flight computes those parts again.
 6. **Staging**, below.
-7. **Incomplete multipart uploads** under `<prefix>/<ns>/` older than the
-   staging age are aborted: promotions a stopped service left. They are
+7. **Incomplete multipart uploads** at the namespace's blob keys older than
+   the staging age are aborted: promotions a stopped service left. They are
    listed once per run, for every namespace.
 
-Keys GC doesn't know (`conditional-write-check/`, anything else) are
-counted as `other` and never deleted. A run of one namespace never deletes
+The epoch object and a probe left by a failed delete
+(`conditional-write-check/<nonce>`) are the service's and counted as
+`other`; they are never deleted. A run of one namespace never deletes
 another's data (`TestNamespacesApart`, and the real-engine `gc` scenario,
 which checks the run's scope after collecting its own).
 
@@ -1567,7 +1772,7 @@ serialized with exports on the index:
    it reports failing are counted apart and reported, and the next batches
    still run (`TestPartialDeleteFailure`).
 3. **Finish.** In a second update, GC marks them deleted in a new epoch,
-   then publishes the epoch in `<prefix>/<ns>/gc-epoch.json`. Each export
+   then publishes the epoch in `<prefix>/ns/<ns>/gc-epoch.json`. Each export
    try reads that object before it checks any blob (one small GET, kept for 10s), and its
    index write is refused if it names an object deleted in a later epoch: it
    checked the object before it was deleted
@@ -1631,7 +1836,7 @@ digest keys only), so deleting one is always safe: at worst a promotion
 still copying it fails, and its export asks for the blob again. GC reads
 the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
 
-- a namespace whose `<prefix>/<ns>/staging/` an enabled rule expires by
+- a namespace whose `<prefix>/ns/<ns>/staging/` an enabled rule expires by
   age (`Expiration.Days`, filtered by prefix alone; a rule with a `Date`
   expires objects once, not as they age), with a prefix within the staging
   prefix, is left to it (`gc_staging_rule_missing` 0,
@@ -1650,14 +1855,17 @@ the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
   store without them), GC deletes old staged uploads in every namespace,
   and removes `gc_staging_rule_missing` (`TestStagingRuleMetricUnknown`).
 
-Stale incomplete multipart uploads (`ListMultipartUploads`) are aborted
-whatever the rules (`TestStagingAndUploads`, `TestMinIOGC`). MinIO lists
+Stale incomplete multipart uploads (`ListMultipartUploads`) at a
+namespace's blob keys are aborted whatever the rules (`TestStagingAndUploads`,
+`TestMinIOGC`). An upload anywhere else is not the service's: it is never
+aborted, at any age, and stops collection as any unexpected key does
+(`TestUnexpectedUploadNeverAborted`, `TestMinIOGCOwnership`); the bucket's
+own abort rule, if it has one, still applies to it. MinIO lists
 multipart uploads only for an exact key: a listing by prefix returns none.
 For an S3-compatible store (a custom `CACHESERVICE_S3_ENDPOINT`),
 `S3Bucket.ListUploads` then lists the bucket's uploads and keeps those
 under the prefix, once per run (`FilterAllUploads`). It doesn't on AWS
-S3, which lists by prefix, so a bucket shared with other uploaders is
-never listed whole. MinIO also drops stale uploads itself after 24h.
+S3, which lists by prefix. MinIO also drops stale uploads itself after 24h.
 
 **Lifecycle rules.** Keep the staging rules and the multipart rule of
 [Lifecycle rule for staging](#lifecycle-rule-for-staging): they cost the
@@ -1720,8 +1928,9 @@ first.
 | `-namespaces-file` | none | Per-namespace limits (see [The namespaces file](#the-namespaces-file)) |
 
 The service's credentials also need `s3:ListBucket`,
-`s3:ListBucketMultipartUploads`, `s3:DeleteObject` on every key under the
-prefix, and, to report namespaces without a staging rule,
+`s3:ListBucketMultipartUploads` (without it, GC does nothing:
+`uploads_unlisted`), `s3:DeleteObject` on every key under the prefix, and,
+to report namespaces without a staging rule,
 `s3:GetLifecycleConfiguration` on the bucket.
 
 ## Stopping and draining
@@ -1927,6 +2136,8 @@ paths record into them through their metadata store. All are prefixed
 | `gc_run_duration_seconds` | `scope` | Time of one namespace's GC run |
 | `gc_entries_expired_total` | `scope`, `reason` | Index entries GC dropped: `expired` (their own expiry, or the max age) or `size` (the max size) |
 | `gc_staging_rule_missing` | `scope` | 1 when no lifecycle rule expires the namespace's staging prefix (GC expires it itself), 0 when one does; absent when the rules can't be read |
+| `gc_unexpected_keys` | `scope` | Keys and multipart uploads of no known shape GC's last run found in the namespace, or for `scope="_root"` outside the namespaces (a lower bound there: one listing page per unexpected prefix). Above 0 is an ownership violation: GC changed nothing in that namespace, or, for `_root`, anywhere (see [Bucket ownership](#bucket-ownership)) |
+| `gc_refused_total` | `reason` | GC runs that did nothing at all: `no_marker`, `other_layout`, `marker_unreadable`, `root_violation` (keys of no known shape outside the namespaces), `uploads_unlisted` (the multipart upload listing failed) |
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
 | `export_enabled` | | 1 when the export path is on, 0 when it is off: a read-only instance (`-export=false`), or no bucket |
 | `draining` | | 1 once the service started draining (SIGTERM), 0 before |
@@ -1938,12 +2149,14 @@ paths record into them through their metadata store. All are prefixed
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
-The `gc_stored_*` and `gc_staging_rule_missing` series of a namespace gone
-from the bucket are removed at the next run (`TestGaugesOfGoneNamespaceRemoved`).
-No label comes from an engine-supplied string: `scope` is a validated
-namespace from the tokens file or `-scope`, or, for the `gc_` metrics, a
-valid namespace name GC listed in the bucket; the others are the service's
-constants (an OTLP `route` is the route that took the request, never its
+The `gc_stored_*`, `gc_staging_rule_missing` and `gc_unexpected_keys` series
+of a namespace gone from the bucket are removed at the next run
+(`TestGaugesOfGoneNamespaceRemoved`). No label comes from an engine-supplied
+or bucket-supplied string unchecked: `scope` is a validated namespace from
+the tokens file or `-scope`, or, for the `gc_` metrics, a valid namespace
+name GC listed under `ns/`, or `_root` (which no namespace can be: a
+namespace starts with a letter or digit); unexpected keys are counted, never
+used as labels; the others are the service's constants (an OTLP `route` is the route that took the request, never its
 path or headers).
 
 `caller` is `export` or `import` for the path that read or updated the index,
@@ -1971,7 +2184,11 @@ What to watch:
 - **Storage:** `gc_stored_bytes` per namespace against its `max-bytes`;
   `gc_deleted_bytes_total` by kind; any `gc_staging_rule_missing` of 1 is a
   namespace whose staging rule is missing; `gc_runs_total{outcome="error"}`
-  is a run that failed somewhere (the log says where). A rising
+  is a run that failed somewhere (the log says where).
+- **Ownership:** any `gc_unexpected_keys` above 0, or any
+  `gc_refused_total`, is GC stopped: something else wrote under the
+  service's prefix, or the marker is gone. The log lists up to 10 keys.
+- A rising
   `export_collected_total` means exports keep naming what GC deletes: a
   grace period too short for the exports' duration.
 - **OTLP limits:** any `otlp_refused_total{reason="too_large"}` from a
@@ -2004,6 +2221,13 @@ The context is the repository root, since the module is the whole monorepo;
 [`Dockerfile.dockerignore`](Dockerfile.dockerignore) keeps it to the
 packages the service builds from (BuildKit is needed for that file, and is
 Docker's default builder).
+
+The build records the image's revision (`--build-arg REVISION`, which CI
+sets to the commit SHA) in the binary, as the `serviceVersion` of the
+ownership marker an instance of it creates (see
+[Bucket ownership](#bucket-ownership)). An image of another layout refuses
+a prefix this one created, and the other way round: moving between them is
+[Changing layouts](#changing-layouts).
 
 It is the static binary on `gcr.io/distroless/static-debian12:nonroot`: CA
 certificates and tzdata, no shell, and it runs as UID 65532. The binary is

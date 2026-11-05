@@ -15,14 +15,21 @@ To run it against a real bucket, its safety guarantees, its variables and what
 each store did, see
 [Testing against a real bucket](../../../hack/remote-cache/README.md#testing-against-a-real-bucket).
 A run needs `CACHESERVICE_S3_PREFIX`, works under `<prefix>/e2e/<run>/`, and
-fails if a request outside it reached the proxy or its direct client.
+fails if a request outside it reached the proxy or its direct client. That
+prefix is new for each run, so the first service's startup check finds it
+empty and claims it with the ownership marker (see
+[Bucket ownership](../README.md#bucket-ownership)); `Env.CheckConsistent`
+checks the marker is there and that every key under the prefix is of the
+service's shapes (`Env.CheckOwned`). Keys are laid out as package
+[`layout`](../layout/) has them: `Env.BlobKeyIn` and the rest build them
+from it.
 
 ## The pieces
 
 | Piece | Where it runs | How the test drives it |
 | --- | --- | --- |
 | Cache service (`Service`, `StartService`) | In the test process, on the Docker bridge gateway | `server.Service`'s Go API: `Engines`, `Entries`, `Imports`, `Export`, `Import`. A recording `slog` handler (`LogRecorder`) keeps what it logs: cache spans, envelopes, engine events, exports and merges. |
-| S3 proxy (`S3Proxy`) | In the test process, on the gateway | The services' S3 endpoint, so presigned URLs point at it too. It records every request (method, key, query, time, status) instead of tracing MinIO, and injects faults (`Fault`): S3 errors or stalls for the requests they match, or a rewrite of their body before MinIO gets it. An engine's blob requests (`S3Request.IsBlob`) are its uploads, PUTs to staging keys (`<ns>/staging/<stage>/<alg>/<hex>`), and its downloads, GETs of digest keys (`<ns>/blobs/<alg>/<hex>`); the service's own (HEADs, and a promotion's copies and reads) are not. |
+| S3 proxy (`S3Proxy`) | In the test process, on the gateway | The services' S3 endpoint, so presigned URLs point at it too. It records every request (method, key, query, time, status) instead of tracing MinIO, and injects faults (`Fault`): S3 errors or stalls for the requests they match, or a rewrite of their body before MinIO gets it. An engine's blob requests (`S3Request.IsBlob`) are its uploads, PUTs to staging keys (`ns/<ns>/staging/<stage>/<alg>/<hex>`), and its downloads, GETs of digest keys (`ns/<ns>/blobs/<alg>/<hex>`); the service's own (HEADs, and a promotion's copies and reads) are not. |
 | MinIO, or any bucket | `hack/remote-cache/compose.yaml`, on loopback; or the bucket in `CACHESERVICE_S3_*` with `CACHESERVICE_TEST_EXTERNAL=1` | Through the proxy for the services and engines; directly (`Env.S3`, `Env.Meta`) to read the index and bundles and delete blobs, so the test's own reads aren't recorded as the engines'. On an HTTPS or virtual-hosted endpoint the proxy checks each signature and signs again for the store (`Upstream`). |
 | Engines (`Engine`, `StartEngines`, `StartEnginesWithTokens`) | Docker containers from an image built for the run | The `docker` CLI: start, restart, remove, logs (`Engine.Logs`). Each authenticates with `Engine.Token`: its host name, or the token it was started with. |
 | Client (`Engine.CLI`, `Engine.Query`) | The `dagger` CLI built for the run | With a clean environment. The CLI's Cloud settings come from the environment, which is process-wide, so it runs as its own process rather than as the engine client in this one. Its token is `e2e-cli`, or its engine's when the engine was started with a token: session spans reach the service under the CLI's token, which must be in the engine's namespace. |

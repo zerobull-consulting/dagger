@@ -40,8 +40,8 @@ type S3Request struct {
 }
 
 // IsBlob reports whether the request is an engine's, for a layer blob: an
-// upload, which goes to a staging key (<ns>/staging/<stage>/<alg>/<hex>), or
-// a download, of a digest key (<ns>/blobs/<alg>/<hex>). The service's own
+// upload, which goes to a staging key (ns/<ns>/staging/<stage>/<alg>/<hex>), or
+// a download, of a digest key (ns/<ns>/blobs/<alg>/<hex>). The service's own
 // requests for blobs (HEADs, and a promotion's copies and reads) are not.
 func (r S3Request) IsBlob() bool {
 	switch r.Method {

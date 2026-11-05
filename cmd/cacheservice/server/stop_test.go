@@ -356,7 +356,7 @@ func TestWaitWaitsForGCRunAskedFor(t *testing.T) {
 	if _, err := st.meta.UpdateIndex(context.Background(), testScope, func(*metastore.Index) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	key := "ns/"+testScope+"/staging/" + strings.Repeat("ab", 16) + "/sha256/" + strings.Repeat("0", 64)
+	key := "ns/" + testScope + "/staging/" + strings.Repeat("ab", 16) + "/sha256/" + strings.Repeat("0", 64)
 	if _, err := st.objs.Put(context.Background(), key, []byte("staged"), metastore.Condition{}); err != nil {
 		t.Fatal(err)
 	}

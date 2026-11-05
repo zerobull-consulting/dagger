@@ -27,9 +27,9 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
-	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
