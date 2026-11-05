@@ -59,9 +59,11 @@ it isn't.
   `</details>`. Follow the repository's PR template, if it has one, for
   everything above it. A follow-up PR from the same prompt links to the
   original's instead of copying it.
-- **The prompt stays out of the commit history:** when enabling auto-merge,
-  set the squash commit's message explicitly to the PR's summary, without the
-  prompt.
+- **The prompt stays out of the commit history:** set the squash commit's
+  title and message explicitly. The title is the PR's title with its full
+  reference, like `(zerobull-consulting/dagger#97)`, never GitHub's default
+  `(#97)`; the message is the PR's summary, without the prompt. Section 12,
+  step 5 says how.
 
 *Why:* repository quirks that bit earlier rounds, and a record of exactly what
 produced each PR.
@@ -104,7 +106,8 @@ Invariants:
 - bound everything;
 - no engine- or bucket-supplied strings in labels, keys or file names without
   validating them;
-- known-gap tests plus issues for anything not fixed;
+- known-gap tests plus issues for confirmed gaps not fixed; unconfirmed leads
+  go in one issue, with no test;
 - stage files explicitly, and never commit built binaries or `dagger.lock`
   changes by accident.
 
@@ -129,11 +132,13 @@ In the prompt, the working agreement's points; the agent follows the
 agreement's full text below:
 
 - open as a draft, and get CI green;
+- decide on splitting once, from the first diff's lines added plus deleted;
 - run `/code-review high` against `origin/feature/remote-cache` and fix the
   real findings, then mark the PR ready;
-- one push per round, at most four rounds;
+- one push per round, at most four review rounds;
 - then known-gap tests and issues for confirmed findings, one issue of
-  unverified leads for the rest, one final push, then auto-merge;
+  unverified leads for the rest, one final push, then the squash merge with
+  its explicit message;
 - the exception for deleting data, publishing unverified blobs or bundles, or
   exposing a token.
 
@@ -162,15 +167,30 @@ keeps the rounds productive.
 - An org ruleset has Copilot review **every push** to a ready PR, and not
   drafts. So each push is a review round.
 - `feature/remote-cache` requires `unit tests`, `S3 tests against MinIO` and
-  `real engines (e2e)`. Copilot is not a required check, so auto-merge waits
-  on CI only.
+  `real engines (e2e)`. Copilot is not a required check, so the merge waits on
+  those checks only.
 
 **The limit:**
 
 - Every PR gets at most **four** review rounds (reviews 1 to 4), whatever its
   size.
-- A PR over about 2,500 lines added should be split before it's marked ready.
-  If it isn't, say why in the PR description.
+- **Decide on splitting once, from the first diff:** when the draft first does
+  what the prompt asks, before `/code-review` or any other review. Its size is
+  the lines added plus the lines deleted, counting every file (tests, docs and
+  generated files included). A PR that adds 2,500 lines and deletes 500 counts
+  as 3,000. The command compares the base with the committed `HEAD`, so
+  commit the draft first. A binary file shows as `-` and counts as 0:
+
+  ```bash
+  git fetch origin feature/remote-cache &&
+    git diff --numstat origin/feature/remote-cache...HEAD |
+    awk '{n += $1 + $2} END {print n}'
+  ```
+
+- Over about 2,500 lines, split it before it's marked ready. Put the size in
+  the PR description, and if a PR over it isn't split, say why.
+- Don't revisit the decision later: fixes during the rounds never reopen it.
+  The cap on review rounds is what limits how big a PR gets after that.
 - Split large work into smaller PRs where it splits naturally. That cuts
   findings more than anything else.
 
@@ -179,6 +199,8 @@ keeps the rounds productive.
 1. **Open the PR as a draft.** Push as often as you need; Copilot doesn't
    review drafts.
 2. **Before marking it ready:**
+   - Measure the first diff and decide on splitting, once (see the limit
+     above).
    - CI is green on the draft, and the PR's tests have passed locally.
    - Run `/code-review high` on the branch against
      `origin/feature/remote-cache` and fix the real findings.
@@ -199,17 +221,24 @@ keeps the rounds productive.
      zerobull-consulting/dagger#1.
    - **Not confirmed, or text you can't read:** list them in one issue under
      zerobull-consulting/dagger#1 as unverified leads (file, lines, type),
-     with no test. Don't ask for Copilot's session findings.
+     with no test.
+     Don't ask for Copilot's session findings.
    - Answer each thread with its issue link, and resolve it.
    - **The one exception:** fix it with a test in this same push, instead of
      filing it, if a confirmed finding means the PR deletes data it shouldn't,
      publishes an unverified blob or bundle, or exposes a token. If that fix
      needs a design decision, don't merge: stop and report.
 5. **Merge:** push those known-gap tests and fixes as one final push. **Then**
-   enable auto-merge (squash), with the commit message set as in section 4.
-   Enabling it before the push could merge the old head the moment its checks
-   are green. The required checks gate the merge; Copilot's review of that
-   push doesn't.
+   squash-merge, with the title and message set as in section 4:
+   - where the auto-merge tool can set the title and message, enable
+     auto-merge (squash) with them;
+   - where it can't, wait for the required checks on the final push to pass,
+     then squash-merge with the explicit title and message, pinned to the head
+     commit.
+
+   Enabling auto-merge before the push could merge the old head the moment its
+   checks are green. The checks gate the merge; Copilot's review of that push
+   doesn't.
 6. **CI red at any point:** fix it at the root cause; never retry or loosen a
    check. After the last round, the reviews these pushes start are handled
    like the final push's.
