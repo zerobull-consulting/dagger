@@ -17,6 +17,11 @@ import (
 // ErrDraining is returned for work the service refuses while it drains.
 var ErrDraining = errors.New("the service is draining before it stops")
 
+// ErrStopping is returned for work the service refuses once its stop began
+// without a drain, or after it: the paths' context ended, or CloseEngines
+// or Wait ran.
+var ErrStopping = errors.New("the service is stopping")
+
 // drainRetryAfter is the Retry-After of an engine connection refused while
 // draining, in seconds. The engine reconnects with its own backoff anyway.
 const drainRetryAfter = "10"
@@ -106,8 +111,10 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //  3. It starts no export past its deadline, or once ctx was canceled: each
 //     pass checks both before it schedules anything, so a drain whose
 //     deadline passed before it began starts nothing. A retry due by the
-//     deadline is waited for and started; one due after it isn't waited
-//     for, and is reported left (DrainState.Later). Exports started before
+//     deadline is waited for, and started if a pass (every 100ms at most)
+//     finds it due before the deadline; one due in the last pass's interval
+//     is left. One due after the deadline isn't waited for, and is reported
+//     left (DrainState.Later). Exports started before
 //     the deadline run on until the stop that follows cuts them off.
 //
 // Drain deletes nothing, and publishes nothing an export didn't verify. It
@@ -206,7 +213,16 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		case <-ctx.Done():
 		case <-p.ctx.Done():
 		case <-t.C:
+			continue
 		}
+		// Woken by the end of ctx or of the export path: the drain ends
+		// there, with that outcome, whatever is left, as it always did.
+		if h := s.testHookDrainWoken; h != nil {
+			h()
+		}
+		now = p.now()
+		outcome, _ := drainEnded(ctx, p.ctx, now, time.Time{})
+		return s.endDrain(start, outcome, s.drainLeft(now, deadline))
 	}
 }
 

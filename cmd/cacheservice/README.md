@@ -1622,7 +1622,9 @@ It ends when nothing is left that it could export, or `-drain-timeout`
 what is still in flight (exports, import syncs, GC runs, those asked for
 with `POST /debug/gc` included) by canceling their context, closes the
 engine connections (each gets a close frame, 1001 going away, all at once;
-those that don't answer within 2s are dropped), shuts down its HTTP
+those that don't answer within 2s are dropped; from then on a new engine
+gets 503, and one upgraded before is closed with 1001 at its hello, so an
+engine reconnecting meanwhile isn't welcomed), shuts down its HTTP
 servers, and waits for their requests and for what it cut off to end. So
 the whole stop, from the first signal to the exit, takes at most
 `-drain-timeout` plus 5s, even with engines that don't answer and work that

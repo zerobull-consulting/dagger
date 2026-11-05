@@ -87,14 +87,13 @@ func TestMinIOBinaryStopBoundedExitsOne(t *testing.T) {
 	b.waitFor(10*time.Second, "the export to be in flight", func() bool { return b.cache.InFlight() == 1 })
 	start := time.Now()
 	b.signal()
-	code, _ := b.waitExitCode(drainTimeout + shutdownGrace + shutdownMargin + 10*time.Second)
+	code, _ := b.waitExitCode(drainTimeout + shutdownGrace + 10*time.Second)
 	took := time.Since(start)
 	if code != 1 {
 		t.Fatalf("exit %d after the stop's bound cut it off, want 1", code)
 	}
-	// The documented bound, with a margin for the process's own start of
-	// the stop and its exit.
-	if bound := drainTimeout + shutdownGrace + shutdownMargin; took > bound {
+	// The documented bound: -drain-timeout plus shutdownGrace.
+	if bound := drainTimeout + shutdownGrace; took > bound {
 		t.Fatalf("the stop took %s, past -drain-timeout plus the shutdown's bound (%s)", took, bound)
 	}
 	if took < drainTimeout+shutdownGrace/2 {
@@ -107,7 +106,7 @@ func TestMinIOBinaryStopBoundedExitsOne(t *testing.T) {
 func TestMinIOBinaryCleanStopExitsZero(t *testing.T) {
 	b := startBinary(t, "-drain-timeout", "0")
 	b.signal()
-	code, took := b.waitExitCode(shutdownGrace + shutdownMargin)
+	code, took := b.waitExitCode(2 * shutdownGrace)
 	if code != 0 {
 		t.Fatalf("exit %d after a clean stop, want 0", code)
 	}

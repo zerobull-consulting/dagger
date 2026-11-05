@@ -149,15 +149,19 @@ const (
 	refusedRevoked
 	// refusedDraining: the service drains, and takes no new engine.
 	refusedDraining
+	// refusedClosing: CloseEngines ran, and the service is going away.
+	refusedClosing
 )
 
 // register lists a connection that said hello as welcomed, if its token
-// still maps to its namespace and the service isn't draining. The check and
+// still maps to its namespace, the service isn't draining, and CloseEngines
+// hasn't run. A revoked token is refused as revoked, even while draining. The check and
 // the listing see the same tokens: a SetTokens between them makes register
 // check again, so no connection is welcomed on tokens already replaced. The
 // drain is checked under s.mu, which Drain starts the drain under: a
 // connection is either listed before the drain starts, and counted in its
-// report (DrainReport.Engines), or refused.
+// report (DrainReport.Engines), or refused; and either listed before
+// CloseEngines takes its list, and closed by it, or refused.
 func (s *Service) register(c *engineConn) registerResult {
 	for {
 		s.mu.Lock()
@@ -169,17 +173,19 @@ func (s *Service) register(c *engineConn) registerResult {
 			s.mu.Unlock()
 			continue
 		}
-		if s.draining.Load() {
+		switch {
+		case !ok:
+			s.mu.Unlock()
+			return refusedRevoked
+		case s.closing.Load():
+			s.mu.Unlock()
+			return refusedClosing
+		case s.draining.Load():
 			s.mu.Unlock()
 			return refusedDraining
 		}
-		if ok {
-			s.conns[c.id] = c
-		}
+		s.conns[c.id] = c
 		s.mu.Unlock()
-		if !ok {
-			return refusedRevoked
-		}
 		c.ns.own(c.hello.CacheID, c.key)
 		c.owned.Store(true)
 		return registered

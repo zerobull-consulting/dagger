@@ -178,7 +178,10 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 	p.mu.Lock()
 	if p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()
-		return nil, ErrDraining
+		if s.draining.Load() {
+			return nil, ErrDraining
+		}
+		return nil, ErrStopping
 	}
 	p.wg.Add()
 	p.mu.Unlock()
@@ -221,7 +224,7 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	if errors.Is(err, ErrDraining) {
+	if errors.Is(err, ErrDraining) || errors.Is(err, ErrStopping) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}

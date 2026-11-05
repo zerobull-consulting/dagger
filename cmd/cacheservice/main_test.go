@@ -76,7 +76,7 @@ func buildBinary(t *testing.T) string {
 			return
 		}
 		binPath = filepath.Join(dir, "cacheservice")
-		out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput()
+		out, err := exec.Command("go", "build", "-tags", "cacheservice_testhooks", "-o", binPath, ".").CombinedOutput()
 		if err != nil {
 			buildErr = errors.New(string(out))
 		}

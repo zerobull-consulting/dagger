@@ -334,10 +334,15 @@ func main() {
 // stop timeout must be longer than.
 const shutdownGrace = 5 * time.Second
 
-// stopTestHoldEnv, set to 1, makes the stop wait for work that ignores
-// cancellation and never ends (server.Service.HoldWaitForTest), so the tests
-// can check the stop's bound on the built binary. Never set it otherwise.
+// stopTestHoldEnv, set to 1 in a binary built with the cacheservice_testhooks
+// tag (main_testhooks.go), makes the stop wait for work that ignores
+// cancellation and never ends, so the tests can check the stop's bound on the
+// built binary. A binary built without the tag ignores it.
 const stopTestHoldEnv = "_CACHESERVICE_TEST_HOLD_STOP"
+
+// testHookStop, set only in a binary built with the cacheservice_testhooks
+// tag, runs as the shutdown begins.
+var testHookStop func(*server.Service, *slog.Logger)
 
 // stopService runs shutdown, bounded by grace, and reports whether the
 // service stopped cleanly: everything ended within grace, and no signal cut
@@ -346,16 +351,15 @@ const stopTestHoldEnv = "_CACHESERVICE_TEST_HOLD_STOP"
 // shutdown itself overrun it. A false stop exits 1, so a process manager,
 // and the tests, can tell it from a clean one (0).
 func stopService(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, sigs <-chan os.Signal, logger *slog.Logger, grace time.Duration) bool {
-	if os.Getenv(stopTestHoldEnv) == "1" {
-		logger.Warn("test hook: the stop waits for work that never ends (" + stopTestHoldEnv + ")")
-		svc.HoldWaitForTest()
+	if testHookStop != nil {
+		testHookStop(svc, logger)
 	}
 	start := time.Now()
 	done := make(chan error, 1)
-	go func() { done <- shutdown(svc, servers, cancelPaths, grace) }()
-	// shutdown's own steps are bounded by grace; this is a margin over it,
-	// for steps that overrun theirs.
-	bound := time.NewTimer(grace + shutdownMargin)
+	go func() { done <- shutdown(svc, servers, cancelPaths, grace-shutdownMargin) }()
+	// shutdown's steps are bounded by grace less the margin; this backstop,
+	// at grace, is for a step that overruns its own bound.
+	bound := time.NewTimer(grace)
 	defer bound.Stop()
 	select {
 	case err := <-done:
@@ -377,9 +381,10 @@ func stopService(svc *server.Service, servers []*http.Server, cancelPaths contex
 	}
 }
 
-// shutdownMargin is how long stopService waits past grace for shutdown,
-// whose steps are each bounded within grace, before it exits regardless.
-const shutdownMargin = time.Second
+// shutdownMargin is how much of stopService's grace shutdown leaves unused,
+// so that the backstop at grace, for a step that overruns its bound, is
+// still within the documented bound.
+const shutdownMargin = 500 * time.Millisecond
 
 // shutdown stops svc after its drain, or without one, within grace: it ends
 // what is still in flight (exports, import syncs, GC runs) by canceling the

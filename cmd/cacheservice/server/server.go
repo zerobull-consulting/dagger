@@ -245,20 +245,18 @@ func (s *Service) WaitContext(ctx context.Context) error {
 // to log.
 type Running struct {
 	// Exports are the exports in flight, and the export path's scheduler.
-	Exports int `json:"exports"`
+	Exports int
 	// Imports are the import sync loops, and the index writes of wiped
 	// caches.
-	Imports int `json:"imports"`
+	Imports int
 	// GC are the GC runs, asked for or scheduled, and its schedule.
-	GC int `json:"gc"`
-	// Engines are the engine connections still welcomed.
-	Engines int `json:"engines"`
+	GC int
+	// Engines are the engine connections still welcomed. Wait doesn't
+	// wait for them: CloseEngines closes them.
+	Engines int
 	// Held is the work HoldWaitForTest holds.
-	Held int `json:"held,omitempty"`
+	Held int
 }
-
-// Idle reports whether nothing Wait waits for runs.
-func (r Running) Idle() bool { return r.Exports == 0 && r.Imports == 0 && r.GC == 0 && r.Held == 0 }
 
 // LogAttrs are r as log attributes.
 func (r Running) LogAttrs() []any {

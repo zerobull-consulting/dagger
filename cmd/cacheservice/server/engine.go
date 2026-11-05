@@ -76,12 +76,18 @@ type Service struct {
 
 	// draining is set once Drain starts: the service takes no new work.
 	draining atomic.Bool
-	drain    drainState
+	// closing is set, under mu, once CloseEngines runs: the service takes
+	// no new engine, so none is welcomed after CloseEngines took its list.
+	closing atomic.Bool
+	drain   drainState
 	// testHookExportRecorded, set by tests only, runs after an export's
 	// result reached the tracker.
 	testHookExportRecorded func()
 	// testHeld is the work HoldWaitForTest holds.
 	testHeld workGroup
+	// testHookDrainWoken, set by tests only, runs when a drain wakes on
+	// the end of its context, before it reports.
+	testHookDrainWoken func()
 	// testHookHello, set by tests only, runs after a connection's hello
 	// was read, before it is registered or refused.
 	testHookHello func()
@@ -185,6 +191,11 @@ func (s *Service) serveEngine(w http.ResponseWriter, r *http.Request) {
 		s.refuseDraining(w, r)
 		return
 	}
+	if s.closing.Load() {
+		w.Header().Set("Retry-After", drainRetryAfter)
+		http.Error(w, ErrStopping.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	token, _, ok := r.BasicAuth()
 	if !ok || token == "" {
 		s.reject(w, r, endpointEngine, "")
@@ -277,6 +288,9 @@ func (c *engineConn) serve(ctx context.Context) error {
 		c.svc.countRefused(metrics.DrainRefusedConnection)
 		_ = c.conn.Close(websocket.StatusTryAgainLater, "service draining")
 		return errors.New("service draining: refused before welcome")
+	case refusedClosing:
+		_ = c.conn.Close(websocket.StatusGoingAway, "service shutting down")
+		return errors.New("service stopping: refused before welcome")
 	default:
 		c.markRevoked()
 		c.closeRevoked()
@@ -553,9 +567,14 @@ func (s *Service) CloseEngines() {
 // engines that answer it end their connection cleanly. Once ctx ends, the
 // connections still waiting for an answer are dropped, as CloseEngine
 // does, and it returns once they are closed. It doesn't hold the service's
-// lock meanwhile.
+// lock meanwhile. From its start, the service welcomes no new engine: a
+// connection gets 503 before the upgrade, or 1001 at its hello.
 func (s *Service) CloseEnginesContext(ctx context.Context) {
 	s.mu.Lock()
+	// From now on no engine is welcomed (register), and none upgraded: the
+	// engines closed here reconnect within about a second, while the HTTP
+	// servers still listen.
+	s.closing.Store(true)
 	conns := make([]*engineConn, 0, len(s.conns))
 	for _, c := range s.conns {
 		conns = append(conns, c)

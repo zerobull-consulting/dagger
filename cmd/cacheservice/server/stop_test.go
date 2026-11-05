@@ -13,6 +13,7 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -104,6 +105,57 @@ func TestCloseEnginesBoundedAndOffTheLock(t *testing.T) {
 		t.Fatalf("CloseEngines took %s with %d silent engines, bound %s", took, silent, bound)
 	}
 	waitUntil(t, 5*time.Second, "the dropped engines to be gone", func() bool { return len(svc.Engines()) == 0 })
+}
+
+// Once CloseEngines runs, no new engine is welcomed: the engines it closed
+// reconnect within about a second, while the HTTP servers still listen, and
+// would otherwise be welcomed after it took its list, and never closed. A
+// connection upgraded before is closed with 1001 at its hello, and a new one
+// gets 503 before the upgrade.
+func TestCloseEnginesRefusesNewEngines(t *testing.T) {
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+	upgraded := dialRaw(t, srv, "engine-token")
+	svc.CloseEngines()
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "late", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgraded.send(env)
+	if got := upgraded.closed(); got != websocket.StatusGoingAway {
+		t.Fatalf("a hello after CloseEngines was closed with %d, want %d", got, websocket.StatusGoingAway)
+	}
+	if n := len(svc.Engines()); n != 0 {
+		t.Fatalf("%d engines welcomed after CloseEngines", n)
+	}
+	if _, code := dialAs(t, srv, "engine-token"); code != http.StatusServiceUnavailable {
+		t.Fatalf("a new engine after CloseEngines got %d, want 503", code)
+	}
+}
+
+// A hello whose token was revoked is refused as revoked (4001), even while
+// the service drains: the engine must learn its token is gone, not retry as
+// if the service were only busy.
+func TestRevokedHelloDuringDrainIsRevoked(t *testing.T) {
+	h := newAuthHarness(t)
+	raw, code := dialAs(t, h.srv, "tok-b")
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade: %d", code)
+	}
+	drainFor(h.svc, time.Minute)
+	h.reload("tok-a team-a\n")
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-b", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.send(env)
+	if got := raw.closed(); got != protocol.CloseTokenRevoked {
+		t.Fatalf("a revoked hello while draining was closed with %d, want %d", got, protocol.CloseTokenRevoked)
+	}
+	if n := countRefused(h.svc, metrics.DrainRefusedConnection); n != 0 {
+		t.Fatalf("the revoked hello was counted as %d refused by the drain", n)
+	}
 }
 
 // An engine whose hello races the drain's start is either welcomed before
@@ -224,6 +276,36 @@ func TestDrainDoesNotStartRetryPastItsDeadline(t *testing.T) {
 	}
 }
 
+// A drain canceled (a second signal) reports canceled even when what it
+// waited for stopped being work it could do as it woke: here its engine went
+// away then. Ending at the top of the next pass instead would find nothing
+// busy, and report complete.
+func TestDrainCanceledReportsCanceled(t *testing.T) {
+	clock := gc.NewNow(time.Now())
+	h, _ := newDrainHarness(t, func(c *ExportConfig) {
+		c.Now = clock.Now
+		// A session that ended with spans still to come keeps the drain
+		// busy while its engine is connected.
+		c.Tracker.EndGrace = time.Hour
+	})
+	h.postSpans("session-1", carrierSpan(5))
+	h.svc.testHookDrainWoken = func() {
+		if err := h.svc.CloseEngine(h.engine.id); err != nil {
+			t.Error(err)
+		}
+		waitUntil(t, 5*time.Second, "the engine to go", func() bool { return !h.svc.connected(h.engine) })
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan DrainReport, 1)
+	go func() { done <- h.svc.Drain(ctx) }()
+	waitUntil(t, 5*time.Second, "the drain to start", h.svc.Draining)
+	drainRunning(t, done, "with a session waiting for its spans")
+	cancel()
+	if rep := waitDrain(t, done, 10*time.Second); rep.Outcome != metrics.DrainCanceled {
+		t.Fatalf("outcome %q, want %q: %+v", rep.Outcome, metrics.DrainCanceled, rep)
+	}
+}
+
 // holdDeleteBucket holds GC's Delete until its context ends, then holds it
 // on until release, as a run that unwinds mid-delete, through work that
 // ignores cancellation (GC's finish update), would.
@@ -308,7 +390,7 @@ func TestWaitWaitsForGCRunAskedFor(t *testing.T) {
 		t.Fatal("the canceled GC run reported no error")
 	}
 	// Once the service waits, a run asked for is refused.
-	if _, err := h.svc.CollectGarbage(context.Background(), false); !errors.Is(err, ErrDraining) {
+	if _, err := h.svc.CollectGarbage(context.Background(), false); !errors.Is(err, ErrStopping) {
 		t.Fatalf("a GC run asked for after the stop: %v", err)
 	}
 }
@@ -324,7 +406,7 @@ func TestWaitContextBounded(t *testing.T) {
 	if err := svc.WaitContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WaitContext with held work: %v", err)
 	}
-	if r := svc.Running(); r.Held != 1 || r.Idle() {
+	if r := svc.Running(); r.Held != 1 {
 		t.Fatalf("running %+v", r)
 	}
 	release()
