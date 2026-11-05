@@ -983,3 +983,63 @@ func TestOTLPStalledRequestsBounded(t *testing.T) {
 		t.Fatalf("a third stalled request: %d", resp.StatusCode)
 	}
 }
+
+// Known gap, zerobull-consulting/dagger#85: a request's headers aren't in the
+// decode budget. net/http parses up to 1 MiB of them (the listeners set no
+// MaxHeaderBytes) and keeps them while the handler runs, but a request
+// reserves only otlpRequestReserve for itself. A request with 512 KiB of
+// headers that stalls its body holds them for the price of any other. When
+// #85 bounds or counts headers, this test changes with it.
+func TestOTLPRequestHeadersNotInBudget(t *testing.T) {
+	svc, _, srv := limitedService(t, 4*testOTLPLimit)
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	pad := strings.Repeat("a", 512<<10)
+	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nX-Pad: %s\r\nContent-Type: application/x-protobuf\r\nContent-Length: 1000\r\n\r\n\x0a", pad)
+	want := int64(otlpRequestReserve + otlpMinBuffer)
+	waitUntil(t, 5*time.Second, "the stalled request to be reserved", func() bool { return svc.otlp.budget.inUse() == want })
+	if used := svc.otlp.budget.inUse(); used >= int64(len(pad)) {
+		t.Fatalf("%d bytes reserved: the headers are counted now; update #85", used)
+	}
+}
+
+// Known gap, zerobull-consulting/dagger#86: walking a deeply nested body
+// costs stack the decode budget doesn't count. OTLP's AnyValue nests through
+// ArrayValue a few bytes per level, so a body of a few KB can nest thousands
+// of messages deep; otlpDecodedSize walks it recursively, as
+// proto.Unmarshal does, up to otlpMaxDepth (10,000), and counts each level's
+// structs but not the stack frames the walk takes. Such a body is estimated
+// and taken. When #86 bounds the depth or walks iteratively, this test
+// changes with it.
+func TestOTLPDeeplyNestedBodyTaken(t *testing.T) {
+	// 2,000 AnyValues, each in an ArrayValue: 4,000 nested messages, within
+	// otlpMaxDepth and proto.Unmarshal's own limit.
+	const depth = 2000
+	v := &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "leaf"}}
+	for range depth {
+		v = &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: []*commonpb.AnyValue{v}}}}
+	}
+	req := &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		Resource:     &resourcepb.Resource{Attributes: []*commonpb.KeyValue{{Key: "nested", Value: v}}},
+		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{Name: "a"}}}},
+	}}}
+	body := encodeOTLP(t, req, false)
+	if len(body) > testOTLPLimit {
+		t.Fatalf("a body of %d bytes", len(body))
+	}
+	if _, err := otlpDecodedSize(body, req, false); err != nil {
+		t.Fatalf("estimate: %v", err)
+	}
+	// Each level's structs are counted (about 150 bytes), so the budget is
+	// large enough for them; the stack isn't.
+	_, rec, srv := limitedService(t, 4<<20)
+	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("a body nested %d deep: %d", depth, resp.StatusCode)
+	}
+	if n := len(rec.find("otlp metrics")); n != 1 {
+		t.Fatalf("%d metric requests recorded", n)
+	}
+}

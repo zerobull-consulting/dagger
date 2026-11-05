@@ -1056,6 +1056,19 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   of the requests taken are in `cacheservice_otlp_request_bytes` (see
   [Metrics](#metrics)), to check the limits against real traffic.
 
+**Known gaps**, each pinned by a test:
+
+- Idle keep-alive connections aren't bounded
+  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
+  `TestIdleKeepAliveConnectionsUnbounded`).
+- A request's headers, up to net/http's 1 MiB default, aren't in the budget
+  ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
+  `TestOTLPRequestHeadersNotInBudget`).
+- Walking a deeply nested body (OTLP values nest) takes stack the budget
+  doesn't count; its structs are counted
+  ([zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86),
+  `TestOTLPDeeplyNestedBodyTaken`).
+
 **How they were chosen.** The e2e run (`./hack/remote-cache/dev.sh e2e`,
 every scenario) logs every request taken, and its `otlp-sizes` scenario
 reports the largest per route (above, the largest of six runs). The
