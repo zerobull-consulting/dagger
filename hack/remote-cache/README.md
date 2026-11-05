@@ -410,11 +410,16 @@ as above, to use the remote cache.
 To build it from a fresh clone, at the repository root:
 
 ```bash
-docker build -f hack/remote-cache/engine.Dockerfile -t dagger-engine .
+docker build -f hack/remote-cache/engine.Dockerfile \
+  --build-arg ENGINE_IMAGE=dagger-engine -t dagger-engine .
 ```
 
-`--build-arg REVISION=<sha>` stamps the commit, and
-`--build-arg ENGINE_IMAGE=<ref>` the CLI's default engine; CI passes both.
+`ENGINE_IMAGE` is the CLI's default engine: keep it the same as `-t`, so the
+CLI copied out of the image provisions the local image (the CLI uses a local
+image when there is one, and pulls only when there isn't). Without it, the
+CLI's default is `registry.dagger.io/engine:v1.0.0-beta.25`, which doesn't
+exist, and it needs `_EXPERIMENTAL_DAGGER_RUNNER_HOST`.
+`--build-arg REVISION=<sha>` stamps the commit. CI passes both.
 [`engine.Dockerfile.dockerignore`](engine.Dockerfile.dockerignore) keeps the
 context to the packages the binaries build from.
 
@@ -424,7 +429,7 @@ connecting to the published service image (no store); and a container run
 through it.
 
 ```bash
-./hack/remote-cache/engine-image-smoke.sh dagger-engine
+RUNNER_HOST=image://dagger-engine ./hack/remote-cache/engine-image-smoke.sh dagger-engine
 ```
 
 ## Real engines: `dev.sh e2e`
