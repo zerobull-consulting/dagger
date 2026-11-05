@@ -95,6 +95,11 @@ type Service struct {
 	// registry holds metrics, which records the storage costs.
 	registry *prometheus.Registry
 	metrics  *metrics.Metrics
+
+	// otlp bounds the OTLP bodies (otlplimit.go); otlpRefusals rate-limits
+	// the warnings of the requests it refuses, by route and reason.
+	otlp         otlpLimits
+	otlpRefusals rejectionLog
 }
 
 // New returns a service with no engines, and with the export and import
@@ -111,6 +116,7 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 		defaultNS:  DefaultNamespace,
 		registry:   reg,
 		metrics:    newMetrics(reg),
+		otlp:       defaultOTLPLimits(),
 	}
 }
 

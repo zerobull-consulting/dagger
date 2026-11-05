@@ -215,3 +215,26 @@ func TestS3ProxyRewrite(t *testing.T) {
 		t.Fatalf("recorded %+v", rs)
 	}
 }
+
+// The OTLP size check reads every request taken, counts refusals of every
+// kind, undecodable ones included, and sets apart a request logged without
+// its sizes rather than reading them as 0.
+func TestOTLPSizesOf(t *testing.T) {
+	rec := &LogRecorder{}
+	logger := slog.New(rec.Handler(nil))
+	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 100, "decodedBytes", 300, "messageBytes", 900, "budgetPeak", 300)
+	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 50, "decodedBytes", 50, "messageBytes", 100, "budgetPeak", 900)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", "x", "decodedBytes", 7, "messageBytes", 70, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "budgetPeak", 7)
+	logger.Warn("otlp request refused", "route", "traces", "reason", "too_large")
+	logger.Warn("undecodable otlp request", "path", "/v1/logs")
+	sizes := otlpSizesOf(rec)
+	tr, lg := sizes.largest["traces"], sizes.largest["logs"]
+	if tr == nil || tr.n != 2 || tr.received != 100 || tr.decoded != 300 || tr.message != 900 || lg == nil || lg.n != 1 || sizes.budgetPeak != 900 {
+		t.Fatalf("sizes %+v %+v, peak %d", tr, lg, sizes.budgetPeak)
+	}
+	if len(sizes.refused) != 2 || len(sizes.malformed) != 2 {
+		t.Fatalf("%d refused, %d malformed", len(sizes.refused), len(sizes.malformed))
+	}
+}

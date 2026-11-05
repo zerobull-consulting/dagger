@@ -13,7 +13,7 @@ spike, and only logs what the engine does on the wire.
 | Address | Path | Purpose |
 | --- | --- | --- |
 | `-listen` (`:8090`) | `/v1/engine` | The engine WebSocket (`protocol.EnginePath`) |
-| `-listen` | `/v1/logs`, `/v1/traces`, `/v1/metrics` | OTLP/HTTP receivers for the engine's Cloud telemetry |
+| `-listen` | `/v1/logs`, `/v1/traces`, `/v1/metrics` | OTLP/HTTP receivers for the engine's Cloud telemetry, each body bounded (see [OTLP limits](#otlp-limits)) |
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
@@ -611,6 +611,11 @@ outputs are every part those spans reported. A session is exported:
   usual. Spans of the sessions it tracks are still taken meanwhile. See
   [Stopping and draining](#stopping-and-draining).
 
+A trace request over its limit is refused whole (413), and the engine then
+stops publishing that session's telemetry: its entries aren't exported from
+that session. Real engines' requests are thousands of times under the limit;
+see [OTLP limits](#otlp-limits).
+
 Entries already stored with the same replacement count and parts are left
 out, and so are entries merged into the engine by the import path that still
 have the replacement count and no part beyond what the merge left: they are
@@ -858,7 +863,8 @@ bucket.** So it runs with a read-only key, and that is testable.
 What it does, and doesn't:
 
 - **No export path.** No tracker and no exporter: session spans are received
-  (200) and dropped, so nothing is recorded, exported or uploaded. `POST
+  (200, within the same [OTLP limits](#otlp-limits)) and dropped, so
+  nothing is recorded, exported or uploaded. `POST
   /debug/engines/{conn}/export` and `GET /debug/engines/{conn}/entries`
   answer 409, `the export path is off: the instance is read-only
   (-export=false)`, distinct from a service with no store (`... no store is
@@ -966,6 +972,146 @@ unchecked. It is per bucket, not per prefix: it reads every prefix of the
 bucket, other namespaces' included, so give the cache a bucket of its own.
 Spaces also refuses a limited access key on a bucket with a bucket policy
 (`PutBucketPolicy`).
+
+## OTLP limits
+
+The OTLP receivers bound what a request can make the service read and hold
+([zerobull-consulting/dagger#77](https://github.com/zerobull-consulting/dagger/issues/77),
+item 1). Before, each body was read whole, and gunzipped whole with
+`Content-Encoding: gzip`, so a gzip bomb of a few kilobytes could run the
+service out of memory, with no token in unauthenticated mode. With tokens,
+the token is checked first, and a request without a known one is refused
+with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
+net/http then reads up to 256 KiB more of the body after the handler, and
+discards it, to reuse the connection; the read timeout, set before the token
+is checked, bounds how long that takes, so a client can't hold the connection
+by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
+
+| Route | Limit, as received and decoded | Largest request in six e2e runs | Margin |
+| --- | --- | --- | --- |
+| `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 19,489 bytes | 3,443x |
+| `POST /v1/logs` | 64 MiB (`server.MaxOTLPLogsBytes`) | 9,466 bytes | 7,089x |
+| `POST /v1/metrics` | 16 MiB (`server.MaxOTLPMetricsBytes`) | 1,437 bytes | 11,675x |
+
+- **Two limits per request.** The body as received is limited
+  (`http.MaxBytesReader`), and so is the decoded stream: the service reads
+  at most one byte past the limit from it, so a gzip bomb stops there however
+  well it compresses (`TestOTLPGzipBomb`). Over either: **413**, the
+  connection closes, and nothing of the request is recorded: no span
+  tracked, no log record, no partial decode, since a body is decoded only
+  once read whole (`TestOTLPOverLimitTracksNothing`).
+- **A shared budget.** The OTLP requests being read at once hold at most
+  128 MiB (`server.OTLPDecodeBudget`, twice the largest limit) across the
+  three routes, and each reserves what it holds before allocating it:
+  - **itself**, 16 KiB (its goroutine and the server's buffers), before
+    anything is read, so the budget also bounds how many requests are read
+    at once, stalled ones included: about 8,000
+    (`TestOTLPStalledRequestsBounded`);
+  - a gzipped body's **decompressor**, 64 KiB, before it is built
+    (`TestOTLPGzipDecompressorReserved`);
+  - the body's **buffer**, doubling from 512 bytes up to the limit as the
+    body arrives, the old buffer staying reserved until it is copied into the
+    new (`TestOTLPBodyReadOnlyIntoReservedBytes`,
+    `TestOTLPBufferGrowthReservesBoth`): at most twice what the client sent,
+    three times while it grows;
+  - the **decoded message**, estimated from the body before it is decoded,
+    from each OTLP message's Go struct size, each repeated element and each
+    string (`TestOTLPDecodedSizeEstimate`). A body decodes to more than its
+    size, and can decode to far more: one of empty entries, 2 bytes each on
+    the wire, decodes to about 70 times its size. A body whose message could
+    never fit in the budget is refused with **413** before it is decoded
+    (`TestOTLPAmplifiedBodyRefused`).
+
+  Since the decoded message counts too, the route limits are not the only
+  bound on a body: one that decodes to more than the budget can hold is
+  refused whatever its size. The e2e's requests estimated at up to 5.6 times
+  their size, so a body as dense as theirs is refused past about 17 MiB
+  (its 32 MiB buffer and its message), and one made mostly of a single
+  string only just short of the limit. The forwarder's 4 MiB batches
+  estimate at about 23 MiB: several fit at once.
+
+  A request that doesn't fit in what is left: **503** with `Retry-After: 1`,
+  and nothing recorded (`TestOTLPDecodeBudget`). Only what requests hold
+  counts, so any number of the engines' usual requests fit, and an at-limit
+  one beside them; two at-limit requests at once may have one refused, and
+  retried. Without the budget, N requests at the limit would hold N times
+  the limit, and their messages more.
+- **A read timeout.** Each body must arrive within 30s of its handler
+  starting (`server.OTLPReadTimeout`), a read deadline on the OTLP routes
+  alone, set before the token is checked (`http.ResponseController`, per
+  stream over HTTP/2 with `-tls-cert`): past it, **408**, and what it held
+  of the budget is given back (`TestOTLPSlowBodyCutOff`). The engine's Cloud
+  exporters give up on a request after 10s themselves. Every listener also
+  bounds a request's headers to 10s (`server.ReadHeaderTimeout`). Neither
+  applies to the engine WebSocket on the same listener, which stays
+  connected past both (same test): the server sets no `ReadTimeout`, which
+  would cut it off. Idle keep-alive connections aren't bounded, as before;
+  they hold no part of the budget
+  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
+  `TestIdleKeepAliveConnectionsUnbounded`).
+- **Every refusal is counted**, by route and reason, in
+  `cacheservice_otlp_refused_total`, and logged: at warning level at most
+  once a minute per route and reason, as refused tokens are, the rest at
+  debug level, so a flood of them can't flood the log; the sizes
+  of the requests taken are in `cacheservice_otlp_request_bytes` (see
+  [Metrics](#metrics)), to check the limits against real traffic.
+
+**Known gaps**, each pinned by a test:
+
+- Idle keep-alive connections aren't bounded
+  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
+  `TestIdleKeepAliveConnectionsUnbounded`).
+- A request's headers, up to net/http's 1 MiB default, aren't in the budget
+  ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
+  `TestOTLPRequestHeadersNotInBudget`).
+- Walking a deeply nested body (OTLP values nest) takes stack the budget
+  doesn't count; its structs are counted
+  ([zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86),
+  `TestOTLPDeeplyNestedBodyTaken`).
+
+**How they were chosen.** The e2e run (`./hack/remote-cache/dev.sh e2e`,
+every scenario) logs every request taken, and its `otlp-sizes` scenario
+reports the largest per route (above, the largest of six runs). The
+engines sent protobuf, not gzipped. In the last run, which counts the
+decoded messages too, the largest estimated at 84,231 bytes (traces), and
+at most 131 KiB of the budget was in use at once. The limits don't follow from those alone: the engine's Cloud
+forwarder, which sends session spans and logs, keeps each request to 4 MiB
+of protobuf, and sends larger only for a single span or log record larger
+than that (`cloudForwardMaxPayloadSize` in
+`engine/server/session_cloud_forwarder.go`). 64 MiB is 16 times that bound,
+and thousands of times what the run sent. The engine's own cache events
+(`/v1/logs`, under the engine's token) come in batches of at most 128
+records, one event each. The largest are a prune run's, about 60 bytes per
+dropped entry, and a sharing pass's, a few hundred bytes per part shared:
+it would take one prune run dropping about a million entries, or one pass
+sharing a few hundred thousand parts, to reach 64 MiB. Metrics are only counted, and the engine sends a few
+kilobytes of them. The margin check (`otlpMargin`, 10x) fails the e2e run if
+an engine change brings a request within a tenth of its limit, or the
+budget's peak within a tenth of it: measure again then, before changing
+either.
+
+They are constants, not flags: real requests are three to four orders of
+magnitude under them, and the engine bounds its own requests, so no operator
+needs to raise them; and lowering one below 4 MiB would refuse a real
+session's telemetry, which costs more than the memory it saves (below).
+
+**What a refused request costs.** The OTLP/HTTP spec doesn't let an exporter
+retry a 413, so its data is lost, and more than the request: the engine's
+forwarder treats a 4xx other than 401, 403, 408 and 429 as a permanent
+refusal, and stops publishing that session's telemetry, every remaining span
+and log of it. A refused trace batch can therefore cost the export path that
+session's entries: their spans never arrive, so they aren't tracked or
+exported from that session, until a later session's spans name them again.
+A refused batch of engine events loses up to 128 of them; a lost prune event
+leaves the service tracking entries the engine dropped, which an export then
+reports `gone`. For real engines this is practically impossible: their
+requests are thousands of times under the limits, and the forwarder's own
+4 MiB bound keeps them there. A 503 costs session telemetry nothing: the
+exporters retry it after `Retry-After`, and the forwarder retries from where
+it was, however long the refusals last. The engine's cache events are
+retried by their exporter alone, for up to a minute by default: a budget
+kept full longer than that, by a flood, drops their batches as a 413 does. A 408 is retried by the forwarder too, and only a
+client that takes 30s to send a body gets one.
 
 ## Auth and namespaces
 
@@ -1172,7 +1318,14 @@ level=WARN msg="UNAUTHENTICATED: no -tokens-file, so the service takes any token
 
 Anyone who can reach it can read everything stored, add to it, and steer
 exports with forged telemetry. Use it only on a trusted network, as the
-real-engine run does on the Docker bridge.
+real-engine run does on the Docker bridge. What its OTLP receivers make the
+service read and hold is bounded all the same: a body over its route's
+limit, gzipped or not, is refused with 413, the bodies read at once share a
+128 MiB budget, and a body must arrive within 30s (see
+[OTLP limits](#otlp-limits)). So an unauthenticated client can't run the
+service out of memory with OTLP. It can still keep the budget full, which
+delays the engines' telemetry (503, retried): session telemetry loses
+nothing, but the engine's cache events are dropped after a minute of it.
 
 ### TLS
 
@@ -1781,6 +1934,8 @@ paths record into them through their metadata store. All are prefixed
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
+| `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full) or `timeout` (408). Nothing of them is recorded |
+| `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
 The `gc_stored_*` and `gc_staging_rule_missing` series of a namespace gone
@@ -1788,7 +1943,8 @@ from the bucket are removed at the next run (`TestGaugesOfGoneNamespaceRemoved`)
 No label comes from an engine-supplied string: `scope` is a validated
 namespace from the tokens file or `-scope`, or, for the `gc_` metrics, a
 valid namespace name GC listed in the bucket; the others are the service's
-constants.
+constants (an OTLP `route` is the route that took the request, never its
+path or headers).
 
 `caller` is `export` or `import` for the path that read or updated the index,
 whether its scheduler, its sync loop or the debug API ran it, `gc` for
@@ -1818,6 +1974,11 @@ What to watch:
   is a run that failed somewhere (the log says where). A rising
   `export_collected_total` means exports keep naming what GC deletes: a
   grace period too short for the exports' duration.
+- **OTLP limits:** any `otlp_refused_total{reason="too_large"}` from a
+  real engine lost telemetry, and may have cost a session's exports (see
+  [OTLP limits](#otlp-limits)); `otlp_request_bytes` shows how close real
+  requests come to the limits. `busy` is a budget that filled: a flood, or
+  many large requests at once.
 - **Promotion cost:** `blob_promotion_duration_seconds` against the blobs'
   sizes, and `blob_hashed_bytes_total{by="service"}`, which is read through
   the service (blobs over 5 GiB, or a store that doesn't hash).
@@ -1852,7 +2013,8 @@ takes the same flags and `CACHESERVICE_S3_*` variables as the binary, with
 the same defaults:
 
 - `-listen` `:8090`: the engine WebSocket and the OTLP receivers. The image
-  exposes this port.
+  exposes this port. Its OTLP bodies are bounded (see
+  [OTLP limits](#otlp-limits)).
 - `-debug-listen` `127.0.0.1:8091`: the container's own loopback, so the
   unauthenticated debug API can't be reached from outside the container,
   even with `-p`. Publishing it takes `-debug-listen :8091` and a `-p` bound
