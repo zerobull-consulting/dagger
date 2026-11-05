@@ -93,11 +93,14 @@ grep -q "\"engineVersion\": *\"$want_version\"" <<<"$engines" ||
 echo "ok: $(grep -o '"engineName": *"[^"]*"' <<<"$engines" | head -n1)"
 
 echo "== 3. the engine runs a container"
-# The CLI runs in the engine's container, on its socket. The Cloud variables
+# The CLI runs in the engine's container, on its socket (set here, not left
+# to the image's ENV, since the CLI's compiled-in default is the image's
+# registry tag). The Cloud variables
 # are the engine's: they are unset for the CLI, which can't resolve the
 # service's name from there, and isn't what this checks.
 query='{ container { from(address: "alpine:3.22") { withExec(args: ["echo", "engine-smoke-ok"]) { stdout } } } }'
 if ! out="$(timeout "$QUERY_LIMIT" docker exec -i \
+	-e _EXPERIMENTAL_DAGGER_RUNNER_HOST=unix:///run/dagger/engine.sock \
 	-e DAGGER_CLOUD_URL= -e DAGGER_CLOUD_TOKEN= -e DAGGER_NO_NAG=1 \
 	"$engine" dagger api query <<<"$query" 2>&1)"; then
 	echo "$out" >&2

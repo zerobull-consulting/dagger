@@ -21,7 +21,8 @@ FROM --platform=$BUILDPLATFORM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8
 ARG TARGETOS
 ARG TARGETARCH
 # The commit, stamped into every binary (`dagger version` prints it). The
-# context has no .git, so Go can't stamp it itself.
+# context has no .git, so Go can't stamp it itself; internal/version/buildinfo
+# takes it instead, as Go's own vcs.revision.
 ARG REVISION=""
 # The CLI's default engine: with ENGINE_IMAGE set (CI sets it to this image's
 # SHA tag), the CLI copied out of the image provisions this same engine by
@@ -35,7 +36,11 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     set -eu; \
-    common="-s -w -X github.com/dagger/dagger/internal/version.Commit=${REVISION}"; \
+    common="-s -w"; \
+    if [ -n "$REVISION" ]; then \
+      bi=github.com/dagger/dagger/internal/version/buildinfo; \
+      common="$common -X $bi.InjectedVCS=git -X $bi.InjectedVCSRevision=${REVISION}"; \
+    fi; \
     cli="$common"; \
     if [ -n "$ENGINE_IMAGE" ]; then \
       cli="$cli -X github.com/dagger/dagger/internal/cmd/dagger.RunnerHost=image://${ENGINE_IMAGE}"; \
