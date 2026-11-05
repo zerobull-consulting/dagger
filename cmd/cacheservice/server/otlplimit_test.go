@@ -18,6 +18,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -460,18 +461,20 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // exporters retry, records nothing, and is taken once the budget frees.
 // Requests well within it are never refused, however many: only bytes count.
 //
-// Sizes: the budget is 96 KiB. A 40 KiB body needs a 64 KiB buffer, and
-// 96 KiB as that buffer grows from 32 KiB: it fits alone, not beside the held
-// 32 KiB.
+// Sizes: the budget is 152 KiB, and every request reserves 16 KiB for
+// itself. The held request holds 48 KiB (itself, and a 32 KiB buffer for the
+// 20 KiB it sent), and needs about 147 KiB to complete (a 64 KiB buffer and
+// its message). A 40 KiB body needs 112 KiB as its buffer grows to 64 KiB,
+// and 122 KiB with its message: it fits alone, not beside the held 48 KiB.
 func TestOTLPDecodeBudget(t *testing.T) {
 	cases := otlpCases()
-	svc, rec, srv := limitedService(t, 96<<10)
+	svc, rec, srv := limitedService(t, 152<<10)
 	// A request that holds half the budget while its body arrives: 20 KiB
 	// sent, into a buffer of 32 KiB reserved.
 	big := sized(t, cases[2].build, false, testOTLPLimit)
 	held := 20 << 10
 	conn, br := slowPost(t, srv, "/v1/metrics", len(big), big[:held])
-	waitUntil(t, 5*time.Second, "the first body to be reserved", func() bool { return svc.otlp.budget.inUse() >= 32<<10 })
+	waitUntil(t, 5*time.Second, "the first body to be reserved", func() bool { return svc.otlp.budget.inUse() >= otlpRequestReserve+32<<10 })
 
 	for _, c := range cases {
 		over := sized(t, c.build, false, 40<<10)
@@ -515,7 +518,7 @@ func TestOTLPDecodeBudget(t *testing.T) {
 func TestOTLPSlowBodyCutOff(t *testing.T) {
 	rec := &logRecorder{}
 	svc := New(slog.New(rec), "")
-	setOTLPLimits(svc, testOTLPLimit, 96<<10)
+	setOTLPLimits(svc, testOTLPLimit, 152<<10)
 	const timeout = 200 * time.Millisecond
 	svc.otlp.readTimeout = timeout
 	srv := httptest.NewUnstartedServer(nil)
@@ -531,7 +534,7 @@ func TestOTLPSlowBodyCutOff(t *testing.T) {
 	held := 20 << 10
 	start := time.Now()
 	_, br := slowPost(t, srv, "/v1/metrics", len(big), big[:held])
-	waitUntil(t, 5*time.Second, "the body to be reserved", func() bool { return svc.otlp.budget.inUse() >= 32<<10 })
+	waitUntil(t, 5*time.Second, "the body to be reserved", func() bool { return svc.otlp.budget.inUse() >= otlpRequestReserve+32<<10 })
 	// While it is held, a request that doesn't fit is refused...
 	if resp := postBody(t, srv.URL+"/v1/metrics", sized(t, otlpCases()[2].build, false, 40<<10), false, false, ""); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("past the budget: %d", resp.StatusCode)
@@ -872,4 +875,111 @@ func TestOTLPRefusedTokenSlowBodyCutOff(t *testing.T) {
 
 func isConnReset(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "connection reset")
+}
+
+// emptyEntries is a body of n empty entries of field 1, the top-level
+// repeated field of every OTLP request (resource_spans, resource_logs,
+// resource_metrics): 2 bytes each on the wire, a whole message each decoded.
+func emptyEntries(n int) []byte {
+	b := make([]byte, 0, 2*n)
+	for range n {
+		b = append(b, 0x0a, 0x00)
+	}
+	return b
+}
+
+// A body within its limit that decodes to far more than the budget, such as
+// tens of thousands of empty entries, is refused with 413 before it is
+// decoded, protobuf or JSON: the budget counts the decoded message, not only
+// the bytes it comes from. Nothing of it is recorded.
+func TestOTLPAmplifiedBodyRefused(t *testing.T) {
+	jsonEntries := func(field string, n int) []byte {
+		var b bytes.Buffer
+		b.WriteString(`{"` + field + `":[`)
+		for i := range n {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString("{}")
+		}
+		b.WriteString("]}")
+		return b.Bytes()
+	}
+	fields := map[string]string{
+		metrics.OTLPRouteTraces: "resourceSpans", metrics.OTLPRouteLogs: "resourceLogs", metrics.OTLPRouteMetrics: "resourceMetrics",
+	}
+	for _, c := range otlpCases() {
+		for _, asJSON := range []bool{false, true} {
+			svc, rec, srv := limitedService(t, 4*testOTLPLimit)
+			body := emptyEntries(testOTLPLimit/2 - 1)
+			if asJSON {
+				body = jsonEntries(fields[c.route], testOTLPLimit/3-10)
+			}
+			if len(body) > testOTLPLimit {
+				t.Fatalf("a body of %d bytes", len(body))
+			}
+			if resp := postBody(t, srv.URL+c.path, body, asJSON, false, ""); resp.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Fatalf("%s, json=%t: %d", c.route, asJSON, resp.StatusCode)
+			}
+			if n := len(rec.find(c.recorded)); n != 0 {
+				t.Fatalf("%s: %d %q logged", c.route, n, c.recorded)
+			}
+			if got := refusedCount(t, svc, c.route, metrics.OTLPRefusedTooLarge); got != 1 {
+				t.Fatalf("%s: refused %v", c.route, got)
+			}
+			if used := svc.otlp.budget.inUse(); used != 0 {
+				t.Fatalf("%s: %d bytes still reserved", c.route, used)
+			}
+		}
+	}
+}
+
+// The estimate of a decoded message errs high: an empty entry counts at
+// least its Go struct and its slice element, a real request a small multiple
+// of its size, and a body that isn't valid protobuf is an error, as decoding
+// it would be.
+func TestOTLPDecodedSizeEstimate(t *testing.T) {
+	const n = 1000
+	est, err := otlpDecodedSize(emptyEntries(n), &coltracepb.ExportTraceServiceRequest{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if per := est / n; per < int64(unsafe.Sizeof(tracepb.ResourceSpans{}))+8 {
+		t.Fatalf("%d bytes per empty ResourceSpans", per)
+	}
+	for _, c := range otlpCases() {
+		msg := c.build("")
+		data := encodeOTLP(t, msg, false)
+		est, err := otlpDecodedSize(data, msg, false)
+		if err != nil || est < int64(len(data)) || est > 64*int64(len(data))+4096 {
+			t.Fatalf("%s: %d bytes estimated for %d, %v", c.route, est, len(data), err)
+		}
+		// A string is counted at its length.
+		padded := encodeOTLP(t, c.build(strings.Repeat("x", 10000)), false)
+		if pest, _ := otlpDecodedSize(padded, msg, false); pest < est+10000 {
+			t.Fatalf("%s: a 10000-byte string added %d", c.route, pest-est)
+		}
+	}
+	if _, err := otlpDecodedSize([]byte("\xff\xff\xff"), &coltracepb.ExportTraceServiceRequest{}, false); err == nil {
+		t.Fatal("no error for an invalid body")
+	}
+}
+
+// Every request being read reserves a fixed share of the budget for itself,
+// so requests that stall after a byte of their body can't each hold a
+// connection and a handler for the price of a 512-byte buffer: past what the
+// budget holds, the next is refused with 503 at once.
+func TestOTLPStalledRequestsBounded(t *testing.T) {
+	svc, _, srv := limitedService(t, 2*(otlpRequestReserve+otlpMinBuffer)+1024)
+	body := encodeOTLP(t, otlpCases()[2].build(""), false)
+	for range 2 {
+		slowPost(t, srv, "/v1/metrics", 1000, body[:1])
+	}
+	waitUntil(t, 5*time.Second, "two stalled requests to be reserved", func() bool {
+		return svc.otlp.budget.inUse() >= 2*(otlpRequestReserve+otlpMinBuffer)
+	})
+	_, br := slowPost(t, srv, "/v1/metrics", 1000, body[:1])
+	if resp := readResponse(t, br); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("a third stalled request: %d", resp.StatusCode)
+	}
 }

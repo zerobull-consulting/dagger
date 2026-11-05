@@ -41,7 +41,9 @@ type otlpSizes struct {
 	malformed []LogRecord
 }
 
-type routeSizes struct{ n, received, decoded int64 }
+// routeSizes are a route's requests taken: how many, and the largest as
+// received, decoded, and as the decoded message's estimated heap.
+type routeSizes struct{ n, received, decoded, message int64 }
 
 // otlpSizesOf reads the OTLP records of the logs.
 func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
@@ -51,7 +53,8 @@ func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
 			received, err1 := attrInt(rec, "receivedBytes")
 			decoded, err2 := attrInt(rec, "decodedBytes")
 			peak, err3 := attrInt(rec, "budgetPeak")
-			if err1 != nil || err2 != nil || err3 != nil {
+			message, err4 := attrInt(rec, "messageBytes")
+			if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
 				out.malformed = append(out.malformed, rec)
 				continue
 			}
@@ -64,6 +67,7 @@ func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
 			sz.n++
 			sz.received = max(sz.received, received)
 			sz.decoded = max(sz.decoded, decoded)
+			sz.message = max(sz.message, message)
 			out.budgetPeak = max(out.budgetPeak, peak)
 		}
 		out.refused = append(out.refused, l.Since(0, "otlp request refused", nil)...)
@@ -100,6 +104,8 @@ func (s *state) otlpSizes(t *testing.T) {
 		Check(t, largest*otlpMargin <= route.limit,
 			"%s: %d requests, largest %d bytes received, %d decoded; limit %d (%.0fx the largest)",
 			route.name, sz.n, sz.received, sz.decoded, route.limit, float64(route.limit)/float64(max(largest, 1)))
+		Check(t, sz.message*otlpMargin <= server.OTLPDecodeBudget,
+			"%s: largest decoded message estimated at %d bytes; budget %d", route.name, sz.message, int64(server.OTLPDecodeBudget))
 	}
 	Check(t, sizes.budgetPeak*otlpMargin <= server.OTLPDecodeBudget,
 		"decode budget: at most %d bytes in use at once; budget %d", sizes.budgetPeak, int64(server.OTLPDecodeBudget))

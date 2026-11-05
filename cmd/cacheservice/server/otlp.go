@@ -15,7 +15,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
@@ -165,51 +164,67 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 		"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
 		"contentLength", r.ContentLength)
 	lim := s.otlp
-	// The read deadline is the route's (otlpDeadline).
-	received := &countingReader{r: http.MaxBytesReader(w, r.Body, route.limit)}
-	var (
-		body       io.Reader = received
-		gzReserved int64
-	)
-	if r.Header.Get("Content-Encoding") == "gzip" {
-		// The decompressor is reserved before it is built, and released
-		// with the body's buffer.
-		if !lim.budget.reserve(otlpGzipReserve) {
-			s.refuseOTLP(w, r, route, http.StatusServiceUnavailable, metrics.OTLPRefusedBusy, errOTLPBusy)
-			return nil, false
-		}
-		gzReserved = otlpGzipReserve
-		gz, err := lim.gunzip(received)
-		if err != nil {
-			lim.budget.release(gzReserved)
-			status, reason := otlpRefusal(err)
-			s.refuseOTLP(w, r, route, status, reason, err)
-			return nil, false
-		}
-		defer gz.Close()
-		body = gz
-	}
-	data, reserved, err := readOTLPBody(body, route.limit, lim.budget)
-	release = func() { lim.budget.release(reserved + gzReserved) }
-	if err != nil {
+	// The read deadline is the route's (otlpDeadline). Everything the
+	// request holds is reserved before it is allocated, and given back by
+	// release: the request itself (its goroutine and the server's buffers),
+	// a gzipped body's decompressor, the body's buffer, and the decoded
+	// message.
+	var held int64
+	release = func() { lim.budget.release(held) }
+	refuse := func(err error) (func(), bool) {
 		release()
 		status, reason := otlpRefusal(err)
 		s.refuseOTLP(w, r, route, status, reason, err)
 		return nil, false
 	}
+	if !lim.budget.reserve(otlpRequestReserve) {
+		return refuse(errOTLPBusy)
+	}
+	held = otlpRequestReserve
+	received := &countingReader{r: http.MaxBytesReader(w, r.Body, route.limit)}
+	var body io.Reader = received
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		if !lim.budget.reserve(otlpGzipReserve) {
+			return refuse(errOTLPBusy)
+		}
+		held += otlpGzipReserve
+		gz, err := lim.gunzip(received)
+		if err != nil {
+			return refuse(err)
+		}
+		defer gz.Close()
+		body = gz
+	}
+	data, reserved, err := readOTLPBody(body, route.limit, lim.budget)
+	held += reserved
+	if err != nil {
+		return refuse(err)
+	}
+	// The message decoded from the body can take far more than the body
+	// (otlpDecodedSize): it is estimated, and reserved, before it is
+	// decoded. One that could never fit in the budget is too large.
+	estimate, err := otlpDecodedSize(data, msg, isJSON(r))
+	if err != nil {
+		return refuse(err)
+	}
+	switch {
+	case estimate+held > lim.budget.size:
+		return refuse(errOTLPDecodesTooLarge)
+	case !lim.budget.reserve(estimate):
+		return refuse(errOTLPBusy)
+	}
+	held += estimate
 	if isJSON(r) {
 		err = protojson.Unmarshal(data, msg)
 	} else {
 		err = proto.Unmarshal(data, msg)
 	}
 	if err != nil {
-		release()
-		s.refuseOTLP(w, r, route, http.StatusBadRequest, "", err)
-		return nil, false
+		return refuse(err)
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "budgetPeak", lim.budget.peakUse())
+		"decodedBytes", len(data), "messageBytes", estimate, "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 

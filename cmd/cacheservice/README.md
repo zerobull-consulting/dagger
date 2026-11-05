@@ -987,7 +987,7 @@ discards it, to reuse the connection; the read timeout, set before the token
 is checked, bounds how long that takes, so a client can't hold the connection
 by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
 
-| Route | Limit, as received and decoded | Largest request in five e2e runs | Margin |
+| Route | Limit, as received and decoded | Largest request in six e2e runs | Margin |
 | --- | --- | --- | --- |
 | `POST /v1/traces` | 64 MiB (`server.MaxOTLPTracesBytes`) | 19,489 bytes | 3,443x |
 | `POST /v1/logs` | 64 MiB (`server.MaxOTLPLogsBytes`) | 9,466 bytes | 7,089x |
@@ -1000,23 +1000,42 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   connection closes, and nothing of the request is recorded: no span
   tracked, no log record, no partial decode, since a body is decoded only
   once read whole (`TestOTLPOverLimitTracksNothing`).
-- **A shared budget.** The bodies being read at once hold at most 128 MiB
-  (`server.OTLPDecodeBudget`, twice the largest limit) across the three
-  routes. Each request reserves its buffer before allocating it, the buffer
-  doubling from 512 bytes up to the limit as the body arrives, and the old
-  buffer stays reserved until it is copied into the new one
-  (`TestOTLPBodyReadOnlyIntoReservedBytes`, `TestOTLPBufferGrowthReservesBoth`).
-  So a client holds at most twice what it sent, three times while its buffer
-  grows, and an at-limit request the limit, 1.5 times at its buffer's last
-  growth. A gzipped request also reserves 64 KiB for its decompressor before
-  it is built (`TestOTLPGzipDecompressorReserved`). A request that doesn't
-  fit in what is left: **503** with `Retry-After: 1`, and nothing recorded
-  (`TestOTLPDecodeBudget`). Only bytes count, so any number of the engines'
-  usual requests fit, and an at-limit request beside them; two at-limit
-  requests at once may have one refused, and retried. The heap the requests
-  take is a small multiple of the budget: the buffers, and the messages
-  decoded from them. Without the budget, N requests at the limit would hold
-  N times the limit.
+- **A shared budget.** The OTLP requests being read at once hold at most
+  128 MiB (`server.OTLPDecodeBudget`, twice the largest limit) across the
+  three routes, and each reserves what it holds before allocating it:
+  - **itself**, 16 KiB (its goroutine and the server's buffers), before
+    anything is read, so the budget also bounds how many requests are read
+    at once, stalled ones included: about 8,000
+    (`TestOTLPStalledRequestsBounded`);
+  - a gzipped body's **decompressor**, 64 KiB, before it is built
+    (`TestOTLPGzipDecompressorReserved`);
+  - the body's **buffer**, doubling from 512 bytes up to the limit as the
+    body arrives, the old buffer staying reserved until it is copied into the
+    new (`TestOTLPBodyReadOnlyIntoReservedBytes`,
+    `TestOTLPBufferGrowthReservesBoth`): at most twice what the client sent,
+    three times while it grows;
+  - the **decoded message**, estimated from the body before it is decoded,
+    from each OTLP message's Go struct size, each repeated element and each
+    string (`TestOTLPDecodedSizeEstimate`). A body decodes to more than its
+    size, and can decode to far more: one of empty entries, 2 bytes each on
+    the wire, decodes to about 70 times its size. A body whose message could
+    never fit in the budget is refused with **413** before it is decoded
+    (`TestOTLPAmplifiedBodyRefused`).
+
+  Since the decoded message counts too, the route limits are not the only
+  bound on a body: one that decodes to more than the budget can hold is
+  refused whatever its size. The e2e's requests estimated at up to 5.6 times
+  their size, so a body as dense as theirs is refused past about 17 MiB
+  (its 32 MiB buffer and its message), and one made mostly of a single
+  string only just short of the limit. The forwarder's 4 MiB batches
+  estimate at about 23 MiB: several fit at once.
+
+  A request that doesn't fit in what is left: **503** with `Retry-After: 1`,
+  and nothing recorded (`TestOTLPDecodeBudget`). Only what requests hold
+  counts, so any number of the engines' usual requests fit, and an at-limit
+  one beside them; two at-limit requests at once may have one refused, and
+  retried. Without the budget, N requests at the limit would hold N times
+  the limit, and their messages more.
 - **A read timeout.** Each body must arrive within 30s of its handler
   starting (`server.OTLPReadTimeout`), a read deadline on the OTLP routes
   alone, set before the token is checked (`http.ResponseController`, per
@@ -1039,9 +1058,10 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
 
 **How they were chosen.** The e2e run (`./hack/remote-cache/dev.sh e2e`,
 every scenario) logs every request taken, and its `otlp-sizes` scenario
-reports the largest per route (above, the largest of five runs). The
-engines sent protobuf, not gzipped, and at most 48 KiB of the budget (the
-buffers, and their copies as they grow) was in use at once. The limits don't follow from those alone: the engine's Cloud
+reports the largest per route (above, the largest of six runs). The
+engines sent protobuf, not gzipped. In the last run, which counts the
+decoded messages too, the largest estimated at 84,231 bytes (traces), and
+at most 131 KiB of the budget was in use at once. The limits don't follow from those alone: the engine's Cloud
 forwarder, which sends session spans and logs, keeps each request to 4 MiB
 of protobuf, and sends larger only for a single span or log record larger
 than that (`cloudForwardMaxPayloadSize` in

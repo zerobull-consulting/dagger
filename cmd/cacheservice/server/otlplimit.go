@@ -153,6 +153,9 @@ var (
 	// errOTLPBusy is a body that doesn't fit in what the decode budget has
 	// left.
 	errOTLPBusy = errors.New("too many OTLP bytes being read at once")
+	// errOTLPDecodesTooLarge is a body whose decoded message, with what
+	// the request holds, could never fit in the decode budget.
+	errOTLPDecodesTooLarge = errors.New("request body decodes to too large a message")
 )
 
 // otlpChunk bounds how much of a body is read at a time, and otlpMinBuffer
@@ -161,6 +164,13 @@ const (
 	otlpChunk     = 32 << 10
 	otlpMinBuffer = 512
 )
+
+// otlpRequestReserve is what every OTLP request being read is reserved for,
+// before anything is read: its goroutine and the server's buffers for its
+// connection, about 16 KiB. With it, the budget bounds how many requests can
+// be read at once, stalled ones included: about 8,000 at the defaults,
+// however little each has sent.
+const otlpRequestReserve = 16 << 10
 
 // otlpGzipReserve is what a gzipped body's decompressor is reserved for,
 // before it is built: compress/flate's 32 KiB window, its Huffman tables and
@@ -230,7 +240,7 @@ func otlpRefusal(err error) (int, string) {
 	var maxBytes *http.MaxBytesError
 	var netErr net.Error
 	switch {
-	case errors.As(err, &maxBytes), errors.Is(err, errOTLPTooLarge):
+	case errors.As(err, &maxBytes), errors.Is(err, errOTLPTooLarge), errors.Is(err, errOTLPDecodesTooLarge):
 		return http.StatusRequestEntityTooLarge, metrics.OTLPRefusedTooLarge
 	case errors.Is(err, errOTLPBusy):
 		return http.StatusServiceUnavailable, metrics.OTLPRefusedBusy
@@ -241,8 +251,7 @@ func otlpRefusal(err error) (int, string) {
 }
 
 // refuseOTLP answers a request whose body wasn't read whole: it records
-// nothing from it, and the connection closes after the answer, so the server
-// doesn't read on what the client is still sending. Refusals are logged at
+// nothing from it, and the connection closes after the answer. Refusals are logged at
 // warning level at most once a minute per route and reason, as refused tokens
 // are (rejectionLog), so a client sending them by the thousand can't flood
 // the log; the others at debug level. The metrics count every one.
@@ -266,6 +275,10 @@ func (s *Service) refuseOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	} else {
 		s.logger.Log(r.Context(), level, "undecodable otlp request", "path", r.URL.Path, "error", err)
 	}
+	// The body isn't closed here: closing a server request's body reads on
+	// it, up to 256 KiB, to reuse the connection, which would hold the
+	// answer until a stalled client sent it or the read timeout passed.
+	// net/http closes it after the handler, once the answer is sent, and
+	// the connection's read deadline bounds that.
 	http.Error(w, err.Error(), status)
-	_ = r.Body.Close()
 }
