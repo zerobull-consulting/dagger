@@ -1,5 +1,7 @@
 # Remote cache prompt template
 
+**Version:** [zerobull-consulting/dagger#99](https://github.com/zerobull-consulting/dagger/pull/99)
+
 Every work item's prompt for the remote cache work
 ([zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1))
 is generated from this file. It holds the template, the conventions for the
@@ -276,19 +278,15 @@ Observable outcomes, each shown by a test or a run.
   from:
 
   > Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
-  > zerobull-consulting/dagger#<N>
+  > `zerobull-consulting/dagger#<N>`
 
-  where zerobull-consulting/dagger#<N> is the last merged PR that changed this
-  file. Its squash commit's title ends with that reference:
+  where `<N>` is the PR in the file's **Version** line, at the top, as the file
+  is on `feature/remote-cache`.
 
-  ```bash
-  git fetch origin feature/remote-cache &&
-    git log -1 --format=%s origin/feature/remote-cache -- hack/remote-cache/PROMPT_TEMPLATE.md
-  ```
-
-  Name the PR, not a commit: `feature/remote-cache` is flattened into new
-  commits before review, so its commit hashes don't last, and the PR also says
-  why the process changed.
+  The version is a PR, not a commit: before the branch's own review into
+  `main`, `feature/remote-cache` will be flattened into new commits, so its
+  commit hashes don't last. A PR number does, and the PR says why the process
+  changed.
 
 ## Starting a session
 
@@ -310,7 +308,8 @@ renders.
 ## Changing this file
 
 - The template changes by PR, like any other file, into `feature/remote-cache`.
-- The PR says what changed in the process and why.
+- The PR says what changed in the process and why, and sets the **Version**
+  line to its own number.
 - The next prompt generated names that PR (see the last convention above),
   so every prompt shows which version of the process it followed.
 - The draft in zerobull-consulting/dagger#95's body and the working
