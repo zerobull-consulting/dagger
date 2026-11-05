@@ -55,6 +55,11 @@ func (c *counting) ListKeys(ctx context.Context, prefix string, max int) ([]stri
 	return c.MemObjects.ListKeys(ctx, prefix, max)
 }
 
+func (c *counting) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	c.count("uploads")
+	return c.MemObjects.ListUploadKeys(ctx, prefix, max)
+}
+
 func (c *counting) Delete(context.Context, string) error {
 	c.count("delete")
 	return errors.New("the ownership check must never delete")
@@ -102,7 +107,7 @@ func TestWriterClaimsEmptyPrefix(t *testing.T) {
 		if err != nil || state != Claimed {
 			t.Fatalf("prefix %q: %v, %v; want claimed", prefix, state, err)
 		}
-		if got := st.snapshot(); fmt.Sprint(got) != fmt.Sprint(map[string]int{"get": 1, "list": 1, "put": 1}) {
+		if got := st.snapshot(); fmt.Sprint(got) != fmt.Sprint(map[string]int{"get": 1, "list": 1, "put": 1, "uploads": 1}) {
 			t.Fatalf("prefix %q: requests %v", prefix, got)
 		}
 		body, _, err := st.MemObjects.Get(ctx, layout.MarkerKey(prefix))
@@ -323,5 +328,48 @@ func TestFolderPlaceholderRefused(t *testing.T) {
 	var not *ErrNotOwned
 	if !errors.As(err, &not) || !slices.Equal(not.Keys, []string{"p/"}) {
 		t.Fatalf("%v; want ErrNotOwned listing p/", err)
+	}
+}
+
+// A marker of layout 2 that lacks a field the service always writes isn't
+// the service's: it claims nothing, for either kind of instance, and nothing
+// is written over it.
+func TestIncompleteMarkerRefused(t *testing.T) {
+	for _, body := range []string{`{"layout":2}`, `{"layout":2,"created":"2026-01-01T00:00:00Z"}`, `{"layout":2,"serviceVersion":"x"}`} {
+		for _, writer := range []bool{true, false} {
+			st := newCounting()
+			put(t, st, "p/cacheservice.json", body)
+			put(t, st, "p/backups/db.tar", "foreign")
+			if _, _, err := Check(context.Background(), st, "p", writer, now); !errors.Is(err, ErrBadMarker) {
+				t.Fatalf("%s, writer %v: %v; want ErrBadMarker", body, writer, err)
+			}
+			if c := st.snapshot(); c["put"] != 0 {
+				t.Fatalf("%s: requests %v", body, c)
+			}
+		}
+	}
+}
+
+// A prefix whose only content is an incomplete multipart upload (another
+// writer's, in progress) has no object to list, but isn't empty: a writer
+// refuses it, naming the upload, and writes no marker. A read-only instance
+// doesn't list uploads (it claims nothing, and its key needn't list them):
+// it starts as on an empty prefix.
+func TestWriterRefusesPrefixWithUpload(t *testing.T) {
+	st := newCounting()
+	st.AddUpload("p/backups/db.tar")
+	_, _, err := Check(context.Background(), st, "p", true, now)
+	var not *ErrNotOwned
+	if !errors.As(err, &not) || !slices.Equal(not.Keys, []string{"upload:p/backups/db.tar"}) {
+		t.Fatalf("%v; want ErrNotOwned naming the upload", err)
+	}
+	if c := st.snapshot(); c["put"] != 0 {
+		t.Fatalf("requests %v", c)
+	}
+	if state, _, err := Check(context.Background(), st, "p", false, now); err != nil || state != Empty {
+		t.Fatalf("read-only: %v, %v", state, err)
+	}
+	if c := st.snapshot(); c["uploads"] != 1 {
+		t.Fatalf("the read-only check listed uploads: %v", c)
 	}
 }

@@ -47,6 +47,9 @@ type Store interface {
 	// ListKeys returns up to max keys under prefix, in key order: one
 	// request.
 	ListKeys(ctx context.Context, prefix string, max int) ([]string, error)
+	// ListUploadKeys returns the keys of up to max incomplete multipart
+	// uploads under prefix.
+	ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error)
 }
 
 // ServiceVersion is the version recorded in a marker this binary creates.
@@ -80,6 +83,10 @@ type Marker struct {
 
 // ErrNoMarker is a prefix without a marker: no store of this service's.
 var ErrNoMarker = errors.New("no ownership marker")
+
+// ErrBadMarker is a marker of this layout that the service didn't write:
+// a field it always writes is missing.
+var ErrBadMarker = errors.New("not an ownership marker of the service's")
 
 // ErrOtherLayout is a marker of another layout version.
 type ErrOtherLayout struct {
@@ -155,6 +162,11 @@ func ReadMarker(ctx context.Context, st interface {
 	if m.Layout != layout.Version {
 		return m, &ErrOtherLayout{Key: key, Found: m.Layout}
 	}
+	// The service writes every field. One missing is a marker the service
+	// didn't write, so it claims nothing.
+	if m.Created.IsZero() || m.ServiceVersion == "" {
+		return m, fmt.Errorf("%w: %s lacks its creation time or service version, so the service didn't write it", ErrBadMarker, key)
+	}
 	return m, nil
 }
 
@@ -163,8 +175,9 @@ func ReadMarker(ctx context.Context, st interface {
 // prefix; a read-only instance (writer false) writes nothing.
 //
 // It costs one GET when the marker is there. Otherwise, one bounded list
-// (MaxListed+1 keys), and for a writer on an empty prefix one conditional
-// PUT, plus one GET if another writer created the marker first. A listing
+// (MaxListed+1 keys), and for a writer on an empty prefix one listing of
+// multipart uploads and one conditional PUT, plus one GET if another writer
+// created the marker first. A listing
 // that finds keys is followed by one more GET of the marker: it may be a
 // writer that claimed the prefix since the first one.
 func Check(ctx context.Context, st Store, prefix string, writer bool, now time.Time) (State, Marker, error) {
@@ -196,6 +209,21 @@ func Check(ctx context.Context, st Store, prefix string, writer bool, now time.T
 	}
 	if !writer {
 		return Empty, Marker{}, nil
+	}
+	// An upload in progress is a writer too, which the object listing
+	// doesn't show. Only a writer, which claims the prefix, asks: a
+	// read-only instance never claims anything.
+	ups, err := st.ListUploadKeys(ctx, layout.Root(prefix), MaxListed+1)
+	if err != nil {
+		return 0, Marker{}, fmt.Errorf("list multipart uploads under %s: %w", where(prefix), err)
+	}
+	if len(ups) > 0 {
+		e := &ErrNotOwned{Prefix: strings.Trim(prefix, "/")}
+		for _, k := range ups[:min(len(ups), MaxListed)] {
+			e.Keys = append(e.Keys, "upload:"+k)
+		}
+		e.More = len(ups) > MaxListed
+		return 0, Marker{}, e
 	}
 	m = Marker{Layout: layout.Version, Created: now.UTC(), ServiceVersion: serviceVersion()}
 	body, err := json.Marshal(m)

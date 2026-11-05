@@ -129,7 +129,7 @@ checks the prefix:
 | --- | --- | --- | --- |
 | layout 2 | anything | starts | starts |
 | another layout | anything | exits 1 | exits 1 |
-| none | nothing | creates the marker (`If-None-Match: *`), starts | starts, with nothing to import; writes nothing |
+| none | nothing | creates the marker (`If-None-Match: *`), starts; unless a multipart upload is in progress there (exit 1) | starts, with nothing to import; writes nothing |
 | none | keys | exits 1 | exits 1 |
 
 - **Two writers on an empty prefix** both start: both create the marker
@@ -150,6 +150,15 @@ checks the prefix:
   purpose: there is no migration, and reading the old layout to recognize
   it would be one (see [Changing layouts](#changing-layouts);
   `TestNonEmptyPrefixRefused`, `TestMinIOBinaryRefusesPrefixNotOwned`).
+- **An upload in progress counts too.** An object listing doesn't show
+  multipart uploads, so a writer about to claim an empty prefix also lists
+  them, and refuses one with any (`upload:<key>` in the error;
+  `TestWriterRefusesPrefixWithUpload`,
+  `TestMinIOBinaryWriterRefusesPrefixWithUpload`). A read-only instance
+  claims nothing and doesn't list them, so its key needn't be allowed to.
+- **A marker of layout 2 lacking `created` or `serviceVersion`** wasn't
+  written by the service: it is refused as unreadable, never taken as a
+  claim (`TestIncompleteMarkerRefused`).
 - **A folder placeholder counts as a key.** The zero-byte `cache/` object
   that the AWS and Spaces consoles create with "Create folder" makes the
   prefix not empty, and a writer refuses it, listing `cache/`. Intended:
@@ -162,12 +171,12 @@ checks the prefix:
   the process stops before anything scrapes it.
 
 "Empty" is decided by one bounded listing (`ListObjectsV2`, at most 11
-keys). What a startup costs, in requests to the store:
+keys), and for a writer about to claim it, the multipart upload listing. What a startup costs, in requests to the store:
 
 | Case | Ownership check | Then |
 | --- | --- | --- |
 | marker there (every start after the first) | 1 GET | writer: the conditional write probe, 4 PUTs and 1 DELETE |
-| empty prefix, writer | 1 GET, 1 LIST, 1 PUT (+1 GET if another writer won) | the probe |
+| empty prefix, writer | 1 GET, 1 LIST, 1 upload listing (2 on MinIO, `FilterAllUploads`), 1 PUT (+1 GET if another writer won) | the probe |
 | empty prefix, read-only | 1 GET, 1 LIST | nothing |
 | refused | 1 GET, 1 LIST, 1 GET | nothing |
 
@@ -495,7 +504,8 @@ and `s3:AbortMultipartUpload` on digest keys (the multipart copy), besides
 what the metadata store needs, and what garbage collection needs (see
 [Retention and garbage collection](#retention-and-garbage-collection)). The
 startup's ownership check needs `s3:ListBucket` on the prefix, and, on an
-empty prefix, `s3:PutObject` on `<prefix>/cacheservice.json`.
+empty prefix, `s3:ListBucketMultipartUploads` (which GC needs anyway) and
+`s3:PutObject` on `<prefix>/cacheservice.json`.
 
 ## Metadata store
 
@@ -1091,8 +1101,9 @@ that has only these (as below, for the test prefix): it merges a writer's
 entries into a fresh engine, the engine pulls their layers and renews their
 addresses, and the bucket's listing is unchanged. With the export path on,
 the same key fails at startup with `AccessDenied`, exit 1: on an empty
-prefix when it creates the ownership marker, and on a writer's prefix at the
-conditional write check (`TestMinIOBinaryReadOnlyKeyRefusedAsWriter`): that
+prefix at the ownership check's listing of multipart uploads, before it
+would create the marker, and on a writer's prefix at the conditional write
+check (`TestMinIOBinaryReadOnlyKeyRefusedAsWriter`): that
 is what stops a
 pull-request job that forgot `-export=false` from running as a writer whose
 every export fails. MinIO answers 404 for a missing key even without
@@ -1602,7 +1613,11 @@ mean "delete". In each namespace, in order:
    Before layout 2, its staged and multipart uploads were collected; now
    a tree under `ns/` is the service's to clean only once it has an index.
    A staged upload left by an export that never recorded waits for the
-   namespace's first index, or for the lifecycle rule. Uploads in a
+   namespace's first index, or for the lifecycle rule. So does a namespace
+   whose first index was written between GC's read of it and its listing
+   (`skipped: the index appeared during the run`): the read found none, so
+   it can't tell what the new index names; the next run collects it
+   (`TestIndexAppearingDuringRunLeftAlone`). Uploads in a
    namespace with no objects at all are left too, and logged.
 1. **Expire.** One conditional index update (only when something changes):
    roots past their own expiry or their max age, and entries past their

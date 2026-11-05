@@ -55,6 +55,10 @@ var (
 type S3Objects struct {
 	Client *s3.Client
 	Bucket string
+	// FilterAllUploads lists the bucket's uploads and keeps those under the
+	// prefix, when a listing by prefix finds none: for stores that list
+	// multipart uploads only by exact key (MinIO). See gc.S3Bucket.
+	FilterAllUploads bool
 }
 
 var _ Objects = (*S3Objects)(nil)
@@ -137,6 +141,39 @@ func (o *S3Objects) ListKeys(ctx context.Context, prefix string, max int) ([]str
 	return keys[:min(len(keys), max)], nil
 }
 
+// ListUploadKeys returns the keys of up to max incomplete multipart uploads
+// under prefix: one ListMultipartUploads, and with FilterAllUploads, when it
+// finds none, one more of the bucket's, filtered.
+func (o *S3Objects) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	list := func(p string) ([]string, error) {
+		in := &s3.ListMultipartUploadsInput{Bucket: &o.Bucket}
+		if p != "" {
+			in.Prefix = aws.String(p)
+		}
+		var keys []string
+		for {
+			out, err := o.Client.ListMultipartUploads(ctx, in)
+			if err != nil {
+				return nil, fmt.Errorf("list uploads %s: %w", p, err)
+			}
+			for _, u := range out.Uploads {
+				if k := aws.ToString(u.Key); strings.HasPrefix(k, prefix) {
+					keys = append(keys, k)
+				}
+			}
+			if len(keys) >= max || !aws.ToBool(out.IsTruncated) || (out.NextKeyMarker == nil && out.NextUploadIdMarker == nil) {
+				return keys[:min(len(keys), max)], nil
+			}
+			in.KeyMarker, in.UploadIdMarker = out.NextKeyMarker, out.NextUploadIdMarker
+		}
+	}
+	keys, err := list(prefix)
+	if err != nil || len(keys) > 0 || prefix == "" || !o.FilterAllUploads {
+		return keys, err
+	}
+	return list("")
+}
+
 func httpStatus(err error) int {
 	var re *smithyhttp.ResponseError
 	if errors.As(err, &re) {
@@ -151,6 +188,7 @@ func httpStatus(err error) int {
 type MemObjects struct {
 	mu      sync.Mutex
 	objects map[string]memObject
+	uploads []string
 	version uint64
 	now     func() time.Time
 }
@@ -212,6 +250,29 @@ func (m *MemObjects) ListKeys(_ context.Context, prefix string, max int) ([]stri
 	return keys, nil
 }
 
+// AddUpload records an incomplete multipart upload at key, which
+// ListUploadKeys reports: MemObjects holds no upload's data.
+func (m *MemObjects) AddUpload(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.uploads = append(m.uploads, key)
+}
+
+// ListUploadKeys returns up to max of the uploads AddUpload recorded under
+// prefix, sorted.
+func (m *MemObjects) ListUploadKeys(_ context.Context, prefix string, max int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var keys []string
+	for _, k := range m.uploads {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	return keys[:min(len(keys), max)], nil
+}
+
 // Get returns a copy of the object.
 func (m *MemObjects) Get(_ context.Context, key string) ([]byte, string, error) {
 	m.mu.Lock()
@@ -270,7 +331,9 @@ func NewS3Objects(ctx context.Context, cfg blobstore.S3Config) (*S3Objects, erro
 	if err != nil {
 		return nil, fmt.Errorf("s3 metadata store: %w", err)
 	}
-	return &S3Objects{Client: client, Bucket: cfg.Bucket}, nil
+	// A custom endpoint is an S3-compatible store, which may list multipart
+	// uploads only by exact key (MinIO), as for GC (server.EnableS3).
+	return &S3Objects{Client: client, Bucket: cfg.Bucket, FilterAllUploads: cfg.Endpoint != ""}, nil
 }
 
 // NewS3 returns a Store in cfg's bucket, under cfg's prefix: the same bucket

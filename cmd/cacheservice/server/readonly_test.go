@@ -65,6 +65,11 @@ func (r *refuseWrites) Delete(_ context.Context, key string) error {
 	return fmt.Errorf("delete %s: %w", key, errAccessDenied)
 }
 
+// ListUploadKeys lists uploads, as the key may.
+func (r *refuseWrites) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	return r.Objects.(ownership.Store).ListUploadKeys(ctx, prefix, max)
+}
+
 // ListKeys lists, as a read-only key may (s3:ListBucket).
 func (r *refuseWrites) ListKeys(ctx context.Context, prefix string, max int) ([]string, error) {
 	return r.Objects.(ownership.Store).ListKeys(ctx, prefix, max)

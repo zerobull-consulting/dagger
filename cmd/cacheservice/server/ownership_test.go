@@ -135,3 +135,20 @@ func TestReadOnlyStartsOnEmptyPrefix(t *testing.T) {
 		t.Fatalf("keys %v, blobs %d", keys, stores.blobs.Len())
 	}
 }
+
+// An invalid scope is refused before the ownership check, so it can't leave
+// a marker behind on a prefix the service then doesn't use.
+func TestInvalidScopeRefusedBeforeClaim(t *testing.T) {
+	stores := emptyStores(t)
+	meta, err := metastore.New(metastore.Config{Objects: stores.objs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(slog.New(slog.DiscardHandler), "")
+	if err := svc.enableStores(context.Background(), storeSet{Blobs: stores.blobs, Meta: meta}, S3Options{Scope: "a/b"}); err == nil {
+		t.Fatal("an invalid scope accepted")
+	}
+	if keys := stores.objs.Keys(); len(keys) != 0 {
+		t.Fatalf("keys %v", keys)
+	}
+}

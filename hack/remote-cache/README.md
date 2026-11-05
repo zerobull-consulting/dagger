@@ -287,8 +287,9 @@ engine-style PUT over HTTPS.
 
 ### What each store does
 
-These are the S3 calls the service makes, and they don't depend on the key
-layout; the layout (version 2, under `ns/`) changed no row.
+These are the S3 calls the service makes. Layout version 2 moved every key
+under `ns/<namespace>/`, but made no call behave differently, so every row
+holds as it was measured.
 
 The checks of
 [zerobull-consulting/dagger#55](https://github.com/zerobull-consulting/dagger/issues/55),

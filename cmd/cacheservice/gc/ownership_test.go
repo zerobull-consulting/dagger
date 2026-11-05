@@ -465,3 +465,60 @@ func TestSkippedNamespaceGaugesCurrent(t *testing.T) {
 		t.Fatalf("stored blob bytes %v, want %v", got, first+5000)
 	}
 }
+
+// listHook runs before each List.
+type listHook struct {
+	Bucket
+	before func(prefix string)
+}
+
+func (b *listHook) List(ctx context.Context, p string, fn func([]Object) error) error {
+	if b.before != nil {
+		b.before(p)
+	}
+	return b.Bucket.List(ctx, p, fn)
+}
+
+// A namespace's first index written between GC's read of it (none, so an
+// empty snapshot) and its listing (which finds it) is left alone for the
+// run: the empty snapshot names nothing the new index does, so its objects,
+// old enough to be candidates, would be reported (dry run) or claimed
+// against it. The next run collects the namespace.
+func TestIndexAppearingDuringRunLeftAlone(t *testing.T) {
+	e := newEnv(t)
+	e.export("team", "a", buildX("x"), 2)
+	ctx := context.Background()
+	key := nsPrefix("team") + layout.IndexName
+	body, _, err := e.objs.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.objs.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Add(24 * time.Hour)
+	for _, dry := range []bool{true, false} {
+		restored := false
+		b := &listHook{Bucket: e.bucket, before: func(p string) {
+			if p == nsPrefix("team") && !restored {
+				restored = true
+				e.put(key, string(body))
+			}
+		}}
+		c := e.collector(func(cfg *Config) { cfg.Bucket = b; cfg.DryRun = dry })
+		r := reportOf(e.run(c), "team")
+		if r.Skipped != "the index appeared during the run" || len(r.WouldDelete) != 0 || len(r.Deleted) != 0 {
+			t.Fatalf("dry run %v: %+v", dry, r)
+		}
+		if !dry {
+			break
+		}
+		if err := e.objs.Delete(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.checkConsistent("team")
+	if r := reportOf(e.run(e.collector(nil)), "team"); r.Skipped != "" {
+		t.Fatalf("next run: %+v", r)
+	}
+}

@@ -562,7 +562,7 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 
 	// 1. Read the index, before the listing: everything it names was
 	// stored before the listing began, so must be in it (see sweep).
-	snap, ierr := c.cfg.Meta.Index(ctx, ns)
+	snap, existed, ierr := c.cfg.Meta.IndexSnapshot(ctx, ns)
 
 	// 2. List what is stored.
 	l, err := c.list(ctx, ns)
@@ -596,6 +596,14 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 	if !l.hasIndex {
 		rep.Skipped = "no index"
 		log.Info("gc: a namespace without an index; left alone")
+		return rep
+	}
+	if ierr == nil && !existed {
+		// The first index was written between the read and the listing:
+		// the snapshot, empty, names nothing the new index does. The next
+		// run collects the namespace.
+		rep.Skipped = "the index appeared during the run"
+		log.Info("gc: the namespace's first index was written during the run; left alone until the next")
 		return rep
 	}
 

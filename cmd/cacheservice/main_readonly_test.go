@@ -321,14 +321,15 @@ func TestMinIOBinaryReadOnlyKey(t *testing.T) {
 
 // The same read-only key with the export path on (the default) fails at
 // startup, with AccessDenied, and exits 1: on an empty prefix at the
-// ownership marker's creation, and on a prefix a writer claimed at the
-// conditional write check. Intended: it's what stops a pull-request job
+// ownership check (its listing of multipart uploads, before it would
+// create the marker), and on a prefix a writer claimed at the conditional
+// write check. Intended: it's what stops a pull-request job
 // holding a read-only key, but missing -export=false, from silently running
 // as a writer whose every export fails.
 func TestMinIOBinaryReadOnlyKeyRefusedAsWriter(t *testing.T) {
 	id, secret := readOnlyKey(t)
 	b := startBinaryWith(t, binaryOpts{accessKey: id, secretKey: secret, noEngine: true})
-	b.waitExit1("level=ERROR msg=\"export path\"", "create ownership marker", "AccessDenied")
+	b.waitExit1("level=ERROR msg=\"export path\"", "ownership check: list multipart uploads", "AccessDenied")
 
 	writer := startBinary(t)
 	writer.signal()

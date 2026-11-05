@@ -201,3 +201,25 @@ func listScope(t *testing.T, scope *s3test.Scope) []string {
 	t.Helper()
 	return (&binaryTest{t: t, scope: scope}).listing()
 }
+
+// A prefix whose only content is another writer's multipart upload, in
+// progress, is refused by a writer: exit 1 naming the upload, and no marker
+// written. The object listing alone would have seen an empty prefix.
+func TestMinIOBinaryWriterRefusesPrefixWithUpload(t *testing.T) {
+	scope := newScope(t)
+	client := rootClient(scope.Guard)
+	bucket := envOr("CACHESERVICE_S3_BUCKET", "dagger-cache")
+	key := scope.Prefix + "/backups/db.tar"
+	up, err := client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: up.UploadId})
+	})
+	b := startBinaryWith(t, binaryOpts{scope: scope, noEngine: true})
+	b.waitExit1("ownership check", "upload:"+key)
+	if l := listScope(t, scope); len(l) != 0 {
+		t.Fatalf("listing %v, want empty", l)
+	}
+}

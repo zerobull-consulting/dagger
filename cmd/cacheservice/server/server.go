@@ -144,6 +144,10 @@ type storeSet struct {
 // service's state: a read-only service (SetReadOnly) takes only NoExport,
 // since the export path's conditional write check would write.
 func (s *Service) checkS3Options(opts S3Options) error {
+	// Before the ownership check, which may claim the prefix.
+	if err := metastore.ValidateScope(opts.Scope); err != nil {
+		return err
+	}
 	if !opts.NoExport {
 		if s.readOnly {
 			return errors.New("the service is read-only (SetReadOnly): set NoExport")

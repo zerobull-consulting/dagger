@@ -255,6 +255,13 @@ func (s *Store) Index(ctx context.Context, scope string) (*Index, error) {
 	return idx, err
 }
 
+// IndexSnapshot is Index, and whether the index exists: a scope with none
+// reads as an empty index, which GC must not take for one that exists.
+func (s *Store) IndexSnapshot(ctx context.Context, scope string) (*Index, bool, error) {
+	idx, etag, err := s.readIndex(ctx, scope)
+	return idx, etag != "", err
+}
+
 // readIndex returns the index and its ETag, or an empty index and "" when the
 // scope has none.
 func (s *Store) readIndex(ctx context.Context, scope string) (*Index, string, error) {
