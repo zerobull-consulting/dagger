@@ -9,6 +9,9 @@
 #   dev.sh test    run the Go tests against it (starts it first)
 #   dev.sh e2e     run the remote cache with real engines (cmd/cacheservice/e2e)
 #   dev.sh e2e-down  remove the engines a run with E2E_KEEP=1 left
+#   dev.sh demo    run the sidecar demo (demo/run.sh) against MinIO
+#   dev.sh demo-store  start MinIO where containers reach it, with the demo's
+#                  read-only user, and print its settings as key=value lines
 #
 # Address, ports, credentials and bucket come from MINIO_BIND_ADDR,
 # MINIO_API_PORT, MINIO_CONSOLE_PORT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
@@ -99,6 +102,23 @@ use_store() {
 	export CACHESERVICE_TEST_READONLY_SECRET_ACCESS_KEY="${READONLY_PASSWORD:-dagger-readonly-secret}"
 }
 
+# MinIO where containers reach it, for the sidecar demo: on the Docker
+# bridge gateway, which this host's containers reach and other machines
+# don't (see README.md, "Pointing an engine at the service and MinIO"), with a
+# read-only user of the demo's own, for its prefix, demo/.
+demo_store() {
+	if [[ "$MINIO_BIND_ADDR" == 127.0.0.1 ]]; then
+		MINIO_BIND_ADDR="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
+		[[ "$MINIO_BIND_ADDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
+			{ echo "dev.sh: the Docker bridge has no IPv4 gateway ('$MINIO_BIND_ADDR')" >&2; exit 1; }
+		host="$MINIO_BIND_ADDR"
+		export MINIO_BIND_ADDR
+	fi
+	up >/dev/null
+	READONLY_PREFIX=demo READONLY_USER=dagger-demo-readonly READONLY_PASSWORD=dagger-demo-readonly-secret \
+		READONLY_POLICY=cacheservice-demo-readonly compose run --rm create-readonly-user >/dev/null
+}
+
 case "${1:-}" in
 up) up ;;
 down) compose down ;;
@@ -131,13 +151,27 @@ e2e)
 	cd "$repo"
 	CACHESERVICE_E2E=1 go test -count=1 -v -timeout 60m -run "$run" ./cmd/cacheservice/e2e/ "${@:2}"
 	;;
+demo-store)
+	demo_store
+	for name in ENDPOINT REGION BUCKET ACCESS_KEY_ID SECRET_ACCESS_KEY; do
+		echo "$(tr 'A-Z_' 'a-z-' <<<"$name")=$(s3_setting "$name")"
+	done
+	echo "readonly-access-key-id=dagger-demo-readonly"
+	echo "readonly-secret-access-key=dagger-demo-readonly-secret"
+	;;
+demo)
+	demo_store
+	eval "$(print_env)"
+	export DEMO_READONLY_ACCESS_KEY_ID=dagger-demo-readonly DEMO_READONLY_SECRET_ACCESS_KEY=dagger-demo-readonly-secret
+	exec "$here/demo/run.sh"
+	;;
 e2e-down)
 	label=dagger-remote-cache-e2e
 	docker ps -aq --filter "label=$label" | xargs -r docker rm -f >/dev/null
 	docker volume ls -q --filter "label=$label" | xargs -r docker volume rm -f >/dev/null
 	;;
 *)
-	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

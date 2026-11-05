@@ -1,0 +1,124 @@
+name: "Remote cache sidecar"
+description: >-
+  Runs the remote cache service and an engine with its client on this runner,
+  and sets up the dagger CLI for later steps. Stop it at the end of the job
+  with remote-cache-sidecar/stop, with if: always().
+
+inputs:
+  role:
+    description: >-
+      writer (exports to the bucket; for jobs on the default branch) or
+      read-only (-export=false and a read-only key; for pull-request jobs)
+    required: true
+  service-image:
+    description: "The cache service image, such as ghcr.io/zerobull-consulting/cacheservice:<commit SHA>"
+    required: true
+  engine-image:
+    description: >-
+      The engine image with the remote cache client, such as
+      ghcr.io/zerobull-consulting/dagger-engine:<the same SHA>; its own CLI is
+      the one set up
+    required: true
+  s3-endpoint:
+    description: "The store's endpoint URL, such as https://nyc3.digitaloceanspaces.com"
+    required: true
+  s3-region:
+    description: "The store's region"
+    required: true
+  s3-bucket:
+    description: "The bucket"
+    required: true
+  s3-prefix:
+    description: >-
+      The prefix the service owns in the bucket; empty for the whole bucket.
+      Nothing else may write under it.
+    required: false
+    default: ""
+  s3-access-key-id:
+    description: "The key's ID, from the caller's secrets. A read-only key for role read-only."
+    required: true
+  s3-secret-access-key:
+    description: "The key's secret, from the caller's secrets"
+    required: true
+  s3-path-style:
+    description: "true for path-style addressing (MinIO); empty for the service's default"
+    required: false
+    default: ""
+  namespace:
+    description: "The namespace entries are stored in and imported from (the service's -scope)"
+    required: false
+    default: "default"
+  drain-timeout:
+    description: >-
+      How long the stop lets the service finish its exports (-drain-timeout).
+      Give the stop step a timeout-minutes above this plus 5s.
+    required: false
+    default: "10m"
+  name:
+    description: >-
+      Prefix of the containers, volume and network; set another one to run a
+      second sidecar in the same job, after the first is stopped. Pass the
+      same to the stop action.
+    required: false
+    default: "remote-cache"
+  debug-port:
+    description: "Publish the service's debug API on 127.0.0.1:<port> of the runner (default: not published)"
+    required: false
+    default: ""
+  engine-config:
+    description: >-
+      A file to mount as the engine's engine.json (default: the action's
+      engine.json, with the engine's GC off; see README.md)
+    required: false
+    default: ""
+  verbose:
+    description: "true: the service logs every cache span (-v)"
+    required: false
+    default: "false"
+
+outputs:
+  dagger:
+    description: "The dagger CLI set up for the sidecar (also first on PATH for later steps)"
+    value: ${{ steps.start.outputs.dagger }}
+  runner-host:
+    description: "The engine, as _EXPERIMENTAL_DAGGER_RUNNER_HOST"
+    value: ${{ steps.start.outputs.runner-host }}
+  service-url:
+    description: "The service's URL, as the engine and the CLI reach it"
+    value: ${{ steps.start.outputs.service-url }}
+  service-container:
+    description: "The service's container"
+    value: ${{ steps.start.outputs.service-container }}
+  engine-container:
+    description: "The engine's container"
+    value: ${{ steps.start.outputs.engine-container }}
+  logs:
+    description: "Where the stop action puts the service's and the engine's logs"
+    value: ${{ steps.start.outputs.logs }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Start the cache service and the engine
+      id: start
+      shell: bash
+      # Inputs reach the script as environment variables only, never
+      # expanded into the script itself.
+      env:
+        SIDECAR_ROLE: ${{ inputs.role }}
+        SIDECAR_SERVICE_IMAGE: ${{ inputs.service-image }}
+        SIDECAR_ENGINE_IMAGE: ${{ inputs.engine-image }}
+        SIDECAR_NAMESPACE: ${{ inputs.namespace }}
+        SIDECAR_DRAIN_TIMEOUT: ${{ inputs.drain-timeout }}
+        SIDECAR_NAME: ${{ inputs.name }}
+        SIDECAR_DEBUG_PORT: ${{ inputs.debug-port }}
+        SIDECAR_VERBOSE: ${{ inputs.verbose }}
+        SIDECAR_ENGINE_CONFIG: ${{ inputs.engine-config }}
+        CACHESERVICE_S3_ENDPOINT: ${{ inputs.s3-endpoint }}
+        CACHESERVICE_S3_REGION: ${{ inputs.s3-region }}
+        CACHESERVICE_S3_BUCKET: ${{ inputs.s3-bucket }}
+        CACHESERVICE_S3_PREFIX: ${{ inputs.s3-prefix }}
+        CACHESERVICE_S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id }}
+        CACHESERVICE_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key }}
+        CACHESERVICE_S3_PATH_STYLE: ${{ inputs.s3-path-style }}
+      run: '"$GITHUB_ACTION_PATH/sidecar.sh" start'

@@ -167,6 +167,113 @@ jobs:
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+  # The sidecar demo (hack/remote-cache/demo) through the composite action
+  # (.github/actions/remote-cache-sidecar), against MinIO: a writer phase
+  # (the action, the demo, the stop, which drains), then a read-only phase on
+  # a fresh engine (-export=false and MinIO's read-only user). check.sh counts
+  # cache spans in the service's log: the cacheable step must be a hit with
+  # 0 executed, and the cache-volume step must rerun. Both images are built
+  # from this checkout, so a pull request tests its own code.
+  sidecar:
+    name: sidecar demo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # As cacheservice-image.yml and engine-image.yml build them; the engine's
+      # CLI provisions this same image by default.
+      - name: Build the images
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" -t cacheservice:ci .
+          docker build -f hack/remote-cache/engine.Dockerfile \
+            --build-arg REVISION="$REVISION" --build-arg ENGINE_IMAGE=dagger-engine:ci \
+            -t dagger-engine:ci .
+      # MinIO on the Docker bridge gateway, where the sidecar's containers
+      # reach it, with a read-only user for the demo's prefix (demo/). The
+      # credentials are MinIO's committed dev ones.
+      - name: Start MinIO
+        id: store
+        run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
+      - name: "Writer: start the sidecar"
+        id: writer
+        uses: ./.github/actions/remote-cache-sidecar
+        with:
+          role: writer
+          name: demo-writer
+          service-image: cacheservice:ci
+          engine-image: dagger-engine:ci
+          s3-endpoint: ${{ steps.store.outputs.endpoint }}
+          s3-region: ${{ steps.store.outputs.region }}
+          s3-bucket: ${{ steps.store.outputs.bucket }}
+          s3-prefix: demo/${{ github.run_id }}-${{ github.run_attempt }}
+          s3-access-key-id: ${{ steps.store.outputs.access-key-id }}
+          s3-secret-access-key: ${{ steps.store.outputs.secret-access-key }}
+          s3-path-style: "true"
+          verbose: "true"
+      - name: "Writer: run the demo"
+        timeout-minutes: 10
+        env:
+          SERVICE: ${{ steps.writer.outputs.service-container }}
+        run: ./hack/remote-cache/demo/check.sh writer "$SERVICE" "$RUNNER_TEMP/demo/writer"
+      - name: "Writer: stop the sidecar"
+        id: writer-stop
+        if: always()
+        # Above the drain timeout (10m) plus 5s.
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache-sidecar/stop
+        with:
+          name: demo-writer
+      - name: "Writer: check the export was stored"
+        env:
+          LOGS: ${{ steps.writer-stop.outputs.logs }}
+        run: ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/demo/writer"
+      # A new engine, with a new, empty state volume: the writer's was
+      # removed by its stop.
+      - name: "Read-only: start the sidecar"
+        id: reader
+        uses: ./.github/actions/remote-cache-sidecar
+        with:
+          role: read-only
+          name: demo-reader
+          service-image: cacheservice:ci
+          engine-image: dagger-engine:ci
+          s3-endpoint: ${{ steps.store.outputs.endpoint }}
+          s3-region: ${{ steps.store.outputs.region }}
+          s3-bucket: ${{ steps.store.outputs.bucket }}
+          s3-prefix: demo/${{ github.run_id }}-${{ github.run_attempt }}
+          s3-access-key-id: ${{ steps.store.outputs.readonly-access-key-id }}
+          s3-secret-access-key: ${{ steps.store.outputs.readonly-secret-access-key }}
+          s3-path-style: "true"
+          verbose: "true"
+      - name: "Read-only: run the demo"
+        timeout-minutes: 10
+        env:
+          SERVICE: ${{ steps.reader.outputs.service-container }}
+        run: ./hack/remote-cache/demo/check.sh read-only "$SERVICE" "$RUNNER_TEMP/demo/read-only" "$RUNNER_TEMP/demo/writer"
+      - name: "Read-only: stop the sidecar"
+        if: always()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache-sidecar/stop
+        with:
+          name: demo-reader
+      # The service's and the engine's logs of both phases (presigned URLs'
+      # credentials redacted), and the demo's CLI output.
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: sidecar-demo
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/demo
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: ./hack/remote-cache/dev.sh reset
   # Runs the Spaces jobs below only where the SPACES_* secrets are set: a job's
   # `if` can't read secrets, so this one answers for them. Forks and repositories
   # without them skip those jobs. Anyone with write access can read repository
