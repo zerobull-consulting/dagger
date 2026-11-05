@@ -104,6 +104,9 @@ func TestRealEngines(t *testing.T) {
 	// A clean stop (#63): the service drains with an export in flight, and
 	// replaces the main service once more.
 	env.Run("drain", st.drain)
+	// Last, over every service's log: the largest OTLP requests the engines
+	// sent, against the limits (zerobull-consulting/dagger#77).
+	env.Run("otlp-sizes", st.otlpSizes)
 }
 
 // retainedStored reports whether every retained entry the service tracks

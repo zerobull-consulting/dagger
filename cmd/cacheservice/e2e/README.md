@@ -70,7 +70,10 @@ compare a retried upload by its digest (`blobDigest`), not its key.
 
 The resilience scenarios (#12) are in `resilience_test.go`; they run last,
 since `service-restart` replaces the main service. `drain` (#63), in
-`drain_test.go`, runs after them, and replaces the main service once more. `namespaces` (#10), in
+`drain_test.go`, runs after them, and replaces the main service once more. `otlp-sizes`
+(#77), in `otlp_test.go`, runs after everything: it reads every service's
+log for the OTLP requests taken, so a scenario added after it isn't
+counted. `namespaces` (#10), in
 `namespaces_test.go`, runs its own service with a tokens file, and its own
 engines. `verify` (#23), in `verify_test.go`, runs after `namespaces` and
 before the resilience scenarios. `gc` (#11), in `gc_test.go`, runs after

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -22,7 +23,9 @@ import (
 // records, under the engine's own token; session spans carry the cache
 // entries their calls touched, under the token of the session's client.
 // With tokens, each POST must carry a known token as its HTTP Basic
-// username, and feeds only its namespace's paths (see otlpAuth).
+// username, and feeds only its namespace's paths (see otlpAuth), which is
+// checked before any of its body is read. Each body is then bounded (see
+// decodeOTLP), and a request refused for it records nothing.
 func (s *Service) otlpRoutes(mux *http.ServeMux) {
 	// Before taking over a session's telemetry, the engine probes the Cloud
 	// URL with HEAD /v1/traces, with no credentials; any answer will do.
@@ -36,9 +39,11 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 			return
 		}
 		var req collogspb.ExportLogsServiceRequest
-		if !s.decodeOTLP(w, r, &req) {
+		release, ok := s.decodeOTLP(w, r, s.otlp.logs, &req)
+		if !ok {
 			return
 		}
+		defer release()
 		s.logRecords(ns, key, &req)
 		writeOTLP(w, r, &collogspb.ExportLogsServiceResponse{})
 	})
@@ -48,9 +53,11 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 			return
 		}
 		var req coltracepb.ExportTraceServiceRequest
-		if !s.decodeOTLP(w, r, &req) {
+		release, ok := s.decodeOTLP(w, r, s.otlp.traces, &req)
+		if !ok {
 			return
 		}
+		defer release()
 		s.logSpans(&req)
 		s.trackSpans(ns, &req)
 		writeOTLP(w, r, &coltracepb.ExportTraceServiceResponse{})
@@ -60,9 +67,11 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 			return
 		}
 		var req colmetricspb.ExportMetricsServiceRequest
-		if !s.decodeOTLP(w, r, &req) {
+		release, ok := s.decodeOTLP(w, r, s.otlp.metrics, &req)
+		if !ok {
 			return
 		}
+		defer release()
 		points := 0
 		for _, rm := range req.ResourceMetrics {
 			for _, sm := range rm.ScopeMetrics {
@@ -127,25 +136,42 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 }
 
 // decodeOTLP reads an OTLP/HTTP request body, protobuf or JSON, gzipped or
-// not.
-func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, msg proto.Message) bool {
+// not, within route's limit and the service's decode budget, and in at most
+// the OTLP read timeout. The body as received and the decoded stream are
+// limited separately, so a gzip bomb stops at the limit however well it
+// compresses. A body over either limit is answered 413, one that doesn't fit
+// in the budget 503 with Retry-After, and one too slow 408; with ok false,
+// nothing of the request may be recorded. With ok true, release gives its
+// bytes back to the budget: call it once the request is recorded.
+func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpRoute, msg proto.Message) (release func(), ok bool) {
 	s.logger.Debug("otlp request", "path", r.URL.Path, "userAgent", r.UserAgent(),
 		"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
 		"contentLength", r.ContentLength)
-	var body io.Reader = r.Body
+	lim := s.otlp
+	// The connection's read deadline, for this request's body alone: the
+	// server clears it before reading the next request.
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(lim.readTimeout)); err != nil {
+		s.logger.Debug("otlp request: no read deadline", "error", err)
+	}
+	received := &countingReader{r: http.MaxBytesReader(w, r.Body, route.limit)}
+	var body io.Reader = received
 	if r.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(r.Body)
+		gz, err := lim.gunzip(received)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return false
+			status, reason := otlpRefusal(err)
+			s.refuseOTLP(w, r, route, status, reason, err)
+			return nil, false
 		}
 		defer gz.Close()
 		body = gz
 	}
-	data, err := io.ReadAll(body)
+	data, reserved, err := readOTLPBody(body, route.limit, lim.budget)
+	release = func() { lim.budget.release(reserved) }
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return false
+		release()
+		status, reason := otlpRefusal(err)
+		s.refuseOTLP(w, r, route, status, reason, err)
+		return nil, false
 	}
 	if isJSON(r) {
 		err = protojson.Unmarshal(data, msg)
@@ -153,11 +179,29 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, msg proto.M
 		err = proto.Unmarshal(data, msg)
 	}
 	if err != nil {
-		s.logger.Warn("undecodable otlp request", "path", r.URL.Path, "error", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return false
+		release()
+		s.refuseOTLP(w, r, route, http.StatusBadRequest, "", err)
+		return nil, false
 	}
-	return true
+	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
+	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
+		"decodedBytes", len(data), "budgetInUse", lim.budget.inUse())
+	return release, true
+}
+
+// gunzipReader opens a gzipped body.
+func gunzipReader(r io.Reader) (io.ReadCloser, error) { return gzip.NewReader(r) }
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func writeOTLP(w http.ResponseWriter, r *http.Request, msg proto.Message) {

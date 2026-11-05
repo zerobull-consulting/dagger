@@ -146,7 +146,8 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 		cancel()
 		t.Fatalf("service %s: %v", name, err)
 	}
-	srv := &http.Server{Handler: svc.Handler()}
+	// As the command serves it: with its header timeout.
+	srv := server.NewHTTPServer("", svc.Handler())
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("serve", "error", err)

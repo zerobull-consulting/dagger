@@ -56,6 +56,8 @@ var (
 	// promotionBuckets span 10ms to about 22 minutes: a promotion takes
 	// time in proportion to the blob's size.
 	promotionBuckets = prometheus.ExponentialBuckets(0.01, 2, 18)
+	// otlpSizeBuckets span 256 bytes to 256 MiB, past every route's limit.
+	otlpSizeBuckets = prometheus.ExponentialBuckets(256, 4, 11)
 )
 
 // Promotion outcomes of an uploaded blob (see blobstore.Outcome), and
@@ -115,6 +117,8 @@ type Metrics struct {
 	drainStoredRoots    prometheus.Counter
 	drainLeftRoots      prometheus.Counter
 	drainRefused        *prometheus.CounterVec
+	otlpRefused         *prometheus.CounterVec
+	otlpRequestBytes    *prometheus.HistogramVec
 	collectors          []prometheus.Collector
 }
 
@@ -338,6 +342,15 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "drain_refused_total",
 			Help: "New work refused while draining, by kind: connection (an engine WebSocket, 503) or span (a cache span or session end of a session the service doesn't track).",
 		}, []string{"kind"}),
+		otlpRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "otlp_refused_total",
+			Help: "OTLP requests refused for their body, by route (traces, logs, metrics) and reason: too_large (413, over the route's limit as received or decoded), busy (503, the decode budget full) or timeout (408, not received within the read timeout). Nothing of a refused request is recorded.",
+		}, []string{"route", "reason"}),
+		otlpRequestBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "otlp_request_bytes",
+			Help:    "Size of each OTLP request taken, by route and form: received (the body as sent, gzipped or not) or decoded (gunzipped). Compare with the routes' limits.",
+			Buckets: otlpSizeBuckets,
+		}, []string{"route", "form"}),
 	}
 	m.collectors = []prometheus.Collector{
 		m.indexReads, m.indexReadBytes, m.indexReadDuration,
@@ -355,6 +368,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule,
 		m.exportCollected,
 		m.draining, m.exportEnabled, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
+		m.otlpRefused, m.otlpRequestBytes,
 	}
 	if reg != nil {
 		reg.MustRegister(m.collectors...)
@@ -772,4 +786,43 @@ func (m *Metrics) DrainRefused(kind string) {
 		return
 	}
 	m.drainRefused.WithLabelValues(kind).Inc()
+}
+
+// OTLP routes, the route label of the OTLP metrics: a fixed set, never taken
+// from the request.
+const (
+	OTLPRouteTraces  = "traces"
+	OTLPRouteLogs    = "logs"
+	OTLPRouteMetrics = "metrics"
+)
+
+// Reasons an OTLP request is refused for its body.
+const (
+	// OTLPRefusedTooLarge is a body over its route's limit, as received or
+	// decoded (413).
+	OTLPRefusedTooLarge = "too_large"
+	// OTLPRefusedBusy is a body that didn't fit in the decode budget (503).
+	OTLPRefusedBusy = "busy"
+	// OTLPRefusedTimeout is a body not received within the read timeout
+	// (408).
+	OTLPRefusedTimeout = "timeout"
+)
+
+// OTLPRefused records an OTLP request refused on route, one of the
+// OTLPRoute constants, for reason, one of the OTLPRefused constants.
+func (m *Metrics) OTLPRefused(route, reason string) {
+	if m == nil {
+		return
+	}
+	m.otlpRefused.WithLabelValues(route, reason).Inc()
+}
+
+// OTLPAccepted records the size of an OTLP request taken on route: as
+// received, and decoded.
+func (m *Metrics) OTLPAccepted(route string, received, decoded int64) {
+	if m == nil {
+		return
+	}
+	m.otlpRequestBytes.WithLabelValues(route, "received").Observe(float64(received))
+	m.otlpRequestBytes.WithLabelValues(route, "decoded").Observe(float64(decoded))
 }

@@ -19,7 +19,10 @@
 //     engine whose DAGGER_CLOUD_URL points here delivers its cache events
 //     (the engine.* log records) here too, and they are logged. With
 //     -tokens-file, they take the same tokens, and feed only their
-//     namespace;
+//     namespace. Each body is bounded, as received and gunzipped (413
+//     past its route's limit), the bodies read at once share a budget
+//     (503 with Retry-After past it), and each must arrive within 30s
+//     (408); see README.md, "OTLP limits";
 //
 //   - PUT /blobs/{digest}, a stand-in for presigned upload URLs that checks
 //     each blob against its digest and keeps nothing;
@@ -282,14 +285,18 @@ func main() {
 	}
 	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", !exports)
 
-	servers := []*http.Server{{Addr: listen, Handler: svc.Handler()}}
+	// Every listener bounds reading a request's headers
+	// (server.ReadHeaderTimeout), and none sets a ReadTimeout, which would
+	// cut off the engine WebSocket; the OTLP routes bound their bodies
+	// themselves.
+	servers := []*http.Server{server.NewHTTPServer(listen, svc.Handler())}
 	if debugListen != "" {
-		servers = append(servers, &http.Server{Addr: debugListen, Handler: svc.DebugHandler()})
+		servers = append(servers, server.NewHTTPServer(debugListen, svc.DebugHandler()))
 	}
 	if metricsListen != "" {
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", svc.MetricsHandler())
-		servers = append(servers, &http.Server{Addr: metricsListen, Handler: mux})
+		servers = append(servers, server.NewHTTPServer(metricsListen, mux))
 	}
 	errs := make(chan error, len(servers))
 	for i, srv := range servers {
