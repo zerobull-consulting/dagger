@@ -114,3 +114,21 @@ func TestShutdownReportsRequestsStillRunning(t *testing.T) {
 		t.Fatalf("shutdown with a request still running reported %v", err)
 	}
 }
+
+// A server that failed during the drain or the shutdown, after the first
+// signal, makes the stop unclean: its error, left in errs, gives exit 1
+// even when the stop itself ended within its bound.
+func TestExitCodeTakesServerErrorsDuringTheStop(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	errs := make(chan error, 2)
+	if code := exitCode(true, errs, logger); code != 0 {
+		t.Fatalf("a clean stop with no server error: exit %d, want 0", code)
+	}
+	if code := exitCode(false, errs, logger); code != 1 {
+		t.Fatalf("an unclean stop: exit %d, want 1", code)
+	}
+	errs <- errors.New("accept: too many open files")
+	if code := exitCode(true, errs, logger); code != 1 {
+		t.Fatalf("a clean stop after a server failed during it: exit %d, want 1", code)
+	}
+}

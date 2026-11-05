@@ -321,10 +321,30 @@ func main() {
 		logger.Error("serve", "error", err)
 		code = 1
 	}
-	if !stopService(svc, servers, stop, sigs, logger, shutdownGrace) {
-		code = 1
+	clean := stopService(svc, servers, stop, sigs, logger, shutdownGrace)
+	os.Exit(exitCode(clean && code == 0, errs, logger))
+}
+
+// exitCode is the process's exit code after the stop: 0 when the stop was
+// clean (clean) and no HTTP server failed, 1 otherwise. A server that failed
+// after the first signal, during the drain or the shutdown, left its error in
+// errs, which nothing read then: it is logged here, and makes the stop
+// unclean too.
+func exitCode(clean bool, errs <-chan error, logger *slog.Logger) int {
+	for {
+		select {
+		case err := <-errs:
+			logger.Error("serve", "error", err)
+			clean = false
+			continue
+		default:
+		}
+		break
 	}
-	os.Exit(code)
+	if clean {
+		return 0
+	}
+	return 1
 }
 
 // shutdownGrace bounds the shutdown that follows the drain, or the first

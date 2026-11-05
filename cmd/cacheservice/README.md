@@ -1635,7 +1635,8 @@ after a cancel, against a store that may not answer).
   1 when the bound cut the shutdown off, with work still running, or a
   signal did: it logs what was still running (`exports`, `imports`, `gc`,
   `engines`), and exits without waiting for it. 1 also when an HTTP server
-  failed (such as its address in use), which stops the service too. A
+  failed (such as its address in use), which stops the service too, or
+  failed during the drain or the shutdown. A
   process manager, and the tests, can tell a clean stop from a cut-off one
   (`TestMinIOBinaryStopBoundedExitsOne`, `TestMinIOBinaryCleanStopExitsZero`).
 - **Signals.** A second signal during the drain ends the drain at once; the
