@@ -38,9 +38,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Test the check
-        timeout-minutes: 5
-        run: hack/remote-cache/check-fork-paths_test.sh
       # On a pull request, the checker comes from the base branch, so a pull request can't weaken the check it's
       # measured by. The allowlist comes from the pull request: an entry is
       # meant to be added there, with its reason, and the job flags it for
@@ -77,3 +74,9 @@ jobs:
             fi
           fi
           "$check"
+      # After the check, so the pull request's own scripts can't change the
+      # checkout before it's measured.
+      - name: Test the check
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: hack/remote-cache/check-fork-paths_test.sh
