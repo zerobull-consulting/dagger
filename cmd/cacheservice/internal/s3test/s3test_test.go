@@ -517,13 +517,51 @@ func TestDeletePrefixReportsUploadsLeft(t *testing.T) {
 // right, and the others must never need them: only the Spaces jobs use an
 // external bucket, and each gives it to the step that runs the tests.
 func TestWorkflowOnlySpacesJobsAreExternal(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "..", "..", ".github", "workflows", "remote-cache-tests.yml"))
+	// Pull requests run remote-cache-tests.yml, none of whose jobs may reach
+	// Spaces; the Spaces jobs are in remote-cache-spaces.yml, off pull
+	// requests.
+	core := workflowJobs(t, "remote-cache-tests.yml")
+	for _, job := range []string{"unit", "minio", "e2e"} {
+		if _, ok := core[job]; !ok {
+			t.Errorf("remote-cache-tests.yml: no job %s", job)
+		}
+	}
+	spaces := workflowJobs(t, "remote-cache-spaces.yml")
+	for _, job := range []string{"spaces-store", "spaces-e2e"} {
+		if _, ok := spaces[job]; !ok {
+			t.Errorf("remote-cache-spaces.yml: no job %s", job)
+		}
+	}
+	check := func(file, job, body string, external bool) {
+		for _, want := range []string{"CACHESERVICE_TEST_EXTERNAL", "CACHESERVICE_TEST_STORE: spaces", "secrets.SPACES_ENDPOINT", "secrets.SPACES_SECRET_ACCESS_KEY", "CACHESERVICE_S3_PATH_STYLE"} {
+			if strings.Contains(body, want) != external {
+				t.Errorf("%s: job %s: has %s: %v, want %v", file, job, want, !external, external)
+			}
+		}
+		if external && strings.Contains(strings.SplitN(body, "steps:", 2)[0], "secrets.") {
+			t.Errorf("%s: job %s gives secrets to every step", file, job)
+		}
+	}
+	for job, body := range core {
+		check("remote-cache-tests.yml", job, body, false)
+	}
+	for _, job := range []string{"spaces-store", "spaces-e2e"} {
+		if body, ok := spaces[job]; ok {
+			check("remote-cache-spaces.yml", job, body, true)
+		}
+	}
+}
+
+// workflowJobs returns each job's text in .github/workflows/<file>, by its id.
+func workflowJobs(t *testing.T, file string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "..", ".github", "workflows", file))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, all, ok := strings.Cut(string(data), "\njobs:\n")
 	if !ok {
-		t.Fatal("no jobs in the workflow")
+		t.Fatalf("%s: no jobs", file)
 	}
 	jobs := map[string]string{}
 	var name string
@@ -531,23 +569,11 @@ func TestWorkflowOnlySpacesJobsAreExternal(t *testing.T) {
 		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "   ") && strings.HasSuffix(line, ":") {
 			name = strings.TrimSuffix(strings.TrimSpace(line), ":")
 		}
-		jobs[name] += line + "\n"
-	}
-	for _, job := range []string{"unit", "minio", "e2e", "spaces-store", "spaces-e2e"} {
-		body, ok := jobs[job]
-		if !ok {
-			t.Fatalf("no job %s", job)
-		}
-		spaces := strings.HasPrefix(job, "spaces-")
-		for _, want := range []string{"CACHESERVICE_TEST_EXTERNAL", "CACHESERVICE_TEST_STORE: spaces", "secrets.SPACES_ENDPOINT", "secrets.SPACES_SECRET_ACCESS_KEY", "CACHESERVICE_S3_PATH_STYLE"} {
-			if strings.Contains(body, want) != spaces {
-				t.Errorf("job %s: has %s: %v, want %v", job, want, !spaces, spaces)
-			}
-		}
-		if spaces && strings.Contains(strings.SplitN(body, "steps:", 2)[0], "secrets.") {
-			t.Errorf("job %s gives secrets to every step", job)
+		if name != "" {
+			jobs[name] += line + "\n"
 		}
 	}
+	return jobs
 }
 
 // External mode without a bucket would otherwise skip every real-store test,
