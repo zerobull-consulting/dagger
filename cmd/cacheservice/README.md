@@ -2437,7 +2437,12 @@ On GitHub Actions, use the composite action, which does everything below
 
 Pin the action and the service's image to the same commit of
 `feature/remote-cache`, and the engine to a stock release by digest (the
-example is CI's pin).
+example is CI's pin). That pairs a service built from the branch with the
+newest release, which works while the branch's client is the release's (see
+[Engine](../../hack/remote-cache/README.md#engine)) but isn't what the
+lockstep policy will support: once
+[zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)
+lands, the engine is the release the service was built from.
 The [demo](../../hack/remote-cache/demo/README.md) is a small project that
 shows what the sidecar carries and what it doesn't; CI runs it through the
 action on every pull request (the `sidecar demo` job), so this section, the

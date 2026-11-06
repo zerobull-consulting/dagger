@@ -398,8 +398,9 @@ bundle version, 3 in all of them). `v1.0.0-beta.23` has a different
 `dagql/cache.go`, `dagql/cache_egraph.go` and persistence code, so it isn't
 claimed. CI runs `v1.0.0-beta.25`, the `STOCK_ENGINE` pin in
 [`remote-cache-tests.yml`](../../.github/workflows/remote-cache-tests.yml)'s
-`sidecar` job, and warns when this branch's client differs from it. To
-recheck against an upstream release tag:
+`sidecar` job, and warns when this branch's `engine/remotecache` or
+`cmd/engine/remotecache.go` differs from it; it doesn't diff the engine's
+cache files. The full check, against an upstream release tag:
 
 ```bash
 git fetch --depth=1 https://github.com/dagger/dagger "refs/tags/<tag>:refs/tags/<tag>"
@@ -411,7 +412,8 @@ The same client shows only `dagql/cache_transfer_types.go`, with that
 constant. Once
 [zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)
 lands, the supported engine is the release matching the service's own
-version, not any release from the minimum on.
+version, not any release from the minimum on, and the service enforces it.
+Until then nothing checks the engine's version: the service only logs it.
 
 Run it as the engine container, pinned by digest (this is CI's pin), with
 the service's URL, the settings `cmd/cacheservice/e2e` starts its engines
@@ -436,6 +438,13 @@ Use the image's own CLI, which matches the engine:
 
 ```bash
 docker cp dagger-engine-rc:/usr/local/bin/dagger ./dagger
+```
+
+That is a Linux binary. On another host, such as macOS, install the same
+release's CLI instead:
+
+```bash
+curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=v1.0.0-beta.25 BIN_DIR=. sh
 ```
 
 Then run it against that engine, with `DAGGER_CLOUD_TOKEN` and

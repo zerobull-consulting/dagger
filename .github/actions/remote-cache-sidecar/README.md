@@ -40,8 +40,12 @@ is the release CI's `sidecar demo` job runs (`STOCK_ENGINE` in
 [`remote-cache-tests.yml`](../../workflows/remote-cache-tests.yml)). The
 minimum release with a compatible client is `v1.0.0-beta.24`; how that was
 checked is in
-[Engine](../../../hack/remote-cache/README.md#engine). The fork no longer
-publishes an engine image of its own.
+[Engine](../../../hack/remote-cache/README.md#engine). Nothing checks the
+engine's version yet: under the lockstep policy
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117))
+the engine will be the release the service was built from, and one version
+input will replace both image inputs. The fork no longer publishes an engine
+image of its own.
 
 ## Inputs
 

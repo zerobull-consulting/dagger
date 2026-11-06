@@ -182,9 +182,9 @@ jobs:
     timeout-minutes: 60
     env:
       # The release's multi-platform index, pinned by digest; update the tag
-      # and the digest together, and STOCK_ENGINE_TAG and
-      # hack/remote-cache/demo/run.sh's default ENGINE_IMAGE with them (a step
-      # below checks run.sh's).
+      # and the digest together, and STOCK_ENGINE_TAG, demo/run.sh's default
+      # ENGINE_IMAGE and the docs' examples with them (a step below checks
+      # those).
       #
       # Temporary: this pairs the branch's service (internal/version/VERSION,
       # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
@@ -213,12 +213,17 @@ jobs:
             git diff --stat "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}"
           fi
       # dev.sh demo runs the engine this job does: run.sh's default is this
-      # pin, as one literal line.
-      - name: Check the demo's default engine is STOCK_ENGINE
+      # pin, as one literal line. Every digest-pinned stock engine the remote
+      # cache's docs and scripts name is this pin too, so a bump can't leave
+      # an example behind.
+      - name: Check the demo's default engine and the docs' examples are STOCK_ENGINE
         run: |
           want=": \"\${ENGINE_IMAGE:=$STOCK_ENGINE}\""
           grep -qxF "$want" hack/remote-cache/demo/run.sh ||
             { echo "::error file=hack/remote-cache/demo/run.sh::its default ENGINE_IMAGE isn't STOCK_ENGINE ($STOCK_ENGINE)"; exit 1; }
+          stale="$(grep -rnoE 'registry\.dagger\.io/engine:[^ "`)]*@sha256:[0-9a-f]{64}' \
+            hack/remote-cache cmd/cacheservice .github/actions/remote-cache-sidecar | grep -vF ":$STOCK_ENGINE" || true)"
+          [[ -z "$stale" ]] || { echo "::error::pinned engines other than STOCK_ENGINE ($STOCK_ENGINE):"; echo "$stale"; exit 1; }
       # The service as cacheservice-image.yml builds it; the engine pulled
       # alongside.
       - name: Build the service's image, pull the engine's
