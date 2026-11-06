@@ -14,6 +14,21 @@ name: Remote cache tests
   workflow_dispatch: {}
 permissions:
   contents: read
+# The stock Dagger release the e2e and the sidecar demo run: its
+# multi-platform index, pinned by digest. Update the tag and the digest
+# together, STOCK_ENGINE_TAG with them, and the e2e harness's default
+# (DefaultEngineImage in cmd/cacheservice/e2e/env.go), which
+# TestDefaultEngineImageIsCIs checks is this.
+#
+# Temporary: this pairs the branch's service (internal/version/VERSION,
+# v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
+# combination the lockstep policy doesn't support (a vX service serves only
+# vX engines). It holds until zerobull-consulting/dagger#117, which repins
+# this to the service's own release and adds a development override for
+# branches that track main.
+env:
+  STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+  STOCK_ENGINE_TAG: v1.0.0-beta.25
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -111,13 +126,36 @@ jobs:
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+  # The e2e on the stock engine (STOCK_ENGINE): its CLI is copied out of
+  # the image, and only the service, in the test process, is built from this
+  # checkout. E2E_BUILD_ENGINE=1 builds the engine too, for work on its
+  # client; CI doesn't.
   e2e:
     name: real engines (e2e)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # TEMPORARY, for measuring the Go cache: none against a small one of the
+    # e2e package's own. Removed before review.
+    strategy:
+      fail-fast: false
+      matrix:
+        go-cache: [none, small]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      # A warning, not a failure: when this branch's engine-side client
+      # (merged from upstream main) differs from the stock engine's, this job
+      # doesn't test it; run `E2E_BUILD_ENGINE=1 dev.sh e2e` for that, and
+      # move STOCK_ENGINE to the release that has it once there is one.
+      - name: Compare the engine's client with the stock engine's
+        timeout-minutes: 5
+        run: |
+          git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"
+          paths=(engine/remotecache cmd/engine/remotecache.go ':!**/*_test.go')
+          if ! git diff --quiet "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}"; then
+            echo "::warning::the remote cache client differs from $STOCK_ENGINE_TAG's, which the e2e runs:"
+            git diff --stat "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}"
+          fi
       - name: Setup Go
         id: setup-go
         uses: actions/setup-go@v6
@@ -126,26 +164,34 @@ jobs:
           # setup-go's own cache uses one key for every job, so only the first
           # job to finish saves it; each job caches its own build below.
           cache: false
-      # Module and build caches, per job: this one builds the engine and the
-      # CLI. Every run restores the newest cache saved by a push to
-      # feature/remote-cache; only those pushes save one.
       - name: Restore Go cache
+        if: matrix.go-cache == 'small'
         id: go-cache
         uses: actions/cache/restore@v5
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          key: go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
-            go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-            go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
-      # Starts MinIO, builds the engine image from this commit, and runs
-      # TestRealEngines in cmd/cacheservice/e2e: the service in-process,
-      # engines in Docker. See hack/remote-cache/README.md, "Real engines".
+            go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      # The test's own build, apart from the run so its time shows; the
+      # engine image is pulled meanwhile.
+      - name: Build the test, pull the engine
+        timeout-minutes: 15
+        run: |
+          docker pull -q "$STOCK_ENGINE" &
+          go test -count=1 -run '^$' ./cmd/cacheservice/e2e/
+          wait $!
+      # Starts MinIO, builds the run's engine image on STOCK_ENGINE (GC off,
+      # the mirror), and runs TestRealEngines in cmd/cacheservice/e2e: the
+      # service in-process, engines in Docker. See hack/remote-cache/README.md,
+      # "Real engines".
       - name: Real engines
         env:
           E2E_DIR: ${{ runner.temp }}/e2e
+          E2E_ENGINE_IMAGE: ${{ env.STOCK_ENGINE }}
         run: ./hack/remote-cache/dev.sh e2e
       # Each run's service logs, CLI output, index and importer state, and
       # the engines' logs when it failed.
@@ -153,14 +199,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: e2e-runs
+          name: e2e-runs-${{ matrix.go-cache }}
           path: ${{ runner.temp }}/e2e/runs
           if-no-files-found: ignore
       - name: Stop MinIO
         if: always()
         run: ./hack/remote-cache/dev.sh reset
       - name: Save Go cache
-        if: github.event_name == 'push' && !cancelled()
+        if: matrix.go-cache == 'small' && steps.go-cache.outputs.cache-hit != 'true' && !cancelled()
         uses: actions/cache/save@v5
         with:
           path: |
@@ -180,18 +226,6 @@ jobs:
     name: sidecar demo
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      # The release's multi-platform index, pinned by digest; update the tag
-      # and the digest together, and STOCK_ENGINE_TAG with them.
-      #
-      # Temporary: this pairs the branch's service (internal/version/VERSION,
-      # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
-      # combination the lockstep policy doesn't support (a vX service serves
-      # only vX engines). It holds until zerobull-consulting/dagger#117, which
-      # repins this to the service's own release and adds a development
-      # override for branches that track main.
-      STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
-      STOCK_ENGINE_TAG: v1.0.0-beta.25
     steps:
       - name: Checkout
         uses: actions/checkout@v5

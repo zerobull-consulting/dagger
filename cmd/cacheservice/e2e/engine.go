@@ -28,8 +28,8 @@ func Docker(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// Engine is an engine built from this repo, in a container with its own,
-// initially empty, cache volume, connected to one service.
+// Engine is an engine of the run's image (Settings.Image), in a container
+// with its own, initially empty, cache volume, connected to one service.
 type Engine struct {
 	Name      string
 	Container string
@@ -115,6 +115,8 @@ func (en *Engine) waitConn(after uint64) {
 		for _, info := range en.Service.Engines() {
 			if info.Conn > after && info.EngineName == en.Hostname() {
 				en.Conn = info.Conn
+				// The version its hello reported: which engine the run tests.
+				en.env.T.Logf("engine %s connected to %s: engine version %q", en.Name, en.Service.Name, info.EngineVersion)
 				return true, nil
 			}
 		}
@@ -233,7 +235,7 @@ func (en *Engine) CLI(svc *Service, out, stdin string, args ...string) ([]byte, 
 	var stdout, stderr bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, filepath.Join(en.env.bin, "dagger"), append([]string{"--progress=plain"}, args...)...)
+	cmd := exec.CommandContext(ctx, en.env.cli, append([]string{"--progress=plain"}, args...)...)
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
