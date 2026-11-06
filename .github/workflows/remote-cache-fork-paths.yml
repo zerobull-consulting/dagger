@@ -1,0 +1,46 @@
+name: Remote cache fork paths
+# Fails if the fork changes a path, relative to the upstream commit it last
+# merged, that hack/remote-cache/fork-paths.txt doesn't allow
+# (zerobull-consulting/dagger#117, D7). See hack/remote-cache/README.md,
+# "The fork's paths".
+"on":
+  pull_request:
+    branches:
+      - feature/remote-cache
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  fork-paths:
+    name: fork paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Shallow: the check fetches upstream and deepens both histories, in
+      # bounded steps, until it finds the merge base.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 200
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test the check
+        timeout-minutes: 5
+        run: hack/remote-cache/check-fork-paths_test.sh
+      - name: Check the fork's paths
+        timeout-minutes: 10
+        run: hack/remote-cache/check-fork-paths.sh
