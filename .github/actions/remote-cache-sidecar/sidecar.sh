@@ -137,7 +137,32 @@ running() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/
 
 # Whether docker says a container has stopped. Unlike ! running, a docker
 # that fails or doesn't answer says nothing: a wait on it goes on.
-exited() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == false ]]; }
+# A second argument bounds the inspect, in seconds (default 30).
+exited() { [[ "$(timeout "${2:-30}" docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == false ]]; }
+
+# A container's state, as docker gives it: running, stopped, or unknown when
+# docker fails or doesn't answer three times in a row.
+container_state() {
+	local tries v
+	for tries in 1 2 3; do
+		v="$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)"
+		case "$v" in
+		true) echo running && return ;;
+		false) echo stopped && return ;;
+		esac
+		((tries < 3)) && sleep 1
+	done
+	echo unknown
+}
+
+# The bound for one docker call in a wait that ends at the time $1 (in
+# SECONDS): at most 10s, and no more than what is left of the wait (at least 1).
+step_bound() {
+	local left=$(($1 - SECONDS))
+	((left > 10)) && left=10
+	((left < 1)) && left=1
+	echo "$left"
+}
 
 # Whether this sidecar's start created a resource (service, engine, volume,
 # network), from the state it read.
@@ -150,8 +175,8 @@ created() { [[ "$st_created" == *" $1 "* ]]; }
 wait_drained() {
 	local container="$1" since="$2" end=$((SECONDS + $3)) log
 	while ((SECONDS < end)); do
-		exited "$container" && return 0
-		log="$(timeout 10 docker logs --since "$since" "$container" 2>&1 || true)"
+		exited "$container" "$(step_bound "$end")" && return 0
+		log="$(timeout "$(step_bound "$end")" docker logs --since "$since" "$container" 2>&1 || true)"
 		grep -q 'msg="drain: done"' <<<"$log" && return 0
 		sleep 0.5
 	done
@@ -164,10 +189,10 @@ wait_drained() {
 wait_exited() {
 	local container="$1" end=$((SECONDS + ($2 > 1 ? $2 : 1)))
 	while ((SECONDS < end)); do
-		exited "$container" && return 0
+		exited "$container" "$(step_bound "$end")" && return 0
 		sleep 0.5
 	done
-	exited "$container"
+	exited "$container" 1
 }
 
 # Whether a container's log has a line matching a pattern. The log is read
@@ -474,7 +499,12 @@ stop() {
 	# they found.
 	local was_running=false code="" still_running=false overran=false engine_code=""
 	local deadline=$((SECONDS + st_stop_seconds))
-	if created service && running "$st_service"; then
+	# A docker that fails here says nothing about the service: it is taken
+	# for running, so the engine still waits for the drain.
+	local service_state=""
+	created service && service_state="$(container_state "$st_service")"
+	[[ "$service_state" == unknown ]] && echo "remote-cache-sidecar: docker didn't say whether the service is running; stopping it as if it is" >&2
+	if [[ "$service_state" == running || "$service_state" == unknown ]]; then
 		was_running=true
 		local since
 		since="$(($(date +%s) - 1))"

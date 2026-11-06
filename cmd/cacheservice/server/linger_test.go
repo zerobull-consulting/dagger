@@ -30,6 +30,13 @@ import (
 // token, as the engine's event export does, and returns the status.
 func postEngineEvent(t *testing.T, srv *httptest.Server, token, cacheID, kind, body string) int {
 	t.Helper()
+	return postEngineEventGen(t, srv, token, cacheID+"/1", kind, body)
+}
+
+// postEngineEventGen is postEngineEvent with the whole cache attribute,
+// "<cacheID>/<generation>".
+func postEngineEventGen(t *testing.T, srv *httptest.Server, token, cache, kind, body string) int {
+	t.Helper()
 	req := &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
 		ScopeLogs: []*logspb.ScopeLogs{{
 			Scope: &commonpb.InstrumentationScope{Name: telemetryattrs.EngineEventScope},
@@ -37,7 +44,7 @@ func postEngineEvent(t *testing.T, srv *httptest.Server, token, cacheID, kind, b
 				Body: strValue(body),
 				Attributes: []*commonpb.KeyValue{
 					kv(telemetryattrs.EngineEventAttr, kind),
-					kv(telemetryattrs.EngineCacheAttr, cacheID+"/1"),
+					kv(telemetryattrs.EngineCacheAttr, cache),
 				},
 			}},
 		}},
@@ -291,10 +298,10 @@ func TestLingerEventCachesBounded(t *testing.T) {
 	// cache-0, the oldest, has a live connection.
 	n.own(id(0), tokenKey{})
 	for i := range maxEventCaches {
-		n.sawEvent(id(i), false, false)
+		n.sawEvent(id(i), 1, false, false)
 		now = now.Add(time.Second)
 	}
-	n.sawEvent(id(maxEventCaches), false, false)
+	n.sawEvent(id(maxEventCaches), 1, false, false)
 	if got := len(n.eventCaches); got != maxEventCaches {
 		t.Fatalf("%d caches remembered, want %d", got, maxEventCaches)
 	}
@@ -308,12 +315,12 @@ func TestLingerEventCachesBounded(t *testing.T) {
 		t.Fatal("the cache heard from least recently, with no live connection, is still remembered")
 	}
 	// While draining, the caches a linger may wait for stay.
-	n.sawEvent("cache-new", false, true)
+	n.sawEvent("cache-new", 1, false, true)
 	if seen, _ := n.eventState("cache-new"); seen {
 		t.Fatal("a cache was replaced while draining")
 	}
 	// One already remembered is still marked stopped.
-	n.sawEvent(id(2), true, true)
+	n.sawEvent(id(2), 1, true, true)
 	if _, stopped := n.eventState(id(2)); !stopped {
 		t.Fatal("a remembered cache's engine.stop wasn't recorded")
 	}
@@ -341,5 +348,24 @@ func TestLingerWaitsForAnEngineThatLeftDuringTheDrain(t *testing.T) {
 	l.event("cache-a", telemetryattrs.EngineEventStop)
 	if rep := l.ended(2 * time.Second); rep.Outcome != LingerStopped || len(rep.Caches) != 1 {
 		t.Fatalf("report %+v, want cache-a stopped", rep)
+	}
+}
+
+// An engine.stop of an earlier generation of the same cache, delivered late,
+// isn't the connected engine's: only the stop of the generation its
+// connection said hello with ends the linger.
+func TestLingerEngineStopOfAnotherGeneration(t *testing.T) {
+	l := newLingerTest(t)
+	welcomedRaw(t, l.srv, "cache-a") // generation 1
+	waitEngines(t, l.svc, 1)
+	l.event("cache-a", telemetryattrs.EngineEventStart)
+	l.linger(time.Minute)
+	if code := postEngineEventGen(t, l.srv, "engine-token", "cache-a/0", telemetryattrs.EngineEventStop, `{"clean":true}`); code != http.StatusOK {
+		t.Fatalf("engine.stop of generation 0: %d", code)
+	}
+	l.still(300*time.Millisecond, "after an engine.stop of another generation")
+	l.event("cache-a", telemetryattrs.EngineEventStop)
+	if rep := l.ended(2 * time.Second); rep.Outcome != LingerStopped {
+		t.Fatalf("outcome %q, want %q", rep.Outcome, LingerStopped)
 	}
 }

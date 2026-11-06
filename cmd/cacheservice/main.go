@@ -181,7 +181,7 @@ func main() {
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
 	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once, with no drain and no linger); -drain-linger and a shutdown of at most 5s follow, so the process manager's stop timeout must be longer than this plus -drain-linger plus 5s")
-	flag.DurationVar(&drainLinger, "drain-linger", DefaultDrainLinger, "after the drain, at most how long to keep answering the engines' OTLP requests, storing nothing, so that each connected engine whose events come here can deliver its engine.stop when it is stopped next; it ends once they all did, or at a second signal (0: stop right after the drain)")
+	flag.DurationVar(&drainLinger, "drain-linger", DefaultDrainLinger, "after the drain, at most how long to keep answering the engines' OTLP requests, storing nothing, so that each engine connected when the drain started whose events come here can deliver its engine.stop when it is stopped next; it ends once they all did, or at a second signal (0: stop right after the drain)")
 	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 

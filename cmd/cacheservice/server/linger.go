@@ -134,10 +134,13 @@ func (s *Service) Linger(ctx context.Context) LingerReport {
 	}
 }
 
-// lingerWait is an engine cache a linger waits for.
+// lingerWait is an engine cache a linger waits for, at the generation its
+// connection said hello with: an engine.stop of an earlier generation of the
+// same cache, delivered late, isn't this engine's.
 type lingerWait struct {
-	ns      *namespace
-	cacheID string
+	ns         *namespace
+	cacheID    string
+	generation uint64
 }
 
 // lingerWaits are the engine caches a linger waits for: those with a
@@ -167,7 +170,7 @@ func (s *Service) lingerWaits() []lingerWait {
 func lingerReportCaches(waits []lingerWait) []LingerCache {
 	out := make([]LingerCache, 0, len(waits))
 	for _, w := range waits {
-		_, stopped := w.ns.eventState(w.cacheID)
+		stopped := w.ns.stoppedWhileDraining(w.cacheID, w.generation)
 		out = append(out, LingerCache{Namespace: w.ns.name, CacheID: w.cacheID, Stopped: stopped})
 	}
 	return out
@@ -208,7 +211,7 @@ func (s *Service) endLinger(start time.Time, outcome string, caches []LingerCach
 // event is taken only from its cache's owner (ownerAccepts), as trackEvent
 // takes it.
 func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache string) {
-	cacheID, _, ok := parseEngineCache(cache)
+	cacheID, generation, ok := parseEngineCache(cache)
 	if !ok || len(cacheID) > maxEventCacheID {
 		return
 	}
@@ -216,7 +219,7 @@ func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache strin
 		return
 	}
 	draining := s.draining.Load()
-	ns.sawEvent(cacheID, kind == telemetryattrs.EngineEventStop && draining, draining)
+	ns.sawEvent(cacheID, generation, kind == telemetryattrs.EngineEventStop && draining, draining)
 }
 
 // eventCache is what a namespace remembers of an engine cache whose events
@@ -224,23 +227,30 @@ func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache strin
 type eventCache struct {
 	// last is when its latest event arrived.
 	last time.Time
-	// stopped is set once its engine.stop arrived while draining.
-	stopped bool
+	// stopped are the generations whose engine.stop arrived while
+	// draining, at most maxStoppedGenerations of them.
+	stopped []uint64
 }
 
+// maxStoppedGenerations bounds the generations an eventCache remembers
+// stopping: a token can send engine.stop for any generation.
+const maxStoppedGenerations = 8
+
 // sawEvent records that an engine event about cacheID arrived, and with
-// stop, that it was engine.stop, while draining. It remembers at most
+// stop, that it was engine.stop of generation, while draining. It remembers at most
 // maxEventCaches caches: past that, a new cache replaces the one heard from
 // least recently that has no live connection, unless draining is set, when
 // the caches a linger may wait for must stay, and the new one isn't
 // remembered.
-func (n *namespace) sawEvent(cacheID string, stop, draining bool) {
+func (n *namespace) sawEvent(cacheID string, generation uint64, stop, draining bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	now := n.now()
 	if c := n.eventCaches[cacheID]; c != nil {
 		c.last = now
-		c.stopped = c.stopped || stop
+		if stop {
+			c.stop(generation)
+		}
 		return
 	}
 	if len(n.eventCaches) >= maxEventCaches {
@@ -251,7 +261,28 @@ func (n *namespace) sawEvent(cacheID string, stop, draining bool) {
 	if n.eventCaches == nil {
 		n.eventCaches = map[string]*eventCache{}
 	}
-	n.eventCaches[cacheID] = &eventCache{last: now, stopped: stop}
+	c := &eventCache{last: now}
+	if stop {
+		c.stop(generation)
+	}
+	n.eventCaches[cacheID] = c
+}
+
+// stop records generation's engine.stop.
+func (c *eventCache) stop(generation uint64) {
+	if slices.Contains(c.stopped, generation) || len(c.stopped) >= maxStoppedGenerations {
+		return
+	}
+	c.stopped = append(c.stopped, generation)
+}
+
+// stoppedWhileDraining reports whether engine.stop of cacheID's generation
+// arrived while draining.
+func (n *namespace) stoppedWhileDraining(cacheID string, generation uint64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	c := n.eventCaches[cacheID]
+	return c != nil && slices.Contains(c.stopped, generation)
 }
 
 // evictEventCacheLocked forgets the remembered cache heard from least
@@ -277,7 +308,8 @@ func (n *namespace) evictEventCacheLocked() bool {
 }
 
 // eventState reports whether an engine event about cacheID arrived (seen),
-// and whether its engine.stop did while draining (stopped).
+// and whether an engine.stop of any of its generations did while draining
+// (stopped).
 func (n *namespace) eventState(cacheID string) (seen, stopped bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -285,5 +317,5 @@ func (n *namespace) eventState(cacheID string) (seen, stopped bool) {
 	if c == nil {
 		return false, false
 	}
-	return true, c.stopped
+	return true, len(c.stopped) > 0
 }

@@ -152,7 +152,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	s.drain.engines = len(s.conns)
 	s.drain.conns = make([]lingerWait, 0, len(s.conns))
 	for _, c := range s.conns {
-		s.drain.conns = append(s.drain.conns, lingerWait{ns: c.ns, cacheID: c.hello.CacheID})
+		s.drain.conns = append(s.drain.conns, lingerWait{ns: c.ns, cacheID: c.hello.CacheID, generation: c.hello.Generation})
 	}
 	s.mu.Unlock()
 	s.drain.mu.Unlock()

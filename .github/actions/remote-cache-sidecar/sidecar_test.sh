@@ -38,6 +38,9 @@ check "namespace default" valid_namespace default
 check "namespace with '..' is refused" not valid_namespace "a..b"
 check "image by tag and digest" valid_image "ghcr.io/o/i:t@sha256:0123"
 check "an image starting with '-' is refused" not valid_image "--privileged"
+check "a docker call in a wait is bounded by what is left of it" [ "$(step_bound $((SECONDS + 3)))" -le 3 ]
+check "... at most 10s" [ "$(step_bound $((SECONDS + 600)))" = 10 ]
+check "... and at least 1s, past its end" [ "$(step_bound $((SECONDS - 5)))" = 1 ]
 check "10m is 600s" [ "$(duration_seconds 10m)" = 600 ]
 check "1h30m is 5400s" [ "$(duration_seconds 1h30m)" = 5400 ]
 check "1.5h is refused" not duration_seconds 1.5h
@@ -79,7 +82,8 @@ check "start refuses a missing secret key" start_refuses CACHESERVICE_S3_SECRET_
 #   FAKE_ENGINE   stops, or hangs: docker stop fails, and it keeps running
 #   FAKE_EXIT     the service's exit code
 #   FAKE_FLAKY    true: after the SIGTERM, docker inspect of the service
-#                 fails its first 3 times
+#                 fails its first 3 times; early: its first 3 inspects fail,
+#                 before the SIGTERM
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
@@ -89,7 +93,7 @@ case "$1 $2" in
 "inspect -f")
 	f="$eng"
 	[[ "$4" == *-service ]] && f="$svc"
-	if [[ "$FAKE_FLAKY" == true && "$4" == *-service && -f "$FAKE_DIR/signaled" ]]; then
+	if [[ "$4" == *-service && ("$FAKE_FLAKY" == early || ("$FAKE_FLAKY" == true && -f "$FAKE_DIR/signaled")) ]]; then
 		fails=$(($(cat "$FAKE_DIR/fails" 2>/dev/null || echo 0) + 1))
 		echo "$fails" >"$FAKE_DIR/fails"
 		((fails <= 3)) && exit 1
@@ -203,6 +207,9 @@ check "... and cleans up" cleaned_up
 
 check "a docker inspect that fails during the drain isn't taken for the service's exit" stop_with 0 FAKE_FLAKY=true
 check "... the engine is still stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+check "a docker inspect that fails before the stop: the service is still signaled, and the stop passes" stop_with 0 FAKE_FLAKY=early
+check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
 
 check "a state from a start before the linger: the stop passes" stop_with 0 old-state
 check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"
