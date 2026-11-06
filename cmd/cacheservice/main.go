@@ -64,12 +64,20 @@
 //     waiting out their quiet period, and waits for those exports and their
 //     uploads, up to -drain-timeout (30s; 0: no drain). The engines stay
 //     connected meanwhile, since exports run over them: stop the service
-//     before its engines. The drain starts no export past its deadline. A
-//     shutdown follows, bounded at 5s: it closes the engine connections
-//     (within 2s), shuts the HTTP servers down and waits for what is still
-//     running. So the whole stop takes at most -drain-timeout plus 5s: give
-//     the process manager a stop timeout longer than that. A second signal
-//     ends the drain at once; a signal during the shutdown exits at once.
+//     before its engines. The drain starts no export past its deadline.
+//     A linger follows, of at most -drain-linger (15s; 0: none): what the
+//     drain started is cut off, nothing new starts and nothing is stored,
+//     but the engine address still answers the engines' OTLP requests, so
+//     an engine stopped after the drain delivers its last cache event,
+//     engine.stop, and stops at once. It ends once each connected engine
+//     whose events come here sent engine.stop (at once when there is
+//     none). A shutdown follows, bounded at 5s: it closes the engine
+//     connections (within 2s), shuts the HTTP servers down and waits for
+//     what is still running. So the whole stop takes at most -drain-timeout
+//     plus -drain-linger plus 5s: give the process manager a stop timeout
+//     longer than that. A second signal ends the drain, or the linger, at
+//     once, and skips the linger; a signal during the shutdown exits at
+//     once.
 //     The process exits 0 only when everything ended within the bound, and
 //     1 when a signal or the bound cut the shutdown off, logging what was
 //     still running. GET /debug/drain shows the drain. See README.md,
@@ -148,6 +156,7 @@ func main() {
 		gcStagingAge  time.Duration
 		gcMaxDeletes  int
 		drainTimeout  time.Duration
+		drainLinger   time.Duration
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
 	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the debug API (empty: off); a non-loopback address needs -debug-token-file")
@@ -171,7 +180,8 @@ func main() {
 	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
-	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once); a shutdown of at most 5s follows, so the process manager's stop timeout must be longer than this plus 5s")
+	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once, with no drain and no linger); -drain-linger and a shutdown of at most 5s follow, so the process manager's stop timeout must be longer than this plus -drain-linger plus 5s")
+	flag.DurationVar(&drainLinger, "drain-linger", DefaultDrainLinger, "after the drain, at most how long to keep answering the engines' OTLP requests, storing nothing, so that each connected engine whose events come here can deliver its engine.stop when it is stopped next; it ends once they all did, or at a second signal (0: stop right after the drain)")
 	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
@@ -190,6 +200,10 @@ func main() {
 
 	if drainTimeout < 0 {
 		logger.Error("-drain-timeout must not be negative (0: no drain)")
+		os.Exit(2)
+	}
+	if drainLinger < 0 {
+		logger.Error("-drain-linger must not be negative (0: no linger)")
 		os.Exit(2)
 	}
 
@@ -349,9 +363,13 @@ func main() {
 	code := 0
 	select {
 	case sig := <-sigs:
-		logger.Info("stopping", "signal", sig.String(), "drainTimeout", drainTimeout, "shutdownGrace", shutdownGrace)
-		if drainTimeout > 0 {
-			drain(svc, logger, sigs, drainTimeout)
+		logger.Info("stopping", "signal", sig.String(), "drainTimeout", drainTimeout, "drainLinger", drainLinger, "shutdownGrace", shutdownGrace)
+		// The linger follows a drain that no second signal ended: the
+		// paths' context ends first, so nothing the drain started can
+		// store anything from then on, and nothing new starts.
+		if drainTimeout > 0 && drain(svc, logger, sigs, drainTimeout) && drainLinger > 0 {
+			stop()
+			linger(svc, logger, sigs, drainLinger)
 		}
 	case err := <-errs:
 		logger.Error("serve", "error", err)
@@ -383,11 +401,11 @@ func exitCode(clean bool, errs <-chan error, logger *slog.Logger) int {
 	return 1
 }
 
-// shutdownGrace bounds the shutdown that follows the drain, or the first
-// signal with -drain-timeout 0: closing the engine connections, shutting
-// the HTTP servers down and waiting for the service's paths. The stop as a
-// whole takes at most -drain-timeout plus this, which the process manager's
-// stop timeout must be longer than.
+// shutdownGrace bounds the shutdown that follows the drain and its linger,
+// or the first signal with -drain-timeout 0: closing the engine connections,
+// shutting the HTTP servers down and waiting for the service's paths. The
+// stop as a whole takes at most -drain-timeout plus -drain-linger plus this,
+// which the process manager's stop timeout must be longer than.
 const shutdownGrace = 5 * time.Second
 
 // stopTestHoldEnv, set to 1 in a binary built with the cacheservice_testhooks
@@ -476,12 +494,21 @@ func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.C
 // DefaultDrainTimeout is -drain-timeout's default.
 const DefaultDrainTimeout = 30 * time.Second
 
+// DefaultDrainLinger is -drain-linger's default. An engine sends engine.stop
+// a fraction of a second into its own stop (measured: 0.3s after SIGTERM, on
+// an engine that had just run a build), once its cache closed; the linger
+// ends as soon as every engine it waits for did. The bound only matters for
+// an engine that isn't stopped, or whose stop stalls, and leaves room for an
+// engine with sessions to remove and a larger cache to close.
+const DefaultDrainLinger = 15 * time.Second
+
 // drain runs svc's drain for at most timeout, while the servers still serve:
 // the engines stay connected, and the spans of the sessions it tracks still
 // arrive. A second signal cancels it: it returns once the drain did, which
-// is at once. Only this goroutine reads sigs meanwhile, so a further signal
-// stays queued for the shutdown that follows, which exits on it.
-func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) {
+// is at once, and reports false. Only this goroutine reads sigs meanwhile,
+// so a further signal stays queued for the shutdown that follows, which
+// exits on it.
+func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	done := make(chan struct{})
@@ -491,9 +518,32 @@ func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, time
 	}()
 	select {
 	case <-done:
-		return
+		return true
 	case sig := <-sigs:
 		logger.Warn("second signal: stopping without finishing the drain", "signal", sig.String())
+		cancel()
+	}
+	<-done
+	return false
+}
+
+// linger runs svc's linger for at most timeout, after its drain: the
+// servers still serve, so an engine stopped now delivers its engine.stop. A
+// second signal ends it at once; as in drain, a further one stays queued for
+// the shutdown.
+func linger(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.Linger(ctx)
+	}()
+	select {
+	case <-done:
+		return
+	case sig := <-sigs:
+		logger.Warn("second signal: stopping without finishing the linger", "signal", sig.String())
 		cancel()
 	}
 	<-done

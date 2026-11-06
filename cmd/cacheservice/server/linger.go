@@ -1,0 +1,243 @@
+package server
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"slices"
+	"time"
+
+	"github.com/dagger/dagger/engine/telemetryattrs"
+)
+
+// Linger outcomes.
+const (
+	// LingerStopped: every engine the linger waited for sent engine.stop.
+	LingerStopped = "stopped"
+	// LingerNothing: no connected engine's events come here, so there was
+	// nothing to wait for.
+	LingerNothing = "nothing"
+	// LingerDeadline: it ended at its bound (-drain-linger).
+	LingerDeadline = "deadline"
+	// LingerCanceled: its context was canceled (a second signal).
+	LingerCanceled = "canceled"
+)
+
+// maxLingerPoll bounds how often Linger checks for the engine.stop events it
+// waits for.
+const maxLingerPoll = 100 * time.Millisecond
+
+// maxEventCaches bounds the engine caches a namespace remembers sending
+// engine events here (namespace.eventCaches): any token of a namespace can
+// name any cache ID in an event. A cache past the bound isn't remembered, and
+// a linger doesn't wait for it.
+const maxEventCaches = 4096
+
+// maxEventCacheID bounds the cache IDs remembered; an engine's is a UUID.
+const maxEventCacheID = 128
+
+// LingerCache is one engine cache a linger waits for.
+type LingerCache struct {
+	Namespace string `json:"namespace"`
+	CacheID   string `json:"cacheID"`
+	// Stopped is whether its engine.stop arrived.
+	Stopped bool `json:"stopped"`
+}
+
+// LingerReport is what a linger did.
+type LingerReport struct {
+	// Outcome is LingerStopped, LingerNothing, LingerDeadline or
+	// LingerCanceled; empty while the linger runs.
+	Outcome string        `json:"outcome,omitempty"`
+	Took    time.Duration `json:"took"`
+	// Caches are the engine caches it waited for, and whether each one's
+	// engine.stop arrived.
+	Caches []LingerCache `json:"caches"`
+}
+
+// stopped is how many of the caches sent engine.stop.
+func (r LingerReport) stopped() int {
+	n := 0
+	for _, c := range r.Caches {
+		if c.Stopped {
+			n++
+		}
+	}
+	return n
+}
+
+// Linger runs after a drain, before the stop that follows: the service keeps
+// answering the engines' OTLP requests on its engine address, starting no
+// new work and storing nothing, so an engine stopped after the drain can
+// deliver its last cache event, engine.stop, and finish its own stop at once
+// rather than retry against a closed port until its event export's bound
+// (30s) runs out. See README.md, "Stopping and draining".
+//
+// It waits for engine.stop from each engine cache with a welcomed connection
+// when it starts whose engine events reach this service (an event about it
+// arrived here). An engine closes its connection in the first phase of its
+// own stop, before it sends engine.stop, so a disconnect ends nothing: the
+// linger ends once every such cache's engine.stop arrived, or ctx ends,
+// whose deadline is its bound, or which a second signal cancels. With no
+// such cache, it returns at once. engine.stop is logged and handled as any
+// other engine event: nothing is deleted on it.
+//
+// Call it once, after Drain returned and once the context the export, import
+// and GC paths run on has ended: what the drain started is then cut off, and
+// publishes nothing, and nothing new starts. New engine connections are still
+// refused (Drain's), and the connected ones stay connected until CloseEngines.
+func (s *Service) Linger(ctx context.Context) LingerReport {
+	start := time.Now()
+	deadline, _ := ctx.Deadline()
+	if !s.draining.Load() {
+		// Only after a drain: before it, new work would still be taken.
+		return LingerReport{Outcome: LingerNothing}
+	}
+	waits := s.lingerWaits()
+	caches := lingerReportCaches(waits)
+	s.drain.mu.Lock()
+	s.drain.linger = &LingerReport{Caches: caches}
+	s.drain.mu.Unlock()
+	if len(waits) == 0 {
+		s.logger.Info("linger: nothing to wait for: no connected engine sends its events here")
+		return s.endLinger(start, LingerNothing, caches)
+	}
+	attrs := []any{"engines", len(waits)}
+	if !deadline.IsZero() {
+		attrs = append(attrs, "bound", time.Until(deadline).Round(time.Millisecond))
+	}
+	s.logger.Info("linger: started: answering the engines' events until each sends engine.stop", attrs...)
+	for _, w := range waits {
+		s.logger.Info("linger: waiting for engine.stop", "namespace", w.ns.name, "cacheID", w.cacheID)
+	}
+
+	t := time.NewTicker(maxLingerPoll)
+	defer t.Stop()
+	for {
+		caches = lingerReportCaches(waits)
+		s.drain.mu.Lock()
+		s.drain.linger.Caches = caches
+		s.drain.mu.Unlock()
+		if lingerDone(caches) {
+			return s.endLinger(start, LingerStopped, caches)
+		}
+		select {
+		case <-ctx.Done():
+			outcome := LingerCanceled
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				outcome = LingerDeadline
+			}
+			return s.endLinger(start, outcome, lingerReportCaches(waits))
+		case <-t.C:
+		}
+	}
+}
+
+// lingerWait is an engine cache a linger waits for.
+type lingerWait struct {
+	ns      *namespace
+	cacheID string
+}
+
+// lingerWaits are the engine caches a linger waits for: those with a
+// welcomed connection whose engine events reach this service.
+func (s *Service) lingerWaits() []lingerWait {
+	s.mu.Lock()
+	conns := make([]*engineConn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	var out []lingerWait
+	for _, c := range conns {
+		w := lingerWait{ns: c.ns, cacheID: c.hello.CacheID}
+		if seen, _ := w.ns.eventState(w.cacheID); seen && !slices.Contains(out, w) {
+			out = append(out, w)
+		}
+	}
+	slices.SortFunc(out, func(a, b lingerWait) int {
+		return cmp.Or(cmp.Compare(a.ns.name, b.ns.name), cmp.Compare(a.cacheID, b.cacheID))
+	})
+	return out
+}
+
+// lingerReportCaches is where each of waits is: whether its engine.stop
+// arrived.
+func lingerReportCaches(waits []lingerWait) []LingerCache {
+	out := make([]LingerCache, 0, len(waits))
+	for _, w := range waits {
+		_, stopped := w.ns.eventState(w.cacheID)
+		out = append(out, LingerCache{Namespace: w.ns.name, CacheID: w.cacheID, Stopped: stopped})
+	}
+	return out
+}
+
+func lingerDone(caches []LingerCache) bool {
+	for _, c := range caches {
+		if !c.Stopped {
+			return false
+		}
+	}
+	return true
+}
+
+// endLinger logs a linger's end, and returns its report.
+func (s *Service) endLinger(start time.Time, outcome string, caches []LingerCache) LingerReport {
+	rep := LingerReport{Outcome: outcome, Took: time.Since(start), Caches: caches}
+	s.drain.mu.Lock()
+	s.drain.linger = &rep
+	s.drain.mu.Unlock()
+	level := s.logger.Info
+	if outcome == LingerDeadline || outcome == LingerCanceled {
+		level = s.logger.Warn
+		for _, c := range caches {
+			if !c.Stopped {
+				s.logger.Warn("linger: no engine.stop", "namespace", c.Namespace, "cacheID", c.CacheID)
+			}
+		}
+	}
+	level("linger: done", "outcome", outcome, "took", rep.Took.Round(time.Millisecond),
+		"engines", len(caches), "stopped", rep.stopped())
+	return rep
+}
+
+// noteEngineEvent remembers that an engine event about cache arrived from
+// token key, for a linger: that the cache's events reach this service, and,
+// for engine.stop while draining, that its engine stopped. With tokens, an
+// event is taken only from its cache's owner (ownerAccepts), as trackEvent
+// takes it.
+func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache string) {
+	cacheID, _, ok := parseEngineCache(cache)
+	if !ok || len(cacheID) > maxEventCacheID {
+		return
+	}
+	if s.authenticated() && !ns.ownerAccepts(cacheID, key) {
+		return
+	}
+	ns.sawEvent(cacheID, kind == telemetryattrs.EngineEventStop && s.draining.Load())
+}
+
+// sawEvent records that an engine event about cacheID arrived, and with
+// stop, that it was engine.stop, while draining. It remembers at most
+// maxEventCaches caches.
+func (n *namespace) sawEvent(cacheID string, stop bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	stopped, ok := n.eventCaches[cacheID]
+	if !ok && len(n.eventCaches) >= maxEventCaches {
+		return
+	}
+	if n.eventCaches == nil {
+		n.eventCaches = map[string]bool{}
+	}
+	n.eventCaches[cacheID] = stopped || stop
+}
+
+// eventState reports whether an engine event about cacheID arrived (seen),
+// and whether its engine.stop did while draining (stopped).
+func (n *namespace) eventState(cacheID string) (seen, stopped bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	stopped, seen = n.eventCaches[cacheID]
+	return seen, stopped
+}

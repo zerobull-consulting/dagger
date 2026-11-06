@@ -1,8 +1,9 @@
 name: "Remote cache sidecar: stop"
 description: >-
   Stops what remote-cache-sidecar started: the service first, which drains
-  its exports, then the engine. Run it with if: always(), and a
-  timeout-minutes above the drain timeout plus 5s.
+  its exports, then, once the drain is done, the engine, then it waits for
+  the service to exit. Run it with if: always(), and a timeout-minutes above
+  the drain timeout plus 25s, with room for the engine's stop (up to 30s).
 
 inputs:
   name:

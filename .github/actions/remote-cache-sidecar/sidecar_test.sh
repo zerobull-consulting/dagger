@@ -67,46 +67,132 @@ check "start refuses role 'admin'" start_refuses SIDECAR_ROLE=admin
 check "start refuses a missing secret key" start_refuses CACHESERVICE_S3_SECRET_ACCESS_KEY=
 
 # --- stop, against a fake docker ---
-# FAKE_RUNNING_AFTER_STOP: whether the service is still running after
-# docker stop. FAKE_EXIT: its exit code.
+# The service and the engine run while $FAKE_DIR/<service|engine>.running
+# exists. Every call is logged to $FAKE_DIR/calls, and the engine's stop
+# records whether the service's drain was done by then. Settings:
+#   FAKE_DRAIN    after: the service logs "drain: done" from the second
+#                 look at its log after the SIGTERM; never: it never does
+#   FAKE_SERVICE  after-engine: it exits once the engine stopped (its
+#                 engine.stop arrived); by-itself: 1s after the SIGTERM,
+#                 whatever the engine does (its linger's bound); stays:
+#                 only on docker stop
+#   FAKE_ENGINE   stops, or hangs: docker stop fails, and it keeps running
+#   FAKE_EXIT     the service's exit code
 mkdir -p "$tmp/bin"
-cat >"$tmp/bin/docker" <<'EOF'
+cat >"$tmp/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
-state="$FAKE_DIR/service.running"
+echo "$*" >>"$FAKE_DIR/calls"
+svc="$FAKE_DIR/service.running" eng="$FAKE_DIR/engine.running"
 case "$1 $2" in
 "inspect -f")
+	f="$eng"
+	[[ "$4" == *-service ]] && f="$svc"
 	case "$3" in
-	*Running*) [[ -f "$state" ]] && echo true || echo false ;;
-	*ExitCode*) [[ -f "$state" ]] && echo 0 || echo "$FAKE_EXIT" ;;
+	*Running*) [[ -f "$f" ]] && echo true || echo false ;;
+	*ExitCode*) [[ -f "$f" ]] && echo 0 || echo "$FAKE_EXIT" ;;
 	esac
 	;;
 "container inspect") exit 0 ;;
+"kill -s")
+	if [[ "$FAKE_SERVICE" == by-itself ]]; then
+		(sleep 1 && rm -f "$svc") >/dev/null 2>&1 &
+	fi
+	;;
+"logs --since")
+	looks=$(($(cat "$FAKE_DIR/looks" 2>/dev/null || echo 0) + 1))
+	echo "$looks" >"$FAKE_DIR/looks"
+	if [[ "$FAKE_DRAIN" == after && "$looks" -ge 2 ]]; then
+		: >"$FAKE_DIR/drained"
+		echo 'time=x level=INFO msg="drain: done" outcome=complete'
+	fi
+	;;
 "stop --time")
-	[[ "$4" == *-service && "$FAKE_RUNNING_AFTER_STOP" != true ]] && rm -f "$state"
+	case "$4" in
+	*-engine)
+		if [[ -f "$FAKE_DIR/drained" ]]; then
+			echo "ENGINE STOPPED AFTER THE DRAIN" >>"$FAKE_DIR/calls"
+		else
+			echo "ENGINE STOPPED BEFORE THE DRAIN" >>"$FAKE_DIR/calls"
+		fi
+		[[ "$FAKE_ENGINE" == hangs ]] && exit 1
+		rm -f "$eng"
+		[[ "$FAKE_SERVICE" == after-engine ]] && rm -f "$svc"
+		;;
+	*-service) rm -f "$svc" ;;
+	esac
 	exit 0
 	;;
 "logs "*) echo 'time=x level=INFO msg="drain: done" outcome=complete' ;;
 *) exit 0 ;;
 esac
-EOF
+FAKE
 chmod +x "$tmp/bin/docker"
+# stop_with <exit code> [FAKE_*=...]: a stop of a running sidecar whose
+# state says the service drains for at most 3s and lingers for at most 1s,
+# so the stop waits 3+5s for the drain and 3+1+10s in all. It leaves its
+# output in $tmp/stop.out, the calls in $tmp/fake/calls, and how long it
+# took, in seconds, in $tmp/stop.took.
 stop_with() {
+	local code="$1"
+	shift
+	rm -rf "$tmp/fake" "$tmp/sc"
+	local t=$SECONDS rc
 	(
 		export PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp/fake" SIDECAR_DIR="$tmp/sc" SIDECAR_NAME=t
-		export FAKE_RUNNING_AFTER_STOP="$1" FAKE_EXIT="$2"
+		export FAKE_DRAIN=after FAKE_SERVICE=after-engine FAKE_ENGINE=stops FAKE_EXIT="$code"
+		(($#)) && export "$@"
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
 		mkdir -p "$FAKE_DIR" "$SIDECAR_DIR/t/logs"
 		: >"$FAKE_DIR/service.running"
+		: >"$FAKE_DIR/engine.running"
 		printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-			stop_seconds=20 "logs=$SIDECAR_DIR/t/logs" role=writer \
+			stop_seconds=14 linger_seconds=1 "logs=$SIDECAR_DIR/t/logs" role=writer \
 			created=network created=service created=volume created=engine >"$SIDECAR_DIR/t/state"
 		stop
-	) >/dev/null 2>&1
+	) >"$tmp/stop.out" 2>&1
+	rc=$?
+	echo $((SECONDS - t)) >"$tmp/stop.took"
+	return $rc
 }
-check "a clean stop passes" stop_with false 0
-check "a stop that exits 1 fails" not stop_with false 1
-check "a stop that exits 137 fails" not stop_with false 137
-check "a service still running after docker stop fails the stop" not stop_with true 0
+calls() { cat "$tmp/fake/calls" 2>/dev/null; }
+called() { calls | grep -qxF -- "$1"; }
+# Whether there were calls matching each pattern, in this order.
+in_order() {
+	local prev=0 n pattern
+	for pattern in "$@"; do
+		n="$(calls | grep -n -F -- "$pattern" | cut -d: -f1 | awk -v p="$prev" '$1 > p { print; exit }')"
+		[[ -n "$n" ]] || return 1
+		prev="$n"
+	done
+}
+cleaned_up() { called "rm -f t-engine" && called "volume rm -f t-engine-state" && called "network rm t-net" && [[ ! -e "$tmp/sc/t/state" ]]; }
+took_at_most() { [[ "$(cat "$tmp/stop.took")" -le "$1" ]]; }
+
+check "a clean stop passes" stop_with 0
+check "... it signals the service, waits for its drain, stops the engine, then waits for the service" \
+	in_order "kill -s TERM t-service" "logs --since" "stop --time 30 t-engine" "inspect -f {{.State.Running}} t-service"
+check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+check "... the service gets no second signal" not called "stop --time 5 t-service"
+check "... in seconds" took_at_most 3
+check "... and keeps both logs" [ -f "$tmp/sc/t/logs/service.log" -a -f "$tmp/sc/t/logs/engine.log" ]
+check "a stop that exits 1 fails" not stop_with 1
+check "a stop that exits 137 fails" not stop_with 137
+
+check "a service that never reports its drain done: the stop still passes" stop_with 0 FAKE_DRAIN=never
+check "... it waits for the drain only up to its bound" took_at_most 10
+check "... then stops the engine" called "ENGINE STOPPED BEFORE THE DRAIN"
+check "... says so" grep -q "didn't report its drain done in time" "$tmp/stop.out"
+check "... and cleans up" cleaned_up
+
+check "a service that doesn't exit by the stop's bound fails the stop" not stop_with 0 FAKE_SERVICE=stays
+check "... after waiting for it only up to the bound" took_at_most 18
+check "... it was stopped" called "stop --time 5 t-service"
+check "... says why" grep -q "past its own bound" "$tmp/stop.out"
+check "... and cleans up" cleaned_up
+
+check "an engine that won't stop: the stop still passes once the service exits" stop_with 0 FAKE_ENGINE=hangs FAKE_SERVICE=by-itself
+check "... says so" grep -q "the engine was still running after docker stop" "$tmp/stop.out"
+check "... and removes the engine" cleaned_up
 
 # --- the stop removes only what the start created ---
 # A docker that logs every removal, and finds every container stopped.
@@ -126,7 +212,7 @@ removed_after_stop() {
 	local created="$1"
 	rm -rf "$tmp/rm" && mkdir -p "$tmp/rm/fake" "$tmp/rm/sc/t/logs"
 	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-		stop_seconds=20 "logs=$tmp/rm/sc/t/logs" role=writer $created >"$tmp/rm/sc/t/state"
+		stop_seconds=20 linger_seconds=15 "logs=$tmp/rm/sc/t/logs" role=writer $created >"$tmp/rm/sc/t/state"
 	(
 		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/rm/fake" SIDECAR_DIR="$tmp/rm/sc" SIDECAR_NAME=t
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
@@ -288,7 +374,7 @@ stop_secrets() {
 	echo x >"$tmp/st/sc/t/secrets/debug-token"
 	[[ "$2" == other ]] && echo y >"$tmp/st/sc/t/secrets/other"
 	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-		stop_seconds=20 "logs=$tmp/st/sc/t/logs" role=writer $created >"$tmp/st/sc/t/state"
+		stop_seconds=20 linger_seconds=15 "logs=$tmp/st/sc/t/logs" role=writer $created >"$tmp/st/sc/t/state"
 	(
 		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/st/fake" SIDECAR_DIR="$tmp/st/sc" SIDECAR_NAME=t
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY

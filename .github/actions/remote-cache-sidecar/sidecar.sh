@@ -4,9 +4,10 @@
 # the dagger CLI set up to use them. See README.md in this directory.
 #
 #   sidecar.sh start   start the service, then the engine; set up the CLI
-#   sidecar.sh stop    stop the service (it drains), then the engine; keep
-#                      their logs; remove the containers, the engine's state
-#                      and the network
+#   sidecar.sh stop    stop the service (it drains), then, once its drain
+#                      is done, the engine, then wait for the service to
+#                      exit; keep their logs; remove the containers, the
+#                      engine's state and the network
 #
 # The composite actions in this directory and in stop/ run it, and so does
 # hack/remote-cache/demo/run.sh, locally. Its settings are environment
@@ -87,6 +88,12 @@ duration_seconds() {
 	echo $((10#$h * 3600 + 10#$m * 60 + 10#$s))
 }
 
+# The service's -drain-linger, its default, which the action leaves as it
+# is: how long, after its drain, it keeps answering the engine's events, so
+# that the engine's stop delivers its last one (engine.stop) and ends in
+# seconds. It ends sooner, once that event arrived.
+linger_seconds=15
+
 # --- state, kept between start and stop ---
 
 sidecar_dir() {
@@ -112,6 +119,7 @@ read_state() {
 		volume) st_volume="$value" ;;
 		network) st_network="$value" ;;
 		stop_seconds) st_stop_seconds="$value" ;;
+		linger_seconds) st_linger_seconds="$value" ;;
 		logs) st_logs="$value" ;;
 		role) st_role="$value" ;;
 		# What this sidecar's start created, one line each as it did: the
@@ -120,7 +128,7 @@ read_state() {
 		esac
 	done <"$file"
 	valid_name "$st_service" && valid_name "$st_engine" && valid_name "$st_volume" &&
-		valid_name "$st_network" && [[ "$st_stop_seconds" =~ ^[0-9]+$ ]] ||
+		valid_name "$st_network" && [[ "$st_stop_seconds" =~ ^[0-9]+$ && "$st_linger_seconds" =~ ^[0-9]+$ ]] ||
 		die "the state file $file isn't one start wrote"
 }
 
@@ -129,6 +137,31 @@ running() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/
 # Whether this sidecar's start created a resource (service, engine, volume,
 # network), from the state it read.
 created() { [[ "$st_created" == *" $1 "* ]]; }
+
+# Waits until the service's log since a Unix time says its drain is done, or
+# the service is no longer running, for at most a number of seconds; returns
+# 1 when that bound passed first.
+wait_drained() {
+	local container="$1" since="$2" end=$((SECONDS + $3)) log
+	while ((SECONDS < end)); do
+		running "$container" || return 0
+		log="$(timeout 10 docker logs --since "$since" "$container" 2>&1 || true)"
+		grep -q 'msg="drain: done"' <<<"$log" && return 0
+		sleep 0.5
+	done
+	return 1
+}
+
+# Waits until a container is no longer running, for at most a number of
+# seconds (at least 1); returns 1 when that bound passed first.
+wait_exited() {
+	local container="$1" end=$((SECONDS + ($2 > 1 ? $2 : 1)))
+	while ((SECONDS < end)); do
+		running "$container" || return 0
+		sleep 0.5
+	done
+	! running "$container"
+}
 
 # Whether a container's log has a line matching a pattern. The log is read
 # whole first: grep -q stopping early would fail the pipeline (pipefail).
@@ -202,9 +235,9 @@ start() {
 	mkdir -p "$logs" "$bin"
 	local service="$name-service" engine="$name-engine" volume="$name-engine-state" network="$name-net"
 	# The stop's own bound: the service's whole stop takes at most the drain
-	# plus 5s (README, "Stopping and draining"); docker stop waits 5s more
-	# before it sends SIGKILL.
-	local stop_seconds=$((drain_seconds + 10))
+	# plus its linger plus 5s (README, "Stopping and draining"); the stop
+	# allows 5s more.
+	local stop_seconds=$((drain_seconds + linger_seconds + 10))
 	# Every name must be free before anything is written or created: the
 	# stop removes what the start created, and must never take a container,
 	# volume or network that was already there (such as a crashed job's on
@@ -217,7 +250,7 @@ start() {
 	[[ -z "$taken" ]] ||
 		die "already there, and not this sidecar's:$taken. Remove them (docker rm -f, docker volume rm, docker network rm), or give this sidecar another name"
 	printf '%s\n' "service=$service" "engine=$engine" "volume=$volume" "network=$network" \
-		"stop_seconds=$stop_seconds" "logs=$logs" "role=$role" >"$state"
+		"stop_seconds=$stop_seconds" "linger_seconds=$linger_seconds" "logs=$logs" "role=$role" >"$state"
 
 	# Pulled only when not here already: a job may have built them.
 	local image
@@ -415,20 +448,51 @@ stop() {
 	valid_name "$name" || die "name '$name' isn't valid"
 	local state
 	state="$(sidecar_dir)/$name/state"
-	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_logs="" st_role="" st_created=" "
+	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_linger_seconds="$linger_seconds" st_logs="" st_role="" st_created=" "
 	if ! read_state "$state"; then
 		echo "remote-cache-sidecar: nothing to stop: no state at $state (did the start step run?)"
 		return 0
 	fi
 	local failed=""
 
-	local was_running=false code="" still_running=false
+	# The service first: the drain's exports run over the engine's
+	# connection, and the engine uploads the layers itself. Then, once the
+	# drain is done, the engine, while the service still answers its events:
+	# the engine's stop sends its last one (engine.stop) to the service, and
+	# ends in seconds rather than retry against a closed port for 30s. Then
+	# the service, which exits once that event arrived (or at its linger's
+	# bound). Every wait is bounded, and the cleanup below runs whatever
+	# they found.
+	local was_running=false code="" still_running=false overran=false engine_code=""
+	local deadline=$((SECONDS + st_stop_seconds))
 	if created service && running "$st_service"; then
 		was_running=true
-		echo "remote-cache-sidecar: stopping the service; it drains for up to $((st_stop_seconds - 10))s, and docker stop waits ${st_stop_seconds}s"
-		# Bounded twice: docker stop sends SIGKILL at its --time, and the
-		# command itself can't outlive that by more than a minute.
-		timeout $((st_stop_seconds + 60)) docker stop --time "$st_stop_seconds" "$st_service" >/dev/null 2>&1 || true
+		local since
+		since="$(($(date +%s) - 1))"
+		echo "remote-cache-sidecar: stopping the service; it drains for up to $((st_stop_seconds - st_linger_seconds - 10))s, then answers the engine's last event for up to ${st_linger_seconds}s; the stop waits ${st_stop_seconds}s for it"
+		timeout 30 docker kill -s TERM "$st_service" >/dev/null 2>&1 || true
+		if ! wait_drained "$st_service" "$since" $((st_stop_seconds - st_linger_seconds - 5)); then
+			echo "remote-cache-sidecar: the service didn't report its drain done in time; stopping the engine anyway" >&2
+		fi
+	fi
+	if created engine && timeout 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
+		# The engine's own bound: a kill before it closed its cache would
+		# leave its store unclean.
+		timeout 90 docker stop --time 30 "$st_engine" >/dev/null 2>&1 || true
+		if running "$st_engine"; then
+			echo "remote-cache-sidecar: the engine was still running after docker stop" >&2
+		else
+			# 0 for a clean stop; 137 when docker stop killed it.
+			engine_code="$(timeout 30 docker inspect -f '{{.State.ExitCode}}' "$st_engine" 2>/dev/null || true)"
+			echo "remote-cache-sidecar: the engine stopped (exit ${engine_code:-unknown})"
+		fi
+		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
+	fi
+	if [[ "$was_running" == true ]] && ! wait_exited "$st_service" $((deadline - SECONDS)); then
+		# Past the service's own bound: stop it. docker stop's SIGTERM
+		# ends its linger at once, or its shutdown with exit 1.
+		overran=true
+		timeout 60 docker stop --time 5 "$st_service" >/dev/null 2>&1 || true
 		# A docker stop that gave up (or was cut off) leaves the service
 		# running, with the exit code of a container that hasn't exited:
 		# never take that for a clean stop.
@@ -439,15 +503,6 @@ stop() {
 	if created service && timeout 30 docker container inspect "$st_service" >/dev/null 2>&1; then
 		code="$(docker inspect -f '{{.State.ExitCode}}' "$st_service")"
 		timeout 60 docker logs "$st_service" 2>&1 | redact >"$st_logs/service.log" || true
-	fi
-	if created engine && timeout 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
-		# After the service: the drain's exports run over the engine's
-		# connection, and the engine uploads the layers itself. The engine's
-		# own stop then waits to send its last cache event to the service,
-		# which is gone, so docker stop usually kills it at 30s; its state
-		# is thrown away with the job, so that costs only the time.
-		timeout 90 docker stop --time 30 "$st_engine" >/dev/null 2>&1 || true
-		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
 	fi
 	# Only what this sidecar's start created.
 	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || true; }
@@ -465,7 +520,7 @@ stop() {
 
 	if [[ -f "$st_logs/service.log" ]]; then
 		echo "remote-cache-sidecar: the drain, from the service's log:"
-		grep -E 'msg="?(stopping|drain|stopped|export stored)' "$st_logs/service.log" | tail -n 20 || true
+		grep -E 'msg="?(stopping|drain|linger|stopped|export stored)' "$st_logs/service.log" | tail -n 20 || true
 	fi
 	if [[ "$still_running" == true ]]; then
 		failed="the service was still running after docker stop gave up: it was killed, and what it was exporting is lost"
@@ -477,6 +532,8 @@ stop() {
 		failed="the service's container is gone, so its exit code is unknown"
 	elif [[ "$was_running" != true ]]; then
 		failed="the service exited during the job, with code $code, before the stop"
+	elif [[ "$overran" == true ]]; then
+		failed="the service was still stopping after ${st_stop_seconds}s, past its own bound, and was stopped (exit $code): what it was exporting is lost"
 	elif [[ "$code" == 137 ]]; then
 		failed="the service was still stopping after ${st_stop_seconds}s, and docker killed it (137): what it was exporting is lost"
 	elif [[ "$code" != 0 ]]; then
@@ -487,6 +544,7 @@ stop() {
 			echo "### remote-cache-sidecar: $st_role stopped"
 			echo
 			echo "- service exit code: ${code:-unknown}"
+			echo "- engine exit code: ${engine_code:-unknown}"
 			echo "- logs: \`$st_logs\`"
 			[[ -n "$failed" ]] && echo "- **failed:** $failed"
 		} >>"$GITHUB_STEP_SUMMARY"
@@ -505,7 +563,7 @@ case "${1:-}" in
 start) start ;;
 stop) stop ;;
 *)
-	sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

@@ -28,7 +28,7 @@ jobs:
           s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
       - run: dagger call build
       - if: always()
-        # Above drain-timeout (10m) plus 5s.
+        # Above drain-timeout (10m) plus the engine's stop and the linger.
         timeout-minutes: 12
         uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
@@ -152,16 +152,26 @@ steps, in another language, that a local run can't share; this way the
 action, the stop, the demo's local run and the README all run one script,
 [`sidecar.sh`](sidecar.sh).
 
-It stops the service first, with `docker stop --time` at `drain-timeout`
-plus 10s: the service's whole stop takes at most `drain-timeout` plus 5s
+It stops the service first: a SIGTERM, then a wait for `drain: done` in its
+log, for up to `drain-timeout` plus 5s. Then the engine, with `docker stop
+--time 30`: the service, done draining, still answers the engine's events
+for up to 15s (its default `-drain-linger`), so the engine's own stop
+delivers its last cache event (`engine.stop`) and ends in seconds, cleanly
+([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
+Then it waits for the service to exit, which it does once that event
+arrived, up to `drain-timeout` plus 25s from the SIGTERM in all: the
+service's whole stop takes at most `drain-timeout` plus its linger plus 5s
 (see [Stopping and draining](../../../cmd/cacheservice/README.md#stopping-and-draining)).
-Then it stops the engine (within 30s: the engine's own stop waits to send
-its last cache event to the service, which is gone by then, so it is
-usually killed at 30s; its state goes with the job:
-[zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)), keeps both logs (with presigned URLs' credentials
-and signatures redacted), and removes the containers, the engine's state
-volume and the network. Give the step a `timeout-minutes` above
-`drain-timeout` plus 5s, with room for the engine's 30s: 12 for `10m`.
+A service still running then is stopped, and fails the step. Every wait is
+bounded, and a wait that runs out doesn't skip the rest: the stop keeps both
+logs (with presigned URLs' credentials and signatures redacted), and
+removes the containers, the engine's state volume and the network. With
+nothing to drain, the stop takes about 10s, most of it the engine's.
+
+Give the step a `timeout-minutes` above `drain-timeout` plus 25s, with room
+for the engine's 30s: 12 for `10m`. A service image from before the linger
+exits right after its drain, and the engine's stop is then held 30s, as it
+was.
 
 **Exit codes**, the service's:
 
@@ -169,7 +179,7 @@ volume and the network. Give the step a `timeout-minutes` above
 | --- | --- | --- |
 | 0 | A clean stop: everything ended within the bound. | passes |
 | 1 | The bound cut the shutdown off with work still running (logged as `the shutdown's bound passed with work still running`, with what was running), a signal arrived during the shutdown, or an HTTP server failed. | fails |
-| 137 | Still stopping at `docker stop`'s `--time`: killed. What it was exporting is lost. | fails |
+| 137 | Killed: still stopping past the stop's bound, `drain-timeout` plus 25s. What it was exporting is lost. | fails |
 | any | The service had exited before the stop. | fails |
 
 Known gaps in the service's exit code and log:
@@ -181,8 +191,9 @@ Of the action: a read-only start doesn't wait for the service's first merge
 and the leads in
 [zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
 
-The stop's step summary has the exit code, and its log the drain's lines
-(`drain: stored`, `drain: done outcome=...`). The logs name the bucket and
+The stop's step summary has the exit code, and its log the drain's and the
+linger's lines (`drain: stored`, `drain: done outcome=...`, `linger: done
+outcome=...`). The logs name the bucket and
 the prefix: upload them, as CI does on failure, only where that's fine.
 
 ## Tested by
