@@ -3,12 +3,14 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,6 +237,93 @@ func TestS3ProxyGuard(t *testing.T) {
 		t.Fatalf("%d requests reached the store, want the 2 allowed", reached)
 	}
 	if len(g.Refused()) != 4 {
+		t.Fatalf("refused %v", g.Refused())
+	}
+}
+
+// The guard reads a bulk delete's body, off the network, before anything is
+// recorded: a slow body holds up neither other requests nor the test's reads
+// of the record.
+func TestS3ProxyGuardDoesNotHoldTheProxy(t *testing.T) {
+	target := startFakeStore(t, func() {})
+	p := StartS3ProxyWith(t, "127.0.0.1", target, ProxyOptions{Guard: s3test.NewGuard("bkt", "test/run", false)})
+	body, stall := io.Pipe()
+	t.Cleanup(func() { _ = stall.Close() })
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		req, err := http.NewRequest(http.MethodPost, p.URL+"/bkt?delete", body)
+		if err != nil {
+			return
+		}
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	// The proxy has the headers, and part of the body.
+	if _, err := stall.Write([]byte("<Delete><Object><Key>test/run/")); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		p.Mark()
+		resp, err := http.Get(p.URL + "/bkt/test/run/k")
+		if err != nil {
+			done <- 0
+			return
+		}
+		_ = resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("GET while a bulk delete's body is held: status %d", status)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proxy's record and its other requests waited for a bulk delete's body")
+	}
+
+	_, _ = stall.Write([]byte("k</Key></Object></Delete>"))
+	_ = stall.Close()
+	select {
+	case <-sent:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bulk delete wasn't answered")
+	}
+}
+
+// A bulk delete's body is bounded, as the guard reads it whole: one larger
+// than S3 takes is refused, even with every key in the prefix.
+func TestS3ProxyGuardBoundsBulkDeletes(t *testing.T) {
+	var reached atomic.Int32
+	target := startFakeStore(t, func() { reached.Add(1) })
+	g := s3test.NewGuard("bkt", "test/run", false)
+	p := StartS3ProxyWith(t, "127.0.0.1", target, ProxyOptions{Guard: g})
+	bulk := func(n int) []byte {
+		var b bytes.Buffer
+		b.WriteString("<Delete>")
+		for i := range n {
+			fmt.Fprintf(&b, "<Object><Key>test/run/k%d</Key></Object>", i)
+		}
+		b.WriteString("</Delete>")
+		return b.Bytes()
+	}
+	if status, body := bareRequest(t, http.MethodPost, p.URL+"/bkt?delete", bulk(1000)); status != http.StatusOK {
+		t.Fatalf("a bulk delete of 1000 keys: status %d: %s", status, body)
+	}
+	big := bulk(1)
+	for len(big) <= maxBulkDeleteBytes {
+		big = bulk(2 * strings.Count(string(big), "<Object>"))
+	}
+	if status, _ := bareRequest(t, http.MethodPost, p.URL+"/bkt?delete", big); status != http.StatusForbidden {
+		t.Fatalf("a bulk delete of %d bytes: status %d, want 403", len(big), status)
+	}
+	if n := reached.Load(); n != 1 {
+		t.Fatalf("%d requests reached the store, want 1", n)
+	}
+	if len(g.Refused()) != 1 {
 		t.Fatalf("refused %v", g.Refused())
 	}
 }

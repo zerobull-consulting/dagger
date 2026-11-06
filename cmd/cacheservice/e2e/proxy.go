@@ -21,15 +21,17 @@ import (
 
 // S3Request is one request through the S3 proxy.
 type S3Request struct {
-	// Time is when the proxy received the request.
+	// Time is when the proxy received the request (a bulk delete: once
+	// its guard has read the body).
 	Time   time.Time
 	Method string
 	// Path is the request path: /<bucket>/<key> (the services use
 	// path-style addressing), and Query its query string.
 	Path  string
 	Query string
-	// Status is the store's answer (0: not answered yet), or the injected
-	// fault's.
+	// Status is the store's answer (0: not answered yet), the injected
+	// fault's, or 403 when the proxy's guard refused the request (with no
+	// Fault).
 	Status int
 	// Fault names the fault the proxy answered with instead of the store
 	// ("" when the store answered), Stalled is whether a stall held it, and
@@ -169,6 +171,10 @@ func (p *S3Proxy) faultLocked(method, path string) *Fault {
 // maxRewriteBytes bounds the body a Rewrite fault holds in memory.
 const maxRewriteBytes = 256 << 20
 
+// maxBulkDeleteBytes bounds the bulk delete body the guard reads: 1000 keys
+// of 1 KiB, with room for XML escaping. A larger one is refused.
+const maxBulkDeleteBytes = 8 << 20
+
 // SameSizeCorruption rewrites a body to other content of the same size: its
 // first byte flipped. A presigned PUT's signed Content-Length still matches,
 // so S3 takes it.
@@ -238,16 +244,26 @@ func StartS3ProxyWith(t *testing.T, host, target string, opts ProxyOptions) *S3P
 		// Recorded as it arrives, with its status set as the response
 		// starts: before the client can see the response, so a client
 		// that got one always finds its request recorded.
+		//
+		// The guard goes first, outside p.mu: it reads a bulk delete's
+		// keys from the body, off the network, and a slow body would hold
+		// up every other request and the test's reads of the record.
+		var refused error
+		if p.guard != nil {
+			if r.Method == http.MethodPost && r.URL.Query().Has("delete") {
+				// S3 takes at most 1000 keys of up to 1 KiB each.
+				r.Body = http.MaxBytesReader(w, r.Body, maxBulkDeleteBytes)
+			}
+			refused = p.guard.CheckRecord(r)
+		}
 		p.mu.Lock()
 		i := len(p.reqs)
 		p.reqs = append(p.reqs, S3Request{Time: time.Now(), Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery})
-		if p.guard != nil {
-			if err := p.guard.CheckRecord(r); err != nil {
-				p.reqs[i].Status = http.StatusForbidden
-				p.mu.Unlock()
-				writeS3Error(w, http.StatusForbidden, "AccessDenied")
-				return
-			}
+		if refused != nil {
+			p.reqs[i].Status = http.StatusForbidden
+			p.mu.Unlock()
+			writeS3Error(w, http.StatusForbidden, "AccessDenied")
+			return
 		}
 		f := p.faultLocked(r.Method, r.URL.Path)
 		if f != nil {
