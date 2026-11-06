@@ -1,6 +1,6 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#99](https://github.com/zerobull-consulting/dagger/pull/99)
+**Version:** [zerobull-consulting/dagger#106](https://github.com/zerobull-consulting/dagger/pull/106)
 
 Every work item's prompt for the remote cache work
 ([zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1))
@@ -168,9 +168,9 @@ keeps the rounds productive.
 
 - An org ruleset has Copilot review **every push** to a ready PR, and not
   drafts. So each push is a review round.
-- `feature/remote-cache` requires `unit tests`, `S3 tests against MinIO` and
-  `real engines (e2e)`. Copilot is not a required check, so the merge waits on
-  those checks only.
+- `feature/remote-cache` requires `unit tests`, `S3 tests against MinIO`,
+  `real engines (e2e)` and `sidecar demo`. Copilot is not a required check, so
+  the merge waits on those checks only.
 
 **The limit:**
 
