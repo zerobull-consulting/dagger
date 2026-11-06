@@ -20,7 +20,7 @@ func TestStaleGenerationExportNotRetried(t *testing.T) {
 	ctx := context.Background()
 	blobs, meta := newMemStores(t)
 	newer := &dagql.ValueBundle{
-		Version: dagql.ValueBundleVersion,
+		Version: metastore.BundleVersion,
 		Values: []dagql.TransferredValue{
 			{Ordinal: 1, SenderNumber: 10, Record: dagql.PersistedRecord{ResultID: 1}},
 			{Ordinal: 2, SenderNumber: 11, DependencyIDs: []uint64{1}, Record: dagql.PersistedRecord{ResultID: 2}},
