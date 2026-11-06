@@ -88,7 +88,9 @@ func (s *Service) AllowEngineVersionMismatch() {
 
 // useManifest replaces the manifest, for tests.
 func (s *Service) useManifest(m *compat.Manifest) {
-	s.engines = newEnginePolicy(m, s.engines.identity.Base)
+	p := newEnginePolicy(m, s.engines.identity.Base)
+	p.allowMismatch.Store(s.engines.allowMismatch.Load())
+	s.engines = p
 }
 
 // checkEngineVersion decides on a connection's hello: it returns false, once
@@ -108,7 +110,7 @@ func (c *engineConn) checkEngineVersion(ctx context.Context, hello protocol.Enve
 		return true
 	}
 	c.svc.metrics.EngineVersionMismatch(true)
-	msg := refusalMessage(v, p.identity)
+	msg := refusalMessage(v, p.identity, p.manifest)
 	c.logger.Warn("engine refused: its version is not accepted",
 		"engineVersion", boundVersion(v), "accept", p.identity.Accept,
 		"base", p.identity.Base, "closeStatus", CloseEngineVersionRefused)
@@ -124,7 +126,7 @@ func (c *engineConn) checkEngineVersion(ctx context.Context, hello protocol.Enve
 
 // refusalMessage tells a refused engine what it sent, what the service
 // accepts and what to run instead.
-func refusalMessage(v string, id compat.Identity) string {
+func refusalMessage(v string, id compat.Identity, m *compat.Manifest) string {
 	var b strings.Builder
 	if v == "" {
 		b.WriteString("the engine sent no version; ")
@@ -133,10 +135,14 @@ func refusalMessage(v string, id compat.Identity) string {
 	}
 	fmt.Fprintf(&b, "this cache service (base %s, revision %s) accepts only %s",
 		id.Base, id.Revision, strings.Join(id.Accept, ", "))
-	if compat.ValidVersion(v) {
-		// Only a version of a release's shape names an image tag.
+	switch r, rejected := m.Rejected(v); {
+	case rejected:
+		// Tried and failed: no service accepts it until the issue is fixed.
+		fmt.Fprintf(&b, ". Version %s was tried and rejected: see %s. Run an engine of an accepted version", v, r.Issue)
+	case compat.ValidVersion(v) && len(v) <= maxQuotedVersion:
+		// Only a bounded version of a release's shape names an image tag.
 		fmt.Fprintf(&b, ". Run the cache service dagger-remote-cache:%s once that version is verified, or an engine of an accepted version", v)
-	} else {
+	default:
 		b.WriteString(". Run an engine of an accepted version")
 	}
 	return b.String()

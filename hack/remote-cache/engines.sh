@@ -35,7 +35,9 @@ die() {
 # accepts prints the accept lines' "<version> <digest>", in order.
 accepts() {
 	local n=0 kw v d rest
-	while read -r kw v d rest; do
+	# "|| [[ -n $kw ]]": a last line without a newline is a line too, as it
+	# is to compat.Parse.
+	while read -r kw v d rest || [[ -n "$kw" ]]; do
 		[[ "$kw" == accept ]] || continue
 		n=$((n + 1))
 		((n <= max_accept)) || die "$file: more than $max_accept accept lines"

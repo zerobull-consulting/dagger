@@ -184,6 +184,16 @@ func (m *Manifest) Accepts(v string) bool {
 	return false
 }
 
+// Rejected returns v's reject line, if it has one.
+func (m *Manifest) Rejected(v string) (Rejected, bool) {
+	for _, r := range m.Reject {
+		if r.Version == v {
+			return r, true
+		}
+	}
+	return Rejected{}, false
+}
+
 // Versions are the accepted versions, in the file's order.
 func (m *Manifest) Versions() []string {
 	vs := make([]string, len(m.Accept))

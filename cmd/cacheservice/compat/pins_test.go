@@ -198,6 +198,15 @@ func TestEnginesScriptMatchesParser(t *testing.T) {
 	require.NoError(t, err, out)
 	require.Contains(t, out, "STOCK_ENGINE_TAG=v1.0.0\n")
 
+	// A last line without a newline is a line to both.
+	noNewline := filepath.Join(t.TempDir(), "engines.txt")
+	require.NoError(t, os.WriteFile(noNewline, []byte("base v1.0.0-beta.25\n"+acceptLine("v1.0.0-beta.25", digestA)), 0o644))
+	_, err = Parse(mustRead(t, noNewline))
+	require.NoError(t, err)
+	out, err = runScript(t, noNewline, "pin")
+	require.NoError(t, err, out)
+	require.Contains(t, out, "STOCK_ENGINE_TAG=v1.0.0-beta.25\n")
+
 	for name, path := range map[string]string{
 		"over the cap": write(MaxAccept+1, ""),
 		"no accept":    write(0, ""),

@@ -106,6 +106,7 @@ func TestEngineVersionRefused(t *testing.T) {
 		{"unlisted release", "v1.0.0-beta.26"},
 		{"prefix of an accepted one", "v1.0.0-beta.2"},
 		{"long", strings.Repeat("v", 500)},
+		{"long, of a release's shape", "v1.0.0-" + strings.Repeat("a", 500)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, rec, srv := newTestService(t, "")
@@ -125,9 +126,14 @@ func TestEngineVersionRefused(t *testing.T) {
 			require.Contains(t, msg, "accepts only v1.0.0-beta.25, v1.0.0-beta.24")
 			require.Contains(t, msg, "base "+svc.Identity().Base)
 			require.Contains(t, msg, "revision "+svc.Identity().Revision)
-			if compat.ValidVersion(tc.version) {
+			switch {
+			case tc.version == "v1.0.0-beta.23":
+				// Rejected: the issue, and no hint to wait for a verification.
+				require.Contains(t, msg, "Version v1.0.0-beta.23 was tried and rejected: see zerobull-consulting/dagger#117")
+				require.NotContains(t, msg, "dagger-remote-cache:")
+			case compat.ValidVersion(tc.version) && len(tc.version) <= maxQuotedVersion:
 				require.Contains(t, msg, "dagger-remote-cache:"+tc.version+" once that version is verified")
-			} else {
+			default:
 				require.NotContains(t, msg, "dagger-remote-cache:")
 			}
 			require.Less(t, len(msg), 1024)
@@ -175,6 +181,8 @@ func TestEngineVersionMismatchAllowed(t *testing.T) {
 	svc, rec, srv := newTestService(t, "")
 	svc.useManifest(testManifest(t))
 	svc.AllowEngineVersionMismatch()
+	// Replacing the manifest keeps the escape hatch.
+	svc.useManifest(testManifest(t))
 	require.Equal(t, []slog.Level{slog.LevelWarn}, levels(rec, "ENGINE VERSION CHECK OFF: -allow-engine-version-mismatch welcomes engines of any version; development only, never in production"))
 	e := dialRaw(t, srv, "tok")
 	e.send(helloEnvelope(t, "v1.0.0-beta.26-dev-0123456789ab"))

@@ -42,6 +42,11 @@ func TestParse(t *testing.T) {
 	require.Equal(t, Accepted{Version: "v1.0.0-beta.25", Digest: digestA, Verified: runA}, m.Default())
 	require.Equal(t, "registry.dagger.io/engine:v1.0.0-beta.25@"+digestA, m.Default().Image())
 	require.Equal(t, []Rejected{{Version: "v1.0.0-beta.23", Issue: "zerobull-consulting/dagger#117"}}, m.Reject)
+	r, ok := m.Rejected("v1.0.0-beta.23")
+	require.True(t, ok)
+	require.Equal(t, "zerobull-consulting/dagger#117", r.Issue)
+	_, ok = m.Rejected("v1.0.0-beta.24")
+	require.False(t, ok)
 }
 
 // TestParseRefuses: every malformed manifest is refused, with the line.

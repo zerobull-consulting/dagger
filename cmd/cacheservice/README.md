@@ -101,8 +101,11 @@ is never tracked, merged into or exported from.
 
 - an `error` reply to the hello, whose message names the engine's version
   (quoted, cut at 64 bytes), the service's base and revision, the versions
-  it accepts, and, for a version of a release's shape, the hint to run
-  `dagger-remote-cache:<engineVersion>` once that version is verified;
+  it accepts, and then: for a version on a `reject` line, its issue; for
+  another version of a release's shape (at most 64 bytes), the hint to run
+  `dagger-remote-cache:<engineVersion>` once that version is verified (the
+  image name zerobull-consulting/dagger#117's D4 publishes; until then,
+  `ghcr.io/zerobull-consulting/cacheservice`);
 - then a close with status **4002** (`server.CloseEngineVersionRefused`;
   4001 is a revoked token) and a short reason, within a close frame's 123
   bytes;
