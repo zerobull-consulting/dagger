@@ -1811,18 +1811,22 @@ An export refreshes a root's time **only when it writes the root's record**
   (`TestLateOlderGenerationAddsNoRootToHeldValue`). The export ends with its
   roots refused, logged once, and the tracker doesn't export them again
   (`TestStaleGenerationExportNotRetried`), until a newer generation of the
-  cache, which the index accepts, reports in: by any span, event or import
-  of that generation, whether or not it names the roots. Then the refused
-  roots still worth exporting are exported again once, at the next export
-  tick, from the newest connection of the cache
+  cache, which the index accepts, reports in: by its engine's hello, or any
+  span, event or import of that generation, whether or not it names the
+  roots. Then the refused roots still worth exporting are exported again
+  once, at the next export tick, from the newest connection of the cache.
+  A batch is never exported from a connection of an older generation than
+  the tracker's: it waits for the newer generation's hello, as it would for
+  an engine not connected (`NoEngineWait`, 10s)
   (`TestTrackerStaleRefusalClearedByNewerGeneration`,
   `TestTrackerStaleRefusalClearedRescheduled`, #129), during a drain too
   (`TestTrackerStaleRefusalClearedDrain`), and even when the newer
   generation reports in while the stale export is still in flight
   (`TestTrackerStaleRefusalInFlightDropped`). With several replicas on one
   prefix, the index can learn the newer generation from another replica
-  before this one does; the root is exported once the engine reports in
-  here (`TestStaleRefusalClearedAcrossReplicas`). The cache's own generation and
+  before this one does; the root is exported once the engine connects here,
+  even when its spans and events go to the other replica
+  (`TestStaleRefusalClearedAcrossReplicas`, `TestStaleGenerationExportNotRetried`). The cache's own generation and
   newer ones still record it: the engine really has it
   (`TestSameAndNewerGenerationRecordAfterCollection`). The record is kept
   `metastore.CacheRecordRetention` (7 days) after its last mapping went,

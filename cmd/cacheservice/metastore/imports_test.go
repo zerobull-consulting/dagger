@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dagger/dagger/dagql"
 )
@@ -363,5 +365,61 @@ func TestRecordImportsReportsOnlyWhatItKept(t *testing.T) {
 	}
 	if err := idx.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// racingObjects runs race once, before the first conditional write of an
+// index: another writer that gets in first, so the update tries again.
+type racingObjects struct {
+	*MemObjects
+	mu    sync.Mutex
+	raced bool
+	race  func()
+}
+
+func (r *racingObjects) Put(ctx context.Context, key string, body []byte, cond Condition) (string, error) {
+	r.mu.Lock()
+	run := !r.raced && cond.IfMatch != "" && strings.HasSuffix(key, "/index.json")
+	r.raced = r.raced || run
+	r.mu.Unlock()
+	if run {
+		r.race()
+	}
+	return r.MemObjects.Put(ctx, key, body, cond)
+}
+
+// Store.RecordImports reads its clock on each try of the index update, as
+// RecordFenced does: a try after losing to another writer stamps the cache's
+// record with its own time, not the first try's.
+func TestStoreRecordImportsStampsEachTry(t *testing.T) {
+	ctx := context.Background()
+	objects := &racingObjects{MemObjects: NewMemObjects(), raced: true}
+	s, clock := newClockedStore(t, objects)
+	rec, err := s.Record(ctx, "s1", chain(10), "cache-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := New(Config{Objects: objects.MemObjects, Prefix: "team", Now: clock.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects.race = func() {
+		clock.add(time.Hour)
+		if _, err := other.Record(ctx, "s1", chain(50), "cache-c", 1); err != nil {
+			t.Error(err)
+		}
+	}
+	objects.mu.Lock()
+	objects.raced = false
+	objects.mu.Unlock()
+	if got, err := s.RecordImports(ctx, "s1", "cache-b", 1, []Import{{Number: rec.Numbers[1], Engine: 100}}); err != nil || len(got) != 1 {
+		t.Fatalf("record imports: %v, %v", got, err)
+	}
+	idx := mustIndex(t, s, "s1")
+	if idx.Caches["cache-c"] == nil {
+		t.Fatal("the racing writer's record is missing: no retry was tested")
+	}
+	if got, want := idx.Caches["cache-b"].UpdatedAtUnix, clock.now().Unix(); got != want {
+		t.Fatalf("cache-b stamped %d, want the retry's time %d", got, want)
 	}
 }

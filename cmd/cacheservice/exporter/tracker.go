@@ -373,6 +373,20 @@ func (t *Tracker) Started(cacheID string, generation uint64, wipedCache string) 
 	}
 }
 
+// Connected records an engine's hello: its cache reports in at generation,
+// as a span or event of that generation would. A newer generation clears the
+// cache's stale-generation refusals, which are exported again (see cache),
+// even when no span or event of that generation reaches this service, as
+// when it goes to another replica.
+func (t *Tracker) Connected(cacheID string, generation uint64) {
+	if cacheID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cache(cacheID, generation)
+}
+
 // ImportedValue is a stored value merged into an engine cache: the engine
 // entry it landed on, at what replacement count, with which parts complete
 // or offered.
@@ -417,6 +431,12 @@ type Batch struct {
 	// generation is the cache's generation when the batch was claimed.
 	generation uint64
 }
+
+// Generation is the cache's generation when the batch was claimed. An
+// engine connection of an older generation must not export it: the index
+// would refuse what that generation no longer holds, and the refusal would
+// be settled against this generation.
+func (b Batch) Generation() uint64 { return b.generation }
 
 // Due returns the exports due at now: the candidates of sessions that ended
 // or went quiet, and roots due for another try. Each root is in at most one

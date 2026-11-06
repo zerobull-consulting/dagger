@@ -526,13 +526,17 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	if nowUnix <= 0 {
 		return nil, nil, fmt.Errorf("no recording time (%d)", nowUnix)
 	}
+	// A late export from an older generation than the latest recorded may
+	// add no value the index has no mapping for (see above). Refused before
+	// anything is changed: no number is handed out.
+	if err := idx.CheckGeneration(bundle, cacheID, generation); err != nil {
+		return nil, nil, err
+	}
 	cache := idx.Caches[cacheID]
 	if cache == nil {
 		cache = &EngineCache{Numbers: map[uint64]Mapping{}}
 		idx.Caches[cacheID] = cache
 	}
-	// A late export from an older generation than the latest recorded:
-	// it may add no value the index has no mapping for (see above).
 	stale := generation < cache.Generation
 	cache.Generation = max(cache.Generation, generation)
 
@@ -548,12 +552,8 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 			imported[v.Ordinal] = imp
 			continue
 		}
-		if stale {
-			// Nothing has been changed yet: a stale value is refused
-			// before any number is handed out, and the cache's
-			// generation was already the later one.
-			return nil, nil, staleGenerationError(cacheID, v.SenderNumber, generation, cache.Generation)
-		}
+		// Not stale: CheckGeneration refused a stale one with any value
+		// unmapped.
 		numbers[v.Ordinal] = idx.allocate()
 	}
 	// Every value is mapped, by this record or before it.
@@ -708,17 +708,18 @@ func staleGenerationError(cacheID string, engineNum, generation, recorded uint64
 // would refuse bundle from cacheID at generation on this index: the
 // generation is older than the cache's recorded one, and a value of the
 // bundle has no stored entry. It changes nothing. An exporter checks a
-// snapshot with it before uploading the bundle's blobs (#111); the check in
-// RecordResolvedAt, on the index it writes, stays the one that decides,
-// since a newer generation can be recorded in between.
+// snapshot with it before uploading the bundle's blobs (#111). RecordResolvedAt
+// runs it on the index it writes, which stays the check that decides, since
+// a newer generation can be recorded in between.
+//
+// An invalid bundle is not refused here: RecordResolvedAt fails it as
+// invalid, which is retried, rather than refused, which isn't.
 func (idx *Index) CheckGeneration(bundle *dagql.ValueBundle, cacheID string, generation uint64) error {
 	cache := idx.Caches[cacheID]
-	if cache == nil || generation >= cache.Generation || bundle == nil {
+	if cache == nil || generation >= cache.Generation || ValidateBundle(bundle) != nil {
 		return nil
 	}
-	values := slices.Clone(bundle.Values)
-	slices.SortFunc(values, func(a, b dagql.TransferredValue) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
-	for _, v := range values {
+	for _, v := range bundle.Values {
 		if _, _, ok := idx.mapped(cache, v.SenderNumber); !ok {
 			return staleGenerationError(cacheID, v.SenderNumber, generation, cache.Generation)
 		}
@@ -1058,12 +1059,14 @@ func (s *Store) RecordImports(ctx context.Context, scope, cacheID string, genera
 	if len(imports) == 0 {
 		return nil, nil
 	}
-	now := s.now().Unix()
-	if now <= 0 {
-		return nil, fmt.Errorf("record imports into %q: the store's clock reads %d", cacheID, now)
-	}
 	var recorded []Import
 	_, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
+		// Read on each try, as RecordFenced does: a retry stamps its own
+		// time.
+		now := s.now().Unix()
+		if now <= 0 {
+			return fmt.Errorf("the store's clock reads %d", now)
+		}
 		recorded = idx.RecordImportsAt(cacheID, generation, imports, now)
 		return nil
 	})

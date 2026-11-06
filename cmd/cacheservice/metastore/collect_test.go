@@ -900,4 +900,14 @@ func TestCheckGenerationAgreesWithRecord(t *testing.T) {
 			}
 		})
 	}
+	// An invalid bundle is not refused as stale, which is never retried:
+	// RecordResolvedAt fails it as invalid.
+	invalid := testBundle([]val{{sender: 11}}, root(1, 0))
+	invalid.Version++
+	if err := idx.CheckGeneration(invalid, "c", 1); err != nil {
+		t.Fatalf("CheckGeneration of an invalid bundle: %v", err)
+	}
+	if _, _, err := idx.Clone().RecordResolvedAt(bid("e"), invalid, "c", 1, testNowUnix); err == nil || errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("RecordResolvedAt of an invalid bundle: %v, want invalid, not stale", err)
+	}
 }

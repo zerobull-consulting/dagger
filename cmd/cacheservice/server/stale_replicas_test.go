@@ -13,6 +13,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/engine/remotecache"
+	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
 // startReplica starts another service on the same stores as a harness: a
@@ -48,9 +49,18 @@ func startReplica(t *testing.T, ctx context.Context, blobs *blobstore.MemStore, 
 // exports the build again, from the restarted engine, and the index records
 // it, although no session of the new generation names those entries.
 func TestStaleRefusalClearedAcrossReplicas(t *testing.T) {
+	t.Run("hello", func(t *testing.T) { testStaleRefusalClearedAcrossReplicas(t, false) })
+	// The restarted engine's engine.start reaches replica 2 before its
+	// hello does: the root waits for the hello, instead of being exported
+	// from the old engine, still connected, and refused for good.
+	t.Run("event before hello", func(t *testing.T) { testStaleRefusalClearedAcrossReplicas(t, true) })
+}
+
+func testStaleRefusalClearedAcrossReplicas(t *testing.T, eventFirst bool) {
 	ctx := context.Background()
 	blobs, meta := newMemStores(t)
-	h := newExportHarness(t, blobs, meta, nil) // replica 2, with the old engine
+	// Replica 2, with the old engine.
+	h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = 100 * time.Millisecond })
 	if h.cache.Generation != 4 {
 		t.Fatalf("setup: the engine is generation %d", h.cache.Generation)
 	}
@@ -100,6 +110,17 @@ func TestStaleRefusalClearedAcrossReplicas(t *testing.T) {
 	for _, d := range layers {
 		if has, err := h.blobs.Has(ctx, d); err != nil || has {
 			t.Fatalf("layer %s stored by the stale export (%v)", d, err)
+		}
+	}
+
+	if eventFirst {
+		h.postEventOf(restarted, telemetryattrs.EngineEventStart, "{}")
+		// A few export ticks with only the old engine connected.
+		time.Sleep(200 * time.Millisecond)
+		for _, e := range h.ns().tracker.Entries(h.cache.ID) {
+			if e.Refused != "" || e.Stored {
+				t.Fatalf("entry %+v, before the restarted engine's hello: want neither refused nor stored", e)
+			}
 		}
 	}
 

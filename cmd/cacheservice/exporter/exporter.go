@@ -434,16 +434,6 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	survivors := survivingRoots(roots, exported.Skipped)
 
-	stripVolatile(exported.Bundle)
-	if err := x.checkMergeSize(ctx, exported.Bundle); err != nil {
-		// Not stored: release the chains, and let the caller split the
-		// roots.
-		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, false, rerr
-		}
-		return Result{}, nil, false, err
-	}
-
 	// A stale generation's export the index would refuse uploads nothing
 	// (#111): refused here, before any blob is asked for. Only a shortcut:
 	// the check in the index update below decides, since a newer
@@ -454,6 +444,16 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		}
 		x.refuseStale(eng, survivors, err, "before upload", &res)
 		return res, nil, false, nil
+	}
+
+	stripVolatile(exported.Bundle)
+	if err := x.checkMergeSize(ctx, exported.Bundle); err != nil {
+		// Not stored: release the chains, and let the caller split the
+		// roots.
+		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
+			return res, nil, false, rerr
+		}
+		return Result{}, nil, false, err
 	}
 
 	blobs, err := neededBlobs(exported.Bundle)
@@ -558,6 +558,11 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 // bundle, as the scope's index reads now (metastore.Index.CheckGeneration),
 // or nil. A failed read returns nil: the export goes on, and the index
 // update's own check decides.
+//
+// It reads the index on every try. Kept generations would save the read,
+// but a stale export reaches the index only from another replica's or an
+// earlier service's engine connection (this service's tracker fences older
+// generations), and what this service kept is what those writes outdate.
 func (x *Exporter) checkGeneration(ctx context.Context, eng Engine, bundle *dagql.ValueBundle) error {
 	idx, err := x.cfg.Meta.Index(ctx, x.cfg.Scope)
 	if err != nil {

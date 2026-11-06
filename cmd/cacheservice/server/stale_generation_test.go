@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 )
@@ -100,5 +101,22 @@ func TestStaleGenerationExportNotRetried(t *testing.T) {
 	}
 	if failed := rec.find("export failed"); len(failed) != 0 {
 		t.Fatalf("logged as failed: %v", failed)
+	}
+
+	// A newer generation of the cache than the index's connects, with the
+	// same entries, and nothing to import and no span: its hello is how
+	// the tracker hears of it. The build is exported from it and recorded
+	// (zerobull-consulting/dagger#129).
+	restarted := fakeengine.New("cache-a", 6)
+	restarted.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	restarted.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Layers: [][]byte{testLayer("base"), testLayer("exec")}})
+	h.connectEngine(restarted)
+	waitIndexFor(t, meta, func(idx *metastore.Index) bool {
+		m, ok := idx.Caches["cache-a"].Numbers[11]
+		_, root := idx.Roots[m.Number]
+		return ok && m.Generation == 6 && root
+	})
+	if restarted.Merges() != 0 {
+		t.Fatalf("the restarted engine was merged %d times; the test needs it told by its hello alone", restarted.Merges())
 	}
 }

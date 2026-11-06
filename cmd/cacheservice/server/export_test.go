@@ -233,6 +233,12 @@ func (h *exportHarness) postSpansOf(cache *fakeengine.Cache, session string, spa
 
 func (h *exportHarness) postEvent(kind, body string) {
 	h.t.Helper()
+	h.postEventOf(h.cache, kind, body)
+}
+
+// postEventOf posts an engine event of another engine's cache.
+func (h *exportHarness) postEventOf(cache *fakeengine.Cache, kind, body string) {
+	h.t.Helper()
 	req := &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
 		ScopeLogs: []*logspb.ScopeLogs{{
 			Scope: &commonpb.InstrumentationScope{Name: telemetryattrs.EngineEventScope},
@@ -240,7 +246,7 @@ func (h *exportHarness) postEvent(kind, body string) {
 				Body: strValue(body),
 				Attributes: []*commonpb.KeyValue{
 					kv(telemetryattrs.EngineEventAttr, kind),
-					kv(telemetryattrs.EngineCacheAttr, h.cache.ID+"/"+strconv.FormatUint(h.cache.Generation, 10)),
+					kv(telemetryattrs.EngineCacheAttr, cache.ID+"/"+strconv.FormatUint(cache.Generation, 10)),
 				},
 			}},
 		}},

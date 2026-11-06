@@ -151,6 +151,15 @@ func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch)
 		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
 		return
 	}
+	if eng.Generation() < b.Generation() {
+		// The tracker heard of a newer generation (a span, an event, or
+		// another replica's work) than the connection here: wait for that
+		// generation's hello rather than export from an older one.
+		s.logger.Debug("export: engine connected at an older generation; waiting", "namespace", ns.name, "cacheID", b.CacheID,
+			"generation", eng.Generation(), "batchGeneration", b.Generation(), "roots", len(b.Request.Roots))
+		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+		return
+	}
 	_, _ = s.exportBatch(ctx, eng, b)
 }
 
