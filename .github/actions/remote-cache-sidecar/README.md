@@ -55,8 +55,10 @@ takes, and the service and engine speak that commit's protocol.
 | `engine-config` | no | [`engine.json`](engine.json) | The engine's `engine.json`. The default turns the engine's GC off (see below) and pulls `docker.io` images through `mirror.gcr.io`, as the release's does. |
 | `verbose` | no | `false` | `true`: the service logs every cache span (`-v`); CI's demo counts them. |
 
-Every input that becomes a container name, a namespace, a path or a flag is
-validated before anything is created ([`sidecar_test.sh`](sidecar_test.sh)
+The start refuses a container, volume or network of its names that is
+already there, before it creates anything, and the stop removes only what
+the start created. Every input that becomes a container name, a namespace,
+a path or a flag is validated before anything is created ([`sidecar_test.sh`](sidecar_test.sh)
 tests it). The S3 settings reach the service as
 environment variables passed by name, never on a command line, and the key
 is masked in the job's log.
@@ -82,8 +84,10 @@ It also sets `_EXPERIMENTAL_DAGGER_RUNNER_HOST`, `DAGGER_CLOUD_URL` and
 the job's own.
 
 **The CLI it sets up** is a wrapper around the engine image's own CLI. It
-unsets `TRACEPARENT`, `TRACESTATE` and `OTEL_*`, and sets the engine and the
-service's URL, whatever a later step's environment holds. A CLI that
+unsets `TRACEPARENT`, `TRACESTATE`, `OTEL_*`, `DAGGER_*` and
+`_EXPERIMENTAL_DAGGER_*` (as the e2e harness runs its CLI: a `DAGGER_ENGINE`
+would pick another engine), then sets the engine and the service's URL,
+whatever a later step's environment holds. A CLI that
 continues an inherited, unsampled `TRACEPARENT`, or lacks the Cloud
 settings, sends the service no session spans, and nothing is exported:
 silently (see

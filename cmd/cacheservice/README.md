@@ -2429,8 +2429,8 @@ service learns entries only from session spans (see
 export `TRACEPARENT=00-…-00` to every process; the CLI continues that
 unsampled trace, records no span, and the service never hears of an entry
 (see [Real-engine run](#real-engine-run)). The action puts a `dagger` first
-on `PATH` that unsets `TRACEPARENT`, `TRACESTATE` and `OTEL_*`, and sets the
-three variables, whatever a later step's environment holds. Any other CLI
+on `PATH` that unsets `TRACEPARENT`, `TRACESTATE`, `OTEL_*`, `DAGGER_*` and
+`_EXPERIMENTAL_DAGGER_*`, then sets the three variables, whatever a later step's environment holds. Any other CLI
 needs the same.
 
 **4. The stop**, at the end of the job, whatever happened before it

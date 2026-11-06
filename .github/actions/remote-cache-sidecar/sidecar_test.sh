@@ -97,9 +97,9 @@ stop_with() {
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
 		mkdir -p "$FAKE_DIR" "$SIDECAR_DIR/t/logs"
 		: >"$FAKE_DIR/service.running"
-		: >"$SIDECAR_DIR/t/started"
 		printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-			stop_seconds=20 "logs=$SIDECAR_DIR/t/logs" role=writer >"$SIDECAR_DIR/t/state"
+			stop_seconds=20 "logs=$SIDECAR_DIR/t/logs" role=writer \
+			created=network created=service created=volume created=engine >"$SIDECAR_DIR/t/state"
 		stop
 	) >/dev/null 2>&1
 }
@@ -107,6 +107,36 @@ check "a clean stop passes" stop_with false 0
 check "a stop that exits 1 fails" not stop_with false 1
 check "a stop that exits 137 fails" not stop_with false 137
 check "a service still running after docker stop fails the stop" not stop_with true 0
+
+# --- the stop removes only what the start created ---
+# A docker that logs every removal, and finds every container stopped.
+mkdir -p "$tmp/rmbin"
+cat >"$tmp/rmbin/docker" <<'EOF2'
+#!/usr/bin/env bash
+case "$1" in
+rm | volume | network) [[ "$1 $2" == "volume inspect" || "$1 $2" == "network inspect" ]] || echo "$*" >>"$FAKE_DIR/removed" ;;
+esac
+case "$1 $2" in
+"inspect -f") echo false ;;
+*) exit 0 ;;
+esac
+EOF2
+chmod +x "$tmp/rmbin/docker"
+removed_after_stop() {
+	local created="$1"
+	rm -rf "$tmp/rm" && mkdir -p "$tmp/rm/fake" "$tmp/rm/sc/t/logs"
+	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
+		stop_seconds=20 "logs=$tmp/rm/sc/t/logs" role=writer $created >"$tmp/rm/sc/t/state"
+	(
+		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/rm/fake" SIDECAR_DIR="$tmp/rm/sc" SIDECAR_NAME=t
+		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		stop
+	) >/dev/null 2>&1
+	cat "$tmp/rm/fake/removed" 2>/dev/null | tr '\n' ';'
+}
+check "a start that created only the network: the stop removes only it" \
+	[ "$(removed_after_stop created=network)" = "network rm t-net;" ]
+check "a start that created nothing: the stop removes nothing" [ -z "$(removed_after_stop "")" ]
 
 # --- start refuses an engine-state volume that already exists ---
 cat >"$tmp/bin/docker-volume" <<'EOF2'
@@ -132,9 +162,9 @@ existing_volume_refused() {
 		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
 		unset GITHUB_ACTIONS GITHUB_ENV GITHUB_OUTPUT
 		start
-	) >/dev/null 2>&1 && [[ ! -e "$tmp/volfake/volume.created" ]]
+	) >/dev/null 2>&1 && [[ ! -e "$tmp/volfake/volume.created" && ! -e "$tmp/vol/remote-cache/state" ]]
 }
-check "start refuses an engine-state volume that already exists" existing_volume_refused
+check "start refuses an engine-state volume that already exists, and writes no state" existing_volume_refused
 
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="drain: done" outcome=complete' >"$tmp/no-exports.log"

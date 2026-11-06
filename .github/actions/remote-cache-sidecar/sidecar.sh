@@ -111,6 +111,9 @@ read_state() {
 		stop_seconds) st_stop_seconds="$value" ;;
 		logs) st_logs="$value" ;;
 		role) st_role="$value" ;;
+		# What this sidecar's start created, one line each as it did: the
+		# stop touches nothing else.
+		created) case "$value" in service | engine | volume | network) st_created+=" $value " ;; esac ;;
 		esac
 	done <"$file"
 	valid_name "$st_service" && valid_name "$st_engine" && valid_name "$st_volume" &&
@@ -118,7 +121,11 @@ read_state() {
 		die "the state file $file isn't one start wrote"
 }
 
-running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]; }
+running() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]; }
+
+# Whether this sidecar's start created a resource (service, engine, volume,
+# network), from the state it read.
+created() { [[ "$st_created" == *" $1 "* ]]; }
 
 # Whether a container's log has a line matching a pattern. The log is read
 # whole first: grep -q stopping early would fail the pipeline (pipefail).
@@ -195,6 +202,17 @@ start() {
 	# plus 5s (README, "Stopping and draining"); docker stop waits 5s more
 	# before it sends SIGKILL.
 	local stop_seconds=$((drain_seconds + 10))
+	# Every name must be free before anything is written or created: the
+	# stop removes what the start created, and must never take a container,
+	# volume or network that was already there (such as a crashed job's on
+	# a self-hosted runner) for this sidecar's.
+	local taken=""
+	timeout 30 docker container inspect "$service" >/dev/null 2>&1 && taken+=" container $service"
+	timeout 30 docker container inspect "$engine" >/dev/null 2>&1 && taken+=" container $engine"
+	timeout 30 docker volume inspect "$volume" >/dev/null 2>&1 && taken+=" volume $volume"
+	timeout 30 docker network inspect "$network" >/dev/null 2>&1 && taken+=" network $network"
+	[[ -z "$taken" ]] ||
+		die "already there, and not this sidecar's:$taken. Remove them (docker rm -f, docker volume rm, docker network rm), or give this sidecar another name"
 	printf '%s\n' "service=$service" "engine=$engine" "volume=$volume" "network=$network" \
 		"stop_seconds=$stop_seconds" "logs=$logs" "role=$role" >"$state"
 
@@ -209,6 +227,7 @@ start() {
 
 	timeout 60 docker network create --label remote-cache-sidecar="$name" "$network" >/dev/null ||
 		die "creating the network $network failed"
+	echo "created=network" >>"$state"
 	# The service's port is published on the network's gateway: the engine
 	# reaches it there, and so does the CLI on this host, at one URL. The
 	# engine sends the session's spans to the CLI's DAGGER_CLOUD_URL, so both
@@ -243,7 +262,7 @@ start() {
 		--label remote-cache-sidecar="$name" "${publish[@]}" "${s3env[@]}" \
 		"$service_image" "${flags[@]}" >/dev/null || die "starting the service failed"
 	# From here on the stop expects a service, and fails without one.
-	: >"$dir/started"
+	echo "created=service" >>"$state"
 	local hostport
 	hostport="$(timeout 30 docker port "$service" 8090/tcp | head -n1)"
 	[[ "$hostport" =~ ^[0-9.]+:[0-9]+$ ]] || { show_log "$service"; die "the service's port isn't published ('$hostport')"; }
@@ -276,13 +295,9 @@ start() {
 		mounts+=(-v "$SIDECAR_ENGINE_CA_FILE:/etc/ssl/certs/ca-certificates.crt:ro")
 	fi
 	echo "remote-cache-sidecar: starting the engine ($engine_image)"
-	# A new volume: never reuse (and then delete) one that is already there,
-	# such as a crashed job's on a self-hosted runner.
-	if timeout 30 docker volume inspect "$volume" >/dev/null 2>&1; then
-		die "the engine's state volume $volume already exists: remove it (docker volume rm $volume), or give this sidecar another name"
-	fi
 	timeout 60 docker volume create --label remote-cache-sidecar="$name" "$volume" >/dev/null ||
 		die "creating the volume $volume failed"
+	echo "created=volume" >>"$state"
 	# The engine's settings, as cmd/cacheservice/e2e/engine.go starts it: the
 	# remote cache URL, and DAGGER_CLOUD_URL for its cache events. The token
 	# is a placeholder: the service runs without a tokens file, and takes any
@@ -293,6 +308,7 @@ start() {
 		-e DAGGER_CLOUD_URL="$url" \
 		-e DAGGER_CLOUD_TOKEN=sidecar-engine \
 		"$engine_image" --debug >/dev/null || die "starting the engine failed"
+	echo "created=engine" >>"$state"
 	deadline=$((SECONDS + wait)) up=false
 	while ((SECONDS < deadline)); do
 		running "$service" || { show_log "$service" 200; die "the service exited while the engine started"; }
@@ -323,8 +339,11 @@ if [[ "\$(timeout 30 docker inspect -f '{{.State.Running}}' $q_service 2>/dev/nu
 	timeout 30 docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2
 	exit 1
 fi
+# As cmd/cacheservice/e2e runs its CLI: no inherited trace, and none of the
+# caller's OTEL_*, DAGGER_* or _EXPERIMENTAL_DAGGER_* settings (DAGGER_ENGINE
+# would take another engine), then the sidecar's own.
 for v in \$(compgen -e); do
-	case "\$v" in TRACEPARENT | TRACESTATE | OTEL_*) unset "\$v" ;; esac
+	case "\$v" in TRACEPARENT | TRACESTATE | OTEL_* | DAGGER_* | _EXPERIMENTAL_DAGGER_*) unset "\$v" ;; esac
 done
 export _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://$engine
 export DAGGER_CLOUD_URL=$url
@@ -364,16 +383,15 @@ stop() {
 	valid_name "$name" || die "name '$name' isn't valid"
 	local state
 	state="$(sidecar_dir)/$name/state"
-	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_logs="" st_role=""
+	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_logs="" st_role="" st_created=" "
 	if ! read_state "$state"; then
 		echo "remote-cache-sidecar: nothing to stop: no state at $state (did the start step run?)"
 		return 0
 	fi
 	local failed=""
 
-	local was_running=false code="" started=false still_running=false
-	[[ -f "$(dirname "$state")/started" ]] && started=true
-	if running "$st_service"; then
+	local was_running=false code="" still_running=false
+	if created service && running "$st_service"; then
 		was_running=true
 		echo "remote-cache-sidecar: stopping the service; it drains for up to $((st_stop_seconds - 10))s, and docker stop waits ${st_stop_seconds}s"
 		# Bounded twice: docker stop sends SIGKILL at its --time, and the
@@ -386,11 +404,11 @@ stop() {
 			still_running=true
 		fi
 	fi
-	if docker container inspect "$st_service" >/dev/null 2>&1; then
+	if created service && timeout 30 docker container inspect "$st_service" >/dev/null 2>&1; then
 		code="$(docker inspect -f '{{.State.ExitCode}}' "$st_service")"
 		timeout 60 docker logs "$st_service" 2>&1 | redact >"$st_logs/service.log" || true
 	fi
-	if docker container inspect "$st_engine" >/dev/null 2>&1; then
+	if created engine && timeout 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
 		# After the service: the drain's exports run over the engine's
 		# connection, and the engine uploads the layers itself. The engine's
 		# own stop then waits to send its last cache event to the service,
@@ -399,10 +417,12 @@ stop() {
 		timeout 90 docker stop --time 30 "$st_engine" >/dev/null 2>&1 || true
 		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
 	fi
-	timeout 60 docker rm -f "$st_service" "$st_engine" >/dev/null 2>&1 || true
-	timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || true
-	timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || true
-	rm -f "$state" "$(dirname "$state")/started"
+	# Only what this sidecar's start created.
+	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || true; }
+	created engine && { timeout 60 docker rm -f "$st_engine" >/dev/null 2>&1 || true; }
+	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || true; }
+	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || true; }
+	rm -f "$state"
 	[[ -n "${GITHUB_OUTPUT:-}" ]] && echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
 
 	if [[ -f "$st_logs/service.log" ]]; then
@@ -411,7 +431,7 @@ stop() {
 	fi
 	if [[ "$still_running" == true ]]; then
 		failed="the service was still running after docker stop gave up: it was killed, and what it was exporting is lost"
-	elif [[ -z "$code" && "$started" != true ]]; then
+	elif [[ -z "$code" ]] && ! created service; then
 		# The start failed before it ran the service; its step said why.
 		echo "remote-cache-sidecar: the start didn't get as far as the service; cleaned up what it left"
 		return 0
