@@ -219,7 +219,9 @@ start() {
 	# Pulled only when not here already: a job may have built them.
 	local image
 	for image in "$service_image" "$engine_image"; do
-		if ! docker image inspect "$image" >/dev/null 2>&1; then
+		# Bounded too: a daemon that doesn't answer reads as "not here", and
+		# the pull's own bound then fails the step.
+		if ! timeout "${SIDECAR_INSPECT_TIMEOUT:-30}" docker image inspect "$image" >/dev/null 2>&1; then
 			echo "remote-cache-sidecar: pulling $image"
 			timeout 900 docker pull -q "$image" >/dev/null || die "pulling $image failed or took over 15m"
 		fi
@@ -311,7 +313,7 @@ start() {
 	echo "created=engine" >>"$state"
 	deadline=$((SECONDS + wait)) up=false
 	while ((SECONDS < deadline)); do
-		running "$service" || { show_log "$service" 200; die "the service exited while the engine started"; }
+		running "$service" || { show_log "$engine" 100; show_log "$service" 200; die "the service exited while the engine started"; }
 		running "$engine" || { show_log "$engine" 200; die "the engine exited at startup"; }
 		log_has "$service" 'msg="engine connected"' && { up=true; break; }
 		sleep 1

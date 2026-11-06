@@ -166,6 +166,72 @@ existing_volume_refused() {
 }
 check "start refuses an engine-state volume that already exists, and writes no state" existing_volume_refused
 
+# --- start's Docker calls are bounded, and its failures show both logs ---
+# A docker whose "image inspect" never answers, and whose pull fails.
+mkdir -p "$tmp/hangbin"
+cat >"$tmp/hangbin/docker" <<'EOF2'
+#!/usr/bin/env bash
+case "$1 $2" in
+"image inspect") sleep 600 ;;
+"pull "*) exit 1 ;;
+"container inspect" | "volume inspect" | "network inspect") exit 1 ;;   # free names
+*) exit 0 ;;
+esac
+EOF2
+chmod +x "$tmp/hangbin/docker"
+fake_start() {
+	local bin="$1"
+	shift
+	(
+		export PATH="$tmp/$bin:$PATH" FAKE_DIR="$tmp/$bin.fake" SIDECAR_DIR="$tmp/$bin.sc" SIDECAR_START_TIMEOUT=5
+		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s SIDECAR_ENGINE_IMAGE=e
+		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
+		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
+		(($#)) && export "$@"
+		mkdir -p "$FAKE_DIR"
+		unset GITHUB_ACTIONS GITHUB_ENV GITHUB_OUTPUT
+		start
+	) 2>&1
+}
+image_inspect_bounded() {
+	local t=$SECONDS out
+	out="$(timeout 60 bash -c "$(declare -f fake_start); tmp='$tmp'; source '$here/sidecar.sh'; set +e; fake_start hangbin SIDECAR_INSPECT_TIMEOUT=2")"
+	[[ $((SECONDS - t)) -lt 30 && "$out" == *"pulling s failed"* ]]
+}
+check "start's image inspect is bounded: a daemon that doesn't answer fails the pull, not the job's timeout" image_inspect_bounded
+
+# A docker whose service runs until the engine starts, then exits.
+mkdir -p "$tmp/exitbin"
+cat >"$tmp/exitbin/docker" <<'EOF2'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == "network inspect -f" ]] && { echo 10.9.0.1; exit 0; }
+case "$1 $2" in
+"container inspect" | "volume inspect" | "network inspect") exit 1 ;;
+"network create" | "volume create") exit 0 ;;
+"run -d")
+	[[ " $* " == *" --privileged "* ]] && : >"$FAKE_DIR/engine.started"
+	exit 0
+	;;
+"port "*) echo 10.9.0.1:30000 ;;
+"inspect -f")
+	case "$4" in
+	*-service) [[ -f "$FAKE_DIR/engine.started" ]] && echo false || echo true ;;
+	*) echo true ;;
+	esac
+	;;
+"logs --tail") echo "LOG OF $4" ;;
+"logs "*) echo 'msg=listening addr=:8090' ;;
+*) exit 0 ;;
+esac
+EOF2
+chmod +x "$tmp/exitbin/docker"
+start_shows_both_logs() {
+	local out
+	out="$(fake_start exitbin)"
+	[[ "$out" == *"the service exited while the engine started"* && "$out" == *"LOG OF remote-cache-engine"* && "$out" == *"LOG OF remote-cache-service"* ]]
+}
+check "a service that exits while the engine starts fails the start with both logs" start_shows_both_logs
+
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="drain: done" outcome=complete' >"$tmp/no-exports.log"
 stored_out="$("$here/../../../hack/remote-cache/demo/check.sh" stored "$tmp/no-exports.log" "$tmp/stored" 2>&1)"
