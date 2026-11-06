@@ -232,6 +232,76 @@ start_shows_both_logs() {
 }
 check "a service that exits while the engine starts fails the start with both logs" start_shows_both_logs
 
+# --- debug-port: a generated token, in a file mounted read-only ---
+# A docker that records the service's docker run, then has it exit.
+mkdir -p "$tmp/dbgbin"
+cat >"$tmp/dbgbin/docker" <<'EOF2'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == "network inspect -f" ]] && { echo 10.9.0.1; exit 0; }
+case "$1 $2" in
+"container inspect" | "volume inspect" | "network inspect") exit 1 ;;
+"run -d") printf '%s\n' "$@" >"$FAKE_DIR/service.args"; exit 0 ;;
+"port "*) echo 10.9.0.1:30000 ;;
+"inspect -f") echo false ;;
+*) exit 0 ;;
+esac
+EOF2
+chmod +x "$tmp/dbgbin/docker"
+debug_out="$(fake_start dbgbin SIDECAR_DEBUG_PORT=8091)"
+dbg_dir="$tmp/dbgbin.sc/remote-cache/secrets"
+dbg_token="$(cat "$dbg_dir/debug-token" 2>/dev/null)"
+dbg_args="$(cat "$tmp/dbgbin.fake/service.args" 2>/dev/null)"
+check "debug-port: the token is 64 hex digits" grep -qxE "[0-9a-f]{64}" <<<"$dbg_token"
+check "debug-port: its file is readable by the service's UID" [ "$(stat -c %a "$dbg_dir/debug-token")" = 644 ]
+check "debug-port: its directory only by this user" [ "$(stat -c %a "$dbg_dir")" = 700 ]
+check "debug-port: the service gets the file, read-only" grep -qxF -- "$dbg_dir/debug-token:/run/secrets/debug-token:ro" <<<"$dbg_args"
+check "debug-port: and -debug-token-file" grep -qxF -- "-debug-token-file" <<<"$dbg_args"
+check "debug-port: published on the host's loopback only" grep -qxF -- "127.0.0.1:8091:8091" <<<"$dbg_args"
+check "debug-port: the token is on no command line" not grep -qF -- "$dbg_token" <<<"$dbg_args"
+check "debug-port: nor in the start's output" not grep -qF -- "$dbg_token" <<<"$debug_out"
+check "without debug-port: no token" bash -c "$(declare -f fake_start); tmp='$tmp'; source '$here/sidecar.sh'; set +e; fake_start dbgbin SIDECAR_NAME=nodebug >/dev/null; ! grep -q -- -debug-token-file '$tmp/dbgbin.fake/service.args' && [ ! -e '$tmp/dbgbin.sc/nodebug/secrets' ]"
+relative_dir_absolute() {
+	(cd "$tmp" && fake_start dbgbin SIDECAR_NAME=rel SIDECAR_DIR=rel.sc SIDECAR_DEBUG_PORT=8091) >/dev/null
+	grep -qxF -- "$tmp/rel.sc/rel/secrets/debug-token:/run/secrets/debug-token:ro" "$tmp/dbgbin.fake/service.args"
+}
+check "debug-port: a relative SIDECAR_DIR still mounts the token by an absolute path" relative_dir_absolute
+check "debug-port: the state records the token, for the stop" grep -qx created=debug-token "$tmp/dbgbin.sc/remote-cache/state"
+# A token file already there, not this start's: refused, and left alone.
+existing_token_refused() {
+	mkdir -p "$tmp/dbgbin.sc/pre/secrets" && echo theirs >"$tmp/dbgbin.sc/pre/secrets/debug-token"
+	! (fake_start dbgbin SIDECAR_NAME=pre SIDECAR_DEBUG_PORT=8091 >/dev/null 2>&1) &&
+		[ "$(cat "$tmp/dbgbin.sc/pre/secrets/debug-token")" = theirs ] &&
+		! grep -qx created=debug-token "$tmp/dbgbin.sc/pre/state" 2>/dev/null
+}
+check "debug-port: a token file already there is refused, and left alone" existing_token_refused
+existing_dir_refused() {
+	mkdir -p "$tmp/dbgbin.sc/predir/secrets" && chmod 755 "$tmp/dbgbin.sc/predir/secrets"
+	! (fake_start dbgbin SIDECAR_NAME=predir SIDECAR_DEBUG_PORT=8091 >/dev/null 2>&1) &&
+		[ "$(stat -c %a "$tmp/dbgbin.sc/predir/secrets")" = 755 ] && [ -z "$(ls -A "$tmp/dbgbin.sc/predir/secrets")" ]
+}
+check "debug-port: a secrets directory already there is refused, and its mode left alone" existing_dir_refused
+# The stop removes the token only when the state says this start wrote it,
+# and nothing else in its directory.
+stop_secrets() {
+	local created="$1"
+	rm -rf "$tmp/st" && mkdir -p "$tmp/st/fake" "$tmp/st/sc/t/logs" "$tmp/st/sc/t/secrets"
+	echo x >"$tmp/st/sc/t/secrets/debug-token"
+	[[ "$2" == other ]] && echo y >"$tmp/st/sc/t/secrets/other"
+	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
+		stop_seconds=20 "logs=$tmp/st/sc/t/logs" role=writer $created >"$tmp/st/sc/t/state"
+	(
+		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/st/fake" SIDECAR_DIR="$tmp/st/sc" SIDECAR_NAME=t
+		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		stop
+	) >/dev/null 2>&1
+}
+stop_secrets created=debug-token none
+check "the stop removes the token this start wrote, and its empty directory" [ ! -e "$tmp/st/sc/t/secrets" ]
+stop_secrets created=debug-token other
+check "... but not another file next to it" [ ! -e "$tmp/st/sc/t/secrets/debug-token" -a -e "$tmp/st/sc/t/secrets/other" ]
+stop_secrets "" none
+check "a start that wrote no token: the stop leaves the file" [ -e "$tmp/st/sc/t/secrets/debug-token" ]
+
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="drain: done" outcome=complete' >"$tmp/no-exports.log"
 stored_out="$("$here/../../../hack/remote-cache/demo/check.sh" stored "$tmp/no-exports.log" "$tmp/stored" 2>&1)"

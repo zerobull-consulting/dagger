@@ -12,7 +12,8 @@
 //     stand-in for presigned upload URLs that checks each blob against its
 //     digest and keeps nothing;
 //
-//   - DebugHandler, unauthenticated, for local use only: it lists the
+//   - DebugHandler, for operators, behind an admin token when one is set
+//     (UseDebugTokenFile): it lists the
 //     connected engines, sends a request to one, and shows and triggers
 //     what the export and import paths do for it.
 //

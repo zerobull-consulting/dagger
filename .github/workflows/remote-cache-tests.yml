@@ -217,6 +217,18 @@ jobs:
           s3-secret-access-key: ${{ steps.store.outputs.secret-access-key }}
           s3-path-style: "true"
           verbose: "true"
+          debug-port: "8091"
+      # The debug API through debug-port: 401 without the generated token,
+      # and the connected engine with it.
+      - name: "Writer: check the debug API takes only its token"
+        env:
+          TOKEN_FILE: ${{ steps.writer.outputs.debug-token-file }}
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8091/debug/engines)"
+          [[ "$code" == 401 ]] || { echo "::error::without the token: $code, want 401"; exit 1; }
+          # The header from a file descriptor: the token on no command line.
+          curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")") http://127.0.0.1:8091/debug/engines | grep -q '"conn"' ||
+            { echo "::error::with the token: no engine listed"; exit 1; }
       - name: "Writer: run the demo"
         timeout-minutes: 10
         env:
