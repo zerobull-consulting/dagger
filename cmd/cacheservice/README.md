@@ -2720,9 +2720,10 @@ To run this and the store suites against a real bucket, safely, and for what
 each store did, see
 [Testing against a real bucket](../../hack/remote-cache/README.md#testing-against-a-real-bucket).
 
-`./hack/remote-cache/dev.sh e2e` runs both paths with real engines built
-from this repo
-([#29](https://github.com/zerobull-consulting/dagger/issues/29)): engine A
+`./hack/remote-cache/dev.sh e2e` runs both paths with real engines, a stock
+release by default, or built from this repo with `E2E_BUILD_ENGINE=1`
+([#29](https://github.com/zerobull-consulting/dagger/issues/29),
+[zerobull-consulting/dagger#112](https://github.com/zerobull-consulting/dagger/issues/112)): engine A
 builds a pipeline and the service exports it to MinIO; engine B, with an
 empty cache, runs the same pipeline and gets cache hits whose layers come
 from MinIO. Then it runs the [scenarios](#the-scenarios) that check what a

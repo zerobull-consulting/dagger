@@ -28,8 +28,8 @@ func Docker(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// Engine is an engine built from this repo, in a container with its own,
-// initially empty, cache volume, connected to one service.
+// Engine is an engine of the run's image (by its ID), in a container
+// with its own, initially empty, cache volume, connected to one service.
 type Engine struct {
 	Name      string
 	Container string
@@ -82,15 +82,7 @@ func (e *Env) StartEnginesWithTokens(svc *Service, tokens map[string]string, nam
 		ctx, cancel := e.ctx()
 		_, err := Docker(ctx, "volume", "create", "--label", Label+"="+e.RunID, en.Volume)
 		if err == nil {
-			_, err = Docker(ctx, "run", "-d", "--privileged",
-				"--name", en.Container,
-				"--hostname", en.Hostname(),
-				"--label", Label+"="+e.RunID,
-				"-v", en.Volume+":/var/lib/dagger",
-				"-e", "_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="+svc.URL,
-				"-e", "DAGGER_CLOUD_TOKEN="+en.Token,
-				"-e", "DAGGER_CLOUD_URL="+svc.URL,
-				e.Settings.Image, "--debug")
+			_, err = Docker(ctx, en.runArgs(svc)...)
 		}
 		cancel()
 		e.root.Cleanup(en.remove)
@@ -107,6 +99,21 @@ func (e *Env) StartEnginesWithTokens(svc *Service, tokens map[string]string, nam
 	return engines
 }
 
+// runArgs are the docker arguments that start the engine's container on
+// svc: from the run's image by its ID (Env.image), which the CLI was copied
+// out of, so a run building the same tag meanwhile doesn't change it.
+func (en *Engine) runArgs(svc *Service) []string {
+	return []string{"run", "-d", "--privileged",
+		"--name", en.Container,
+		"--hostname", en.Hostname(),
+		"--label", Label + "=" + en.env.RunID,
+		"-v", en.Volume + ":/var/lib/dagger",
+		"-e", "_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL=" + svc.URL,
+		"-e", "DAGGER_CLOUD_TOKEN=" + en.Token,
+		"-e", "DAGGER_CLOUD_URL=" + svc.URL,
+		en.env.image, "--debug"}
+}
+
 // waitConn waits for the engine to connect with a connection number above
 // after, and records it.
 func (en *Engine) waitConn(after uint64) {
@@ -115,6 +122,8 @@ func (en *Engine) waitConn(after uint64) {
 		for _, info := range en.Service.Engines() {
 			if info.Conn > after && info.EngineName == en.Hostname() {
 				en.Conn = info.Conn
+				// The version its hello reported: which engine the run tests.
+				en.env.T.Logf("engine %s connected to %s: engine version %q", en.Name, en.Service.Name, info.EngineVersion)
 				return true, nil
 			}
 		}
@@ -198,9 +207,26 @@ func (en *Engine) remove() {
 	_, _ = Docker(ctx, "volume", "rm", "-f", en.Volume)
 }
 
-// CLI runs the dagger CLI built for the run against the engine, with stdin
-// and args, and its telemetry pointed at svc (the engine's own service when
-// nil). It writes stdout to RunDir/<out>.out and stderr to RunDir/<out>.log,
+// cleanEnv is this process's environment without TRACEPARENT,
+// TRACESTATE, OTEL_*, DAGGER_* and _EXPERIMENTAL_DAGGER_*: the CLI's, before
+// its own settings (CLI).
+func cleanEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == "TRACEPARENT" || name == "TRACESTATE" ||
+			strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "DAGGER_") ||
+			strings.HasPrefix(name, "_EXPERIMENTAL_DAGGER_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
+}
+
+// CLI runs the run's dagger CLI (copied out of its engine image) against
+// the engine, with stdin and args, and its telemetry pointed at svc (the
+// engine's own service when nil). It writes stdout to RunDir/<out>.out and stderr to RunDir/<out>.log,
 // and returns stdout and how long it took. It fails the test if the CLI
 // fails.
 //
@@ -214,17 +240,7 @@ func (en *Engine) CLI(svc *Service, out, stdin string, args ...string) ([]byte, 
 	if svc == nil {
 		svc = en.Service
 	}
-	var env []string
-	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
-		if name == "TRACEPARENT" || name == "TRACESTATE" ||
-			strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "DAGGER_") ||
-			strings.HasPrefix(name, "_EXPERIMENTAL_DAGGER_") {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env,
+	env := append(cleanEnv(),
 		"_EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://"+en.Container,
 		"DAGGER_CLOUD_TOKEN="+en.cliToken,
 		"DAGGER_CLOUD_URL="+svc.URL,
@@ -233,7 +249,7 @@ func (en *Engine) CLI(svc *Service, out, stdin string, args ...string) ([]byte, 
 	var stdout, stderr bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, filepath.Join(en.env.bin, "dagger"), append([]string{"--progress=plain"}, args...)...)
+	cmd := exec.CommandContext(ctx, en.env.cli, append([]string{"--progress=plain"}, args...)...)
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
