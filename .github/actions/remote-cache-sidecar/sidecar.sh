@@ -14,8 +14,9 @@
 #
 #   SIDECAR_ROLE            writer | read-only (required)
 #   SIDECAR_SERVICE_IMAGE   the cache service image (required)
-#   SIDECAR_ENGINE_IMAGE    the engine image with the remote cache client
-#                           (required); its own dagger CLI is the one used
+#   SIDECAR_ENGINE_IMAGE    the engine image: a stock Dagger release with the
+#                           remote cache client (required); its own dagger
+#                           CLI is the one used
 #   CACHESERVICE_S3_*       the store: ENDPOINT, REGION, BUCKET, ACCESS_KEY_ID
 #                           and SECRET_ACCESS_KEY (required), PREFIX and
 #                           PATH_STYLE (optional); passed to the service by

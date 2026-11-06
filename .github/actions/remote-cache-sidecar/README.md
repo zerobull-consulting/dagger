@@ -19,7 +19,7 @@ jobs:
           # with role: read-only and a read-only key.
           role: writer
           service-image: ghcr.io/zerobull-consulting/cacheservice:<commit SHA>
-          engine-image: ghcr.io/zerobull-consulting/dagger-engine:<commit SHA>
+          engine-image: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
           s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
           s3-region: ${{ vars.CACHE_S3_REGION }}
           s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -33,9 +33,19 @@ jobs:
         uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
 
-Pin both actions and both images to the same commit of
+Pin both actions and the service's image to the same commit of
 `feature/remote-cache`: the action passes flags that commit's service
-takes, and the service and engine speak that commit's protocol.
+takes. The engine is a stock Dagger release, pinned by digest: the example
+is the release CI's `sidecar demo` job runs (`STOCK_ENGINE` in
+[`remote-cache-tests.yml`](../../workflows/remote-cache-tests.yml)). The
+minimum release with a compatible client is `v1.0.0-beta.24`; how that was
+checked is in
+[Engine](../../../hack/remote-cache/README.md#engine). Nothing checks the
+engine's version yet: under the lockstep policy
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117))
+the engine will be the release the service was built from, and one version
+input will replace both image inputs. The fork no longer publishes an engine
+image of its own.
 
 ## Inputs
 
@@ -43,7 +53,7 @@ takes, and the service and engine speak that commit's protocol.
 | --- | --- | --- | --- |
 | `role` | yes | | `writer`: exports what the job builds, with `-gc-interval=0` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
 | `service-image` | yes | | The cache service image, by SHA tag. |
-| `engine-image` | yes | | The engine image with the remote cache client, by the same SHA. Its own `dagger` CLI is the one set up. |
+| `engine-image` | yes | | A stock Dagger engine release, `v1.0.0-beta.24` or later, pinned by digest (`registry.dagger.io/engine:<release>@sha256:<digest>`). Its own `dagger` CLI is the one set up. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
 | `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. |
 | `s3-prefix` | no | empty: the whole bucket | The prefix the service [owns](../../../cmd/cacheservice/README.md#bucket-ownership): nothing else may write under it. Segments of letters, digits, `.`, `_` and `-`, separated by `/`, none of them `.` or `..`, with no leading or trailing `/`. |
