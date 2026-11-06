@@ -15,7 +15,8 @@ import (
 // the harness's cache (5, the engine is 4) recorded the build's entries,
 // and GC collected them. The engine, an older generation still running,
 // exports them late: the export ends with the roots refused, not failed,
-// publishes no root, logs it once, and isn't tried again.
+// uploads no blob (#111), publishes no root, logs it once, and isn't tried
+// again.
 func TestStaleGenerationExportNotRetried(t *testing.T) {
 	ctx := context.Background()
 	blobs, meta := newMemStores(t)
@@ -49,7 +50,7 @@ func TestStaleGenerationExportNotRetried(t *testing.T) {
 	if h.cache.Generation != 4 {
 		t.Fatalf("setup: the engine is generation %d", h.cache.Generation)
 	}
-	h.build()
+	layers := h.build()
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 	h.postSpans("session-1", carrierSpan(2))
 
@@ -88,6 +89,11 @@ func TestStaleGenerationExportNotRetried(t *testing.T) {
 	}
 	if len(idx.Roots) != 0 || len(idx.Entries) != 0 || idx.NextNumber != collected.NextNumber {
 		t.Fatalf("the stale export changed the index: roots %v, entries %v, next %d (was %d)", idx.Roots, idx.Entries, idx.NextNumber, collected.NextNumber)
+	}
+	for _, d := range layers {
+		if has, err := h.blobs.Has(ctx, d); err != nil || has {
+			t.Fatalf("layer %s uploaded by the stale export (%v)", d, err)
+		}
 	}
 	if logged := rec.find("export: older generation than the index's, not recorded"); len(logged) != 1 {
 		t.Fatalf("logged %d times, want once: %v", len(logged), logged)

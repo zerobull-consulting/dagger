@@ -1,0 +1,149 @@
+package server
+
+import (
+	"context"
+	"log/slog"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/importer"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/engine/remotecache"
+)
+
+// startReplica starts another service on the same stores as a harness: a
+// replica on the same prefix. It returns the replica's URL.
+func startReplica(t *testing.T, ctx context.Context, blobs *blobstore.MemStore, meta *metastore.Store) (*Service, string) {
+	t.Helper()
+	svc := New(slog.New(slog.DiscardHandler), "")
+	if err := svc.EnableExport(ctx, ExportConfig{
+		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
+		Tracker:  exporter.TrackerConfig{QuietPeriod: time.Minute, EndGrace: 50 * time.Millisecond},
+		Tick:     10 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnableImport(ctx, ImportConfig{Importer: importer.Config{Blobs: blobs, Meta: meta, Scope: testScope}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(svc.Handler())
+	t.Cleanup(func() {
+		srv.Close()
+		svc.Wait()
+	})
+	return svc, srv.URL
+}
+
+// zerobull-consulting/dagger#129's realistic path, with two replicas on one
+// prefix. Engine cache-a restarts (generation 5) and connects to replica 1,
+// which merges a stored value into it and records the import: the index now
+// knows generation 5. The old engine (generation 4), still connected to
+// replica 2, exports its build there late, and the index refuses it as a
+// stale generation's, before any upload. Then the restarted engine
+// reconnects to replica 2, which only now hears of generation 5. Replica 2
+// exports the build again, from the restarted engine, and the index records
+// it, although no session of the new generation names those entries.
+func TestStaleRefusalClearedAcrossReplicas(t *testing.T) {
+	ctx := context.Background()
+	blobs, meta := newMemStores(t)
+	h := newExportHarness(t, blobs, meta, nil) // replica 2, with the old engine
+	if h.cache.Generation != 4 {
+		t.Fatalf("setup: the engine is generation %d", h.cache.Generation)
+	}
+	layers := h.build()
+
+	// A value of another cache, stored, for replica 1 to merge.
+	z := fakeengine.New("cache-z", 1)
+	z.Add(fakeengine.Entry{Number: 30, Recipe: "from(busybox)", Layers: [][]byte{testLayer("zbase")}})
+	h.connectEngine(z)
+	h.postSpansOf(z, "session-z", cacheSpan(30), carrierSpan(1))
+	waitMapped(t, meta, "cache-z", 30)
+
+	// The restarted engine: the same cache, with the same entries, at
+	// generation 5, connected to replica 1.
+	restarted := fakeengine.New("cache-a", 5)
+	restarted.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	restarted.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Layers: [][]byte{testLayer("base"), testLayer("exec")}})
+	r1ctx, stopR1 := context.WithCancel(h.ctx)
+	_, r1URL := startReplica(t, r1ctx, blobs, meta)
+	r1done := make(chan error, 1)
+	go func() {
+		r1done <- remotecache.Run(r1ctx, fakeengine.Adapter{Cache: restarted}, remotecache.Config{URL: r1URL, Token: "engine-token", EngineName: "engine-a"})
+	}()
+	waitIndexFor(t, meta, func(idx *metastore.Index) bool {
+		c := idx.Caches["cache-a"]
+		return c != nil && c.Generation == 5 && len(c.Imported) == 1
+	})
+	// The restarted engine leaves replica 1 (a reconnect, a rollout).
+	stopR1()
+	select {
+	case <-r1done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the restarted engine didn't leave replica 1")
+	}
+
+	// The old engine's session ends on replica 2: refused, uploading nothing.
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitFor(t, "the stale refusal", func() bool {
+		refused := 0
+		for _, e := range h.ns().tracker.Entries(h.cache.ID) {
+			if e.Refused == exporter.StaleGenerationMessage {
+				refused++
+			}
+		}
+		return refused == 2
+	})
+	for _, d := range layers {
+		if has, err := h.blobs.Has(ctx, d); err != nil || has {
+			t.Fatalf("layer %s stored by the stale export (%v)", d, err)
+		}
+	}
+
+	// The restarted engine reconnects to replica 2: the build is exported
+	// from it, and recorded at generation 5.
+	h.connectEngine(restarted)
+	idx := waitIndexFor(t, meta, func(idx *metastore.Index) bool {
+		c := idx.Caches["cache-a"]
+		if c == nil {
+			return false
+		}
+		m, ok := c.Numbers[11]
+		_, root := idx.Roots[m.Number]
+		return ok && m.Generation == 5 && root
+	})
+	if m := idx.Caches["cache-a"].Numbers[10]; m.Generation != 5 {
+		t.Fatalf("entry 10's mapping %+v", m)
+	}
+	for _, d := range layers {
+		if has, err := h.blobs.Has(ctx, d); err != nil || !has {
+			t.Fatalf("layer %s not stored (%v)", d, err)
+		}
+	}
+	// Once: not exported again after it was stored.
+	exports := restarted.Exports()
+	time.Sleep(300 * time.Millisecond)
+	if n := restarted.Exports(); n != exports {
+		t.Fatalf("exported again: %d exports, was %d", n, exports)
+	}
+	for _, e := range h.ns().tracker.Entries(h.cache.ID) {
+		if (e.Number == 10 || e.Number == 11) && (!e.Stored || e.Refused != "") {
+			t.Fatalf("entry %+v, want stored", e)
+		}
+	}
+}
+
+// waitFor waits, up to 20 seconds, until ok holds.
+func waitFor(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

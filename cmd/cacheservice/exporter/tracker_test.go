@@ -171,25 +171,166 @@ func TestTrackerGenerationFence(t *testing.T) {
 
 // A root the index refused as a stale generation's export (#59) isn't
 // exported again by that generation, but is by a newer one, which the index
-// accepts. An engine's own refusal stays across generations.
+// accepts. An engine's own refusal stays across generations. Tested through
+// Due, as the service runs: All exports whatever is wanted, scheduled or not
+// (#129).
 func TestTrackerStaleRefusalClearedByNewerGeneration(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)
 	tr.Observe(state(2, 10, fsPart), t0)
-	b := tr.All("c", t0)
+	now := t0.Add(10 * time.Second)
+	b := tr.Due(now)
+	if got := roots(b); !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("first export: %v", got)
+	}
 	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{
 		{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
 		{Number: 2, Reason: protocol.SkipRefused, Message: "not exportable"},
-	}}, t0)
-	if got := roots(tr.All("c", t0)); len(got) != 0 {
+	}}, now)
+	if got := exportedWithin(tr, now, 2*time.Hour); len(got) != 0 {
 		t.Fatalf("refused roots exported again in the same generation: %v", got)
 	}
-	newer := state(1, 20, fsPart)
-	newer.Generation = 2
-	tr.Observe(newer, t0)
-	if got := roots(tr.All("c", t0)); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("after a newer generation: %v, want the stale refusal exported again", got)
+	// A newer generation reports in, naming neither root.
+	now = now.Add(2 * time.Hour)
+	tr.Started("c", 2, "")
+	got := exportedWithin(tr, now, 2*time.Hour)
+	if !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after a newer generation: %v, want the stale refusal exported again, once", got)
 	}
+}
+
+// exportedWithin runs Due every minute for d after now, settling each batch
+// as stored, and returns every root it exported, in order of export.
+func exportedWithin(tr *Tracker, now time.Time, d time.Duration) []uint64 {
+	return exportedBy(tr.Due, tr, now, d)
+}
+
+func exportedBy(due func(time.Time) []Batch, tr *Tracker, now time.Time, d time.Duration) []uint64 {
+	var out []uint64
+	for at := now; !at.After(now.Add(d)); at = at.Add(time.Minute) {
+		for _, b := range due(at) {
+			out = append(out, b.Request.Roots...)
+			tr.Done(b, Result{Stored: b.Request.Roots}, at)
+		}
+	}
+	return out
+}
+
+// #129's repro: a stale-generation refusal that settled before the newer
+// generation reported in is cleared by it, and Due exports the root again.
+func TestTrackerStaleRefusalClearedRescheduled(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{
+		{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
+	}}, t0)
+	tr.Started("c", 2, "")
+	for i := 1; i <= 120; i++ {
+		if got := roots(tr.Due(t0.Add(time.Duration(i) * time.Minute))); len(got) > 0 {
+			if !slices.Equal(got, []uint64{1}) {
+				t.Fatalf("Due exported %v, want [1]", got)
+			}
+			return
+		}
+	}
+	t.Fatal("Due exported nothing in 2 hours, while All would export root 1")
+}
+
+// The same, for a service that is draining: DrainStatus counts the root as
+// left to export, and DrainDue exports it.
+func TestTrackerStaleRefusalClearedDrain(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{
+		{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
+	}}, t0)
+	tr.Started("c", 2, "")
+	now := t0.Add(time.Minute)
+	tr.StartDrain(now)
+	if st := tr.DrainStatus(now, time.Time{}); len(st) != 1 || st[0].Roots() != 1 || st[0].Retrying != 1 {
+		t.Fatalf("drain status %+v, want root 1 retrying", st)
+	}
+	if got := exportedBy(tr.DrainDue, tr, now, time.Hour); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("DrainDue exported %v, want [1] once", got)
+	}
+	if st := tr.DrainStatus(now.Add(time.Hour), time.Time{}); len(st) != 0 {
+		t.Fatalf("drain status after: %+v, want nothing left", st)
+	}
+}
+
+// A cleared refusal is exported once, and not while an export already holds
+// the root, nor once it is no longer worth exporting.
+func TestTrackerStaleRefusalClearedNoDouble(t *testing.T) {
+	refuse := func(tr *Tracker, at time.Time) {
+		b := tr.All("c", at)
+		tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{
+			{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
+		}}, at)
+	}
+	t.Run("in flight", func(t *testing.T) {
+		// The manual export holds the root when the newer generation
+		// reports in: Due doesn't export it alongside, and once that
+		// export stores it, nothing more.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		refuse(tr, t0)
+		held, err := tr.Claim("c", Request{Roots: []uint64{1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.Started("c", 2, "")
+		if got := roots(tr.Due(t0.Add(time.Minute))); len(got) != 0 {
+			t.Fatalf("Due exported %v while an export holds it", got)
+		}
+		tr.Done(held, Result{Stored: []uint64{1}}, t0.Add(2*time.Minute))
+		if got := exportedWithin(tr, t0.Add(2*time.Minute), 2*time.Hour); len(got) != 0 {
+			t.Fatalf("exported %v after it was stored", got)
+		}
+	})
+	t.Run("in flight and refused again", func(t *testing.T) {
+		// That export is refused as stale too (claimed at generation 1):
+		// done drops the refusal and schedules it, once.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		refuse(tr, t0)
+		held, err := tr.Claim("c", Request{Roots: []uint64{1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.Started("c", 2, "")
+		tr.Done(held, Result{Refused: []protocol.SkippedRoot{
+			{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
+		}}, t0.Add(time.Minute))
+		if got := exportedWithin(tr, t0.Add(time.Minute), 2*time.Hour); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("exported %v, want [1] once", got)
+		}
+	})
+	t.Run("named by a session", func(t *testing.T) {
+		// A session of the newer generation names it too: one export.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		refuse(tr, t0)
+		newer := state(1, 20, fsPart)
+		newer.Generation = 2
+		newer.Session = "s2"
+		tr.Observe(newer, t0)
+		if got := exportedWithin(tr, t0, 2*time.Hour); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("exported %v, want [1] once", got)
+		}
+	})
+	t.Run("pruned", func(t *testing.T) {
+		// The newer generation pruned it before the next Due: not wanted.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		refuse(tr, t0)
+		tr.Started("c", 2, "")
+		tr.Pruned("c", 2, []Drop{{Number: 1, DroppedAtUnixNano: 100}})
+		if got := exportedWithin(tr, t0, 2*time.Hour); len(got) != 0 {
+			t.Fatalf("exported %v, want nothing: pruned", got)
+		}
+	})
 }
 
 // A stale-generation refusal that lands after a newer generation reported

@@ -618,7 +618,12 @@ changed on every service restart would make engines re-key everything. So:
   adds nothing the index has no mapping for: if any of its values has no
   stored entry, the whole record is refused (`metastore.ErrStaleGeneration`,
   #59), and the exporter settles its roots as refused rather than retry
-  them. See [Max age](#max-age).
+  them. The exporter checks this against the index as soon as the engine
+  answers export, before it asks for any upload, so a stale export uploads
+  and publishes nothing (`TestExportStaleGenerationUploadsNothing`, #111).
+  That check is only a shortcut: the one in the index update decides, since
+  a newer generation can be recorded between the two
+  (`TestExportStaleGenerationAfterEarlyCheck`). See [Max age](#max-age).
 - A cache's record (its `generation`) outlives its mappings, for that check:
   once it has none, exported or imported, it stays until
   `metastore.CacheRecordRetention` (7 days) after it last changed
@@ -1806,9 +1811,18 @@ An export refreshes a root's time **only when it writes the root's record**
   (`TestLateOlderGenerationAddsNoRootToHeldValue`). The export ends with its
   roots refused, logged once, and the tracker doesn't export them again
   (`TestStaleGenerationExportNotRetried`), until a newer generation of the
-  cache, which the index accepts, reports them
-  (`TestTrackerStaleRefusalClearedByNewerGeneration`), even while the stale
-  export is still in flight (`TestTrackerStaleRefusalInFlightDropped`). The cache's own generation and
+  cache, which the index accepts, reports in: by any span, event or import
+  of that generation, whether or not it names the roots. Then the refused
+  roots still worth exporting are exported again once, at the next export
+  tick, from the newest connection of the cache
+  (`TestTrackerStaleRefusalClearedByNewerGeneration`,
+  `TestTrackerStaleRefusalClearedRescheduled`, #129), during a drain too
+  (`TestTrackerStaleRefusalClearedDrain`), and even when the newer
+  generation reports in while the stale export is still in flight
+  (`TestTrackerStaleRefusalInFlightDropped`). With several replicas on one
+  prefix, the index can learn the newer generation from another replica
+  before this one does; the root is exported once the engine reports in
+  here (`TestStaleRefusalClearedAcrossReplicas`). The cache's own generation and
   newer ones still record it: the engine really has it
   (`TestSameAndNewerGenerationRecordAfterCollection`). The record is kept
   `metastore.CacheRecordRetention` (7 days) after its last mapping went,

@@ -46,6 +46,9 @@ type fakeEngine struct {
 	mangle func(*fakeengine.Capture)
 	// noPut lists blobs the engine reports done without uploading them.
 	noPut map[digest.Digest]bool
+	// onUpload, when set, runs when an upload that asks for blobs arrives,
+	// before the engine answers it.
+	onUpload func()
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -105,7 +108,11 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 			e.inFlight--
 		}
 		e.uploads = append(e.uploads, req.URLs)
+		onUpload := e.onUpload
 		e.mu.Unlock()
+		if onUpload != nil && len(req.URLs) > 0 {
+			onUpload()
+		}
 		if !ok {
 			return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: "no export " + req.ExportID})
 		}
@@ -782,5 +789,123 @@ func TestExportKnownGapImportWithOtherParts(t *testing.T) {
 	after := idx.Entries[n]
 	if after.Bundle != before.Bundle || after.Source.CacheID != "cache-z" || slices.Contains(after.Parts, `{"part":"newPart"}`) || idx.NextNumber != n+1 {
 		t.Fatalf("entry %d: %+v (next %d)", n, after, idx.NextNumber)
+	}
+}
+
+// recordNewer records, for the test engine's cache, a value of another
+// engine entry (99) at a newer generation than the engine's: the index then
+// knows a later generation of the cache, as when another replica recorded a
+// restarted engine's export.
+func (e *testEnv) recordNewer(t *testing.T, generation uint64) {
+	t.Helper()
+	newer := &dagql.ValueBundle{
+		Version: metastore.BundleVersion,
+		Roots:   []dagql.TransferredRoot{{Ordinal: 1}},
+		Values:  []dagql.TransferredValue{{Ordinal: 1, SenderNumber: 99, Record: dagql.PersistedRecord{ResultID: 99}}},
+	}
+	if _, err := e.meta.Record(context.Background(), "team", newer, e.cache.ID, generation); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (e *testEnv) indexBytes(t *testing.T) []byte {
+	t.Helper()
+	key, err := e.meta.IndexKey("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, err := e.objects.Get(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// A stale generation's export (#59) is refused before any blob is asked for
+// (#111): the engine gets no upload URL, nothing is stored, and the index
+// and the other objects are as they were. The newer generation's export of
+// the same value is recorded.
+func TestExportStaleGenerationUploadsNothing(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	ctx := context.Background()
+	e.recordNewer(t, e.cache.Generation+1)
+	before := e.indexBytes(t)
+	keys := slices.Sorted(slices.Values(e.objects.Keys()))
+
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Stored) != 0 || len(res.Failed) != 0 || len(res.Bundles) != 0 ||
+		len(res.Refused) != 1 || res.Refused[0].Number != 11 || res.Refused[0].Message != StaleGenerationMessage {
+		t.Fatalf("result %+v, want root 11 refused as a stale generation's", res)
+	}
+	if len(res.Uploaded) != 0 || len(res.Present) != 0 {
+		t.Fatalf("uploaded %v, present %v", res.Uploaded, res.Present)
+	}
+	// One upload, empty: it releases the chains.
+	if ups := e.eng.uploadMaps(); len(ups) != 1 || len(ups[0]) != 0 {
+		t.Fatalf("uploads %v, want one release asking for nothing", ups)
+	}
+	for _, l := range [][]byte{layer("base"), layer("exec")} {
+		if _, ok := e.blobs.Get(digest.FromBytes(l)); ok {
+			t.Fatalf("layer %s stored", digest.FromBytes(l))
+		}
+	}
+	if after := e.indexBytes(t); !bytes.Equal(after, before) {
+		t.Fatal("index changed")
+	}
+	if got := slices.Sorted(slices.Values(e.objects.Keys())); !slices.Equal(got, keys) {
+		t.Fatalf("objects %v, want %v: nothing published", got, keys)
+	}
+
+	// A newer generation of the cache exports the same value: recorded.
+	e.cache.Generation += 2
+	res, err = e.x.Export(ctx, e.eng, Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{11}) || len(res.Refused) != 0 || len(res.Uploaded) != 2 {
+		t.Fatalf("newer generation's export: %+v", res)
+	}
+	idx, err := e.meta.Index(ctx, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := idx.Caches[e.cache.ID]; m == nil || m.Generation != e.cache.Generation || m.Numbers[11].Number == 0 || idx.Roots[m.Numbers[11].Number].RecordedAtUnix == 0 {
+		t.Fatalf("index after the newer generation's export: %+v", m)
+	}
+}
+
+// The early check is only a shortcut: a newer generation recorded after it,
+// while the engine uploads, is still refused by the index update, which
+// adds no root or entry (#59, #111).
+func TestExportStaleGenerationAfterEarlyCheck(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	ctx := context.Background()
+	var once sync.Once
+	var before []byte
+	e.eng.onUpload = func() {
+		once.Do(func() {
+			e.recordNewer(t, e.cache.Generation+1)
+			before = e.indexBytes(t)
+		})
+	}
+
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == nil {
+		t.Fatal("no upload asked for blobs: the early check refused it")
+	}
+	if len(res.Stored) != 0 || len(res.Failed) != 0 ||
+		len(res.Refused) != 1 || res.Refused[0].Number != 11 || res.Refused[0].Message != StaleGenerationMessage {
+		t.Fatalf("result %+v, want root 11 refused as a stale generation's", res)
+	}
+	if after := e.indexBytes(t); !bytes.Equal(after, before) {
+		t.Fatal("index changed by the refused export")
 	}
 }

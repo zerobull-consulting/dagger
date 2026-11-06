@@ -1,6 +1,7 @@
 package metastore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -100,14 +101,30 @@ func TestRecordStampsRoots(t *testing.T) {
 		t.Fatalf("a newer record didn't refresh the root: %d, want %d", got, clock.now().Unix())
 	}
 
-	// Index.Record (no clock) stamps nothing.
+	// Index.Record stamps the caller's time only, and the cache's record
+	// with it too: no wall clock (#111). It refuses no time at all.
 	idx := NewIndex()
-	nums, err := idx.Record(rec.BundleID, testBundle([]val{{sender: 5}}, root(1, 0)), "c", 1)
+	nums, err := idx.Record(rec.BundleID, testBundle([]val{{sender: 5}}, root(1, 0)), "c", 1, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := idx.Roots[nums[1]].RecordedAtUnix; got != 0 {
-		t.Fatalf("Index.Record stamped %d", got)
+	if got := idx.Roots[nums[1]].RecordedAtUnix; got != testNowUnix {
+		t.Fatalf("Index.Record stamped %d, want %d", got, testNowUnix)
+	}
+	if got := idx.Caches["c"].UpdatedAtUnix; got != testNowUnix {
+		t.Fatalf("Index.Record stamped the cache's record %d, want %d", got, testNowUnix)
+	}
+	before := jsonMarshal(t, idx)
+	for _, now := range []int64{0, -1} {
+		if _, err := idx.Record(rec.BundleID, testBundle([]val{{sender: 6}}, root(1, 0)), "c", 1, now); err == nil {
+			t.Fatalf("recorded at %d", now)
+		}
+		if got := idx.RecordImportsAt("d", 1, []Import{{Number: nums[1], Engine: 7}}, now); len(got) != 0 {
+			t.Fatalf("imports recorded at %d: %v", now, got)
+		}
+	}
+	if !bytes.Equal(jsonMarshal(t, idx), before) {
+		t.Fatal("a refused record changed the index")
 	}
 }
 
@@ -656,13 +673,13 @@ func TestLateOlderGenerationAddsNoRootToHeldValue(t *testing.T) {
 	t.Run("exported", func(t *testing.T) {
 		idx := NewIndex()
 		// Gen 1: X (10), a root until 100, and Y (11), a root over it.
-		nums, err := idx.Record(bid("a"), testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0)), "c", 1)
+		nums, err := idx.Record(bid("a"), testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0)), "c", 1, testNowUnix)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Gen 3 records something else; X's root expires, X stays as Y's
 		// dependency.
-		if _, err := idx.Record(bid("b"), testBundle([]val{{sender: 12}}, root(1, 0)), "c", 3); err != nil {
+		if _, err := idx.Record(bid("b"), testBundle([]val{{sender: 12}}, root(1, 0)), "c", 3, testNowUnix); err != nil {
 			t.Fatal(err)
 		}
 		idx.DropExpired(200)
@@ -672,7 +689,7 @@ func TestLateOlderGenerationAddsNoRootToHeldValue(t *testing.T) {
 		}
 		// Gen 2, older than 3 but newer than X's record: the record is
 		// written, as before; no root.
-		if _, err := idx.Record(bid("d"), testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2); err != nil {
+		if _, err := idx.Record(bid("d"), testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2, testNowUnix); err != nil {
 			t.Fatal(err)
 		}
 		if e := idx.Entries[x]; e.Source.Generation != 2 {
@@ -687,13 +704,13 @@ func TestLateOlderGenerationAddsNoRootToHeldValue(t *testing.T) {
 		// Cache s: X (10, an fs part), a root until 100, and Y over it.
 		b := testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0))
 		withParts(b, 1, "fs")
-		nums, err := idx.Record(bid("a"), b, "s", 1)
+		nums, err := idx.Record(bid("a"), b, "s", 1, testNowUnix)
 		if err != nil {
 			t.Fatal(err)
 		}
 		x := nums[1]
 		// Cache c imports X on its entry 50 at gen 2; X's root expires.
-		if got := idx.RecordImports("c", 2, []Import{{Number: x, Engine: 50}}); len(got) != 1 {
+		if got := idx.RecordImportsAt("c", 2, []Import{{Number: x, Engine: 50}}, testNowUnix); len(got) != 1 {
 			t.Fatalf("imports %v", got)
 		}
 		idx.DropExpired(200)
@@ -702,7 +719,7 @@ func TestLateOlderGenerationAddsNoRootToHeldValue(t *testing.T) {
 		}
 		// c's gen 1, with more parts: it takes the entry over, as before,
 		// and adds no root.
-		if _, err := idx.Record(bid("d"), withParts(testBundle([]val{{sender: 50}}, root(1, 0)), 1, "fs", "execMeta"), "c", 1); err != nil {
+		if _, err := idx.Record(bid("d"), withParts(testBundle([]val{{sender: 50}}, root(1, 0)), 1, "fs", "execMeta"), "c", 1, testNowUnix); err != nil {
 			t.Fatal(err)
 		}
 		if e := idx.Entries[x]; e.Source.CacheID != "c" {
@@ -832,5 +849,55 @@ func TestIndexVersion3Reads(t *testing.T) {
 	}
 	if raw["version"] != float64(IndexVersion) || raw["caches"].(map[string]any)["c"].(map[string]any)["updatedAtUnix"] == nil {
 		t.Fatalf("written back as %s", body)
+	}
+}
+
+// CheckGeneration, the exporter's early check (#111), refuses exactly what
+// RecordResolvedAt refuses as a stale generation's export, and changes
+// nothing.
+func TestCheckGenerationAgreesWithRecord(t *testing.T) {
+	bid := func(c string) string { return strings.Repeat(c, 64) }
+	idx := NewIndex()
+	if _, err := idx.Record(bid("a"), testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2, testNowUnix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Record(bid("b"), testBundle([]val{{sender: 50}}, root(1, 0)), "s", 1, testNowUnix); err != nil {
+		t.Fatal(err)
+	}
+	idx.RecordImportsAt("c", 2, []Import{{Number: idx.Caches["s"].Numbers[50].Number, Engine: 20}}, testNowUnix)
+	for _, tc := range []struct {
+		name       string
+		cache      string
+		generation uint64
+		senders    []uint64
+		stale      bool
+	}{
+		{"older, mapped", "c", 1, []uint64{10}, false},
+		{"older, imported", "c", 1, []uint64{20}, false},
+		{"older, one unmapped", "c", 1, []uint64{10, 11}, true},
+		{"older, unmapped", "c", 1, []uint64{11}, true},
+		{"same generation", "c", 2, []uint64{11}, false},
+		{"newer generation", "c", 3, []uint64{11}, false},
+		{"unknown cache", "d", 1, []uint64{11}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var vals []val
+			for _, s := range tc.senders {
+				vals = append(vals, val{sender: s})
+			}
+			b := testBundle(vals, root(1, 0))
+			before := jsonMarshal(t, idx)
+			early := idx.CheckGeneration(b, tc.cache, tc.generation)
+			if !bytes.Equal(jsonMarshal(t, idx), before) {
+				t.Fatal("CheckGeneration changed the index")
+			}
+			_, _, record := idx.Clone().RecordResolvedAt(bid("e"), b, tc.cache, tc.generation, testNowUnix)
+			if got := errors.Is(early, ErrStaleGeneration); got != tc.stale {
+				t.Fatalf("CheckGeneration: %v, want stale %v", early, tc.stale)
+			}
+			if got := errors.Is(record, ErrStaleGeneration); got != tc.stale || (!tc.stale && record != nil) {
+				t.Fatalf("RecordResolvedAt: %v, want stale %v", record, tc.stale)
+			}
+		})
 	}
 }

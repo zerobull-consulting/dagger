@@ -344,7 +344,7 @@ func TestRecordRetainsOfferAndOutputOwners(t *testing.T) {
 	}
 	b.Outputs = []dagql.TransferredOutput{{Ordinal: 3, Owner: &dagql.PersistedOfferOwner{DependencyIDs: []uint64{2, 1}}}}
 	idx := NewIndex()
-	if _, err := idx.Record(strings.Repeat("a", 64), b, "c", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "c", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	if deps := idx.Entries[3].Deps; !slices.Equal(deps, []uint64{1, 2}) {
@@ -396,7 +396,7 @@ func TestRecordRejectsBadInput(t *testing.T) {
 		t.Errorf("rejected records wrote %v", keys)
 	}
 	idx := NewIndex()
-	if _, err := idx.Record("nope", chain(1), "c", 1); err == nil {
+	if _, err := idx.Record("nope", chain(1), "c", 1, testNowUnix); err == nil {
 		t.Error("bad bundle ID: no error")
 	}
 }
@@ -734,7 +734,7 @@ func TestDropExpired(t *testing.T) {
 		{sender: 8, deps: []uint64{7}, expires: now + 1},
 		{sender: 9},
 	}, root(3, 0), root(5, 0), root(6, now-1), root(8, now+5))
-	if _, err := idx.Record(strings.Repeat("a", 64), b, "c", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "c", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	// Record's numbers follow the ordinals here.
@@ -763,7 +763,7 @@ func TestDropExpired(t *testing.T) {
 		t.Fatalf("next number %d: dropping must not free numbers", idx.NextNumber)
 	}
 	// A dropped engine entry, exported again, gets a new number.
-	r, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 6}}, root(1, 0)), "c", 1)
+	r, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 6}}, root(1, 0)), "c", 1, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,3 +831,7 @@ func TestMemObjects(t *testing.T) {
 		t.Fatalf("body %q", body)
 	}
 }
+
+// testNowUnix is the time tests record at, when only the index's logic is
+// under test: the index takes its time from the caller (#111).
+const testNowUnix = 10

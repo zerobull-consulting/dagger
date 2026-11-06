@@ -15,7 +15,7 @@
 //     parts, and which roots it retained or skipped as expired. The importer
 //     keeps that, by service number, to know what the engine kept.
 //     The engine entries the values landed on are recorded in the index as
-//     the cache's imports (metastore.Index.RecordImports), so a later export
+//     the cache's imports (metastore.Index.RecordImportsAt), so a later export
 //     of them reuses the stored entries instead of storing them again.
 //  3. Offer: a stored part the merged entry has neither complete nor offered
 //     is offered to that entry, by the engine's number. accepted and
