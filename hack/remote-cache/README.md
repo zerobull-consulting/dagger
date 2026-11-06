@@ -326,9 +326,12 @@ automatic. AWS S3 is still open in zerobull-consulting/dagger#55.
 
 ### In CI
 
-`Remote cache tests` has two optional jobs, `S3 tests against Spaces` and
-`real engines (e2e) against Spaces`. They are skipped unless these repository
-secrets are set: `SPACES_ENDPOINT`, `SPACES_REGION`, `SPACES_BUCKET`,
+`Remote cache tests against Spaces`
+([`remote-cache-spaces.yml`](../../.github/workflows/remote-cache-spaces.yml))
+has two jobs, `S3 tests against Spaces` and `real engines (e2e) against
+Spaces`. It runs on pushes to `feature/remote-cache` and by hand
+(`workflow_dispatch`) on any branch, not on pull requests. Its jobs are
+skipped unless these repository secrets are set: `SPACES_ENDPOINT`, `SPACES_REGION`, `SPACES_BUCKET`,
 `SPACES_PREFIX`, `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY`. An
 optional `SPACES_DISPOSABLE_BUCKET`, set to `1`, runs the lifecycle part on a
 bucket dedicated to the tests. Concurrent runs with it replace each other's
