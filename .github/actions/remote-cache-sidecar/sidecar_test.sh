@@ -96,7 +96,7 @@ case "$1 $2" in
 	if [[ "$4" == *-service && ("$FAKE_FLAKY" == early || ("$FAKE_FLAKY" == true && -f "$FAKE_DIR/signaled")) ]]; then
 		fails=$(($(cat "$FAKE_DIR/fails" 2>/dev/null || echo 0) + 1))
 		echo "$fails" >"$FAKE_DIR/fails"
-		((fails <= 3)) && exit 1
+		((fails <= 3)) && { [[ -n "${FAKE_PROBE_SLEEP:-}" && ! -f "$FAKE_DIR/signaled" ]] && sleep "$FAKE_PROBE_SLEEP"; exit 1; }
 	fi
 	case "$3" in
 	*Running*) [[ -f "$f" ]] && echo true || echo false ;;
@@ -107,7 +107,7 @@ case "$1 $2" in
 "kill -s")
 	: >"$FAKE_DIR/signaled"
 	if [[ "$FAKE_SERVICE" == by-itself ]]; then
-		(sleep 1 && rm -f "$svc") >/dev/null 2>&1 &
+		(sleep "${FAKE_EXIT_AFTER:-1}" && rm -f "$svc") >/dev/null 2>&1 &
 	fi
 	;;
 "logs --since")
@@ -210,6 +210,8 @@ check "... the engine is still stopped only once the drain is done" called "ENGI
 check "a docker inspect that fails before the stop: the service is still signaled, and the stop passes" stop_with 0 FAKE_FLAKY=early
 check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
 check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
+check "a slow probe before the SIGTERM doesn't eat the service's time: it isn't stopped by force" stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=5 FAKE_SERVICE=by-itself FAKE_EXIT_AFTER=3
+check "... no second signal" not called "stop --time 5 t-service"
 
 check "a state from a start before the linger: the stop passes" stop_with 0 old-state
 check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"

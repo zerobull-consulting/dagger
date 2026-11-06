@@ -369,3 +369,22 @@ func TestLingerEngineStopOfAnotherGeneration(t *testing.T) {
 		t.Fatalf("outcome %q, want %q", rep.Outcome, LingerStopped)
 	}
 }
+
+// Known gap (zerobull-consulting/dagger#124): an engine whose events come here,
+// but none of which the service has received yet (such as after a service
+// restart under a running engine), isn't waited for. With no other engine to
+// wait for, the linger ends at once, before that engine's engine.stop. When
+// the gap is fixed, this test fails: turn it around.
+func TestKnownGapLingerMissesEngineNotSeenYet(t *testing.T) {
+	l := newLingerTest(t)
+	welcomedRaw(t, l.srv, "cache-a")
+	waitEngines(t, l.svc, 1)
+	// No engine event about cache-a before the drain.
+	l.linger(time.Minute)
+	rep := l.ended(time.Second)
+	if rep.Outcome != LingerNothing {
+		t.Fatalf("outcome %q: the gap is fixed, turn this test around", rep.Outcome)
+	}
+	// Its engine.stop now comes after the linger ended.
+	l.event("cache-a", telemetryattrs.EngineEventStop)
+}

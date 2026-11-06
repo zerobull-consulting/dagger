@@ -2202,6 +2202,13 @@ only costs time when an engine whose events come here isn't stopped, or its
 stop stalls, such as the service restarting under engines that run on. Set
 `-drain-linger 0` there.
 
+**An engine not heard from yet.** One whose events come here, but none of
+which arrived since the service started (such as after a service restart
+under a running engine), isn't waited for: the service can't tell it from
+an engine whose events go elsewhere. Its `engine.stop` then finds the
+service gone. Known gap, pinned by `TestKnownGapLingerMissesEngineNotSeenYet`
+([zerobull-consulting/dagger#124](https://github.com/zerobull-consulting/dagger/issues/124)).
+
 It logs `linger: started` with the engines it waits for (`linger: waiting
 for engine.stop`, by namespace and cache ID), and `linger: done` with its
 outcome: `stopped` (every engine sent `engine.stop`), `nothing` (none to

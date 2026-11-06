@@ -498,6 +498,8 @@ stop() {
 	# bound). Every wait is bounded, and the cleanup below runs whatever
 	# they found.
 	local was_running=false code="" still_running=false overran=false engine_code=""
+	# The stop's bound counts from the SIGTERM, set below: the probe before
+	# it doesn't eat into the service's time.
 	local deadline=$((SECONDS + st_stop_seconds))
 	# A docker that fails here says nothing about the service: it is taken
 	# for running, so the engine still waits for the drain.
@@ -509,6 +511,7 @@ stop() {
 		local since
 		since="$(($(date +%s) - 1))"
 		echo "remote-cache-sidecar: stopping the service; it drains for up to $((st_stop_seconds - st_linger_seconds - 10))s, then answers the engine's last event for up to ${st_linger_seconds}s; the stop waits ${st_stop_seconds}s for it"
+		deadline=$((SECONDS + st_stop_seconds))
 		timeout 30 docker kill -s TERM "$st_service" >/dev/null 2>&1 || true
 		if ! wait_drained "$st_service" "$since" $((st_stop_seconds - st_linger_seconds - 5)); then
 			echo "remote-cache-sidecar: the service didn't report its drain done in time; stopping the engine anyway" >&2
