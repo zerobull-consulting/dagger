@@ -51,7 +51,7 @@ takes, and the service and engine speak that commit's protocol.
 | `namespace` | no | `default` | The namespace entries are stored in and imported from (`-scope`). Writers and readers that should share a cache use the same one. |
 | `drain-timeout` | no | `10m` | How long the stop lets the service finish its exports (`-drain-timeout`): hours, minutes and seconds, such as `10m` or `1h30m`. |
 | `name` | no | `remote-cache` | Prefix of the containers (`<name>-service`, `<name>-engine`), the engine's state volume and the network. Set another one to run a second sidecar in the same job after the first is stopped, and pass the same to `stop`. |
-| `debug-port` | no | not published | Publishes the service's unauthenticated debug API on the runner's `127.0.0.1:<port>`. |
+| `debug-port` | no | not published | Publishes the service's debug API on the runner's `127.0.0.1:<port>`, behind a token generated for this start (see [The debug API](#the-debug-api)). |
 | `engine-config` | no | [`engine.json`](engine.json) | The engine's `engine.json`. The default turns the engine's GC off (see below) and pulls `docker.io` images through `mirror.gcr.io`, as the release's does. |
 | `verbose` | no | `false` | `true`: the service logs every cache span (`-v`); CI's demo counts them. |
 
@@ -78,6 +78,7 @@ fills, pass an `engine-config` with GC on.
 | `service-url` | The service, as the engine and the CLI reach it: on the sidecar network's gateway, which only this runner reaches. |
 | `service-container`, `engine-container` | The containers. |
 | `logs` | Where `stop` puts the service's and the engine's logs (`service.log`, `engine.log`). |
+| `debug-token-file` | With `debug-port`: the file holding the debug API's token; empty otherwise. |
 
 It also sets `_EXPERIMENTAL_DAGGER_RUNNER_HOST`, `DAGGER_CLOUD_URL` and
 `DAGGER_CLOUD_TOKEN` (a placeholder) in the job's environment, for a CLI of
@@ -95,6 +96,32 @@ silently (see
 It also fails at once, with the service's log, if the service isn't running.
 Another CLI (such as one an action installs) gets the variables, but not
 the `TRACEPARENT` guard.
+
+## The debug API
+
+With `debug-port`, the service's debug API (`-debug-listen :8091`) is
+published on the runner's `127.0.0.1:<debug-port>` only, and requires a
+token (`-debug-token-file`; see
+[The debug API](../../../cmd/cacheservice/README.md#the-debug-api)): the
+start generates one for this sidecar, from `/dev/urandom`, masks it in the
+job's log, and writes it to a file in a directory only the runner's user
+can read, mounted read-only into the service's container. The token never
+appears on a command line, in the container's environment, or in an output:
+the `debug-token-file` output is the file's path. The stop removes the file.
+
+```yaml
+- name: Ask the service which engines are connected
+  env:
+    PORT: "8091"
+    TOKEN_FILE: ${{ steps.sidecar.outputs.debug-token-file }}
+  # curl reads the header from a file descriptor, so the token is on no
+  # command line (printf is a bash builtin).
+  run: curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")") "http://127.0.0.1:$PORT/debug/engines"
+```
+
+A request without the token, or with another, gets 401. Before this,
+`debug-port` published an unauthenticated API; a step that `curl`s it now
+needs the header.
 
 ## Failing loudly
 
@@ -163,6 +190,7 @@ the prefix: upload them, as CI does on failure, only where that's fine.
 The `sidecar demo` job of
 [`remote-cache-tests.yml`](../../workflows/remote-cache-tests.yml) runs the
 [demo](../../../hack/remote-cache/demo/README.md) through both actions on
-every pull request, against MinIO: a writer phase, then a read-only phase on
-a fresh engine with a read-only key. Locally, `hack/remote-cache/dev.sh demo`
+every pull request, against MinIO: a writer phase, with `debug-port` (it
+checks that the debug API refuses a request without the token and answers
+one with it), then a read-only phase on a fresh engine with a read-only key. Locally, `hack/remote-cache/dev.sh demo`
 runs the same with `sidecar.sh`.

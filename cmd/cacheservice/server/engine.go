@@ -52,6 +52,8 @@ type Service struct {
 
 	// rejections rate-limits the logs of refused tokens, by fingerprint.
 	rejections rejectionLog
+	// debug is the debug API's admin token (UseDebugTokenFile).
+	debug debugToken
 
 	// nsMu guards the namespaces and the default namespace.
 	nsMu       sync.Mutex
@@ -656,7 +658,11 @@ func tokenFingerprint(token string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-// DebugHandler serves the debug API, which is not authenticated.
+// DebugHandler serves the debug API. With a debug token (UseDebugTokenFile),
+// every request, /metrics and unknown paths included, must carry it as
+// `Authorization: Bearer <token>`, and is refused with 401 otherwise.
+// Without one, it is open, unless the service checks engine tokens: it then
+// refuses every request (see debugAuth).
 func (s *Service) DebugHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/engines", s.listEngines)
@@ -668,7 +674,7 @@ func (s *Service) DebugHandler() http.Handler {
 	mux.HandleFunc("POST /debug/gc", s.serveGC)
 	mux.HandleFunc("GET /debug/drain", s.serveDrain)
 	mux.Handle("GET /metrics", s.MetricsHandler())
-	return mux
+	return s.debugAuth(mux)
 }
 
 // EngineInfo is a welcomed engine connection, as Engines lists it. Token is

@@ -25,7 +25,10 @@
 #   SIDECAR_NAME            prefix of the containers, volume and network
 #                           (default: remote-cache)
 #   SIDECAR_DEBUG_PORT      publish the debug API on 127.0.0.1:<port>
-#                           (default: not published)
+#                           (default: not published), behind a token
+#                           generated for this start, in
+#                           <dir>/secrets/debug-token (the debug-token-file
+#                           output)
 #   SIDECAR_VERBOSE         true: the service's -v, which logs every cache span
 #   SIDECAR_ENGINE_CONFIG   the engine's engine.json (default: engine.json in
 #                           this directory: GC off, docker.io through
@@ -113,7 +116,7 @@ read_state() {
 		role) st_role="$value" ;;
 		# What this sidecar's start created, one line each as it did: the
 		# stop touches nothing else.
-		created) case "$value" in service | engine | volume | network) st_created+=" $value " ;; esac ;;
+		created) case "$value" in service | engine | volume | network | debug-token) st_created+=" $value " ;; esac ;;
 		esac
 	done <"$file"
 	valid_name "$st_service" && valid_name "$st_engine" && valid_name "$st_volume" &&
@@ -246,10 +249,34 @@ start() {
 		# A pull-request job: never writes to or deletes from the bucket.
 		flags+=(-export=false)
 	fi
-	local publish=(-p "$gateway::8090")
+	local publish=(-p "$gateway::8090") token_mount=() token_file=""
 	if [[ -n "$debug_port" ]]; then
-		# The unauthenticated debug API, on this host's loopback only.
-		flags+=(-debug-listen :8091)
+		# The debug API, on this host's loopback only, and behind a token
+		# generated for this start: :8091 isn't loopback in the container,
+		# and the service refuses it without one. The token goes in a file
+		# mounted read-only, never on a command line or in the container's
+		# environment. The file is readable by the service's UID (65532);
+		# its directory only by this user.
+		# Absolute: docker takes a relative -v source for a volume name.
+		local secrets token
+		secrets="$(cd "$dir" && pwd)/secrets"
+		token_file="$secrets/debug-token"
+		[[ "$token_file" != *:* ]] || die "the sidecar's directory $dir has a ':'"
+		# Never change, overwrite or later delete what this start didn't
+		# create: the directory is new, so the token file is too.
+		[[ ! -e "$secrets" && ! -L "$secrets" ]] ||
+			die "$secrets is already there, and not this start's: remove it, or give this sidecar another name"
+		mkdir -m 700 "$secrets" || die "creating $secrets failed"
+		token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+		[[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "generating the debug token failed"
+		[[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::add-mask::$token"
+		# Recorded first: the stop removes the token file only when this
+		# start wrote it.
+		echo "created=debug-token" >>"$state"
+		(umask 022 && printf '%s\n' "$token" >"$token_file") || die "writing $token_file failed"
+		chmod 644 "$token_file"
+		token_mount=(-v "$token_file:/run/secrets/debug-token:ro")
+		flags+=(-debug-listen :8091 -debug-token-file /run/secrets/debug-token)
 		publish+=(-p "127.0.0.1:$debug_port:8091")
 	fi
 	[[ "${SIDECAR_VERBOSE:-}" == true ]] && flags+=(-v)
@@ -261,7 +288,7 @@ start() {
 
 	echo "remote-cache-sidecar: starting the $role service ($service_image)"
 	timeout 120 docker run -d --name "$service" --network "$network" \
-		--label remote-cache-sidecar="$name" "${publish[@]}" "${s3env[@]}" \
+		--label remote-cache-sidecar="$name" "${publish[@]}" "${token_mount[@]}" "${s3env[@]}" \
 		"$service_image" "${flags[@]}" >/dev/null || die "starting the service failed"
 	# From here on the stop expects a service, and fails without one.
 	echo "created=service" >>"$state"
@@ -373,6 +400,9 @@ EOF
 			echo "engine-container=$engine"
 			echo "logs=$logs"
 			echo "state=$state"
+			if [[ -n "$token_file" ]]; then
+				echo "debug-token-file=$token_file"
+			fi
 		} >>"$GITHUB_OUTPUT"
 	fi
 	echo "remote-cache-sidecar: ready ($role, namespace $namespace). CLI: $bin/dagger"
@@ -425,6 +455,12 @@ stop() {
 	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || true; }
 	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || true; }
 	rm -f "$state"
+	# The debug token, if this start generated it: it opened only this
+	# service. Its directory goes only if nothing else is in it.
+	if created debug-token; then
+		rm -f -- "$(sidecar_dir)/$name/secrets/debug-token"
+		rmdir -- "$(sidecar_dir)/$name/secrets" 2>/dev/null || true
+	fi
 	[[ -n "${GITHUB_OUTPUT:-}" ]] && echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
 
 	if [[ -f "$st_logs/service.log" ]]; then

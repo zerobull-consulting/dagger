@@ -230,7 +230,7 @@ npx @dotenvx/dotenvx run -- bash -c '
 
 | Variable | Meaning |
 | --- | --- |
-| `CACHESERVICE_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | The bucket. The e2e's proxy signs with static credentials. |
+| `CACHESERVICE_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | The bucket. Without the keys, the SDK's default chain is used; the e2e's proxy, when it signs again, uses what the S3 client resolved. |
 | `CACHESERVICE_S3_PREFIX` | Required: everything happens under it. Empty or `/` is refused. |
 | `CACHESERVICE_S3_PATH_STYLE` | `true` or `false`; set it. Unset, the `blobstore`, `gc` and `metastore` suites use virtual-hosted addressing, and `server` and the e2e path-style. |
 | `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
@@ -246,12 +246,15 @@ enforces this in test setup:
 - A run refuses an empty or `/` prefix.
 - Every key a test writes, deletes or aborts is under `<prefix>/<run>/` (the
   e2e: `<prefix>/e2e/<run>/`). Every S3 client of the tests, and the e2e's
-  proxy, goes through a guard (`s3test.Guard`) that refuses
-  anything else before it reaches the store, and fails the test. It reads the
-  keys of bulk deletes too. Presigned PUTs a test sends itself are checked by
-  `s3test.CheckURL`. The ones the service hands a fake engine go through
-  `remotecache`'s own HTTP client, past the guard: their keys come from a store
-  configured with the test's prefix, which is what keeps them in it.
+  proxy, goes through a guard (`s3test.Guard`) that refuses any other write,
+  delete or abort before it reaches the store, and the test then fails. It
+  reads the keys of bulk deletes too, from a body bounded by
+  `s3test.MaxBulkDeleteBytes`.
+  Presigned PUTs a test sends itself are checked by `s3test.CheckURL`. In the
+  e2e, the ones the service hands real engines go through the proxy, and its
+  guard. The ones it hands a fake engine go through `remotecache`'s own HTTP
+  client, past the guard: their keys come from a store configured with the
+  test's prefix, which is what keeps them in it.
 - Nothing changes the bucket's configuration. The guard refuses every
   bucket-level change. The one exception is the lifecycle configuration with
   `CACHESERVICE_TEST_DISPOSABLE_BUCKET=1`, since
@@ -268,8 +271,8 @@ stay under `<prefix>/<run>/`, whose name starts with the run's UTC time.
 `TestGuardWithSDK` and `TestGuardBucketConfiguration` check the guard with the
 requests the SDK really makes, in both ways of addressing the bucket, and
 `TestMinIODeletePrefix` the cleanup, against a real store. `TestS3ProxyGuard`
-checks the proxy's, and an e2e run fails if a request outside its prefix reached
-it.
+checks the proxy's, and an e2e run fails if its proxy or its direct client
+refused a request.
 
 ### The e2e's proxy on an HTTPS store
 

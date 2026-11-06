@@ -21,15 +21,17 @@ import (
 
 // S3Request is one request through the S3 proxy.
 type S3Request struct {
-	// Time is when the proxy received the request.
+	// Time is when the proxy received the request (a bulk delete: once
+	// its guard has read the body).
 	Time   time.Time
 	Method string
 	// Path is the request path: /<bucket>/<key> (the services use
 	// path-style addressing), and Query its query string.
 	Path  string
 	Query string
-	// Status is the store's answer (0: not answered yet), or the injected
-	// fault's.
+	// Status is the store's answer (0: not answered yet), the injected
+	// fault's, or 403 when the proxy's guard refused the request (with no
+	// Fault).
 	Status int
 	// Fault names the fault the proxy answered with instead of the store
 	// ("" when the store answered), Stalled is whether a stall held it, and
@@ -90,6 +92,10 @@ type ProxyOptions struct {
 	// Guard, when set, answers 403 to requests it refuses, which don't reach
 	// the store. Guard.Refused and Guard.Touched say what it saw.
 	Guard *s3test.Guard
+
+	// onGuard, when set, is called with each request just before the guard
+	// checks it: a test's way to know the guard has a request.
+	onGuard func(*http.Request)
 }
 
 // Fault makes the proxy answer some requests itself instead of passing them
@@ -235,19 +241,29 @@ func StartS3ProxyWith(t *testing.T, host, target string, opts ProxyOptions) *S3P
 		rp.Transport = opts.Upstream.Transport
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Recorded as it arrives, with its status set as the response
-		// starts: before the client can see the response, so a client
-		// that got one always finds its request recorded.
+		// Recorded as it arrives (a bulk delete: once the guard has read
+		// its body), with its status set as the response starts: before
+		// the client can see the response, so a client that got one always
+		// finds its request recorded.
+		//
+		// The guard goes first, outside p.mu: it reads a bulk delete's
+		// keys from the body, off the network, and a slow body would hold
+		// up every other request and the test's reads of the record.
+		var refused error
+		if p.guard != nil {
+			if opts.onGuard != nil {
+				opts.onGuard(r)
+			}
+			refused = p.guard.CheckRecord(r)
+		}
 		p.mu.Lock()
 		i := len(p.reqs)
 		p.reqs = append(p.reqs, S3Request{Time: time.Now(), Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery})
-		if p.guard != nil {
-			if err := p.guard.CheckRecord(r); err != nil {
-				p.reqs[i].Status = http.StatusForbidden
-				p.mu.Unlock()
-				writeS3Error(w, http.StatusForbidden, "AccessDenied")
-				return
-			}
+		if refused != nil {
+			p.reqs[i].Status = http.StatusForbidden
+			p.mu.Unlock()
+			writeS3Error(w, http.StatusForbidden, "AccessDenied")
+			return
 		}
 		f := p.faultLocked(r.Method, r.URL.Path)
 		if f != nil {

@@ -259,7 +259,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		authRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "auth_rejected_total",
-			Help: "Requests refused for a missing or unknown token, by endpoint: engine (the WebSocket) or otlp.",
+			Help: "Requests refused for a missing or unknown token, by endpoint: engine (the WebSocket), otlp, or debug (the debug API).",
 		}, []string{"endpoint"}),
 		tokensRevoked: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "connections_revoked_total",
