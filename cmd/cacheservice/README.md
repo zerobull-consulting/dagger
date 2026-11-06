@@ -1817,7 +1817,10 @@ An export refreshes a root's time **only when it writes the root's record**
   once, at the next export tick, from the newest connection of the cache.
   A batch is never exported from a connection of an older generation than
   the tracker's: it waits for the newer generation's hello, as it would for
-  an engine not connected (`NoEngineWait`, 10s)
+  an engine not connected (`NoEngineWait`, 10s). With several connections of
+  one cache, exports go to the newest generation's, even when an older
+  generation's engine connected later
+  (`TestOlderGenerationConnectingLaterDoesNotTakeExports`)
   (`TestTrackerStaleRefusalClearedByNewerGeneration`,
   `TestTrackerStaleRefusalClearedRescheduled`, #129), during a drain too
   (`TestTrackerStaleRefusalClearedDrain`), and even when the newer

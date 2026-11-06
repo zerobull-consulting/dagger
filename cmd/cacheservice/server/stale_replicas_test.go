@@ -80,10 +80,18 @@ func testStaleRefusalClearedAcrossReplicas(t *testing.T, eventFirst bool) {
 	restarted.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Layers: [][]byte{testLayer("base"), testLayer("exec")}})
 	r1ctx, stopR1 := context.WithCancel(h.ctx)
 	_, r1URL := startReplica(t, r1ctx, blobs, meta)
-	r1done := make(chan error, 1)
+	// r1done is closed when the restarted engine leaves replica 1.
+	r1done := make(chan struct{})
 	go func() {
-		r1done <- remotecache.Run(r1ctx, fakeengine.Adapter{Cache: restarted}, remotecache.Config{URL: r1URL, Token: "engine-token", EngineName: "engine-a"})
+		defer close(r1done)
+		_ = remotecache.Run(r1ctx, fakeengine.Adapter{Cache: restarted}, remotecache.Config{URL: r1URL, Token: "engine-token", EngineName: "engine-a"})
 	}()
+	// Cleanups run last first: this one before replica 1's, which waits
+	// for its connections to end, even when the test fails before stopR1.
+	t.Cleanup(func() {
+		stopR1()
+		<-r1done
+	})
 	waitIndexFor(t, meta, func(idx *metastore.Index) bool {
 		c := idx.Caches["cache-a"]
 		return c != nil && c.Generation == 5 && len(c.Imported) == 1
@@ -166,5 +174,51 @@ func waitFor(t *testing.T, what string, ok func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// An older generation's engine that connects after a newer one, as a process
+// still running beside its restart, doesn't take the exports from it: the
+// newest generation's connection is chosen, not the latest connection.
+func TestOlderGenerationConnectingLaterDoesNotTakeExports(t *testing.T) {
+	blobs, meta := newMemStores(t)
+	h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = 100 * time.Millisecond })
+	build := func(c *fakeengine.Cache) {
+		c.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+		c.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Layers: [][]byte{testLayer("base"), testLayer("exec")}})
+	}
+	restarted := fakeengine.New("cache-a", 5)
+	build(restarted)
+	h.connectEngine(restarted)
+	// connectEngine returns on any connection of cache-a, which the
+	// harness's engine already is: wait for this one, so the older engine
+	// below connects after it.
+	waitEngines(t, h.svc, 2)
+	old := fakeengine.New("cache-a", 4)
+	build(old)
+	ctx, cancel := context.WithCancel(h.ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: old}, remotecache.Config{URL: h.srv.URL, Token: "engine-token", EngineName: "engine-old"})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waitEngines(t, h.svc, 3)
+	if c := h.svc.engineFor(h.ns(), "cache-a"); c == nil || c.Generation() != 5 {
+		t.Fatalf("engineFor chose %+v, want the generation-5 connection", c)
+	}
+	h.postSpansOf(restarted, "session-5", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitIndexFor(t, meta, func(idx *metastore.Index) bool {
+		c := idx.Caches["cache-a"]
+		if c == nil {
+			return false
+		}
+		m, ok := c.Numbers[11]
+		return ok && m.Generation == 5
+	})
+	if n := old.Exports(); n != 0 {
+		t.Fatalf("the older engine exported %d times", n)
 	}
 }

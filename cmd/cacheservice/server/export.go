@@ -226,16 +226,24 @@ func (s *Service) connected(c *engineConn) bool {
 	return s.conns[c.id] == c
 }
 
-// engineFor returns the latest welcomed connection of an engine cache in a
-// namespace. A connection of another namespace that says hello with the same
-// cache ID is never chosen: its token gives it no say over this namespace's
+// engineFor returns the welcomed connection of an engine cache in a
+// namespace of its newest generation, and of those the latest. An older
+// generation's engine that connects after a newer one (a process still
+// running beside its restart) is not chosen over it: the tracker exports for
+// the newest generation it heard of, and runBatch won't export from an older
+// one. A connection of another namespace that says hello with the same cache
+// ID is never chosen: its token gives it no say over this namespace's
 // exports.
 func (s *Service) engineFor(ns *namespace, cacheID string) *engineConn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var latest *engineConn
 	for _, c := range s.conns {
-		if c.ns == ns && c.hello.CacheID == cacheID && (latest == nil || c.id > latest.id) {
+		if c.ns != ns || c.hello.CacheID != cacheID {
+			continue
+		}
+		if latest == nil || c.hello.Generation > latest.hello.Generation ||
+			(c.hello.Generation == latest.hello.Generation && c.id > latest.id) {
 			latest = c
 		}
 	}
