@@ -2344,14 +2344,15 @@ What to watch:
 ## Image
 
 CI publishes the service as `ghcr.io/zerobull-consulting/cacheservice`
-([`cacheservice-image.yml`](../../.github/workflows/cacheservice-image.yml)),
+([`cacheservice-publish.yml`](../../.github/workflows/cacheservice-publish.yml)),
 `linux/amd64` only:
 
 - `:<commit SHA>` (the full SHA) for each push to `feature/remote-cache`;
 - `:feature-remote-cache`, which moves to the newest of those.
 
 Pull requests that touch the service build the image and smoke-test it
-([`hack/remote-cache/image-smoke.sh`](../../hack/remote-cache/image-smoke.sh)),
+([`cacheservice-image.yml`](../../.github/workflows/cacheservice-image.yml),
+[`hack/remote-cache/image-smoke.sh`](../../hack/remote-cache/image-smoke.sh)),
 and push nothing. To build it from a fresh clone, at the repository root:
 
 ```bash

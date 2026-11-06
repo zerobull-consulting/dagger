@@ -1,0 +1,110 @@
+name: Cache service image publish
+# Builds cmd/cacheservice/Dockerfile, smoke-tests it
+# (hack/remote-cache/image-smoke.sh), and pushes
+# ghcr.io/zerobull-consulting/cacheservice:<commit SHA> and the moving
+# :feature-remote-cache tag. Runs on pushes to feature/remote-cache, and
+# workflow_dispatch on it; never for a pull request (cacheservice-image.yml
+# builds and smoke-tests those). See cmd/cacheservice/README.md, "Image".
+"on":
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  # A group per commit, so none is dropped while another waits, and each
+  # pushes its SHA tag; the moving-tag job below serializes the moving tag
+  # across them.
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/zerobull-consulting/cacheservice
+jobs:
+  # Build, smoke-test, then push the SHA tag. This job and moving-tag are the
+  # only ones with packages: write. A workflow_dispatch on another branch
+  # fails here rather than publishing it.
+  publish:
+    name: image build, smoke test and push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Only feature/remote-cache publishes
+        if: github.ref != 'refs/heads/feature/remote-cache'
+        run: |
+          echo "::error::publishes only from feature/remote-cache, not $GITHUB_REF; cacheservice-image.yml builds other branches"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" -t "$IMAGE:$REVISION" .
+          docker image inspect "$IMAGE:$REVISION" \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        env:
+          REVISION: ${{ github.sha }}
+        run: ./hack/remote-cache/image-smoke.sh "$IMAGE:$REVISION"
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Push
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker push "$IMAGE:$REVISION"
+          echo "pushed $IMAGE:$REVISION" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+  # Moves :feature-remote-cache, after a publish pushed its SHA tag. Publishes
+  # of different commits can overlap, and this job's group runs one at a time
+  # across them, so its check and its retag can't interleave with another's.
+  # GitHub keeps only the newest pending job of a group, and jobs arrive in
+  # the order their publishes finish, not their commits' order; so it moves
+  # the tag to the branch's head at the time it runs, if that head's SHA tag
+  # is pushed, not to its own commit. The head's own publish runs a move after
+  # its push, so the tag ends on the newest head, and never moves backwards.
+  moving-tag:
+    name: image moving tag
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-moving-tag
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # A registry-side copy of the head's manifest, with the same digest:
+      # nothing is pulled or rebuilt.
+      - name: Move :feature-remote-cache to the branch head
+        run: |
+          head="$(git ls-remote origin refs/heads/feature/remote-cache | cut -f1)"
+          if ! out="$(docker buildx imagetools inspect "$IMAGE:$head" 2>&1)"; then
+            if grep -q 'not found' <<<"$out"; then
+              echo "$IMAGE:$head isn't pushed yet: its own run moves the tag" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "$out" >&2
+            exit 1
+          fi
+          docker buildx imagetools create --prefer-index=false -t "$IMAGE:feature-remote-cache" "$IMAGE:$head"
+          echo "$IMAGE:feature-remote-cache -> $head" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io

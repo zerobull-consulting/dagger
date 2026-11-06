@@ -11,7 +11,8 @@
 #      after which docker sends SIGKILL and the exit code is 137.
 #
 # Needs only docker, curl, grep and bash (no GNU date or bc).
-# Used by .github/workflows/cacheservice-image.yml; runs the same locally.
+# Used by .github/workflows/cacheservice-image.yml and cacheservice-publish.yml;
+# runs the same locally.
 set -euo pipefail
 
 image="${1:?usage: image-smoke.sh <image>}"

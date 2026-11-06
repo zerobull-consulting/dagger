@@ -1,0 +1,109 @@
+name: Remote cache tests against Spaces
+# The remote cache's S3 suites and real-engine e2e against DigitalOcean
+# Spaces, a real bucket rather than MinIO. Not on pull requests: these jobs
+# need the SPACES_* secrets, which this repository doesn't set yet, and a job
+# that can't run would show on every pull request as a skipped check. Runs
+# on pushes to feature/remote-cache, and by hand (workflow_dispatch) on any
+# branch, including a pull request's. See hack/remote-cache/README.md,
+# "Testing against a real bucket".
+"on":
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  # Runs the Spaces jobs below only where the SPACES_* secrets are set: a job's
+  # `if` can't read secrets, so this one answers for them. Forks and repositories
+  # without them skip those jobs. Anyone with write access can read repository
+  # secrets through a workflow on a branch, so use a key for a dedicated test
+  # bucket. See hack/remote-cache/README.md, "Testing against a real bucket".
+  spaces-config:
+    name: Spaces configured?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Check the secrets
+        id: check
+        env:
+          ENDPOINT: ${{ secrets.SPACES_ENDPOINT }}
+          REGION: ${{ secrets.SPACES_REGION }}
+          BUCKET: ${{ secrets.SPACES_BUCKET }}
+          PREFIX: ${{ secrets.SPACES_PREFIX }}
+          ACCESS_KEY_ID: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+        run: |
+          if [[ -n "$ENDPOINT" && -n "$REGION" && -n "$BUCKET" && -n "$PREFIX" && -n "$ACCESS_KEY_ID" && -n "$SECRET_ACCESS_KEY" ]]; then
+            echo "configured=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >>"$GITHUB_OUTPUT"
+          fi
+  # Both Spaces jobs work under fresh prefixes below SPACES_PREFIX
+  # (<prefix>/<run>/ for each test, <prefix>/e2e/<run>/ for the e2e), so the
+  # service's startup ownership check always finds an empty prefix and claims
+  # it. Leftovers of earlier runs, of any layout, sit in other runs'
+  # prefixes, which nothing here reads or deletes; a run whose prefix wasn't
+  # empty would fail at the check, not clean it up.
+  spaces-store:
+    name: S3 tests against Spaces
+    needs: spaces-config
+    if: needs.spaces-config.outputs.configured == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Store suites
+        # On this step only, not the job: the other steps run third-party actions.
+        env:
+          CACHESERVICE_TEST_EXTERNAL: "1"
+          CACHESERVICE_TEST_STORE: spaces
+          CACHESERVICE_TEST_DISPOSABLE_BUCKET: ${{ secrets.SPACES_DISPOSABLE_BUCKET }}
+          CACHESERVICE_S3_ENDPOINT: ${{ secrets.SPACES_ENDPOINT }}
+          CACHESERVICE_S3_REGION: ${{ secrets.SPACES_REGION }}
+          CACHESERVICE_S3_BUCKET: ${{ secrets.SPACES_BUCKET }}
+          CACHESERVICE_S3_PREFIX: ${{ secrets.SPACES_PREFIX }}
+          CACHESERVICE_S3_ACCESS_KEY_ID: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          CACHESERVICE_S3_SECRET_ACCESS_KEY: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          CACHESERVICE_S3_PATH_STYLE: "false"
+        run: ./hack/remote-cache/dev.sh test
+  # No upload of the run's files, unlike the e2e job: their logs name the bucket.
+  spaces-e2e:
+    name: real engines (e2e) against Spaces
+    needs: spaces-config
+    if: needs.spaces-config.outputs.configured == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Real engines
+        # On this step only, not the job: the other steps run third-party actions.
+        env:
+          E2E_DIR: ${{ runner.temp }}/e2e
+          CACHESERVICE_TEST_EXTERNAL: "1"
+          CACHESERVICE_TEST_STORE: spaces
+          CACHESERVICE_S3_ENDPOINT: ${{ secrets.SPACES_ENDPOINT }}
+          CACHESERVICE_S3_REGION: ${{ secrets.SPACES_REGION }}
+          CACHESERVICE_S3_BUCKET: ${{ secrets.SPACES_BUCKET }}
+          CACHESERVICE_S3_PREFIX: ${{ secrets.SPACES_PREFIX }}
+          CACHESERVICE_S3_ACCESS_KEY_ID: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          CACHESERVICE_S3_SECRET_ACCESS_KEY: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          CACHESERVICE_S3_PATH_STYLE: "false"
+        run: ./hack/remote-cache/dev.sh e2e
