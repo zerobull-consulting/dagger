@@ -172,29 +172,47 @@ jobs:
   # (the action, the demo, the stop, which drains), then a read-only phase on
   # a fresh engine (-export=false and MinIO's read-only user). check.sh counts
   # cache spans in the service's log: the cacheable step must be a hit with
-  # 0 executed, and the cache-volume step must rerun. Both images are built
-  # from this checkout, so a pull request tests its own code.
+  # 0 executed, and the cache-volume step must rerun. The service's image is
+  # built from this checkout, so a pull request tests its own service; the
+  # engine is a stock Dagger release (STOCK_ENGINE), whose remote cache
+  # client is the one users run.
   sidecar:
     name: sidecar demo
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # The release's multi-platform index, pinned by digest; update the tag
+      # and the digest together, and STOCK_ENGINE_TAG with them.
+      STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+      STOCK_ENGINE_TAG: v1.0.0-beta.25
     steps:
       - name: Checkout
         uses: actions/checkout@v5
       # sidecar.sh's validation and stop, against a fake docker.
       - name: Test the action's script
         run: ./.github/actions/remote-cache-sidecar/sidecar_test.sh
-      # As cacheservice-image.yml and engine-image.yml build them; the engine's
-      # CLI provisions this same image by default.
-      - name: Build the images
+      # A warning, not a failure: when this branch's engine-side client
+      # (merged from upstream main) differs from the stock engine's, this job
+      # doesn't test it, and STOCK_ENGINE should move to the release that
+      # has it once there is one.
+      - name: Compare the engine's client with the stock engine's
+        run: |
+          git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"
+          paths=(engine/remotecache cmd/engine/remotecache.go ':!**/*_test.go')
+          if ! git diff --quiet "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}"; then
+            echo "::warning::the remote cache client differs from $STOCK_ENGINE_TAG's, which this job runs:"
+            git diff --stat "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}"
+          fi
+      # The service as cacheservice-image.yml builds it; the engine pulled
+      # alongside.
+      - name: Build the service's image, pull the engine's
         env:
           REVISION: ${{ github.sha }}
         run: |
+          docker pull -q "$STOCK_ENGINE" &
           docker build -f cmd/cacheservice/Dockerfile \
             --build-arg REVISION="$REVISION" -t cacheservice:ci .
-          docker build -f hack/remote-cache/engine.Dockerfile \
-            --build-arg REVISION="$REVISION" --build-arg ENGINE_IMAGE=dagger-engine:ci \
-            -t dagger-engine:ci .
+          wait $!
       # MinIO on the Docker bridge gateway, where the sidecar's containers
       # reach it, with a read-only user for the demo's prefix (demo/). The
       # credentials are MinIO's committed dev ones.
@@ -208,7 +226,7 @@ jobs:
           role: writer
           name: demo-writer
           service-image: cacheservice:ci
-          engine-image: dagger-engine:ci
+          engine-image: ${{ env.STOCK_ENGINE }}
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
@@ -256,7 +274,7 @@ jobs:
           role: read-only
           name: demo-reader
           service-image: cacheservice:ci
-          engine-image: dagger-engine:ci
+          engine-image: ${{ env.STOCK_ENGINE }}
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
