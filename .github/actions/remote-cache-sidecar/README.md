@@ -194,3 +194,10 @@ every pull request, against MinIO: a writer phase, with `debug-port` (it
 checks that the debug API refuses a request without the token and answers
 one with it), then a read-only phase on a fresh engine with a read-only key. Locally, `hack/remote-cache/dev.sh demo`
 runs the same with `sidecar.sh`.
+
+The job builds the service's image from the pull request, but runs the stock
+Dagger engine release in `STOCK_ENGINE`, not an engine built from this
+branch: the engine's remote cache client comes from upstream, and a step of
+the job warns when this branch's differs from that release's. Which engine to
+pin is settled by the lockstep policy, a vX service for vX engines
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)).
