@@ -1654,7 +1654,8 @@ mean "delete". In each namespace, in order:
    (`metastore.Index.Expire`, the same rules as `DropExpired`). Roots with no
    recording time (indexes before version 3) are stamped now. Cache
    records with no mappings left are kept `metastore.CacheRecordRetention`
-   (7 days) after they last changed, then dropped. Finished
+   (7 days) after they last changed, then dropped, even when nothing else
+   changes (the report's `caches`, `TestEmptyCacheRecordDroppedAlone`). Finished
    deletions older than 4h are dropped from the index.
 2. *(The listing is step 0, before the expiry, so a namespace with a
    violation has nothing written.)*
@@ -1735,7 +1736,9 @@ An export refreshes a root's time **only when it writes the root's record**
   `TestLateOlderGenerationDoesNotReviveCollectedRoot`,
   `TestLateOlderGenerationBeforeCollection`). The export ends with its
   roots refused, logged once, and the tracker doesn't export them again
-  (`TestStaleGenerationExportNotRetried`). The cache's own generation and
+  (`TestStaleGenerationExportNotRetried`), until a newer generation of the
+  cache, which the index accepts, reports them
+  (`TestTrackerStaleRefusalClearedByNewerGeneration`). The cache's own generation and
   newer ones still record it: the engine really has it
   (`TestSameAndNewerGenerationRecordAfterCollection`). The record is kept
   `metastore.CacheRecordRetention` (7 days) after its last mapping went,

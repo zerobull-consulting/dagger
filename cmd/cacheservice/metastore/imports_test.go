@@ -95,10 +95,16 @@ func TestRecordReusesImports(t *testing.T) {
 // cache, and the old source's mapping becomes an import.
 func TestRecordImportWithMoreParts(t *testing.T) {
 	idx := importChain(t)
+	idx.Caches["cache-a"].UpdatedAtUnix = 1
 	b := withParts(testBundle([]val{{sender: 100}}, root(1, 0)), 1, "fs", "execMeta")
-	nums, err := idx.Record(strings.Repeat("b", 64), b, "cache-b", 1)
+	nums, _, err := idx.RecordResolvedAt(strings.Repeat("b", 64), b, "cache-b", 1, 5000)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// cache-a's mapping changed (it became an import): its record is
+	// stamped, so its retention counts from now (#59).
+	if got := idx.Caches["cache-a"].UpdatedAtUnix; got != 5000 {
+		t.Fatalf("cache-a updated at %d, want 5000", got)
 	}
 	if nums[1] != 1 || idx.NextNumber != 4 {
 		t.Fatalf("numbers %v, next %d", nums, idx.NextNumber)

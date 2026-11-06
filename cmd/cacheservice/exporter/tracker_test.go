@@ -169,6 +169,29 @@ func TestTrackerGenerationFence(t *testing.T) {
 	}
 }
 
+// A root the index refused as a stale generation's export (#59) isn't
+// exported again by that generation, but is by a newer one, which the index
+// accepts. An engine's own refusal stays across generations.
+func TestTrackerStaleRefusalClearedByNewerGeneration(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Observe(state(2, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{
+		{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
+		{Number: 2, Reason: protocol.SkipRefused, Message: "not exportable"},
+	}}, t0)
+	if got := roots(tr.All("c", t0)); len(got) != 0 {
+		t.Fatalf("refused roots exported again in the same generation: %v", got)
+	}
+	newer := state(1, 20, fsPart)
+	newer.Generation = 2
+	tr.Observe(newer, t0)
+	if got := roots(tr.All("c", t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after a newer generation: %v, want the stale refusal exported again", got)
+	}
+}
+
 func TestTrackerPruneWatermark(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 100, fsPart), t0)

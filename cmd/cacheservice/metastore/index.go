@@ -592,6 +592,7 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 						src.Imported = map[uint64]Mapping{}
 					}
 					src.Imported[old.Source.Number] = sm
+					src.UpdatedAtUnix = max(src.UpdatedAtUnix, stampUnix)
 				}
 			}
 			delete(cache.Imported, v.SenderNumber)

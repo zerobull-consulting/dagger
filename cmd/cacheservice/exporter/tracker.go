@@ -205,6 +205,16 @@ func (t *Tracker) cache(cacheID string, generation uint64) *trackedCache {
 	if generation < c.generation {
 		return nil
 	}
+	if generation > c.generation {
+		// A refusal of a stale generation's export (the index had a
+		// later one) says nothing of this generation's: it may record
+		// the same value, so it is exported again (#59).
+		for _, e := range c.entries {
+			if e.refused != nil && e.refusedMessage == StaleGenerationMessage {
+				e.refused, e.refusedMessage = nil, ""
+			}
+		}
+	}
 	c.generation = generation
 	return c
 }
