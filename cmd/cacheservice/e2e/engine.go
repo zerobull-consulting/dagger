@@ -200,9 +200,26 @@ func (en *Engine) remove() {
 	_, _ = Docker(ctx, "volume", "rm", "-f", en.Volume)
 }
 
-// CLI runs the dagger CLI built for the run against the engine, with stdin
-// and args, and its telemetry pointed at svc (the engine's own service when
-// nil). It writes stdout to RunDir/<out>.out and stderr to RunDir/<out>.log,
+// cleanEnv is this process's environment without TRACEPARENT,
+// TRACESTATE, OTEL_*, DAGGER_* and _EXPERIMENTAL_DAGGER_*: the CLI's, before
+// its own settings (CLI).
+func cleanEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == "TRACEPARENT" || name == "TRACESTATE" ||
+			strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "DAGGER_") ||
+			strings.HasPrefix(name, "_EXPERIMENTAL_DAGGER_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
+}
+
+// CLI runs the run's dagger CLI (copied out of its engine image) against
+// the engine, with stdin and args, and its telemetry pointed at svc (the
+// engine's own service when nil). It writes stdout to RunDir/<out>.out and stderr to RunDir/<out>.log,
 // and returns stdout and how long it took. It fails the test if the CLI
 // fails.
 //
@@ -216,17 +233,7 @@ func (en *Engine) CLI(svc *Service, out, stdin string, args ...string) ([]byte, 
 	if svc == nil {
 		svc = en.Service
 	}
-	var env []string
-	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
-		if name == "TRACEPARENT" || name == "TRACESTATE" ||
-			strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "DAGGER_") ||
-			strings.HasPrefix(name, "_EXPERIMENTAL_DAGGER_") {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env,
+	env := append(cleanEnv(),
 		"_EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://"+en.Container,
 		"DAGGER_CLOUD_TOKEN="+en.cliToken,
 		"DAGGER_CLOUD_URL="+svc.URL,

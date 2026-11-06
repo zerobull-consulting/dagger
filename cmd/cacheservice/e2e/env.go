@@ -278,8 +278,6 @@ func (e *Env) ctx() (context.Context, context.CancelFunc) {
 func (e *Env) build() {
 	t := e.T
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
 	// The image's context: Dir/bin when it copies the binaries built there,
 	// or a directory of its own, so the build doesn't send them.
 	dir := filepath.Join(e.Settings.Dir, "image")
@@ -290,6 +288,9 @@ func (e *Env) build() {
 		t.Fatal(err)
 	}
 	if e.Settings.BuildEngine && !e.Settings.SkipBuild {
+		// A budget of its own: a cold build of the engine takes minutes.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
 		start := time.Now()
 		root := repoRoot(t)
 		for _, b := range []struct {
@@ -341,6 +342,8 @@ func (e *Env) build() {
 		_ = os.Remove(filepath.Join(dir, "extra-ca.crt"))
 	}
 	write("Dockerfile", dockerfile)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 	start := time.Now()
 	out, err := Docker(ctx, "build", "-q", "-t", e.Settings.Image, dir)
 	if err != nil {
@@ -352,7 +355,9 @@ func (e *Env) build() {
 	}
 	t.Logf("built %s on %s, with %s, in %s", e.Settings.Image, e.Settings.EngineImage, what, time.Since(start).Round(time.Second))
 	e.cli = e.copyCLI(ctx, strings.TrimSpace(out))
-	if v, err := exec.CommandContext(ctx, e.cli, "version").Output(); err != nil {
+	version := exec.CommandContext(ctx, e.cli, "version")
+	version.Env = cleanEnv()
+	if v, err := version.Output(); err != nil {
 		t.Fatalf("%s version: %v", e.cli, err)
 	} else {
 		t.Logf("the CLI, from %s: %s", e.Settings.Image, strings.Join(strings.Fields(string(v)), " "))
@@ -364,7 +369,9 @@ var imageID = regexp.MustCompile(`^sha256:([0-9a-f]{64})$`)
 
 // copyCLI copies the dagger CLI out of the image with ID id, which matches
 // its engine, to Dir/cli/<id>/dagger, unless it is there already, and
-// returns its path.
+// returns its path. It removes the copies of other images not used for a
+// day (cliKeep), so rebuilt images don't pile them up, without taking one
+// from a run going on now.
 func (e *Env) copyCLI(ctx context.Context, id string) string {
 	t := e.T
 	t.Helper()
@@ -372,9 +379,14 @@ func (e *Env) copyCLI(ctx context.Context, id string) string {
 	if m == nil {
 		t.Fatalf("docker build -q printed %q, not an image ID", id)
 	}
-	dir := filepath.Join(e.Settings.Dir, "cli", m[1])
+	root := filepath.Join(e.Settings.Dir, "cli")
+	dir := filepath.Join(root, m[1])
 	cli := filepath.Join(dir, "dagger")
+	defer pruneCLIs(t, root, m[1])
 	if _, err := os.Stat(cli); err == nil {
+		// Marks it used, for pruneCLIs.
+		now := time.Now()
+		_ = os.Chtimes(dir, now, now)
 		return cli
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -390,9 +402,16 @@ func (e *Env) copyCLI(ctx context.Context, id string) string {
 		defer cancel()
 		_, _ = Docker(rmCtx, "rm", "-f", container)
 	}()
-	// To a temporary name first: a copy cut short isn't taken for the CLI
-	// by a later run.
-	tmp := cli + ".tmp"
+	// To a temporary file of this run's own first, then renamed into place:
+	// a copy cut short isn't taken for the CLI by a later run, and runs
+	// copying the same image at once don't share one.
+	f, err := os.CreateTemp(dir, "dagger-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp)
 	if _, err := Docker(ctx, "cp", container+":/usr/local/bin/dagger", tmp); err != nil {
 		t.Fatalf("copy the CLI out of %s: %v", e.Settings.Image, err)
 	}
@@ -400,6 +419,33 @@ func (e *Env) copyCLI(ctx context.Context, id string) string {
 		t.Fatal(err)
 	}
 	return cli
+}
+
+// cliKeep is how long a copied CLI of another image is kept unused.
+const cliKeep = 24 * time.Hour
+
+// pruneCLIs removes the CLI copies under root (Dir/cli) of images other
+// than keep that no run has used for cliKeep. Only directories named as
+// copyCLI names them (an image ID's hex) are touched.
+func pruneCLIs(t *testing.T, root, keep string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Logf("prune the copied CLIs: %v", err)
+		return
+	}
+	for _, de := range entries {
+		name := de.Name()
+		if name == keep || !de.IsDir() || !imageID.MatchString("sha256:"+name) {
+			continue
+		}
+		info, err := de.Info()
+		if err != nil || time.Since(info.ModTime()) < cliKeep {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
+			t.Logf("prune the copied CLI of %s: %v", name, err)
+		}
+	}
 }
 
 func repoRoot(t *testing.T) string {

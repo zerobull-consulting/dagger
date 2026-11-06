@@ -378,7 +378,11 @@ before stopping the engine.
 
 ## Engine image
 
-The stock engine has no remote cache client. CI publishes one that has it, as
+Stock Dagger engine releases have the remote cache client too: it comes from
+upstream, and CI's sidecar demo runs `v1.0.0-beta.25` as it is. Whether this
+fork keeps its own image is
+[zerobull-consulting/dagger#114](https://github.com/zerobull-consulting/dagger/issues/114).
+CI publishes one built from this branch, as
 `ghcr.io/zerobull-consulting/dagger-engine`
 ([`engine-image.yml`](../../.github/workflows/engine-image.yml)),
 `linux/amd64` only, with the same tags as the
@@ -588,7 +592,7 @@ e2e-down` removes the engines and volumes later.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | The image's build context (`image/`), the CLI copied out of each engine image (`cli/<image ID>/`), the binaries `E2E_BUILD_ENGINE=1` builds (`bin/`), and each run's files (`runs/`) |
+| `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | The image's build context (`image/`), the CLI copied out of each engine image (`cli/<image ID>/`; another image's copy is removed once unused for a day), the binaries `E2E_BUILD_ENGINE=1` builds (`bin/`), and each run's files (`runs/`) |
 | `E2E_ENGINE_IMAGE` | `registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe…`, the workflow's `STOCK_ENGINE` | The release image the run's engine image is built on |
 | `E2E_BUILD_ENGINE` | unset | `1` builds the engine, `dagger-init-session` and the CLI from this repo and copies them over `E2E_ENGINE_IMAGE` |
 | `E2E_SKIP_BUILD` | unset | With `E2E_BUILD_ENGINE=1`, `1` reuses the binaries in `E2E_DIR/bin`; without it, the run fails |
@@ -610,8 +614,11 @@ another engine than asked.
 The default run tests the stock engine's client, not this branch's. Where
 they differ (this branch merges upstream main, whose client can be ahead of
 the release), the `real engines (e2e)` job and the `sidecar demo` job both
-warn: `the remote cache client differs from v1.0.0-beta.25's`, with the
-files. To test this branch's client, run:
+warn: `the engine's side of the remote cache differs from v1.0.0-beta.25's`,
+with the files (the client, its adapter in `engine/server`, and the `dagql`
+bundle code). The step fails only on a pin that contradicts itself: a
+`STOCK_ENGINE_TAG` that isn't `STOCK_ENGINE`'s tag, or a digest the registry
+doesn't give for that tag. To test this branch's client, run:
 
 ```bash
 E2E_BUILD_ENGINE=1 ./hack/remote-cache/dev.sh e2e

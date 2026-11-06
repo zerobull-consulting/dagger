@@ -2,9 +2,11 @@ package e2e
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestDefaultEngineImageIsCIs checks that the harness's default engine image
@@ -31,5 +33,38 @@ func TestDefaultEngineImageIsCIs(t *testing.T) {
 	tag := setting("STOCK_ENGINE_TAG")
 	if !strings.HasPrefix(DefaultEngineImage, "registry.dagger.io/engine:"+tag+"@sha256:") {
 		t.Errorf("STOCK_ENGINE_TAG %s is not DefaultEngineImage's tag (%s)", tag, DefaultEngineImage)
+	}
+}
+
+// TestPruneCLIs checks that pruneCLIs removes only the CLI copies of other
+// images unused for cliKeep, and nothing it didn't name.
+func TestPruneCLIs(t *testing.T) {
+	root := t.TempDir()
+	hex := func(c string) string { return strings.Repeat(c, 64) }
+	old := time.Now().Add(-2 * cliKeep)
+	dirs := map[string]bool{ // name: kept
+		hex("a"):      true,  // the image in use, however old
+		hex("b"):      false, // another image's, unused for longer than cliKeep
+		hex("c"):      true,  // another image's, used recently
+		"notes":       true,  // not an image ID: not copyCLI's
+		hex("d")[:63]: true,
+	}
+	for name := range dirs {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if name != hex("c") {
+			if err := os.Chtimes(dir, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	pruneCLIs(t, root, hex("a"))
+	for name, kept := range dirs {
+		_, err := os.Stat(filepath.Join(root, name))
+		if got := err == nil; got != kept {
+			t.Errorf("%s: kept %v, want %v", name, got, kept)
+		}
 	}
 }
