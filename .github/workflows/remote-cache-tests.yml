@@ -183,6 +183,13 @@ jobs:
     env:
       # The release's multi-platform index, pinned by digest; update the tag
       # and the digest together, and STOCK_ENGINE_TAG with them.
+      #
+      # Temporary: this pairs the branch's service (internal/version/VERSION,
+      # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
+      # combination the lockstep policy doesn't support (a vX service serves
+      # only vX engines). It holds until zerobull-consulting/dagger#117, which
+      # repins this to the service's own release and adds a development
+      # override for branches that track main.
       STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
       STOCK_ENGINE_TAG: v1.0.0-beta.25
     steps:
