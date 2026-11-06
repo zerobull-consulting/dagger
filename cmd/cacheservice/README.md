@@ -1738,7 +1738,8 @@ An export refreshes a root's time **only when it writes the root's record**
   roots refused, logged once, and the tracker doesn't export them again
   (`TestStaleGenerationExportNotRetried`), until a newer generation of the
   cache, which the index accepts, reports them
-  (`TestTrackerStaleRefusalClearedByNewerGeneration`). The cache's own generation and
+  (`TestTrackerStaleRefusalClearedByNewerGeneration`), even while the stale
+  export is still in flight (`TestTrackerStaleRefusalInFlightDropped`). The cache's own generation and
   newer ones still record it: the engine really has it
   (`TestSameAndNewerGenerationRecordAfterCollection`). The record is kept
   `metastore.CacheRecordRetention` (7 days) after its last mapping went,

@@ -192,6 +192,28 @@ func TestTrackerStaleRefusalClearedByNewerGeneration(t *testing.T) {
 	}
 }
 
+// A stale-generation refusal that lands after a newer generation reported
+// in, while the export was in flight, is dropped: the newer generation's
+// export of the same value is accepted (#59).
+func TestTrackerStaleRefusalInFlightDropped(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	newer := state(1, 20, fsPart)
+	newer.Generation = 2
+	newer.Session = "s2"
+	tr.Observe(newer, t0)
+	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{
+		{Number: 1, Reason: protocol.SkipRefused, Message: StaleGenerationMessage},
+	}}, t0)
+	if e := tr.Entries("c"); len(e) != 1 || e[0].Refused != "" || e[0].Failures != 0 {
+		t.Fatalf("entries %+v, want not refused, not failed", e)
+	}
+	if got := roots(tr.All("c", t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after the in-flight refusal: %v, want it exported again", got)
+	}
+}
+
 func TestTrackerPruneWatermark(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 100, fsPart), t0)
