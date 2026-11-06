@@ -56,8 +56,13 @@ jobs:
           check=hack/remote-cache/check-fork-paths.sh
           allow=hack/remote-cache/fork-paths.txt
           if [ "$EVENT" = pull_request ]; then
-            git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
-              || timeout 120 git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"
+            # Fails closed: without the base commit, the pull request's own
+            # checker would run.
+            if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+              && ! timeout 120 git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"; then
+              echo "::error::Couldn't fetch the base commit $BASE_SHA, so the base branch's checker can't run."
+              exit 1
+            fi
             if git cat-file -e "$BASE_SHA:$check" 2>/dev/null; then
               git show "$BASE_SHA:$check" >"$RUNNER_TEMP/check-fork-paths.sh"
               chmod +x "$RUNNER_TEMP/check-fork-paths.sh"
