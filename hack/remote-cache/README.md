@@ -477,9 +477,13 @@ checkout (below); nothing else here does.
 ./hack/remote-cache/dev.sh e2e
 ```
 
-One command runs the remote cache end to end with engines built from this
-repo ([#29](https://github.com/zerobull-consulting/dagger/issues/29)), then
+One command runs the remote cache end to end with real engines
+([#29](https://github.com/zerobull-consulting/dagger/issues/29)), then
 the [scenarios](#scenarios) that check the paths beyond a first cache hit.
+The engines are a stock Dagger release, the one CI's sidecar demo runs
+([zerobull-consulting/dagger#112](https://github.com/zerobull-consulting/dagger/issues/112)):
+their remote cache client is the one users run. The service is built from
+this checkout, in the test process.
 It is a Go test, `TestRealEngines` in
 [`cmd/cacheservice/e2e`](../../cmd/cacheservice/e2e/); `dev.sh e2e` starts
 MinIO and runs it with `CACHESERVICE_E2E=1`, which it skips without. The
@@ -489,11 +493,16 @@ Each run starts from nothing without deleting anything: it works under its
 own prefix in the bucket (`test/e2e/<run>/`), and gives each engine a new, empty
 cache volume. It:
 
-1. builds `dagger-engine`, `dagger-init-session` and the `dagger` CLI from
-   this repo, and an engine image that copies them over the release image
-   `E2E_BASE_IMAGE` (`registry.dagger.io/engine:v1.0.0-beta.22`), with
+1. builds the run's engine image on the release image `E2E_ENGINE_IMAGE`
+   (`registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest), adding only
    `{"gc":{"enabled":false}}` and a `mirror.gcr.io` mirror for `docker.io`
-   in `/etc/dagger/engine.json`;
+   in `/etc/dagger/engine.json`, and the CA bundle of `E2E_CA_FILE` if set;
+   and copies the `dagger` CLI out of it (`docker create`, then `docker cp`
+   of `/usr/local/bin/dagger`), so the CLI matches the engine. With
+   `E2E_BUILD_ENGINE=1` it first builds `dagger-engine`, `dagger-init-session`
+   and the CLI from this repo, and copies them over the release image too: for
+   work on the engine's client itself (see [Engine
+   builds](#engine-builds-e2e_build_engine1));
 2. starts a recording proxy to MinIO, and the cache service, both **in the
    test process**, on the Docker bridge gateway with free ports. The service
    (`server.Service`) is configured with the proxy as its S3 endpoint, so
@@ -597,9 +606,11 @@ e2e-down` removes the engines and volumes later.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | Binaries (`bin/`) and each run's files (`runs/`) |
-| `E2E_SKIP_BUILD` | unset | `1` reuses the binaries in `E2E_DIR/bin` |
-| `E2E_BASE_IMAGE` | `registry.dagger.io/engine:v1.0.0-beta.22` | The release image the engine binaries are copied over |
+| `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | The image's build context (`image/`), the CLI copied out of each engine image (`cli/<image ID>/`; another image's copy is removed once unused for a day), the binaries `E2E_BUILD_ENGINE=1` builds (`bin/`), and each run's files (`runs/`) |
+| `E2E_ENGINE_IMAGE` | The workflow's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on |
+| `E2E_BUILD_ENGINE` | unset | `1` builds the engine, `dagger-init-session` and the CLI from this repo and copies them over `E2E_ENGINE_IMAGE` |
+| `E2E_SKIP_BUILD` | unset | With `E2E_BUILD_ENGINE=1`, `1` reuses the binaries in `E2E_DIR/bin`; without it, the run fails |
+| `E2E_IMAGE` | `dagger-remote-cache-e2e-engine` | The run's engine image's tag. Engines start from the image's ID, so a run building the same tag meanwhile doesn't change a running one's engine |
 | `E2E_CA_FILE` | unset | A CA bundle to add to the engine image, for hosts behind a TLS-intercepting proxy |
 | `E2E_TIMEOUT` | `180` | Seconds to wait for each export, and each merge |
 | `E2E_SCENARIOS` | all | The scenarios to run after the first part, which always runs |
@@ -607,6 +618,39 @@ e2e-down` removes the engines and volumes later.
 | `E2E_IMPORT_POLL` | `1` | Seconds between the replica's import polls (`prune`) |
 | `E2E_TTL` | `10` | The cache TTL of the `superseded` scenario's function, in seconds. The value has to reach engine F and be read there before it expires; the scenario fails asking for a longer one if it doesn't |
 | `E2E_KEEP` | unset | `1` leaves the engines and the run's objects in the bucket |
+
+`E2E_BASE_IMAGE`, the image built binaries used to be copied over, is now
+`E2E_ENGINE_IMAGE`; a run with it set fails, saying so, rather than testing
+another engine than asked.
+
+### Engine builds: `E2E_BUILD_ENGINE=1`
+
+The default run tests the stock engine's client, not this branch's. Where
+they differ (this branch merges upstream main, whose client can be ahead of
+the release), the `real engines (e2e)` job and the `sidecar demo` job both
+warn, from one script
+([`compare-client.sh`](compare-client.sh), which takes `STOCK_ENGINE` and
+`STOCK_ENGINE_TAG` from the environment): `the engine's side of the remote cache differs from v1.0.0-beta.25's`,
+with the files (the client, its adapter in `engine/server`, and the `dagql`
+bundle code). The step fails only on a pin that contradicts itself: a
+`STOCK_ENGINE_TAG` that isn't `STOCK_ENGINE`'s tag, or a digest the registry
+doesn't give for that tag. To test this branch's client, run:
+
+```bash
+E2E_BUILD_ENGINE=1 ./hack/remote-cache/dev.sh e2e
+```
+
+It builds the three binaries with `CGO_ENABLED=0` (the engine with the
+`dfexcludepatterns,dfparents` tags) and copies them over `E2E_ENGINE_IMAGE`,
+whose other files (`dagger-init`, `crun`, `tini`, the QEMU helpers) stay the
+release's. Each run logs the CLI's `dagger version` and every engine's
+version from its hello (`engine A connected to main: engine version
+"v1.0.0-beta.25"`), so a log says which engine it tested.
+
+The pin is `DefaultEngineImage` in `cmd/cacheservice/e2e/env.go` and
+`STOCK_ENGINE` in the workflow's top-level `env`; CI passes `STOCK_ENGINE` in
+as `E2E_ENGINE_IMAGE`, and `TestDefaultEngineImageMatchesCI` (in the unit job)
+fails when they differ. Update them together, with `STOCK_ENGINE_TAG`.
 
 Notes:
 

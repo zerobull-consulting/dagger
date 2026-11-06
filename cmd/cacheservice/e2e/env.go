@@ -1,6 +1,7 @@
 // Package e2e runs the remote cache end to end with real engines: the cache
-// service in this process, engines built from this repo in Docker
-// containers, the dagger CLI against them, and MinIO behind a recording
+// service in this process, engines of a stock Dagger release (or, with
+// E2E_BUILD_ENGINE=1, built from this repo) in Docker containers, the
+// engine image's own dagger CLI against them, and MinIO behind a recording
 // proxy. See README.md in this directory.
 package e2e
 
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -36,15 +38,30 @@ import (
 // few minutes, so they skip unless it is set to 1.
 const EnvEnable = "CACHESERVICE_E2E"
 
+// DefaultEngineImage is the engine image runs use unless E2E_ENGINE_IMAGE
+// says otherwise: a stock Dagger release, its multi-platform index pinned by
+// digest. It is the workflow's STOCK_ENGINE (.github/workflows/
+// remote-cache-tests.yml), which CI passes in as E2E_ENGINE_IMAGE;
+// TestDefaultEngineImageMatchesCI keeps the two the same, so update both
+// together.
+const DefaultEngineImage = "registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834"
+
 // Settings are the run's knobs, from E2E_* variables.
 type Settings struct {
-	// Dir holds the binaries (Dir/bin) and each run's logs and results.
+	// Dir holds the run's image context (Dir/image), the CLI copied out of
+	// each engine image (Dir/cli), the binaries built with BuildEngine
+	// (Dir/bin), and each run's logs and results (Dir/runs).
 	Dir string
-	// BaseImage is the release engine image the binaries are copied over.
-	BaseImage string
-	// Image is the engine image's tag.
+	// EngineImage is the engine image the run's image is built on: a stock
+	// release by default (DefaultEngineImage).
+	EngineImage string
+	// BuildEngine builds the engine, init-session and the CLI from this
+	// repo, and copies them over EngineImage: for work on the engine's
+	// client itself.
+	BuildEngine bool
+	// Image is the run's engine image's tag.
 	Image string
-	// SkipBuild reuses the binaries in Dir/bin.
+	// SkipBuild, with BuildEngine, reuses the binaries in Dir/bin.
 	SkipBuild bool
 	// CAFile is a CA bundle the engines should trust, for hosts behind a
 	// TLS-intercepting proxy.
@@ -79,18 +96,29 @@ func SettingsFromEnv(t *testing.T) Settings {
 		}
 		return time.Duration(n) * time.Second
 	}
-	return Settings{
-		Dir:        str("E2E_DIR", filepath.Join(os.TempDir(), "dagger-remote-cache-e2e")),
-		BaseImage:  str("E2E_BASE_IMAGE", "registry.dagger.io/engine:v1.0.0-beta.22"),
-		Image:      str("E2E_IMAGE", "dagger-remote-cache-e2e-engine"),
-		SkipBuild:  os.Getenv("E2E_SKIP_BUILD") == "1",
-		CAFile:     os.Getenv("E2E_CA_FILE"),
-		Timeout:    secs("E2E_TIMEOUT", 180),
-		GetExpiry:  secs("E2E_GET_EXPIRY", 5),
-		ImportPoll: secs("E2E_IMPORT_POLL", 1),
-		TTL:        secs("E2E_TTL", 10),
-		Keep:       os.Getenv("E2E_KEEP") == "1",
+	// E2E_BASE_IMAGE was the image the built binaries were copied over; that
+	// is now E2E_ENGINE_IMAGE, with or without E2E_BUILD_ENGINE. Refused
+	// rather than ignored, so a run doesn't quietly test another engine.
+	if v := os.Getenv("E2E_BASE_IMAGE"); v != "" {
+		t.Fatalf("E2E_BASE_IMAGE=%q: it is now E2E_ENGINE_IMAGE (add E2E_BUILD_ENGINE=1 to copy binaries built from this repo over it)", v)
 	}
+	s := Settings{
+		Dir:         str("E2E_DIR", filepath.Join(os.TempDir(), "dagger-remote-cache-e2e")),
+		EngineImage: str("E2E_ENGINE_IMAGE", DefaultEngineImage),
+		BuildEngine: os.Getenv("E2E_BUILD_ENGINE") == "1",
+		Image:       str("E2E_IMAGE", "dagger-remote-cache-e2e-engine"),
+		SkipBuild:   os.Getenv("E2E_SKIP_BUILD") == "1",
+		CAFile:      os.Getenv("E2E_CA_FILE"),
+		Timeout:     secs("E2E_TIMEOUT", 180),
+		GetExpiry:   secs("E2E_GET_EXPIRY", 5),
+		ImportPoll:  secs("E2E_IMPORT_POLL", 1),
+		TTL:         secs("E2E_TTL", 10),
+		Keep:        os.Getenv("E2E_KEEP") == "1",
+	}
+	if s.SkipBuild && !s.BuildEngine {
+		t.Fatal("E2E_SKIP_BUILD=1 reuses the binaries of E2E_BUILD_ENGINE=1, which is not set: without it nothing is built")
+	}
+	return s
 }
 
 // Env is one end-to-end run: its own bucket prefix, engine image and
@@ -121,7 +149,13 @@ type Env struct {
 	// proxyOpts are Proxy's options, for NewProxy.
 	proxyOpts ProxyOptions
 
+	// bin holds the binaries built with BuildEngine.
 	bin string
+	// image is the run's engine image's ID: engines start from it, not
+	// from Settings.Image, a tag another run can move to its own build.
+	image string
+	// cli is the dagger CLI copied out of the run's engine image.
+	cli string
 	// deleted are the blobs scenarios deleted from MinIO on purpose.
 	deleted map[digest.Digest]bool
 	// root is the run's own test: what the run starts is cleaned up when it
@@ -133,8 +167,8 @@ type Env struct {
 	services []*Service
 }
 
-// New starts a run: it skips unless EnvEnable is set, builds the engine image
-// unless told not to, and starts the S3 proxy.
+// New starts a run: it skips unless EnvEnable is set, starts the S3 proxy,
+// and builds the run's engine image.
 func New(t *testing.T) *Env {
 	t.Helper()
 	if os.Getenv(EnvEnable) != "1" {
@@ -240,15 +274,26 @@ func (e *Env) ctx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), e.Settings.Timeout)
 }
 
-// build builds the engine, init-session and the CLI from this repo, and the
-// engine image that copies them over the base image.
+// build builds the run's engine image on EngineImage: GC off, docker.io
+// pulls through mirror.gcr.io, the CA bundle if there is one, and, with
+// BuildEngine, the engine, init-session and the CLI built from this repo.
+// Then it copies the image's CLI out, which matches its engine.
 func (e *Env) build() {
 	t := e.T
 	t.Helper()
-	if err := os.MkdirAll(e.bin, 0o755); err != nil {
+	// The image's context: Dir/bin when it copies the binaries built there,
+	// or a directory of its own, so the build doesn't send them.
+	dir := filepath.Join(e.Settings.Dir, "image")
+	if e.Settings.BuildEngine {
+		dir = e.bin
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if !e.Settings.SkipBuild {
+	if e.Settings.BuildEngine && !e.Settings.SkipBuild {
+		// A budget of its own: a cold build of the engine takes minutes.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
 		start := time.Now()
 		root := repoRoot(t)
 		for _, b := range []struct {
@@ -264,7 +309,7 @@ func (e *Env) build() {
 			if b.tags != "" {
 				args = append(args, "-tags", b.tags)
 			}
-			cmd := exec.Command("go", append(args, b.pkg)...)
+			cmd := exec.CommandContext(ctx, "go", append(args, b.pkg)...)
 			cmd.Dir = root
 			cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 			if out, err := cmd.CombinedOutput(); err != nil {
@@ -278,14 +323,16 @@ func (e *Env) build() {
 	// the session. docker.io pulls go through mirror.gcr.io, as in the
 	// release image's own engine.json.
 	write := func(name, content string) {
-		if err := os.WriteFile(filepath.Join(e.bin, name), []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	write("engine.json", `{"gc": {"enabled": false}, "registries": {"docker.io": {"mirrors": ["mirror.gcr.io"]}}}`+"\n")
-	dockerfile := "FROM " + e.Settings.BaseImage + "\n" +
-		"COPY dagger-engine dagger-init-session dagger /usr/local/bin/\n" +
-		"COPY engine.json /etc/dagger/engine.json\n"
+	dockerfile := "FROM " + e.Settings.EngineImage + "\n"
+	if e.Settings.BuildEngine {
+		dockerfile += "COPY dagger-engine dagger-init-session dagger /usr/local/bin/\n"
+	}
+	dockerfile += "COPY engine.json /etc/dagger/engine.json\n"
 	if e.Settings.CAFile != "" {
 		ca, err := os.ReadFile(e.Settings.CAFile)
 		if err != nil {
@@ -295,16 +342,118 @@ func (e *Env) build() {
 		dockerfile += "COPY extra-ca.crt /usr/local/share/ca-certificates/extra-ca.crt\n" +
 			"RUN cat /usr/local/share/ca-certificates/extra-ca.crt >>/etc/ssl/certs/ca-certificates.crt\n"
 	} else {
-		_ = os.Remove(filepath.Join(e.bin, "extra-ca.crt"))
+		_ = os.Remove(filepath.Join(dir, "extra-ca.crt"))
 	}
 	write("Dockerfile", dockerfile)
-	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	if _, err := Docker(ctx, "build", "-q", "-t", e.Settings.Image, e.bin); err != nil {
+	start := time.Now()
+	out, err := Docker(ctx, "build", "-q", "-t", e.Settings.Image, dir)
+	if err != nil {
 		t.Fatalf("engine image: %v", err)
 	}
-	t.Logf("built %s from %s in %s", e.Settings.Image, e.Settings.BaseImage, time.Since(start).Round(time.Second))
+	what := "the stock engine"
+	if e.Settings.BuildEngine {
+		what = "the engine built from this repo"
+	}
+	id := strings.TrimSpace(out)
+	if !imageID.MatchString(id) {
+		t.Fatalf("docker build -q printed %q, not an image ID", id)
+	}
+	e.image = id
+	t.Logf("built %s (%s) on %s, with %s, in %s", e.Settings.Image, Short(id), e.Settings.EngineImage, what, time.Since(start).Round(time.Second))
+	e.cli = e.copyCLI(ctx, id)
+	version := exec.CommandContext(ctx, e.cli, "version")
+	version.Env = cleanEnv()
+	if v, err := version.Output(); err != nil {
+		t.Fatalf("%s version: %v", e.cli, err)
+	} else {
+		t.Logf("the CLI, from %s: %s", e.Settings.Image, strings.Join(strings.Fields(string(v)), " "))
+	}
+}
+
+// imageID is a local image's ID, as docker build -q prints it.
+var imageID = regexp.MustCompile(`^sha256:([0-9a-f]{64})$`)
+
+// copyCLI copies the dagger CLI out of the image with ID id, which matches
+// its engine, to Dir/cli/<id>/dagger, unless it is there already, and
+// returns its path. It removes the copies of other images not used for a
+// day (cliKeep), so rebuilt images don't pile them up, without taking one
+// from a run going on now.
+func (e *Env) copyCLI(ctx context.Context, id string) string {
+	t := e.T
+	t.Helper()
+	m := imageID.FindStringSubmatch(id)
+	if m == nil {
+		t.Fatalf("%q is not an image ID", id)
+	}
+	root := filepath.Join(e.Settings.Dir, "cli")
+	dir := filepath.Join(root, m[1])
+	cli := filepath.Join(dir, "dagger")
+	defer pruneCLIs(t, root, m[1])
+	if _, err := os.Stat(cli); err == nil {
+		// Marks it used, for pruneCLIs.
+		now := time.Now()
+		_ = os.Chtimes(dir, now, now)
+		return cli
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Docker(ctx, "create", id)
+	if err != nil {
+		t.Fatalf("a container to copy the CLI out of: %v", err)
+	}
+	container := strings.TrimSpace(out)
+	defer func() {
+		rmCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_, _ = Docker(rmCtx, "rm", "-f", container)
+	}()
+	// To a temporary file of this run's own first, then renamed into place:
+	// a copy cut short isn't taken for the CLI by a later run, and runs
+	// copying the same image at once don't share one.
+	f, err := os.CreateTemp(dir, "dagger-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp)
+	if _, err := Docker(ctx, "cp", container+":/usr/local/bin/dagger", tmp); err != nil {
+		t.Fatalf("copy the CLI out of %s: %v", e.Settings.Image, err)
+	}
+	if err := os.Rename(tmp, cli); err != nil {
+		t.Fatal(err)
+	}
+	return cli
+}
+
+// cliKeep is how long a copied CLI of another image is kept unused.
+const cliKeep = 24 * time.Hour
+
+// pruneCLIs removes the CLI copies under root (Dir/cli) of images other
+// than keep that no run has used for cliKeep. Only directories named as
+// copyCLI names them (an image ID's hex) are touched.
+func pruneCLIs(t *testing.T, root, keep string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Logf("prune the copied CLIs: %v", err)
+		return
+	}
+	for _, de := range entries {
+		name := de.Name()
+		if name == keep || !de.IsDir() || !imageID.MatchString("sha256:"+name) {
+			continue
+		}
+		info, err := de.Info()
+		if err != nil || time.Since(info.ModTime()) < cliKeep {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
+			t.Logf("prune the copied CLI of %s: %v", name, err)
+		}
+	}
 }
 
 func repoRoot(t *testing.T) string {

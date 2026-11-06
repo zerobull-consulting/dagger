@@ -7,7 +7,8 @@
 #   dev.sh status  show the containers
 #   dev.sh env     print the settings as shell exports
 #   dev.sh test    run the Go tests against it (starts it first)
-#   dev.sh e2e     run the remote cache with real engines (cmd/cacheservice/e2e)
+#   dev.sh e2e     run the remote cache with real engines (cmd/cacheservice/e2e):
+#                  the stock release, or with E2E_BUILD_ENGINE=1 built from here
 #   dev.sh e2e-down  remove the engines a run with E2E_KEEP=1 left
 #   dev.sh demo    run the sidecar demo (demo/run.sh) against MinIO
 #   dev.sh demo-store  start MinIO where containers reach it, with the demo's
@@ -178,7 +179,7 @@ e2e-down)
 	docker volume ls -q --filter "label=$label" | xargs -r docker volume rm -f >/dev/null
 	;;
 *)
-	sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

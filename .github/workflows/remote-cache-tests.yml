@@ -14,6 +14,22 @@ name: Remote cache tests
   workflow_dispatch: {}
 permissions:
   contents: read
+# The stock Dagger release the e2e and the sidecar demo run: its
+# multi-platform index, pinned by digest. Update the tag and the digest
+# together, and with them STOCK_ENGINE_TAG, demo/run.sh's default
+# ENGINE_IMAGE, the docs' examples (the sidecar job checks those) and the
+# e2e harness's default (DefaultEngineImage in cmd/cacheservice/e2e/env.go,
+# which TestDefaultEngineImageMatchesCI checks).
+#
+# Temporary: this pairs the branch's service (internal/version/VERSION,
+# v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
+# combination the lockstep policy doesn't support (a vX service serves only
+# vX engines). It holds until zerobull-consulting/dagger#117, which repins
+# this to the service's own release and adds a development override for
+# branches that track main.
+env:
+  STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+  STOCK_ENGINE_TAG: v1.0.0-beta.25
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -111,6 +127,10 @@ jobs:
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+  # The e2e on the stock engine (STOCK_ENGINE): its CLI is copied out of
+  # the image, and only the service, in the test process, is built from this
+  # checkout. E2E_BUILD_ENGINE=1 builds the engine too, for work on its
+  # client; CI doesn't.
   e2e:
     name: real engines (e2e)
     runs-on: ubuntu-24.04
@@ -118,6 +138,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      # Warns when this branch's engine side of the remote cache differs from
+      # STOCK_ENGINE's (run `E2E_BUILD_ENGINE=1 dev.sh e2e` to test it);
+      # fails only on a pin that contradicts itself. See the script.
+      - name: Compare the engine's client with the stock engine's
+        timeout-minutes: 8
+        run: ./hack/remote-cache/compare-client.sh "the e2e"
       - name: Setup Go
         id: setup-go
         uses: actions/setup-go@v6
@@ -126,8 +152,11 @@ jobs:
           # setup-go's own cache uses one key for every job, so only the first
           # job to finish saves it; each job caches its own build below.
           cache: false
-      # Module and build caches, per job: this one builds the engine and the
-      # CLI. Every run restores the newest cache saved by a push to
+      # Module and build caches of the e2e package alone (go-e2e-test-: the
+      # engine isn't built, so the old go-e2e- cache was mostly unused).
+      # Measured in zerobull-consulting/dagger#120: ~495 MB restores in 10s
+      # and the test then builds in 20s; without it, it builds in ~95s.
+      # Every run restores the newest cache saved by a push to
       # feature/remote-cache; only those pushes save one.
       - name: Restore Go cache
         id: go-cache
@@ -136,16 +165,26 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          key: go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
-            go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-            go-e2e-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
-      # Starts MinIO, builds the engine image from this commit, and runs
-      # TestRealEngines in cmd/cacheservice/e2e: the service in-process,
-      # engines in Docker. See hack/remote-cache/README.md, "Real engines".
+            go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      # The test's own build, apart from the run so its time shows; the
+      # engine image is pulled meanwhile.
+      - name: Build the test, pull the engine
+        timeout-minutes: 15
+        run: |
+          docker pull -q "$STOCK_ENGINE" &
+          go test -count=1 -run '^$' ./cmd/cacheservice/e2e/
+          wait $!
+      # Starts MinIO, builds the run's engine image on STOCK_ENGINE (GC off,
+      # the mirror), and runs TestRealEngines in cmd/cacheservice/e2e: the
+      # service in-process, engines in Docker. See hack/remote-cache/README.md,
+      # "Real engines".
       - name: Real engines
         env:
           E2E_DIR: ${{ runner.temp }}/e2e
+          E2E_ENGINE_IMAGE: ${{ env.STOCK_ENGINE }}
         run: ./hack/remote-cache/dev.sh e2e
       # Each run's service logs, CLI output, index and importer state, and
       # the engines' logs when it failed.
@@ -180,75 +219,18 @@ jobs:
     name: sidecar demo
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      # The release's multi-platform index, pinned by digest; update the tag
-      # and the digest together, and STOCK_ENGINE_TAG, demo/run.sh's default
-      # ENGINE_IMAGE and the docs' examples with them (a step below checks
-      # those).
-      #
-      # Temporary: this pairs the branch's service (internal/version/VERSION,
-      # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
-      # combination the lockstep policy doesn't support (a vX service serves
-      # only vX engines). It holds until zerobull-consulting/dagger#117, which
-      # repins this to the service's own release and adds a development
-      # override for branches that track main.
-      STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
-      STOCK_ENGINE_TAG: v1.0.0-beta.25
     steps:
       - name: Checkout
         uses: actions/checkout@v5
       # sidecar.sh's validation and stop, against a fake docker.
       - name: Test the action's script
         run: ./.github/actions/remote-cache-sidecar/sidecar_test.sh
-      # A warning, not a failure: when this branch's engine side of the
-      # remote cache (merged from upstream main) differs from the stock
-      # engine's, this job doesn't test it, and STOCK_ENGINE should move to
-      # the release that has it once there is one. Only a pin that
-      # contradicts itself fails the step: a STOCK_ENGINE_TAG that isn't
-      # STOCK_ENGINE's own tag, or a digest that isn't the one the registry
-      # gives for that tag (the job runs the digest, and compares the code of
-      # the tag). A registry or upstream that can't be reached, or a compare
-      # that fails, is a warning, so the required check never fails on it.
+      # Warns when this branch's engine side of the remote cache differs from
+      # STOCK_ENGINE's; fails only on a pin that contradicts itself. See the
+      # script.
       - name: Compare the engine's client with the stock engine's
-        run: |
-          ref="${STOCK_ENGINE%@*}"
-          if [[ "${ref##*:}" != "$STOCK_ENGINE_TAG" ]]; then
-            echo "::error::STOCK_ENGINE_TAG ($STOCK_ENGINE_TAG) isn't STOCK_ENGINE's tag (${ref##*:}); update them together"
-            exit 1
-          fi
-          if digest="$(timeout 120 docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
-            if [[ "$digest" != "${STOCK_ENGINE##*@}" ]]; then
-              echo "::error::$ref is $digest in the registry, not STOCK_ENGINE's ${STOCK_ENGINE##*@}; update the tag and the digest together"
-              exit 1
-            fi
-          else
-            echo "::warning::couldn't resolve $ref in the registry; STOCK_ENGINE's digest wasn't checked against it"
-          fi
-          if ! timeout 300 git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
-            echo "::warning::couldn't fetch $STOCK_ENGINE_TAG from dagger/dagger; the engine's client wasn't compared"
-            exit 0
-          fi
-          # The client, its adapter in the engine, and the bundles it moves.
-          paths=(
-            engine/remotecache cmd/engine/remotecache.go 'engine/server/remote_cache*.go'
-            dagql/cache_transfer_types.go dagql/cache_value_capture.go dagql/cache_value_import.go dagql/cache_stored_bundle.go
-            ':!**/*_test.go'
-          )
-          # Ignored: the fork's export of the bundle version
-          # (zerobull-consulting/dagger#116), and blank lines. The blank-line
-          # pattern can't match an empty string: one that could would ignore
-          # every change.
-          ignore='ValueBundleVersion|store of bundles checks it|^[[:space:]]+$'
-          rc=0
-          git diff --quiet -I"$ignore" "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}" || rc=$?
-          case "$rc" in
-          0) echo "the engine's side of the remote cache is $STOCK_ENGINE_TAG's" ;;
-          1)
-            echo "::warning::the engine's side of the remote cache differs from $STOCK_ENGINE_TAG's, which this job runs:"
-            git diff --stat -I"$ignore" "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}" || true
-            ;;
-          *) echo "::warning::couldn't compare the engine's client with $STOCK_ENGINE_TAG's (git diff exited $rc)" ;;
-          esac
+        timeout-minutes: 8
+        run: ./hack/remote-cache/compare-client.sh "the sidecar demo"
       # dev.sh demo runs the engine this job does: run.sh's default is this
       # pin, as one literal line. Every digest-pinned stock engine the remote
       # cache's docs and scripts name is this pin too, so a bump can't leave
