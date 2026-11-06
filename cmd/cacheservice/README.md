@@ -1571,10 +1571,10 @@ admin token guards it
   to start (exit 2, naming `-debug-token-file`) with an explicit
   `-debug-listen` and no token, and with the default one turns the debug API
   off, logging `debug API off`, so a service that never used it keeps
-  starting. And when `-debug-listen` isn't loopback: a loopback IP, or a
-  name, such as `localhost`, that resolves to loopback IPs only (`:8091`
-  and `0.0.0.0:8091` are every interface); it refuses to start without a
-  token. A loopback
+  starting. And when `-debug-listen` isn't a loopback IP, such as
+  `127.0.0.1` or `[::1]` (`:8091` and `0.0.0.0:8091` are every interface; a
+  name, even `localhost`, needs a token too, since the listener resolves it
+  again when it binds); it refuses to start without a token. A loopback
   `-debug-listen` without `-tokens-file` may stay open, for local
   development; the service then logs a warning,
   `UNAUTHENTICATED debug API on 127.0.0.1:8091`. In-process, a service with

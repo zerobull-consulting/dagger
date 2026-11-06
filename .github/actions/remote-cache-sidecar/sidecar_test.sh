@@ -274,6 +274,12 @@ existing_token_refused() {
 		! grep -qx created=debug-token "$tmp/dbgbin.sc/pre/state" 2>/dev/null
 }
 check "debug-port: a token file already there is refused, and left alone" existing_token_refused
+existing_dir_refused() {
+	mkdir -p "$tmp/dbgbin.sc/predir/secrets" && chmod 755 "$tmp/dbgbin.sc/predir/secrets"
+	! (fake_start dbgbin SIDECAR_NAME=predir SIDECAR_DEBUG_PORT=8091 >/dev/null 2>&1) &&
+		[ "$(stat -c %a "$tmp/dbgbin.sc/predir/secrets")" = 755 ] && [ -z "$(ls -A "$tmp/dbgbin.sc/predir/secrets")" ]
+}
+check "debug-port: a secrets directory already there is refused, and its mode left alone" existing_dir_refused
 # The stop removes the token only when the state says this start wrote it,
 # and nothing else in its directory.
 stop_secrets() {

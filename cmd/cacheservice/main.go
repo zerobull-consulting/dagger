@@ -530,29 +530,18 @@ func checkDebugListen(debugListen, debugToken, tokensFile string, explicit bool,
 	return debugListen, nil
 }
 
-// loopbackAddr reports whether a listen address binds only loopback: a
-// loopback IP, or a name, such as localhost, that resolves to loopback IPs
-// only. An empty host is every interface.
+// loopbackAddr reports whether a listen address binds only loopback: its
+// host is a loopback IP literal, such as 127.0.0.1 or ::1. A name, even
+// localhost, isn't: the listener resolves it again when it binds, and could
+// get another address than a check here did. An empty host is every
+// interface.
 func loopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
-	if err != nil || host == "" {
+	if err != nil {
 		return false
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil || len(ips) == 0 {
-		return false
-	}
-	for _, ip := range ips {
-		if !ip.IP.IsLoopback() {
-			return false
-		}
-	}
-	return true
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // explicitFlags returns the flags set on the command line, by name.

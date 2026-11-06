@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -61,6 +62,8 @@ func TestBinaryDebugListenStartupErrors(t *testing.T) {
 		{"every interface, no token", []string{"-debug-listen", ":0"}, 2, []string{"-debug-listen", "-debug-token-file"}},
 		{"0.0.0.0, no token", []string{"-debug-listen", "0.0.0.0:0"}, 2, []string{"-debug-listen", "-debug-token-file"}},
 		{"a host name, no token", []string{"-debug-listen", "example.invalid:0"}, 2, []string{"-debug-listen", "-debug-token-file"}},
+		// The listener would resolve it again: only an IP is checked.
+		{"localhost, no token", []string{"-debug-listen", "localhost:0"}, 2, []string{"-debug-listen", "-debug-token-file"}},
 		{"tokens file, explicit loopback, no token", []string{"-tokens-file", tokens, "-debug-listen", "127.0.0.1:0"}, 2, []string{"-tokens-file", "-debug-token-file"}},
 		{"token without the debug API", []string{"-debug-listen=", "-debug-token-file", writeFile(t, "dt", binDebugToken)}, 2, []string{"-debug-token-file", "-debug-listen"}},
 		{"empty token file", []string{"-debug-listen", ":0", "-debug-token-file", writeFile(t, "empty", "\n")}, 1, []string{"debug token file: empty"}},
@@ -238,11 +241,16 @@ func TestBinaryDebugOffByDefaultWithTokens(t *testing.T) {
 	}
 }
 
-// localhost resolves to loopback here, so it counts as loopback.
-func TestBinaryDebugLocalhostIsLoopback(t *testing.T) {
-	port := strings.TrimPrefix(freeAddr(t), "127.0.0.1")
-	_, logs := storelessBinary(t, 2, "-debug-listen", "localhost"+port)
-	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on localhost"+port) {
+// ::1 is loopback, as 127.0.0.1 is.
+func TestBinaryDebugIPv6LoopbackOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skip("no IPv6 loopback here")
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	_, logs := storelessBinary(t, 2, "-debug-listen", addr)
+	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on "+addr) {
 		t.Errorf("no open-API warning:\n%s", logs.String())
 	}
 }
