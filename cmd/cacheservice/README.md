@@ -2397,9 +2397,9 @@ with backoff. To try it, unauthenticated and with no store (export path off):
 docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache
 ```
 
-An engine that connects to it is published next to it, as
-`ghcr.io/zerobull-consulting/dagger-engine` (see
-[Engine image](../../hack/remote-cache/README.md#engine-image)).
+The engine that connects to it is a stock Dagger release, `v1.0.0-beta.24`
+or later (see [Engine](../../hack/remote-cache/README.md#engine)); the fork
+no longer publishes an engine image of its own.
 
 With a bucket, a pull-request job's instance adds `-export=false` and a
 read-only key (see [Read-only instances](#read-only-instances)). Running it
@@ -2422,7 +2422,7 @@ On GitHub Actions, use the composite action, which does everything below
   with:
     role: writer                    # read-only in pull-request jobs
     service-image: ghcr.io/zerobull-consulting/cacheservice:<commit SHA>
-    engine-image: ghcr.io/zerobull-consulting/dagger-engine:<commit SHA>
+    engine-image: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
     s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
     s3-region: ${{ vars.CACHE_S3_REGION }}
     s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -2435,7 +2435,9 @@ On GitHub Actions, use the composite action, which does everything below
   uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
 
-Pin the action and both images to the same commit of `feature/remote-cache`.
+Pin the action and the service's image to the same commit of
+`feature/remote-cache`, and the engine to a stock release by digest (the
+example is CI's pin).
 The [demo](../../hack/remote-cache/demo/README.md) is a small project that
 shows what the sidecar carries and what it doesn't; CI runs it through the
 action on every pull request (the `sidecar demo` job), so this section, the
@@ -2495,8 +2497,9 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
   doesn't own) or 2 (a flag error) instead. Fail the job if it exits, with
   its log.
 
-**3. The engine and the CLI.** The engine image with the remote cache client
-(see [Engine image](../../hack/remote-cache/README.md#engine-image)), with
+**3. The engine and the CLI.** A stock Dagger engine release, pinned by
+digest (see [Engine](../../hack/remote-cache/README.md#engine) for the
+minimum release), with
 the settings `cmd/cacheservice/e2e` starts its engines with:
 
 ```bash
@@ -2506,7 +2509,7 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   -e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
   -e DAGGER_CLOUD_URL="$url" \
   -e DAGGER_CLOUD_TOKEN=sidecar-engine \
-  ghcr.io/zerobull-consulting/dagger-engine:<commit SHA> --debug
+  registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834 --debug
 ```
 
 - `DAGGER_CLOUD_TOKEN` is a placeholder (any string but `oidc`): without a
@@ -2652,8 +2655,8 @@ For a local S3-compatible store (MinIO), see
    `-debug-token-file debug-token`, after
    `openssl rand -hex 32 > debug-token`.
 
-2. Build and start a dev engine (see `hack/dev`), or run the published
-   [engine image](../../hack/remote-cache/README.md#engine-image). Then
+2. Build and start a dev engine (see `hack/dev`), or run a stock
+   release (see [Engine](../../hack/remote-cache/README.md#engine)). Then
    restart its container with these variables set:
 
    ```bash

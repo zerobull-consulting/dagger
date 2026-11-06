@@ -15,9 +15,10 @@ inputs:
     required: true
   engine-image:
     description: >-
-      The engine image with the remote cache client, such as
-      ghcr.io/zerobull-consulting/dagger-engine:<the same SHA>; its own CLI is
-      the one set up
+      A stock Dagger engine release, v1.0.0-beta.24 or later, pinned by
+      digest, such as
+      registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834;
+      its own CLI is the one set up
     required: true
   s3-endpoint:
     description: "The store's endpoint URL, such as https://nyc3.digitaloceanspaces.com"

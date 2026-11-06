@@ -182,7 +182,9 @@ jobs:
     timeout-minutes: 60
     env:
       # The release's multi-platform index, pinned by digest; update the tag
-      # and the digest together, and STOCK_ENGINE_TAG with them.
+      # and the digest together, and STOCK_ENGINE_TAG and
+      # hack/remote-cache/demo/run.sh's default ENGINE_IMAGE with them (a step
+      # below checks run.sh's).
       #
       # Temporary: this pairs the branch's service (internal/version/VERSION,
       # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
@@ -210,6 +212,13 @@ jobs:
             echo "::warning::the remote cache client differs from $STOCK_ENGINE_TAG's, which this job runs:"
             git diff --stat "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}"
           fi
+      # dev.sh demo runs the engine this job does: run.sh's default is this
+      # pin, as one literal line.
+      - name: Check the demo's default engine is STOCK_ENGINE
+        run: |
+          want=": \"\${ENGINE_IMAGE:=$STOCK_ENGINE}\""
+          grep -qxF "$want" hack/remote-cache/demo/run.sh ||
+            { echo "::error file=hack/remote-cache/demo/run.sh::its default ENGINE_IMAGE isn't STOCK_ENGINE ($STOCK_ENGINE)"; exit 1; }
       # The service as cacheservice-image.yml builds it; the engine pulled
       # alongside.
       - name: Build the service's image, pull the engine's
