@@ -37,9 +37,6 @@ type debugToken struct {
 	loadMu sync.Mutex
 	path   string
 	hash   atomic.Pointer[[sha256.Size]byte]
-	// rejections rate-limits the logs of refused debug requests, by remote
-	// host and reason.
-	rejections rejectionLog
 }
 
 // parseDebugToken reads the content of a debug token file: one token, with
@@ -220,7 +217,10 @@ func (s *Service) rejectDebug(w http.ResponseWriter, r *http.Request, route, msg
 		host = r.RemoteAddr
 	}
 	level := slog.LevelDebug
-	if s.debug.rejections.allow(msg+"\x00"+host, time.Now()) {
+	// The service's limiter, shared with the engine refusals: one warning
+	// budget for the process. Its keys are token fingerprints, which have
+	// no NUL, so these never collide with them.
+	if s.rejections.allow(endpointDebug+"\x00"+msg+"\x00"+host, time.Now()) {
 		level = slog.LevelWarn
 	}
 	s.logger.Log(r.Context(), level, msg, "endpoint", endpointDebug, "route", route, "remote", r.RemoteAddr)

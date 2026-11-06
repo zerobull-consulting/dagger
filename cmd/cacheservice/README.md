@@ -1588,7 +1588,8 @@ admin token guards it
   `POST /debug/gc`, or `unmatched`) and the remote address, never the
   request's own path, query or method, where a client could put the token,
   and never the token: at warning level at most once a minute per remote host and
-  reason, and 10 times a minute in all, then at debug level. `auth_rejected_total{endpoint="debug"}`
+  reason, and 10 times a minute in all (a budget shared with the engine and
+  OTLP refusals), then at debug level. `auth_rejected_total{endpoint="debug"}`
   counts them all.
 - **Rotation.** Write the new token to the file and send SIGHUP: from then
   on the new one works, and the old one doesn't.

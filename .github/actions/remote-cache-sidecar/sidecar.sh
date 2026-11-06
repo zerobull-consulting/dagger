@@ -262,6 +262,10 @@ start() {
 		secrets="$(cd "$dir" && pwd)/secrets"
 		token_file="$secrets/debug-token"
 		[[ "$token_file" != *:* ]] || die "the sidecar's directory $dir has a ':'"
+		# Never overwrite, or later delete, a file this start didn't write
+		# (or write through a symlink).
+		[[ ! -e "$token_file" && ! -L "$token_file" ]] ||
+			die "$token_file is already there, and not this start's: remove it, or give this sidecar another name"
 		mkdir -p "$secrets" && chmod 700 "$secrets" || die "creating $secrets failed"
 		token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
 		[[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "generating the debug token failed"

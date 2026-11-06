@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 )
@@ -384,5 +385,28 @@ func TestDebugRefusalLogsNoRequestData(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("the log has no %s:\n%s", want, out)
 		}
+	}
+}
+
+// Engine and debug refusals share one warning budget: with the minute's
+// warnings spent on engine tokens, a debug refusal is logged at debug level.
+func TestDebugRefusalsShareTheWarningBudget(t *testing.T) {
+	var logs bytes.Buffer
+	svc := New(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})), "")
+	if err := svc.UseDebugTokenFile(writeDebugToken(t, testDebugToken)); err != nil {
+		t.Fatal(err)
+	}
+	debug := httptest.NewServer(svc.DebugHandler())
+	defer debug.Close()
+	// As reject does for rejectionWarnings unknown engine tokens.
+	now := time.Now()
+	for i := range rejectionWarnings {
+		if !svc.rejections.allow(tokenFingerprint("engine-"+strconv.Itoa(i)), now) {
+			t.Fatalf("engine refusal %d wasn't allowed a warning", i)
+		}
+	}
+	debugRequest(t, debug.URL, "GET", "/debug/engines", "")
+	if out := logs.String(); !strings.Contains(out, `level=DEBUG msg="request refused: no debug token"`) {
+		t.Fatalf("a debug refusal past the shared budget wasn't at debug level:\n%s", out)
 	}
 }

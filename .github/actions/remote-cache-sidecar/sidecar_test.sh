@@ -266,6 +266,14 @@ relative_dir_absolute() {
 }
 check "debug-port: a relative SIDECAR_DIR still mounts the token by an absolute path" relative_dir_absolute
 check "debug-port: the state records the token, for the stop" grep -qx created=debug-token "$tmp/dbgbin.sc/remote-cache/state"
+# A token file already there, not this start's: refused, and left alone.
+existing_token_refused() {
+	mkdir -p "$tmp/dbgbin.sc/pre/secrets" && echo theirs >"$tmp/dbgbin.sc/pre/secrets/debug-token"
+	! (fake_start dbgbin SIDECAR_NAME=pre SIDECAR_DEBUG_PORT=8091 >/dev/null 2>&1) &&
+		[ "$(cat "$tmp/dbgbin.sc/pre/secrets/debug-token")" = theirs ] &&
+		! grep -qx created=debug-token "$tmp/dbgbin.sc/pre/state" 2>/dev/null
+}
+check "debug-port: a token file already there is refused, and left alone" existing_token_refused
 # The stop removes the token only when the state says this start wrote it,
 # and nothing else in its directory.
 stop_secrets() {
