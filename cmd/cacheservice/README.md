@@ -2209,6 +2209,14 @@ under a running engine), isn't waited for: the service can't tell it from
 an engine whose events go elsewhere. Its `engine.stop` then finds the
 service gone. Known gap, pinned by `TestKnownGapLingerMissesEngineNotSeenYet`
 ([zerobull-consulting/dagger#124](https://github.com/zerobull-consulting/dagger/issues/124)).
+Past 8 generations of one cache ID welcomed at the drain's start, an
+`engine.stop` isn't recorded and the linger waits out its bound, pinned by
+`TestKnownGapLingerStoppedGenerationsCapped`
+([zerobull-consulting/dagger#126](https://github.com/zerobull-consulting/dagger/issues/126)).
+An engine killed during its "stop engine events" phase, which is where it
+waits for the service that the linger keeps up, loses its cache on a kept
+state volume
+([zerobull-consulting/dagger#127](https://github.com/zerobull-consulting/dagger/issues/127)).
 
 It logs `linger: started` with the engines it waits for (`linger: waiting
 for engine.stop`, by namespace and cache ID), and `linger: done` with its

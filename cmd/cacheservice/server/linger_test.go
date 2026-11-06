@@ -23,6 +23,7 @@ import (
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
+	"github.com/dagger/dagger/engine/remotecache/protocol"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
@@ -387,4 +388,36 @@ func TestKnownGapLingerMissesEngineNotSeenYet(t *testing.T) {
 	}
 	// Its engine.stop now comes after the linger ended.
 	l.event("cache-a", telemetryattrs.EngineEventStop)
+}
+
+// Known gap (zerobull-consulting/dagger#126): past maxStoppedGenerations
+// generations of one cache ID welcomed at the drain's start, an engine.stop
+// isn't recorded, and the linger waits out its bound though every stop
+// arrived. When the gap is fixed, this test fails: turn it around.
+func TestKnownGapLingerStoppedGenerationsCapped(t *testing.T) {
+	l := newLingerTest(t)
+	gens := maxStoppedGenerations + 1
+	for g := 1; g <= gens; g++ {
+		e := dialRaw(t, l.srv, "engine-token")
+		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-a", Generation: uint64(g), EngineName: "cache-a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.send(env)
+		if got := e.next(); got.Type != protocol.TypeWelcome {
+			t.Fatalf("hello of generation %d answered with %+v", g, got)
+		}
+	}
+	waitEngines(t, l.svc, gens)
+	l.event("cache-a", telemetryattrs.EngineEventStart)
+	const bound = 700 * time.Millisecond
+	l.linger(bound)
+	for g := 1; g <= gens; g++ {
+		if code := postEngineEventGen(t, l.srv, "engine-token", "cache-a/"+strconv.Itoa(g), telemetryattrs.EngineEventStop, `{"clean":true}`); code != http.StatusOK {
+			t.Fatalf("engine.stop of generation %d: %d", g, code)
+		}
+	}
+	if rep := l.ended(bound + 2*time.Second); rep.Outcome != LingerDeadline {
+		t.Fatalf("outcome %q: the gap is fixed, turn this test around", rep.Outcome)
+	}
 }

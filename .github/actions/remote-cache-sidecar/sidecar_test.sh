@@ -212,6 +212,15 @@ check "... the engine is stopped only once the drain is done" called "ENGINE STO
 check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
 check "a slow probe before the SIGTERM doesn't eat the service's time: it isn't stopped by force" stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=5 FAKE_SERVICE=by-itself FAKE_EXIT_AFTER=3
 check "... no second signal" not called "stop --time 5 t-service"
+# Known gap (zerobull-consulting/dagger#125): the probe before the SIGTERM
+# isn't bounded by the step's budget. Three failing 2s probes and the pauses
+# between them come before the SIGTERM, on top of the stop's own time. When
+# the gap is fixed, turn this around.
+probe_adds_time() {
+	stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=2 FAKE_SERVICE=after-engine || return 1
+	[[ "$(cat "$tmp/stop.took")" -ge 7 ]]
+}
+check "known gap: the probe before the SIGTERM adds to the stop's time (zerobull-consulting/dagger#125)" probe_adds_time
 
 check "a state from a start before the linger: the stop passes" stop_with 0 old-state
 check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"

@@ -205,8 +205,11 @@ and
 [zerobull-consulting/dagger#81](https://github.com/zerobull-consulting/dagger/issues/81).
 Of the action: a read-only start doesn't wait for the service's first merge
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)),
-and the leads in
-[zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
+the leads in
+[zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104),
+and the probe of the service before the stop's SIGTERM, which the step's
+bound doesn't count
+([zerobull-consulting/dagger#125](https://github.com/zerobull-consulting/dagger/issues/125)).
 
 The stop's step summary has the exit code, and its log the drain's and the
 linger's lines (`drain: stored`, `drain: done outcome=...`, `linger: done
