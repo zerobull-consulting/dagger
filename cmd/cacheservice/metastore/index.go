@@ -506,8 +506,11 @@ func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cac
 // CacheRecordRetention). A bundle is a closure, so it is refused whole rather
 // than recorded in part: the values that are mapped keep their stored
 // records. A stale export whose values are all mapped is recorded as
-// before, and newerThan keeps it from replacing a later record. The cache's
-// own generation and newer ones are never refused.
+// before, and newerThan keeps it from replacing a later record, but it adds
+// no root: a mapped value with no root had its root expired, and a stale
+// record would revive it, whether through an exported mapping or an import
+// it takes over with more parts. A root that is still there is refreshed
+// as before. The cache's own generation and newer ones are never refused.
 func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64, nowUnix int64) (map[dagql.TransferOrdinal]uint64, *Resolution, error) {
 	if !bundleIDPattern.MatchString(bundleID) {
 		return nil, nil, fmt.Errorf("invalid bundle ID %q", bundleID)
@@ -628,13 +631,16 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	for _, r := range bundle.Roots {
 		n := numbers[r.Ordinal]
 		root, existed := idx.Roots[n]
-		if !existed && !written[r.Ordinal] {
+		if !existed && (stale || !written[r.Ordinal]) {
 			// A root is added only with its record. This export didn't
 			// write it (a late export from an older generation, or an
 			// import exported back unchanged): the stored entry stays,
 			// kept alive by whatever keeps it now, and no root, with a
 			// fresh recording time, revives a value whose own root
-			// expired. Merges never keep data alive by themselves.
+			// expired. Merges never keep data alive by themselves. Nor
+			// does a stale generation's export, even when it writes the
+			// record (a later state than the stored one, or an import's
+			// with more parts): the root it would add expired (#59).
 			continue
 		}
 		if !existed || !laterExpiry(root.ExpiresAtUnix, r.ExpiresAtUnix) {

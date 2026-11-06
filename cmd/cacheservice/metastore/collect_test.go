@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -643,6 +644,77 @@ func TestLateOlderGenerationBeforeCollection(t *testing.T) {
 			t.Fatalf("%s: the refused export changed the index:\nbefore %s\nafter  %s", name, before, after)
 		}
 	}
+}
+
+// A stale generation's export of a value the index still holds, as another
+// root's dependency, whose own root expired, adds no root, even when it
+// writes the value's record: through an exported mapping whose stored
+// record is older still, or by taking over an import with more parts.
+// (Copilot on zerobull-consulting/dagger#109, #59.)
+func TestLateOlderGenerationAddsNoRootToHeldValue(t *testing.T) {
+	bid := func(c string) string { return strings.Repeat(c, 64) }
+	t.Run("exported", func(t *testing.T) {
+		idx := NewIndex()
+		// Gen 1: X (10), a root until 100, and Y (11), a root over it.
+		nums, err := idx.Record(bid("a"), testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0)), "c", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Gen 3 records something else; X's root expires, X stays as Y's
+		// dependency.
+		if _, err := idx.Record(bid("b"), testBundle([]val{{sender: 12}}, root(1, 0)), "c", 3); err != nil {
+			t.Fatal(err)
+		}
+		idx.DropExpired(200)
+		x := nums[1]
+		if _, ok := idx.Roots[x]; ok || idx.Entries[x] == nil {
+			t.Fatalf("setup: X root %v, entry %+v", idx.Roots, idx.Entries[x])
+		}
+		// Gen 2, older than 3 but newer than X's record: the record is
+		// written, as before; no root.
+		if _, err := idx.Record(bid("d"), testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2); err != nil {
+			t.Fatal(err)
+		}
+		if e := idx.Entries[x]; e.Source.Generation != 2 {
+			t.Fatalf("X's entry %+v: want gen 2's record", e)
+		}
+		if r, ok := idx.Roots[x]; ok {
+			t.Fatalf("X got a root back: %+v", r)
+		}
+	})
+	t.Run("imported", func(t *testing.T) {
+		idx := NewIndex()
+		// Cache s: X (10, an fs part), a root until 100, and Y over it.
+		b := testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0))
+		withParts(b, 1, "fs")
+		nums, err := idx.Record(bid("a"), b, "s", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		x := nums[1]
+		// Cache c imports X on its entry 50 at gen 2; X's root expires.
+		if got := idx.RecordImports("c", 2, []Import{{Number: x, Engine: 50}}); len(got) != 1 {
+			t.Fatalf("imports %v", got)
+		}
+		idx.DropExpired(200)
+		if _, ok := idx.Roots[x]; ok || idx.Caches["c"].Imported[50].Number != x {
+			t.Fatalf("setup: roots %v, cache c %+v", idx.Roots, idx.Caches["c"])
+		}
+		// c's gen 1, with more parts: it takes the entry over, as before,
+		// and adds no root.
+		if _, err := idx.Record(bid("d"), withParts(testBundle([]val{{sender: 50}}, root(1, 0)), 1, "fs", "execMeta"), "c", 1); err != nil {
+			t.Fatal(err)
+		}
+		if e := idx.Entries[x]; e.Source.CacheID != "c" {
+			t.Fatalf("X's entry %+v: want c's record", e)
+		}
+		if r, ok := idx.Roots[x]; ok {
+			t.Fatalf("X got a root back: %+v", r)
+		}
+		if err := idx.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 // The cache's record outlives its mappings, and a wipe's ForgetImports: it

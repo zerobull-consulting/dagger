@@ -1734,7 +1734,11 @@ An export refreshes a root's time **only when it writes the root's record**
   for another max age
   ([#59](https://github.com/zerobull-consulting/dagger/issues/59),
   `TestLateOlderGenerationDoesNotReviveCollectedRoot`,
-  `TestLateOlderGenerationBeforeCollection`). The export ends with its
+  `TestLateOlderGenerationBeforeCollection`). One that names only values
+  the index holds is recorded as before, but adds no root: a held value
+  with no root had its root expired, whether its mapping is exported or an
+  import the stale record takes over with more parts
+  (`TestLateOlderGenerationAddsNoRootToHeldValue`). The export ends with its
   roots refused, logged once, and the tracker doesn't export them again
   (`TestStaleGenerationExportNotRetried`), until a newer generation of the
   cache, which the index accepts, reports them
