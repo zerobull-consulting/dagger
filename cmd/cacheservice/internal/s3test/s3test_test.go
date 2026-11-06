@@ -289,6 +289,45 @@ func TestGuardOtherBucketAndReads(t *testing.T) {
 	}
 }
 
+// The guard reads a bulk delete's body whole, so it bounds it: a body over
+// MaxBulkDeleteBytes is refused, even with every key in the root, and one of
+// 1000 keys, S3's limit, is allowed and left for the request.
+func TestGuardBoundsBulkDeletes(t *testing.T) {
+	bulk := func(n int) []byte {
+		var b bytes.Buffer
+		b.WriteString("<Delete>")
+		for i := range n {
+			fmt.Fprintf(&b, "<Object><Key>%s/k%d</Key></Object>", testRoot, i)
+		}
+		b.WriteString("</Delete>")
+		return b.Bytes()
+	}
+	check := func(body []byte) (*http.Request, error) {
+		r, err := http.NewRequest(http.MethodPost, "https://s3.example.test/"+testBucket+"?delete", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, NewGuard(testBucket, testRoot, false).Check(r)
+	}
+	small := bulk(1000)
+	r, err := check(small)
+	if err != nil {
+		t.Fatalf("a bulk delete of 1000 keys: %v", err)
+	}
+	if left, _ := io.ReadAll(r.Body); !bytes.Equal(left, small) {
+		t.Fatalf("the body left for the request: %d bytes, want %d", len(left), len(small))
+	}
+	n := 1000
+	big := small
+	for len(big) <= MaxBulkDeleteBytes {
+		n *= 2
+		big = bulk(n)
+	}
+	if _, err := check(big); err == nil || !strings.Contains(err.Error(), "over") {
+		t.Fatalf("a bulk delete of %d bytes: %v, want refused", len(big), err)
+	}
+}
+
 // Bound to its endpoint, the guard takes only that host and the bucket's name
 // under it. A request for another bucket's host is refused even when its key
 // starts with this bucket's name, which would otherwise look path-style.

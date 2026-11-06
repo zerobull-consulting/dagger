@@ -331,15 +331,24 @@ func (g *Guard) key(r *http.Request) (key string, ok bool) {
 	return rest, found
 }
 
-// bulkDeleteKeys are the keys of a DeleteObjects request. The body is read
-// and put back; one that can't be read refuses the request.
+// MaxBulkDeleteBytes bounds the DeleteObjects body the guard reads: S3 takes
+// at most 1000 keys of up to 1 KiB each, and this leaves room for XML
+// escaping. A larger body refuses the request.
+const MaxBulkDeleteBytes = 8 << 20
+
+// bulkDeleteKeys are the keys of a DeleteObjects request. The body is read,
+// up to MaxBulkDeleteBytes, and put back; one that can't be read, or is
+// larger, refuses the request.
 func bulkDeleteKeys(r *http.Request) ([]string, error) {
 	if r.Body == nil {
 		return nil, errors.New("a bulk delete without a body")
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxBulkDeleteBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read the bulk delete: %w", err)
+	}
+	if len(body) > MaxBulkDeleteBytes {
+		return nil, fmt.Errorf("a bulk delete over %d bytes", MaxBulkDeleteBytes)
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))

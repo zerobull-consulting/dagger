@@ -1,14 +1,18 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -236,6 +240,76 @@ func TestS3ProxyGuard(t *testing.T) {
 	}
 	if len(g.Refused()) != 4 {
 		t.Fatalf("refused %v", g.Refused())
+	}
+}
+
+// The guard reads a bulk delete's body, off the network, before anything is
+// recorded: a slow body holds up neither other requests nor the test's reads
+// of the record.
+func TestS3ProxyGuardDoesNotHoldTheProxy(t *testing.T) {
+	target := startFakeStore(t, func() {})
+	inGuard := make(chan struct{})
+	var once sync.Once
+	p := StartS3ProxyWith(t, "127.0.0.1", target, ProxyOptions{
+		Guard: s3test.NewGuard("bkt", "test/run", false),
+		onGuard: func(r *http.Request) {
+			if r.Method == http.MethodPost {
+				once.Do(func() { close(inGuard) })
+			}
+		},
+	})
+
+	// A bulk delete whose body stops partway: once the guard has it, it
+	// waits on the rest of the body.
+	head := []byte("<Delete>")
+	tail := []byte("<Object><Key>test/run/k</Key></Object></Delete>")
+	conn, err := net.Dial("tcp", strings.TrimPrefix(p.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	fmt.Fprintf(conn, "POST /bkt?delete HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n", strings.TrimPrefix(p.URL, "http://"), len(head)+len(tail))
+	if _, err := conn.Write(head); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inGuard:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bulk delete didn't reach the guard")
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		p.Mark()
+		resp, err := http.Get(p.URL + "/bkt/test/run/k")
+		if err != nil {
+			done <- 0
+			return
+		}
+		_ = resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("GET while a bulk delete's body is held: status %d", status)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proxy's record and its other requests waited for a bulk delete's body")
+	}
+
+	// The rest of the body: the delete is checked, and goes through.
+	if _, err := conn.Write(tail); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the bulk delete: status %d", resp.StatusCode)
 	}
 }
 

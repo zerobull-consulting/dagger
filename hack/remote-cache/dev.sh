@@ -81,7 +81,7 @@ up() {
 # lifecycle configuration.
 use_store() {
 	if [[ "${CACHESERVICE_TEST_EXTERNAL:-}" == "1" ]]; then
-		# Without these, every real-store test would skip, and the run pass.
+		# Without these, every real-store test would skip, and the run would still pass.
 		for name in ENDPOINT BUCKET PREFIX; do
 			var="CACHESERVICE_S3_$name"
 			if [[ -z "${!var:-}" ]]; then
