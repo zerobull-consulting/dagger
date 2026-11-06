@@ -42,7 +42,7 @@ const EnvEnable = "CACHESERVICE_E2E"
 // says otherwise: a stock Dagger release, its multi-platform index pinned by
 // digest. It is the workflow's STOCK_ENGINE (.github/workflows/
 // remote-cache-tests.yml), which CI passes in as E2E_ENGINE_IMAGE;
-// TestDefaultEngineImageIsCIs keeps the two the same, so update both
+// TestDefaultEngineImageMatchesCI keeps the two the same, so update both
 // together.
 const DefaultEngineImage = "registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834"
 
@@ -151,6 +151,9 @@ type Env struct {
 
 	// bin holds the binaries built with BuildEngine.
 	bin string
+	// image is the run's engine image's ID: engines start from it, not
+	// from Settings.Image, a tag another run can move to its own build.
+	image string
 	// cli is the dagger CLI copied out of the run's engine image.
 	cli string
 	// deleted are the blobs scenarios deleted from MinIO on purpose.
@@ -353,8 +356,13 @@ func (e *Env) build() {
 	if e.Settings.BuildEngine {
 		what = "the engine built from this repo"
 	}
-	t.Logf("built %s on %s, with %s, in %s", e.Settings.Image, e.Settings.EngineImage, what, time.Since(start).Round(time.Second))
-	e.cli = e.copyCLI(ctx, strings.TrimSpace(out))
+	id := strings.TrimSpace(out)
+	if !imageID.MatchString(id) {
+		t.Fatalf("docker build -q printed %q, not an image ID", id)
+	}
+	e.image = id
+	t.Logf("built %s (%s) on %s, with %s, in %s", e.Settings.Image, Short(id), e.Settings.EngineImage, what, time.Since(start).Round(time.Second))
+	e.cli = e.copyCLI(ctx, id)
 	version := exec.CommandContext(ctx, e.cli, "version")
 	version.Env = cleanEnv()
 	if v, err := version.Output(); err != nil {
@@ -377,7 +385,7 @@ func (e *Env) copyCLI(ctx context.Context, id string) string {
 	t.Helper()
 	m := imageID.FindStringSubmatch(id)
 	if m == nil {
-		t.Fatalf("docker build -q printed %q, not an image ID", id)
+		t.Fatalf("%q is not an image ID", id)
 	}
 	root := filepath.Join(e.Settings.Dir, "cli")
 	dir := filepath.Join(root, m[1])

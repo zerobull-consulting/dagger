@@ -28,7 +28,7 @@ func Docker(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// Engine is an engine of the run's image (Settings.Image), in a container
+// Engine is an engine of the run's image (by its ID), in a container
 // with its own, initially empty, cache volume, connected to one service.
 type Engine struct {
 	Name      string
@@ -82,15 +82,7 @@ func (e *Env) StartEnginesWithTokens(svc *Service, tokens map[string]string, nam
 		ctx, cancel := e.ctx()
 		_, err := Docker(ctx, "volume", "create", "--label", Label+"="+e.RunID, en.Volume)
 		if err == nil {
-			_, err = Docker(ctx, "run", "-d", "--privileged",
-				"--name", en.Container,
-				"--hostname", en.Hostname(),
-				"--label", Label+"="+e.RunID,
-				"-v", en.Volume+":/var/lib/dagger",
-				"-e", "_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="+svc.URL,
-				"-e", "DAGGER_CLOUD_TOKEN="+en.Token,
-				"-e", "DAGGER_CLOUD_URL="+svc.URL,
-				e.Settings.Image, "--debug")
+			_, err = Docker(ctx, en.runArgs(svc)...)
 		}
 		cancel()
 		e.root.Cleanup(en.remove)
@@ -105,6 +97,21 @@ func (e *Env) StartEnginesWithTokens(svc *Service, tokens map[string]string, nam
 	}
 	t.Logf("engines %s connected to %s in %s", strings.Join(names, ", "), svc.Name, time.Since(start).Round(time.Second))
 	return engines
+}
+
+// runArgs are the docker arguments that start the engine's container on
+// svc: from the run's image by its ID (Env.image), which the CLI was copied
+// out of, so a run building the same tag meanwhile doesn't change it.
+func (en *Engine) runArgs(svc *Service) []string {
+	return []string{"run", "-d", "--privileged",
+		"--name", en.Container,
+		"--hostname", en.Hostname(),
+		"--label", Label + "=" + en.env.RunID,
+		"-v", en.Volume + ":/var/lib/dagger",
+		"-e", "_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL=" + svc.URL,
+		"-e", "DAGGER_CLOUD_TOKEN=" + en.Token,
+		"-e", "DAGGER_CLOUD_URL=" + svc.URL,
+		en.env.image, "--debug"}
 }
 
 // waitConn waits for the engine to connect with a connection number above

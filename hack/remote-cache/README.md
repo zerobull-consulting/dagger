@@ -610,7 +610,7 @@ e2e-down` removes the engines and volumes later.
 | `E2E_ENGINE_IMAGE` | The workflow's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on |
 | `E2E_BUILD_ENGINE` | unset | `1` builds the engine, `dagger-init-session` and the CLI from this repo and copies them over `E2E_ENGINE_IMAGE` |
 | `E2E_SKIP_BUILD` | unset | With `E2E_BUILD_ENGINE=1`, `1` reuses the binaries in `E2E_DIR/bin`; without it, the run fails |
-| `E2E_IMAGE` | `dagger-remote-cache-e2e-engine` | The run's engine image's tag |
+| `E2E_IMAGE` | `dagger-remote-cache-e2e-engine` | The run's engine image's tag. Engines start from the image's ID, so a run building the same tag meanwhile doesn't change a running one's engine |
 | `E2E_CA_FILE` | unset | A CA bundle to add to the engine image, for hosts behind a TLS-intercepting proxy |
 | `E2E_TIMEOUT` | `180` | Seconds to wait for each export, and each merge |
 | `E2E_SCENARIOS` | all | The scenarios to run after the first part, which always runs |
@@ -649,7 +649,7 @@ version from its hello (`engine A connected to main: engine version
 
 The pin is `DefaultEngineImage` in `cmd/cacheservice/e2e/env.go` and
 `STOCK_ENGINE` in the workflow's top-level `env`; CI passes `STOCK_ENGINE` in
-as `E2E_ENGINE_IMAGE`, and `TestDefaultEngineImageIsCIs` (in the unit job)
+as `E2E_ENGINE_IMAGE`, and `TestDefaultEngineImageMatchesCI` (in the unit job)
 fails when they differ. Update them together, with `STOCK_ENGINE_TAG`.
 
 Notes:

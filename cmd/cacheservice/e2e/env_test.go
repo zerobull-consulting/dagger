@@ -9,11 +9,11 @@ import (
 	"time"
 )
 
-// TestDefaultEngineImageIsCIs checks that the harness's default engine image
+// TestDefaultEngineImageMatchesCI checks that the harness's default engine image
 // is the workflow's STOCK_ENGINE, the stock release CI runs the e2e and the
 // sidecar demo on, and that STOCK_ENGINE_TAG is its tag: so `dev.sh e2e`
 // tests locally the engine CI does. It runs without Docker, in the unit job.
-func TestDefaultEngineImageIsCIs(t *testing.T) {
+func TestDefaultEngineImageMatchesCI(t *testing.T) {
 	data, err := os.ReadFile("../../../.github/workflows/remote-cache-tests.yml")
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +65,31 @@ func TestPruneCLIs(t *testing.T) {
 		_, err := os.Stat(filepath.Join(root, name))
 		if got := err == nil; got != kept {
 			t.Errorf("%s: kept %v, want %v", name, got, kept)
+		}
+	}
+}
+
+// TestEnginesStartFromTheImageID checks that engines start from the run's
+// image by its ID, not from its tag (Settings.Image), which another run
+// building the same tag can move to an engine other than the one the CLI was
+// copied out of.
+func TestEnginesStartFromTheImageID(t *testing.T) {
+	id := "sha256:" + strings.Repeat("e", 64)
+	env := &Env{Settings: Settings{Image: "dagger-remote-cache-e2e-engine"}, RunID: "run", image: id}
+	en := &Engine{Name: "a", Container: "c", Volume: "v", Token: "tok", env: env}
+	args := en.runArgs(&Service{URL: "http://svc"})
+	var image string
+	for i, a := range args {
+		if a == "--debug" && i > 0 {
+			image = args[i-1]
+		}
+	}
+	if image != id {
+		t.Errorf("engines start from %q, want the image ID %s (args: %v)", image, id, args)
+	}
+	for _, a := range args {
+		if a == env.Settings.Image {
+			t.Errorf("the run's tag %q is in the engine's docker run: %v", a, args)
 		}
 	}
 }

@@ -19,7 +19,7 @@ permissions:
 # together, and with them STOCK_ENGINE_TAG, demo/run.sh's default
 # ENGINE_IMAGE, the docs' examples (the sidecar job checks those) and the
 # e2e harness's default (DefaultEngineImage in cmd/cacheservice/e2e/env.go,
-# which TestDefaultEngineImageIsCIs checks).
+# which TestDefaultEngineImageMatchesCI checks).
 #
 # Temporary: this pairs the branch's service (internal/version/VERSION,
 # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
