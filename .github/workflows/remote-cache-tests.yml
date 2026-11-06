@@ -216,7 +216,7 @@ jobs:
             echo "::error::STOCK_ENGINE_TAG ($STOCK_ENGINE_TAG) isn't STOCK_ENGINE's tag (${ref##*:}); update them together"
             exit 1
           fi
-          if digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
+          if digest="$(timeout 120 docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
             if [[ "$digest" != "${STOCK_ENGINE##*@}" ]]; then
               echo "::error::$ref is $digest in the registry, not STOCK_ENGINE's ${STOCK_ENGINE##*@}; update the tag and the digest together"
               exit 1
@@ -224,7 +224,7 @@ jobs:
           else
             echo "::warning::couldn't resolve $ref in the registry; STOCK_ENGINE's digest wasn't checked against it"
           fi
-          if ! git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
+          if ! timeout 300 git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
             echo "::warning::couldn't fetch $STOCK_ENGINE_TAG from dagger/dagger; the engine's client wasn't compared"
             exit 0
           fi
@@ -262,12 +262,12 @@ jobs:
             hack/remote-cache cmd/cacheservice .github/actions/remote-cache-sidecar | grep -vF ":$STOCK_ENGINE" || true)"
           [[ -z "$stale" ]] || { echo "::error::pinned engines other than STOCK_ENGINE ($STOCK_ENGINE):"; echo "$stale"; exit 1; }
       # The service as cacheservice-image.yml builds it; the engine pulled
-      # alongside.
+      # alongside, bounded as the action's own pull is (15 minutes).
       - name: Build the service's image, pull the engine's
         env:
           REVISION: ${{ github.sha }}
         run: |
-          docker pull -q "$STOCK_ENGINE" &
+          timeout 900 docker pull -q "$STOCK_ENGINE" &
           docker build -f cmd/cacheservice/Dockerfile \
             --build-arg REVISION="$REVISION" -t cacheservice:ci .
           wait $!
