@@ -35,8 +35,10 @@ permissions:
 # (DefaultEngineImage) and demo/run.sh's default come from it too, and
 # TestPinsMatchManifest (unit tests) checks every pin the docs name against
 # it (zerobull-consulting/dagger#117, D1).
+# A candidate's run is a group of its own, so verifying a version neither
+# cancels nor is cancelled by the branch's other runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.candidate-version }}
   cancel-in-progress: true
 jobs:
   unit:
