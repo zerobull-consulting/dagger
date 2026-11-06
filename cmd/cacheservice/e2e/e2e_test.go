@@ -86,6 +86,7 @@ func TestRealEngines(t *testing.T) {
 	env.Run("renew", st.renew)
 	env.Run("prune", st.prune)
 	env.Run("superseded", st.superseded)
+	env.Run("parts", st.parts)
 	// A read-only service (-export=false, #65): its own service and engine,
 	// and nothing written.
 	env.Run("readonly", st.readonly)
