@@ -624,6 +624,10 @@ changed on every service restart would make engines re-key everything. So:
   values are seen again, holds fewer parts there; without this rule its
   entry moved to the later bundle with fewer parts, and the bundle holding
   its outputs, named by no entry, was collected (`TestDependencyKeepsItsBundle`).
+  The kept entry's dependencies become those of both records: an engine can
+  find more dependencies of a value at the same replacement count, and a merge
+  of the later bundle sends its own record of the value, which names them
+  (`TestRecordKeptRecordKeepsNewDependencies`).
   A record of a new value (more replacements) replaces the stored one
   whatever its parts. A record with other parts, neither more nor fewer, keeps
   the stored one too: an entry names one record

@@ -619,19 +619,20 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 					// slower export finishing late (#133). The stored
 					// record stays, so its parts aren't lost; the value's
 					// root, if this bundle has it, is refreshed as one
-					// whose record was written.
+					// whose record was written. The entry keeps alive what
+					// either record depends on: the engine can find more
+					// dependencies of a value at the same replacement count,
+					// and this bundle's record of it, which merges of its
+					// roots send, names them.
+					kept := *old
+					kept.Deps = slices.Compact(slices.Sorted(slices.Values(append(slices.Clone(old.Deps), valueDeps(bundle, v, numbers)...))))
+					idx.Entries[n] = &kept
 					current[v.Ordinal] = true
 					continue
 				}
 			}
 		}
-		vdeps := retentionDeps(bundle, v)
-		deps := make([]uint64, 0, len(vdeps))
-		for _, d := range vdeps {
-			deps = append(deps, numbers[dagql.TransferOrdinal(d)])
-		}
-		slices.Sort(deps)
-		deps = slices.Compact(deps)
+		deps := valueDeps(bundle, v, numbers)
 		written[v.Ordinal] = true
 		idx.Entries[n] = &Entry{
 			Bundle:        bundleID,
@@ -672,6 +673,18 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 		idx.Roots[n] = root
 	}
 	return numbers, res, nil
+}
+
+// valueDeps returns the service numbers of the entries a value of the bundle
+// keeps alive (retentionDeps), sorted, without repeats.
+func valueDeps(bundle *dagql.ValueBundle, v dagql.TransferredValue, numbers map[dagql.TransferOrdinal]uint64) []uint64 {
+	vdeps := retentionDeps(bundle, v)
+	deps := make([]uint64, 0, len(vdeps))
+	for _, d := range vdeps {
+		deps = append(deps, numbers[dagql.TransferOrdinal(d)])
+	}
+	slices.Sort(deps)
+	return slices.Compact(deps)
 }
 
 // bundleParts returns the parts each value has outputs of in a bundle, by

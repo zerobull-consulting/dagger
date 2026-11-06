@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -152,5 +153,46 @@ func TestSyncPartialImportOfferRefused(t *testing.T) {
 		if got := st.Values[rec.Numbers[1]]; !slices.Equal(partKeys(got.Complete...), partKeys(fsPart)) || len(got.Offered) != 0 || st.Pending != 0 {
 			t.Fatalf("%s: B's value %+v, pending %d", outcome, got, st.Pending)
 		}
+	}
+}
+
+// zerobull-consulting/dagger#133, found in review: the engine can find more
+// dependencies of a value at the same replacement count (the tracker keeps
+// the longest list). V is stored with fs and no dependencies; W's bundle
+// then holds V, with no outputs, depending on D, which only V depends on.
+// The index keeps V's stored record, and V's entry keeps D alive too: W's
+// merge sends V's record from W's bundle, which names D, so with D dropped
+// as unreferenced, W's merge would fail as "no longer stored".
+func TestRecordKeptRecordKeepsNewDependencies(t *testing.T) {
+	idx := metastore.NewIndex()
+	first := valueBundle(fsPart)
+	v := record(t, idx, strings.Repeat("a", 64), first, "cache-a")[1]
+
+	w := &dagql.ValueBundle{
+		Version: metastore.BundleVersion,
+		Roots:   []dagql.TransferredRoot{{Ordinal: 3}},
+		Values: []dagql.TransferredValue{
+			{Ordinal: 1, SenderNumber: 12, Record: dagql.PersistedRecord{ResultID: 1, Call: &dagql.ResultCall{Field: "d"}}},
+			{Ordinal: 2, SenderNumber: 10, DependencyIDs: []uint64{1}, Record: dagql.PersistedRecord{ResultID: 2, Call: &dagql.ResultCall{Field: "v"}}},
+			{Ordinal: 3, SenderNumber: 11, DependencyIDs: []uint64{2}, Record: dagql.PersistedRecord{ResultID: 3, Call: &dagql.ResultCall{Field: "w"}}},
+		},
+		Outputs: []dagql.TransferredOutput{{
+			Ordinal: 3, Address: fsPart, State: "completed",
+			Value: &dagql.SnapshotValue{Kind: "directory", Path: "/"},
+			Chain: &dagql.OfferedChain{Layers: []snapshots.ExportLayer{layer("w")}},
+		}},
+	}
+	wID := strings.Repeat("b", 64)
+	numbers := record(t, idx, wID, w, "cache-a")
+	d, wn := numbers[1], numbers[3]
+	if e := idx.Entries[v]; e.Bundle != strings.Repeat("a", 64) || !slices.Contains(e.Deps, d) {
+		t.Fatalf("V's entry %+v: want its first record, keeping D (%d) alive", e, d)
+	}
+	idx.DropExpired(testNowUnix)
+	if _, ok := idx.Entries[d]; !ok {
+		t.Fatalf("D (%d), which W's bundle's record of V depends on, was dropped", d)
+	}
+	if _, err := BuildMerge(context.Background(), idx, wID, w, resolutionOf(t, idx, wn), []uint64{wn}, testSigner, "team"); err != nil {
+		t.Fatalf("W's merge: %v", err)
 	}
 }
