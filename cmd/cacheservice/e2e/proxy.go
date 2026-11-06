@@ -171,10 +171,6 @@ func (p *S3Proxy) faultLocked(method, path string) *Fault {
 // maxRewriteBytes bounds the body a Rewrite fault holds in memory.
 const maxRewriteBytes = 256 << 20
 
-// maxBulkDeleteBytes bounds the bulk delete body the guard reads: 1000 keys
-// of 1 KiB, with room for XML escaping. A larger one is refused.
-const maxBulkDeleteBytes = 8 << 20
-
 // SameSizeCorruption rewrites a body to other content of the same size: its
 // first byte flipped. A presigned PUT's signed Content-Length still matches,
 // so S3 takes it.
@@ -241,19 +237,16 @@ func StartS3ProxyWith(t *testing.T, host, target string, opts ProxyOptions) *S3P
 		rp.Transport = opts.Upstream.Transport
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Recorded as it arrives, with its status set as the response
-		// starts: before the client can see the response, so a client
-		// that got one always finds its request recorded.
+		// Recorded as it arrives (a bulk delete: once the guard has read
+		// its body), with its status set as the response starts: before
+		// the client can see the response, so a client that got one always
+		// finds its request recorded.
 		//
 		// The guard goes first, outside p.mu: it reads a bulk delete's
 		// keys from the body, off the network, and a slow body would hold
 		// up every other request and the test's reads of the record.
 		var refused error
 		if p.guard != nil {
-			if r.Method == http.MethodPost && r.URL.Query().Has("delete") {
-				// S3 takes at most 1000 keys of up to 1 KiB each.
-				r.Body = http.MaxBytesReader(w, r.Body, maxBulkDeleteBytes)
-			}
 			refused = p.guard.CheckRecord(r)
 		}
 		p.mu.Lock()

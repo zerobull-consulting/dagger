@@ -248,7 +248,8 @@ enforces this in test setup:
   e2e: `<prefix>/e2e/<run>/`). Every S3 client of the tests, and the e2e's
   proxy, goes through a guard (`s3test.Guard`) that refuses any other write,
   delete or abort before it reaches the store, and the test then fails. It
-  reads the keys of bulk deletes too, and the proxy bounds their bodies.
+  reads the keys of bulk deletes too, from a body bounded by
+  `s3test.MaxBulkDeleteBytes`.
   Presigned PUTs a test sends itself are checked by `s3test.CheckURL`. In the
   e2e, the ones the service hands real engines go through the proxy, and its
   guard. The ones it hands a fake engine go through `remotecache`'s own HTTP
