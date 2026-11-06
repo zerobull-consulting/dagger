@@ -614,7 +614,9 @@ another engine than asked.
 The default run tests the stock engine's client, not this branch's. Where
 they differ (this branch merges upstream main, whose client can be ahead of
 the release), the `real engines (e2e)` job and the `sidecar demo` job both
-warn: `the engine's side of the remote cache differs from v1.0.0-beta.25's`,
+warn, from one script
+([`compare-client.sh`](compare-client.sh), which takes `STOCK_ENGINE` and
+`STOCK_ENGINE_TAG` from the environment): `the engine's side of the remote cache differs from v1.0.0-beta.25's`,
 with the files (the client, its adapter in `engine/server`, and the `dagql`
 bundle code). The step fails only on a pin that contradicts itself: a
 `STOCK_ENGINE_TAG` that isn't `STOCK_ENGINE`'s tag, or a digest the registry
