@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os/exec"
 	"path/filepath"
@@ -71,9 +70,11 @@ func TestBinaryEngineVersionRefused(t *testing.T) {
 	listen, debug := freeAddr(t), freeAddr(t)
 	_, logs := storelessBinary(t, 2, "-listen", listen, "-debug-listen", debug)
 	m := compat.Embedded()
-	identity := fmt.Sprintf("msg=identity base=dev accept=[%s] revision=", strings.Join(m.Versions(), " "))
-	if !strings.Contains(logs.String(), identity) {
-		t.Fatalf("no startup identity %q:\n%s", identity, logs.String())
+	// slog quotes the list once it has a space.
+	list := `"?\[` + regexp.QuoteMeta(strings.Join(m.Versions(), " ")) + `\]"?`
+	identity := regexp.MustCompile(`msg=identity base=dev accept=` + list + ` revision=\S+`)
+	if !identity.MatchString(logs.String()) {
+		t.Fatalf("no startup identity %s:\n%s", identity, logs.String())
 	}
 	if strings.Contains(logs.String(), "ENGINE VERSION CHECK OFF") {
 		t.Fatalf("the check is off by default:\n%s", logs.String())
@@ -88,7 +89,7 @@ func TestBinaryEngineVersionRefused(t *testing.T) {
 	waitFor(t, 15*time.Second, "the refusal in the service's log", func() bool {
 		return strings.Contains(logs.String(), `msg="engine refused: its version is not accepted"`)
 	})
-	if !regexp.MustCompile(`engineVersion=v0\.0\.1 accept=\[` + regexp.QuoteMeta(strings.Join(m.Versions(), " ")) + `\] base=dev closeStatus=4002`).MatchString(logs.String()) {
+	if !regexp.MustCompile(`engineVersion=v0\.0\.1 accept=` + list + ` base=dev closeStatus=4002`).MatchString(logs.String()) {
 		t.Fatalf("the refusal's log line lacks its fields:\n%s", logs.String())
 	}
 	waitFor(t, 15*time.Second, "the refusal in the engine's log", func() bool {

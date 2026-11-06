@@ -133,7 +133,7 @@ the checkout, and says so in the run's output. The default is strict.
 revision, not `internal/version/VERSION` (which tracks upstream main):
 
 ```json
-{"base": "dev", "accept": ["v1.0.0-beta.25"], "revision": "<commit>"}
+{"base": "dev", "accept": ["v1.0.0-beta.25", "v1.0.0-beta.24"], "revision": "<commit>"}
 ```
 
 It is in the welcome (`{"service": {...}}`, alongside `protocol.Welcome`'s
