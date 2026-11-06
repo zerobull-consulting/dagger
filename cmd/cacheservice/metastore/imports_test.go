@@ -194,10 +194,12 @@ func TestDropExpiredAndForgetImports(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A wiped cache that only imported keeps its record, with no
+	// mappings, for its generation (#59): Expire drops it later.
 	idx = importChain(t)
-	idx.ForgetImports("cache-b")
-	if _, ok := idx.Caches["cache-b"]; ok {
-		t.Fatalf("cache-b kept: %+v", idx.Caches["cache-b"])
+	idx.ForgetImports("cache-b", 1000)
+	if c := idx.Caches["cache-b"]; c == nil || len(c.Imported) != 0 || len(c.Numbers) != 0 || c.UpdatedAtUnix < 1000 {
+		t.Fatalf("cache-b %+v", c)
 	}
 	if len(idx.Entries) != 3 || len(idx.Caches["cache-a"].Numbers) != 3 {
 		t.Fatalf("forgetting imports dropped entries")
@@ -207,7 +209,7 @@ func TestDropExpiredAndForgetImports(t *testing.T) {
 	if _, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 200}}, root(1, 0)), "cache-b", 1); err != nil {
 		t.Fatal(err)
 	}
-	idx.ForgetImports("cache-b")
+	idx.ForgetImports("cache-b", 1000)
 	if c := idx.Caches["cache-b"]; c == nil || len(c.Imported) != 0 || len(c.Numbers) != 1 {
 		t.Fatalf("cache-b %+v", c)
 	}
@@ -232,8 +234,8 @@ func TestStoreRecordImports(t *testing.T) {
 	if err := s.ForgetImports(ctx, "s1", "cache-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := mustIndex(t, s, "s1").Caches["cache-b"]; ok {
-		t.Fatal("imports not forgotten")
+	if c := mustIndex(t, s, "s1").Caches["cache-b"]; c == nil || len(c.Imported) != 0 {
+		t.Fatalf("imports not forgotten, or the record with them: %+v", c)
 	}
 	if _, err := s.RecordImports(ctx, "s1", "", 1, []Import{{Number: 3, Engine: 7}}); err == nil {
 		t.Fatal("no cacheID: no error")
@@ -315,7 +317,7 @@ func cloneIndex(t *testing.T, idx *Index) *Index {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cp, err := decodeIndex(body)
+	cp, err := decodeIndex(body, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}

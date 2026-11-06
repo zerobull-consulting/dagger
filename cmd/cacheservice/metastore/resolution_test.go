@@ -133,7 +133,7 @@ func (o *orderedObjects) Put(ctx context.Context, key string, body []byte, cond 
 	switch {
 	case strings.HasSuffix(key, "/index.json"):
 		kind = "index"
-		idx, err := decodeIndex(body)
+		idx, err := decodeIndex(body, 1000)
 		if err != nil {
 			o.t.Errorf("index write: %v", err)
 		}
@@ -263,8 +263,9 @@ func TestIndexBeforeResolutions(t *testing.T) {
 	// The same index, as written before resolutions: version 1, and no
 	// "resolution".
 	legacy := strings.ReplaceAll(mustJSON(t, rec.Index), `,"resolution":"`+rec.ResolutionID+`"`, "")
-	legacy = strings.Replace(legacy, `{"version":3,`, `{"version":1,`, 1)
+	legacy = strings.Replace(legacy, `{"version":4,`, `{"version":1,`, 1)
 	legacy = regexp.MustCompile(`"recordedAtUnix":[0-9]+`).ReplaceAllString(legacy, "")
+	legacy = regexp.MustCompile(`"updatedAtUnix":[0-9]+,`).ReplaceAllString(legacy, "")
 	if strings.Contains(legacy, "resolution") || !strings.HasPrefix(legacy, `{"version":1,`) {
 		t.Fatalf("legacy index %s", legacy)
 	}
@@ -283,14 +284,14 @@ func TestIndexBeforeResolutions(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkResolution(t, s, "s1", rec2, "cache-a")
-	// And it was written back as the current version (3, since #11), which
+	// And it was written back as the current version (4, since #59), which
 	// a service that reads only version 1 refuses rather than rewrite
 	// without the resolutions.
 	raw, _, err := objects.Get(ctx, "team/ns/s1/index.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(raw), `{"version":3,`) {
+	if !strings.HasPrefix(string(raw), `{"version":4,`) {
 		t.Fatalf("written back as %.40s...", raw)
 	}
 

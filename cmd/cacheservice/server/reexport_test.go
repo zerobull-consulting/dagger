@@ -193,7 +193,11 @@ func TestWipedCacheImportsDropped(t *testing.T) {
 	waitImports(t, h.meta, b.ID, 2)
 
 	h.postEvent(telemetryattrs.EngineEventStart, `{"wipedCache":"cache-b"}`)
-	idx := waitIndexFor(t, h.meta, func(idx *metastore.Index) bool { return idx.Caches[b.ID] == nil })
+	// The record stays, with no mappings, for its generation (#59).
+	idx := waitIndexFor(t, h.meta, func(idx *metastore.Index) bool {
+		c := idx.Caches[b.ID]
+		return c != nil && len(c.Imported) == 0 && len(c.Numbers) == 0
+	})
 	if len(idx.Entries) != 2 {
 		t.Fatalf("entries %d: the wipe dropped A's entries", len(idx.Entries))
 	}

@@ -555,7 +555,7 @@ func (f *interfere) Put(ctx context.Context, key string, body []byte, cond Condi
 		raw, etag, err := f.Objects.Get(ctx, key)
 		idx := NewIndex()
 		if err == nil {
-			if idx, err = decodeIndex(raw); err != nil {
+			if idx, err = decodeIndex(raw, 1000); err != nil {
 				return "", err
 			}
 		}
@@ -686,7 +686,8 @@ func TestReadIndexRefuses(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct{ name, body, want string }{
 		{"not JSON", "{", "decode"},
-		{"a later version", `{"version":4,"nextNumber":1}`, "version 4"},
+		{"a later version", `{"version":5,"nextNumber":1}`, "version 5"},
+		{"a cache with no update time", `{"version":4,"nextNumber":1,"caches":{"c":{"generation":1,"numbers":{}}}}`, "no update time"},
 		{"version 0", `{"version":0,"nextNumber":1}`, "version 0"},
 		{"no next number", `{"version":1}`, "next number"},
 		{"a root not stored", `{"version":1,"nextNumber":5,"roots":{"3":{}}}`, "root 3"},

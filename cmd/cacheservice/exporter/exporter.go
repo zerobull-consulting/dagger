@@ -214,7 +214,10 @@ type Result struct {
 	// Stored roots are in a published bundle, with every blob their
 	// outputs need.
 	Stored []uint64 `json:"stored,omitempty"`
-	// Gone, Busy and Refused are the roots the engine skipped.
+	// Gone, Busy and Refused are the roots the engine skipped. Refused
+	// also holds the roots the index refused because the export came
+	// from an older generation of the cache than it recorded
+	// (StaleGenerationMessage): neither is exported again unchanged.
 	Gone    []uint64               `json:"gone,omitempty"`
 	Busy    []protocol.SkippedRoot `json:"busy,omitempty"`
 	Refused []protocol.SkippedRoot `json:"refused,omitempty"`
@@ -234,6 +237,12 @@ type Result struct {
 	// uploaded. Each try that rejected one is counted.
 	Rejected []digest.Digest `json:"rejected,omitempty"`
 }
+
+// StaleGenerationMessage is the message of a root in Result.Refused that the
+// index refused, not the engine: a late export from an older generation of
+// the cache than the index recorded, naming a value it no longer holds (see
+// metastore.ErrStaleGeneration).
+const StaleGenerationMessage = "not recorded: exported by an older generation of the cache than the index's"
 
 // FailedRoot is a root that could not be stored, and why.
 type FailedRoot struct {
@@ -512,6 +521,18 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			x.log.Info("export: garbage collection raced it; trying again", "cacheID", eng.CacheID(), "roots", len(survivors), "error", err)
 			x.forgetEpoch()
 			return res, survivors, true, nil
+		}
+		if errors.Is(err, metastore.ErrStaleGeneration) {
+			// A late export from an older generation of the cache than
+			// the index recorded, of a value the index no longer holds
+			// (#59). Its generation never changes, so trying again
+			// can't help: the roots are settled as refused, and the
+			// tracker doesn't export this state of them again.
+			x.log.Info("export: older generation than the index's, not recorded", "cacheID", eng.CacheID(), "generation", eng.Generation(), "roots", len(survivors), "error", err)
+			for _, n := range survivors {
+				res.Refused = append(res.Refused, protocol.SkippedRoot{Number: n, Reason: protocol.SkipRefused, Message: StaleGenerationMessage})
+			}
+			return res, nil, false, nil
 		}
 		res.fail(survivors, fmt.Errorf("publish: %w", err))
 		return res, nil, false, nil

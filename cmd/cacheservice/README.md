@@ -602,6 +602,16 @@ changed on every service restart would make engines re-key everything. So:
 - A record replaces the stored one unless the stored one is newer: from a
   later generation, or from the same generation with more replacements. So a
   late export from an older generation never overwrites a newer record.
+- A late export from a generation older than the cache's latest recorded one
+  adds nothing the index has no mapping for: if any of its values has no
+  stored entry, the whole record is refused (`metastore.ErrStaleGeneration`,
+  #59), and the exporter settles its roots as refused rather than retry
+  them. See [Max age](#max-age).
+- A cache's record (its `generation`) outlives its mappings, for that check:
+  once it has none, exported or imported, it stays until
+  `metastore.CacheRecordRetention` (7 days) after it last changed
+  (`updatedAtUnix`), then `Expire` drops it. A late export after that is
+  recorded as new. Each kept record is about a hundred bytes of index.
 - The index is refused unless its mappings and entries agree both ways: each
   exported mapping names an entry from that cache and engine number, and
   each entry is its source's mapping. Each imported mapping names a stored
@@ -629,7 +639,7 @@ read-only instance doesn't (see [Read-only instances](#read-only-instances)):
   which keeps its own number. A stored entry imported onto another engine
   entry than before moves there.
 - A wiped cache (`engine.start` naming it) loses its imports; its exported
-  entries stay. `engine.prune` does not drop imports: a prune drops
+  entries stay, and so does its record, with its generation (see above). `engine.prune` does not drop imports: a prune drops
   retention edges, and an entry another one depends on lives on, so a later
   export may still name it in a closure. Dropping its import then would
   store it again under a new number, or leave that bundle unmergeable. Engine
@@ -730,6 +740,13 @@ bucket; garbage collection runs both on a schedule, and deletes what no
 entry names any more (see
 [Retention and garbage collection](#retention-and-garbage-collection)).
 
+- **Index version 4.** Each cache record carries the time the index last
+  changed it (`updatedAtUnix`, required), so a record with no mappings is
+  kept for its generation and then dropped (#59). A version 1 to 3 index
+  reads with every cache record stamped with the reader's clock, so an
+  empty one is kept a whole retention from the upgrade. A service that
+  reads only version 3 refuses a version 4 index, rather than write it back
+  without the times.
 - **Index version 3.** Roots carry the time an export last recorded them
   (`recordedAtUnix`), and the index holds GC's deletions (`gc`). A version 1
   or 2 index reads as one whose roots have no recording time (GC stamps them
@@ -1635,7 +1652,9 @@ mean "delete". In each namespace, in order:
    roots past their own expiry or their max age, and entries past their
    own expiry, are dropped, with what only they keep alive
    (`metastore.Index.Expire`, the same rules as `DropExpired`). Roots with no
-   recording time (indexes before version 3) are stamped now. Finished
+   recording time (indexes before version 3) are stamped now. Cache
+   records with no mappings left are kept `metastore.CacheRecordRetention`
+   (7 days) after they last changed, then dropped. Finished
    deletions older than 4h are dropped from the index.
 2. *(The listing is step 0, before the expiry, so a namespace with a
    violation has nothing written.)*
@@ -1705,12 +1724,23 @@ An export refreshes a root's time **only when it writes the root's record**
   (`TestRootAddedOnlyWithItsRecord`). Merges hand stored entries to engines,
   so a refresh by them would keep data alive forever by merging it around.
   The tracker doesn't export unchanged imports anyway; the index doesn't
-  rely on it. **Known gap
-  ([#59](https://github.com/zerobull-consulting/dagger/issues/59)):** once
-  GC has dropped the value's entry and its cache mapping too, a late
-  export from an older generation has nothing to compare against. It is
-  recorded as new, with a fresh root, and kept for another max age
-  (`TestKnownGapLateOlderGenerationRevivesCollectedRoot`).
+  rely on it.
+- once GC has dropped the value's entry and its cache mapping too, a late
+  export from an older generation is compared with the cache's record,
+  which outlives its mappings: if it names any value the index has no
+  entry for, the whole record is refused (`metastore.ErrStaleGeneration`)
+  and nothing is added, so the value doesn't come back with a fresh root
+  for another max age
+  ([#59](https://github.com/zerobull-consulting/dagger/issues/59),
+  `TestLateOlderGenerationDoesNotReviveCollectedRoot`,
+  `TestLateOlderGenerationBeforeCollection`). The export ends with its
+  roots refused, logged once, and the tracker doesn't export them again
+  (`TestStaleGenerationExportNotRetried`). The cache's own generation and
+  newer ones still record it: the engine really has it
+  (`TestSameAndNewerGenerationRecordAfterCollection`). The record is kept
+  `metastore.CacheRecordRetention` (7 days) after its last mapping went,
+  wipes included (`TestCacheRecordOutlivesItsMappings`); a late export
+  after that is recorded as new.
 
 **Merges are capped at it.** Most stored roots have no expiry (0), and a
 merge used to send the index's: every engine kept every imported root until
@@ -1860,6 +1890,8 @@ need to agree within minutes.
 **Rolling upgrade.** Index version 3 holds the claims; a replica that reads
 only version 2 refuses it and stops updating the namespace, rather than
 record an export without checking them (see [Metadata store](#metadata-store)).
+Version 4 (#59) is refused the same way by a replica that reads only
+version 3.
 
 ### Staging and multipart uploads
 

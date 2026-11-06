@@ -401,7 +401,7 @@ func TestBundleOfMovedImportsMerges(t *testing.T) {
 // The same after a wipe, which drops the cache's imports altogether.
 func TestBundleOfWipedImportsMerges(t *testing.T) {
 	idx, cID, cBundle, want := movedImportsFixture(t)
-	idx.ForgetImports("cache-c")
+	idx.ForgetImports("cache-c", 1000)
 	if c := idx.Caches["cache-c"]; c == nil || len(c.Imported) != 0 {
 		t.Fatalf("cache-c after the wipe: %+v", c)
 	}
@@ -443,8 +443,10 @@ func TestLegacyBundleResolvesThroughCurrentMappings(t *testing.T) {
 
 // A bundle one cache recorded twice, resolved differently, plans a candidate
 // per resolution: each root merges with the resolution its record names.
-// Here the second record (an older generation's export, arriving late) keeps
-// the newer records of exec, and adds lone, dropped since the first.
+// Here the second record (an earlier state of the same generation, arriving
+// late: fewer replacements) keeps the newer records of base and exec, and
+// adds lone, dropped since the first. (A late export from an older
+// generation can't add lone back: see #59.)
 func TestPlanSplitsByResolution(t *testing.T) {
 	idx := metastore.NewIndex()
 	id := testBundleID("a")
@@ -454,6 +456,8 @@ func TestPlanSplitsByResolution(t *testing.T) {
 		Record: dagql.PersistedRecord{ResultID: 3, Call: &dagql.ResultCall{Field: "lone"}},
 	})
 	stored.Roots = append(stored.Roots, dagql.TransferredRoot{Ordinal: 3, ExpiresAtUnix: 10})
+	stored.Values[0].SenderReplacements = 1
+	stored.Values[1].SenderReplacements = 1
 	first, res1, err := idx.RecordResolved(id, stored, "cache-a", 2)
 	if err != nil {
 		t.Fatal(err)
@@ -461,7 +465,9 @@ func TestPlanSplitsByResolution(t *testing.T) {
 	keepResolution(t, res1)
 	idx.DropExpired(20)
 	stored.Roots[1].ExpiresAtUnix = 0
-	second, res2, err := idx.RecordResolved(id, stored, "cache-a", 1)
+	stored.Values[0].SenderReplacements = 0
+	stored.Values[1].SenderReplacements = 0
+	second, res2, err := idx.RecordResolved(id, stored, "cache-a", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
