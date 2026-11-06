@@ -134,12 +134,6 @@ jobs:
     name: real engines (e2e)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # TEMPORARY, for measuring the Go cache: none against a small one of the
-    # e2e package's own. Removed before review.
-    strategy:
-      fail-fast: false
-      matrix:
-        go-cache: [none, small]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -164,8 +158,13 @@ jobs:
           # setup-go's own cache uses one key for every job, so only the first
           # job to finish saves it; each job caches its own build below.
           cache: false
+      # Module and build caches of the e2e package alone (go-e2e-test-: the
+      # engine isn't built, so the old go-e2e- cache was mostly unused).
+      # Measured in zerobull-consulting/dagger#120: ~495 MB restores in 10s
+      # and the test then builds in 20s; without it, it builds in ~95s.
+      # Every run restores the newest cache saved by a push to
+      # feature/remote-cache; only those pushes save one.
       - name: Restore Go cache
-        if: matrix.go-cache == 'small'
         id: go-cache
         uses: actions/cache/restore@v5
         with:
@@ -199,14 +198,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: e2e-runs-${{ matrix.go-cache }}
+          name: e2e-runs
           path: ${{ runner.temp }}/e2e/runs
           if-no-files-found: ignore
       - name: Stop MinIO
         if: always()
         run: ./hack/remote-cache/dev.sh reset
       - name: Save Go cache
-        if: matrix.go-cache == 'small' && steps.go-cache.outputs.cache-hit != 'true' && !cancelled()
+        if: github.event_name == 'push' && !cancelled()
         uses: actions/cache/save@v5
         with:
           path: |
