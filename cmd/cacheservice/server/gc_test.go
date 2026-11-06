@@ -591,13 +591,19 @@ func TestKnownGapPastCapNotSentToEngines(t *testing.T) {
 	}
 }
 
-// Known gap (zerobull-consulting/dagger#60): the debug API is not
-// authenticated, and POST /debug/gc runs a real collection. It deletes only
-// what a scheduled run would, by the same limits, but anyone who reaches
-// -debug-listen (127.0.0.1 by default) can run one at any time.
-func TestKnownGapDebugGCUnauthenticated(t *testing.T) {
+// zerobull-consulting/dagger#60, closed: POST /debug/gc runs a real
+// collection, so on a service with -tokens-file it takes the debug token,
+// and nothing else: no credentials, an engine token, or no debug token set
+// at all are refused with 401, and run nothing.
+func TestDebugGCRequiresToken(t *testing.T) {
 	st := newGCStores(t, nil)
-	svc := New(slog.New(slog.DiscardHandler), "")
+	h := newExportHarness(t, st.blobs, st.meta, nil)
+	enableGC(t, h.svc, st, nil)
+	h.buildRecipes()
+	h.exportBuild()
+	// The tokens file after the export: the harness's engine is revoked,
+	// and its namespace stays in the bucket, for GC to run over.
+	svc := h.svc
 	tokens := filepath.Join(t.TempDir(), "tokens")
 	if err := os.WriteFile(tokens, []byte(testTokens), 0o600); err != nil {
 		t.Fatal(err)
@@ -605,17 +611,27 @@ func TestKnownGapDebugGCUnauthenticated(t *testing.T) {
 	if err := svc.UseTokensFile(tokens); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.EnableGC(context.Background(), GCConfig{Collector: gc.Config{Bucket: st.bucket, Meta: st.meta}}); err != nil {
+	srv := h.debug
+	runs := counterSum(t, svc, "gc_runs_total")
+	// The tokens file, and no debug token yet: closed.
+	if code, _, _ := debugRequest(t, srv.URL, "POST", "/debug/gc", ""); code != http.StatusUnauthorized {
+		t.Fatalf("POST /debug/gc, no debug token set: %d, want 401", code)
+	}
+	if err := svc.UseDebugTokenFile(writeDebugToken(t, testDebugToken)); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(svc.DebugHandler())
-	defer srv.Close()
-	resp, err := http.Post(srv.URL+"/debug/gc", "", nil)
-	if err != nil {
-		t.Fatal(err)
+	for _, auth := range []string{"", "Bearer tok-a", "Basic dG9rLWE6"} {
+		if code, _, _ := debugRequest(t, srv.URL, "POST", "/debug/gc", auth); code != http.StatusUnauthorized {
+			t.Fatalf("POST /debug/gc with %q: %d, want 401", auth, code)
+		}
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /debug/gc with no credentials: %d; if the debug API now checks them, the gap is fixed: update #60 and this test", resp.StatusCode)
+	if got := counterSum(t, svc, "gc_runs_total"); got != runs {
+		t.Fatalf("refused requests ran %v collections", got-runs)
+	}
+	if code, _, body := debugRequest(t, srv.URL, "POST", "/debug/gc", "Bearer "+testDebugToken); code != http.StatusOK {
+		t.Fatalf("POST /debug/gc with the debug token: %d %s", code, body)
+	}
+	if counterSum(t, svc, "gc_runs_total") == runs {
+		t.Fatal("the debug token's request ran no collection")
 	}
 }

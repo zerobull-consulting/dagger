@@ -33,8 +33,10 @@ LABEL org.opencontainers.image.source="https://github.com/zerobull-consulting/da
 COPY --from=build /out/cacheservice /cacheservice
 USER 65532:65532
 # The engine WebSocket and the OTLP receivers (-listen). The debug API
-# (-debug-listen, 127.0.0.1:8091) is the container's own loopback, and the
-# metrics address (-metrics-listen) is off by default.
+# (-debug-listen, 127.0.0.1:8091) is the container's own loopback; to publish
+# it, bind it to :8091, which then needs -debug-token-file (a token file
+# mounted read-only, readable by 65532). The metrics address
+# (-metrics-listen) is off by default.
 EXPOSE 8090
 # No HEALTHCHECK: there is no shell or HTTP client in the image, and the
 # engine reconnects with backoff.

@@ -23,7 +23,11 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
 | `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
-| `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, for a scraper that shouldn't reach the debug API |
+| `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, without credentials, for a scraper that shouldn't reach the debug API |
+
+Every `-debug-listen` route, `/metrics` included, takes the debug token as
+`Authorization: Bearer <token>` when `-debug-token-file` is set, and answers
+401 without it (see [The debug API](#the-debug-api)).
 
 On the engine WebSocket, the service:
 
@@ -44,8 +48,11 @@ On the engine WebSocket, the service:
 `-dump-dir DIR` also writes every envelope body and engine event body to a
 numbered file in `DIR`.
 
-The debug API has no authentication, and sees and drives every namespace. It
-listens on localhost only by default; keep it there.
+The debug API sees and drives every namespace. It listens on localhost only
+by default. With `-debug-token-file`, every request needs that token; the
+service refuses to start without one when it has `-tokens-file`, or when
+`-debug-listen` isn't a loopback address (see
+[The debug API](#the-debug-api)).
 
 ## Code layout
 
@@ -61,6 +68,10 @@ if err := svc.EnableS3(ctx, s3cfg, server.S3Options{Scope: "default"}); err != n
 	return err
 }
 engines := httptest.NewServer(svc.Handler())     // the -listen address
+// Optional: require a token on the debug API (needed with tokens).
+if err := svc.UseDebugTokenFile("debug-token"); err != nil {
+	return err
+}
 debug := httptest.NewServer(svc.DebugHandler())  // the -debug-listen address
 // To stop: cancel ctx, then
 svc.CloseEngines()
@@ -1531,12 +1542,57 @@ Either way, `DAGGER_CLOUD_URL` should be the same `https://` URL, so the OTLP
 requests, which carry the token too, are encrypted. The debug and metrics
 addresses are never served over TLS: they are for local use.
 
-The debug API (`-debug-listen`) is **not authenticated**, and lists, exports
-and imports for every namespace's engines, and runs garbage collection
-(`POST /debug/gc`). It listens on `127.0.0.1` by default; never expose it.
-**Known gap ([#60](https://github.com/zerobull-consulting/dagger/issues/60)):**
-nothing enforces that; anyone who reaches it can run a collection at any
-time (`TestKnownGapDebugGCUnauthenticated`). `-metrics-listen` serves only `/metrics`, whose
+### The debug API
+
+The debug API (`-debug-listen`) lists, exports and imports for every
+namespace's engines, and runs garbage collection (`POST /debug/gc`). An
+admin token guards it
+([zerobull-consulting/dagger#60](https://github.com/zerobull-consulting/dagger/issues/60)):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-debug-listen` | `127.0.0.1:8091` | The debug API's address (empty: off) |
+| `-debug-token-file` | none | A file holding the debug token: one line of at least 16 printable ASCII characters, no white space, at most 4KiB of file. SIGHUP reloads it |
+
+- **The token.** With `-debug-token-file`, every request to the debug
+  address, `/metrics` and unknown paths included, must carry
+  `Authorization: Bearer <token>`. Anything else (no header, another token,
+  an engine token, HTTP Basic, two `Authorization` headers) is refused with
+  401, a `WWW-Authenticate: Bearer` header and no detail, before the route
+  runs: a refused `POST /debug/gc` collects nothing, and a refused export
+  sends the engine nothing. The service keeps only the token's SHA-256 hash,
+  and compares it in constant time. Generate one with
+  `openssl rand -hex 32 > debug-token`.
+- **Never an engine token.** A debug token that the tokens file maps too is
+  refused at startup and on reload, and refused per request if a later
+  tokens reload adds it.
+- **When it is required.** The service refuses to start (exit 2, naming
+  `-debug-token-file`) without one when `-tokens-file` is set, since an
+  authenticated service shouldn't have an unauthenticated side door, or when
+  `-debug-listen` isn't a loopback address (`127.0.0.1`, `::1`, `localhost`;
+  `:8091` and `0.0.0.0:8091` are every interface). A loopback
+  `-debug-listen` without `-tokens-file` may stay open, for local
+  development; the service then logs a warning,
+  `UNAUTHENTICATED debug API on 127.0.0.1:8091`. In-process, a service with
+  engine tokens and no debug token refuses every debug request too. There is
+  no flag to expose an open debug API.
+- **A file it can't use** (missing, unreadable, empty, malformed, over 4KiB,
+  or an engine token) is refused at startup (exit 1), and on SIGHUP keeps
+  the token loaded before, logging an error: it never turns the check off.
+  Errors never show the file's content.
+- **Refusals** are logged with the method, path and remote address, never
+  the token: at warning level at most once a minute per remote host, and 10
+  times a minute in all, then at debug level. `auth_rejected_total{endpoint="debug"}`
+  counts them all.
+- **Rotation.** Write the new token to the file and send SIGHUP: from then
+  on the new one works, and the old one doesn't.
+
+```bash
+curl -s -H "Authorization: Bearer $(cat debug-token)" localhost:8091/debug/engines
+```
+
+An admin sees every namespace: there is no per-namespace debug access.
+`-metrics-listen` stays unauthenticated, and serves only `/metrics`, whose
 `scope` labels name the namespaces.
 
 ## Retention and garbage collection
@@ -2156,7 +2212,7 @@ paths record into them through their metadata store. All are prefixed
 | `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
-| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket) or `otlp` |
+| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, or `debug` (the debug API; see [The debug API](#the-debug-api)) |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
 | `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
@@ -2277,9 +2333,13 @@ the same defaults:
   exposes this port. Its OTLP bodies are bounded (see
   [OTLP limits](#otlp-limits)).
 - `-debug-listen` `127.0.0.1:8091`: the container's own loopback, so the
-  unauthenticated debug API can't be reached from outside the container,
-  even with `-p`. Publishing it takes `-debug-listen :8091` and a `-p` bound
-  to the host's loopback, such as `-p 127.0.0.1:8091:8091`.
+  debug API can't be reached from outside the container, even with `-p`.
+  Publishing it takes `-debug-listen :8091`, which isn't loopback, so the
+  service then requires `-debug-token-file` (see
+  [The debug API](#the-debug-api)); mount the file read-only, readable by
+  UID 65532, and bind the `-p` to the host's loopback too:
+  `-v "$PWD/debug-token:/run/secrets/debug-token:ro" -p 127.0.0.1:8091:8091
+  ... -debug-listen :8091 -debug-token-file /run/secrets/debug-token`.
 - `-metrics-listen`: off.
 
 There is no `HEALTHCHECK`: the image has no shell, and the engine reconnects
@@ -2377,8 +2437,11 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 - **`-drain-timeout 10m`**: the stop's chance to store what the job built
   (see step 4).
 - **The debug API**, when wanted: `-debug-listen :8091` with
-  `-p 127.0.0.1:8091:8091`, on the runner's loopback only. It is
-  unauthenticated.
+  `-p 127.0.0.1:8091:8091`, on the runner's loopback only, and
+  `-debug-token-file` with a token generated for the job and mounted
+  read-only: `:8091` isn't loopback inside the container, so the service
+  refuses to start without one (see [The debug API](#the-debug-api)). The
+  composite action does this for its `debug-port` input.
 - It is up once it logs `msg=listening addr=:8090`: it checked the prefix's
   ownership before that, and exits 1 (a store error, such as a prefix it
   doesn't own) or 2 (a flag error) instead. Fail the job if it exits, with
@@ -2532,10 +2595,14 @@ For a local S3-compatible store (MinIO), see
    go run ./cmd/cacheservice -v -dump-dir /tmp/cacheservice-dump
    ```
 
-   That is unauthenticated, with any token in the `default` namespace. To
-   check tokens, add `-tokens-file tokens.txt`, with a line
+   That is unauthenticated, with any token in the `default` namespace, and
+   its debug API is open on `127.0.0.1:8091` (it logs a warning saying so).
+   To check tokens, add `-tokens-file tokens.txt`, with a line
    `<token> <namespace>` for the engine's token, and for the CLI's if it
-   sends spans (see [Auth and namespaces](#auth-and-namespaces)).
+   sends spans (see [Auth and namespaces](#auth-and-namespaces)). The debug
+   API then needs a token of its own: also add
+   `-debug-token-file debug-token`, after
+   `openssl rand -hex 32 > debug-token`.
 
 2. Build and start a dev engine (see `hack/dev`), or run the published
    [engine image](../../hack/remote-cache/README.md#engine-image). Then
@@ -2580,6 +2647,9 @@ For a local S3-compatible store (MinIO), see
    ```bash
    curl -s -XPOST 'localhost:8091/debug/engines/1/request?type=export' -d '{"roots":[1,2,3]}'
    ```
+
+   With `-debug-token-file`, add the token to each request:
+   `curl -s -H "Authorization: Bearer $(cat debug-token)" localhost:8091/debug/engines`.
 
    Take entry numbers from the `result` fields of the `cache span` log lines.
    Cache spans arrive only when the CLI itself has Cloud telemetry configured,

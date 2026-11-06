@@ -6,9 +6,12 @@
 # Checks, with no bucket and no secrets:
 #   1. the image's CLI reports this repo's version, and with REVISION set, its
 #      commit; with RUNNER_HOST set, that it provisions that engine by default;
-#   2. the engine, started next to the cache service (unauthenticated, no
+#   2. the engine, started next to the cache service (no engine tokens, no
 #      store) with _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL, connects to it: the
-#      service's debug API lists it, at this repo's version;
+#      service's debug API lists it, at this repo's version. The debug API
+#      is published, so it takes a token generated for the run, when the
+#      service image knows -debug-token-file (zerobull-consulting/dagger#60);
+#      an older image's is open;
 #   3. the engine runs a container (alpine, through the release image's
 #      runtime and CNI), so the binaries copied over the release work with the
 #      rest of it.
@@ -43,9 +46,11 @@ fail() {
 	exit 1
 }
 
+secrets="$(mktemp -d)"
 cleanup() {
 	docker rm -f "$engine" "$service" >/dev/null 2>&1 || true
 	docker network rm "$net" >/dev/null 2>&1 || true
+	rm -rf "$secrets"
 }
 trap cleanup EXIT
 
@@ -67,9 +72,19 @@ echo "ok"
 echo "== 2. the engine connects to the cache service"
 docker network create "$net" >/dev/null
 # The debug API on the container's port, published to the host's loopback
-# only.
-docker run -d --name "$service" --network "$net" -p 127.0.0.1::8091 \
-	"$service_image" -debug-listen :8091 >/dev/null || fail "cache service: docker run failed"
+# only. :8091 isn't loopback in the container, so an image that knows
+# -debug-token-file requires one: a token for this run, in a file mounted
+# read-only (readable by the image's UID, 65532), never on a command line.
+token_args=() auth=()
+if docker run --rm "$service_image" -h 2>&1 | grep -q -- -debug-token-file; then
+	chmod 700 "$secrets"
+	(umask 022 && od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$secrets/debug-token")
+	token_args=(-v "$secrets/debug-token:/run/secrets/debug-token:ro")
+	auth=(-H "Authorization: Bearer $(cat "$secrets/debug-token")")
+fi
+docker run -d --name "$service" --network "$net" -p 127.0.0.1::8091 "${token_args[@]}" \
+	"$service_image" -debug-listen :8091 ${token_args:+-debug-token-file /run/secrets/debug-token} >/dev/null ||
+	fail "cache service: docker run failed"
 debug="$(docker port "$service" 8091/tcp | head -n1)"
 [[ -n "$debug" ]] || fail "no published debug port"
 ca_mount=()
@@ -83,7 +98,7 @@ docker run -d --name "$engine" --privileged --network "$net" "${ca_mount[@]}" \
 	"$image" >/dev/null || fail "engine: docker run failed"
 engines=""
 for _ in $(seq 1 "$CONNECT_LIMIT"); do
-	engines="$(curl -fsS "http://$debug/debug/engines" 2>/dev/null || true)"
+	engines="$(curl -fsS "${auth[@]}" "http://$debug/debug/engines" 2>/dev/null || true)"
 	grep -q "\"engineVersion\": *\"$want_version\"" <<<"$engines" && break
 	[[ "$(docker inspect -f '{{.State.Running}}' "$engine")" == true ]] || fail "the engine exited"
 	sleep 1

@@ -38,9 +38,14 @@
 //     GETs for their layers, offers the stored parts the merged entries
 //     lack, and answers renew with fresh GETs;
 //
-//   - on a separate, local-only address, a debug API, not authenticated and
-//     across every namespace, that lists the connected engines and sends a
-//     request to one, to probe what the engine answers:
+//   - on a separate address, a debug API, across every namespace, that
+//     lists the connected engines and sends a request to one, to probe
+//     what the engine answers. With -debug-token-file, every request to it
+//     must carry that file's token as `Authorization: Bearer <token>` (401
+//     otherwise); SIGHUP reloads it. The service refuses to start without
+//     one when -tokens-file is set, or when -debug-listen isn't a loopback
+//     address. Only a loopback -debug-listen without -tokens-file may be
+//     left open, with a warning. See README.md, "The debug API".
 //
 //     GET  /debug/engines
 //     POST /debug/engines/{conn}/request?type=export   (body: the request body)
@@ -103,6 +108,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -129,6 +135,7 @@ func main() {
 		exports       bool
 		importPoll    time.Duration
 		tokensFile    string
+		debugToken    string
 		tlsCert       string
 		tlsKey        string
 		nsFile        string
@@ -142,7 +149,8 @@ func main() {
 		drainTimeout  time.Duration
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
-	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the unauthenticated debug API (empty: off)")
+	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the debug API (empty: off); a non-loopback address needs -debug-token-file")
+	flag.StringVar(&debugToken, "debug-token-file", "", "file holding the debug API's admin token, required as 'Authorization: Bearer <token>'; SIGHUP reloads it. Required with -tokens-file, or a non-loopback -debug-listen (empty: the debug API is open, on loopback only)")
 	flag.StringVar(&metricsListen, "metrics-listen", "", "address serving only the Prometheus metrics at /metrics (empty: off; the debug API serves them too)")
 	flag.StringVar(&dumpDir, "dump-dir", "", "write every envelope and engine event body to this directory")
 	flag.BoolVar(&verbose, "v", false, "log pings and every cache span")
@@ -189,6 +197,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	if err := checkDebugListen(debugListen, debugToken, tokensFile); err != nil {
+		logger.Error(err.Error())
+		os.Exit(2)
+	}
+
 	if (tlsCert == "") != (tlsKey == "") {
 		logger.Error("set both -tls-cert and -tls-key, or neither")
 		os.Exit(2)
@@ -219,7 +232,7 @@ func main() {
 		logger.Error("namespaces file", "error", err)
 		os.Exit(1)
 	}
-	if tokensFile != "" || nsFile != "" {
+	if tokensFile != "" || nsFile != "" || debugToken != "" {
 		// SIGHUP reloads the files; one that doesn't parse leaves what it
 		// set as it was.
 		hup := make(chan os.Signal, 1)
@@ -231,6 +244,9 @@ func main() {
 				}
 				if nsFile != "" {
 					_ = svc.ReloadLimits()
+				}
+				if debugToken != "" {
+					_ = svc.ReloadDebugToken()
 				}
 			}
 		}()
@@ -244,6 +260,17 @@ func main() {
 		logger.Warn("UNAUTHENTICATED: no -tokens-file, so the service takes any token, and every engine that reaches it " +
 			"shares namespace " + scope + ": it can read everything stored there and add to it. " +
 			"Set -tokens-file to authenticate engines and keep namespaces apart.")
+	}
+	// After the tokens file: the debug token is refused if it is also an
+	// engine token.
+	if debugToken != "" {
+		if err := svc.UseDebugTokenFile(debugToken); err != nil {
+			logger.Error("debug token", "error", err)
+			os.Exit(1)
+		}
+	} else if debugListen != "" {
+		logger.Warn("UNAUTHENTICATED debug API on " + debugListen + ": anything that reaches it can run exports, imports and garbage collection " +
+			"in every namespace. Set -debug-token-file to require a token.")
 	}
 	store := os.Getenv(blobstore.EnvBucket) != ""
 	if store {
@@ -468,6 +495,44 @@ func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, time
 		cancel()
 	}
 	<-done
+}
+
+// checkDebugListen refuses a debug API that would be open where it
+// shouldn't be: with -tokens-file, since an authenticated service has no
+// unauthenticated side door, or on an address that isn't loopback. It also
+// refuses -debug-token-file without -debug-listen, which would do nothing.
+func checkDebugListen(debugListen, debugToken, tokensFile string) error {
+	if debugListen == "" {
+		if debugToken != "" {
+			return errors.New("-debug-token-file without -debug-listen: the debug API is off; drop -debug-token-file, or set -debug-listen")
+		}
+		return nil
+	}
+	if debugToken != "" {
+		return nil
+	}
+	if tokensFile != "" {
+		return errors.New("-tokens-file without -debug-token-file: the debug API would be open on a service that authenticates engines; set -debug-token-file, or turn the debug API off with -debug-listen=")
+	}
+	if !loopbackAddr(debugListen) {
+		return fmt.Errorf("-debug-listen %q isn't a loopback address, and there is no -debug-token-file: anything that reaches it could run exports, imports and garbage collection; set -debug-token-file, or listen on 127.0.0.1", debugListen)
+	}
+	return nil
+}
+
+// loopbackAddr reports whether a listen address binds only loopback: a
+// loopback IP, or localhost. An empty host is every interface; any other
+// name may resolve to anything.
+func loopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // explicitFlags returns the flags set on the command line, by name.

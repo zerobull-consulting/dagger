@@ -62,7 +62,11 @@ inputs:
     required: false
     default: "remote-cache"
   debug-port:
-    description: "Publish the service's debug API on 127.0.0.1:<port> of the runner (default: not published)"
+    description: >-
+      Publish the service's debug API on 127.0.0.1:<port> of the runner
+      (default: not published). It requires a token, generated for this
+      start: send the content of the debug-token-file output as
+      Authorization: Bearer <token>
     required: false
     default: ""
   engine-config:
@@ -95,6 +99,11 @@ outputs:
   logs:
     description: "Where the stop action puts the service's and the engine's logs"
     value: ${{ steps.start.outputs.logs }}
+  debug-token-file:
+    description: >-
+      With debug-port: the file holding the debug API's token (masked in the
+      job's log), removed by the stop; empty otherwise
+    value: ${{ steps.start.outputs.debug-token-file }}
 
 runs:
   using: "composite"
