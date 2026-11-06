@@ -38,7 +38,7 @@ func layer(s string) snapshots.ExportLayer {
 // the one before, numbered from first. Each has an fs output with one layer
 // of its own on top of the ones before. The last entry is the root.
 func chainBundle(first uint64, recipes ...string) *dagql.ValueBundle {
-	b := &dagql.ValueBundle{Version: dagql.ValueBundleVersion}
+	b := &dagql.ValueBundle{Version: metastore.BundleVersion}
 	var layers []snapshots.ExportLayer
 	for i, r := range recipes {
 		o := dagql.TransferOrdinal(i + 1)

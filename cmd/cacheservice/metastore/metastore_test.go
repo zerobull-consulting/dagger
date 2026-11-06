@@ -27,7 +27,7 @@ type val struct {
 // testBundle returns a bundle of vals, ordinals from 1, rooted at the given
 // ordinals.
 func testBundle(vals []val, roots ...dagql.TransferredRoot) *dagql.ValueBundle {
-	b := &dagql.ValueBundle{Version: 3, Roots: roots}
+	b := &dagql.ValueBundle{Version: BundleVersion, Roots: roots}
 	for i, v := range vals {
 		b.Values = append(b.Values, dagql.TransferredValue{
 			Ordinal:            dagql.TransferOrdinal(i + 1),
@@ -166,7 +166,7 @@ func TestBundleRoundTrip(t *testing.T) {
 
 	// A bundle whose content doesn't hash to its key is refused.
 	otherKey, _ := s.BundleKey("s1", other)
-	if _, err := mem.Put(ctx, otherKey, []byte(`{"version":3,"roots":[]}`), Condition{}); err != nil {
+	if _, err := mem.Put(ctx, otherKey, []byte(fmt.Sprintf(`{"version":%d,"roots":[]}`, BundleVersion)), Condition{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.GetBundle(ctx, "s1", other); !errors.Is(err, ErrCorruptBundle) {

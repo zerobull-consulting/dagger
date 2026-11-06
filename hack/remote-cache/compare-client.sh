@@ -44,11 +44,9 @@ paths=(
   dagql/cache_transfer_types.go dagql/cache_value_capture.go dagql/cache_value_import.go dagql/cache_stored_bundle.go
   ':!**/*_test.go'
 )
-# Ignored: the fork's export of the bundle version
-# (zerobull-consulting/dagger#116), and blank lines. The blank-line
-# pattern can't match an empty string: one that could would ignore
-# every change.
-ignore='ValueBundleVersion|store of bundles checks it|^[[:space:]]+$'
+# Ignored: blank lines only. The pattern can't match an empty string: one
+# that could would ignore every change.
+ignore='^[[:space:]]+$'
 rc=0
 git diff --quiet -I"$ignore" "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}" || rc=$?
 case "$rc" in
