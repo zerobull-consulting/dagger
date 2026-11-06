@@ -279,7 +279,7 @@ func (s *Store) readIndex(ctx context.Context, scope string) (*Index, string, er
 	if err != nil {
 		return nil, "", fmt.Errorf("read index: %w", err)
 	}
-	idx, err := decodeIndex(body)
+	idx, err := decodeIndex(body, s.now().Unix())
 	if err != nil {
 		return nil, "", fmt.Errorf("read index %s: %w", key, err)
 	}

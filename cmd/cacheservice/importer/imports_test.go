@@ -133,7 +133,7 @@ func TestSyncImportsRacingWipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c := idx.Caches["cache-b"]; c != nil {
+	if c := idx.Caches["cache-b"]; c != nil && len(c.Imported) != 0 {
 		t.Fatalf("a wiped cache's imports stayed: %+v", c)
 	}
 	if len(calls.all()) != 0 {

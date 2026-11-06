@@ -145,6 +145,12 @@ const (
 // export took longer than MaxFenceAge. Try the export again from the start.
 var ErrCollected = errors.New("the export names an object garbage collection is deleting or deleted after the export checked it")
 
+// ErrStaleGeneration is an export refused because it came from an older
+// generation of its engine cache than the index has recorded, and would add
+// a value the index has no entry for (see Index.RecordResolvedAt). Trying it
+// again can't succeed: the engine's generation doesn't change.
+var ErrStaleGeneration = errors.New("a late export from an older generation of the engine cache names a value the index doesn't hold")
+
 // Fence is what an export knew of GC's deletions when it started: the
 // epoch it read (Store.ReadEpoch) before checking any object, and when.
 type Fence struct {

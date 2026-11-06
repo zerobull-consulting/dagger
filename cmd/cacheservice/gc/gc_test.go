@@ -292,6 +292,34 @@ func TestExpiredDataCollectedAfterGrace(t *testing.T) {
 	}
 }
 
+// A cache record GC emptied is dropped CacheRecordRetention later, by a run
+// that has nothing else to change in the index (#59).
+func TestEmptyCacheRecordDroppedAlone(t *testing.T) {
+	e := newEnv(t)
+	e.setLimits("team", Limits{MaxAge: time.Hour})
+	e.export("team", "a", buildX("x"), 2)
+	c := e.collector(nil)
+	e.clock.Add(2 * time.Hour)
+	e.run(c)
+	if cr := e.index("team").Caches["a"]; cr == nil || len(cr.Numbers) != 0 {
+		t.Fatalf("after expiry, cache record %+v", cr)
+	}
+	// Deletions finish, and are pruned: nothing left to change but the
+	// record.
+	e.clock.Add(3 * time.Hour)
+	e.run(c)
+	e.clock.Add(metastore.DeletionRetention + time.Minute)
+	e.run(c)
+	if idx := e.index("team"); idx.Caches["a"] == nil || len(idx.GC.Deletions) != 0 {
+		t.Fatalf("setup: cache %+v, deletions %v", idx.Caches["a"], idx.GC.Deletions)
+	}
+	e.clock.Add(metastore.CacheRecordRetention)
+	rep := reportOf(e.run(c), "team")
+	if cr := e.index("team").Caches["a"]; cr != nil || rep.Caches != 1 {
+		t.Fatalf("past the retention: cache record %+v, report %+v", cr, rep)
+	}
+}
+
 // What a live entry names is never deleted, however old; what nothing
 // names is, once past the grace period: here a bundle and blob of an export
 // whose index write never happened, and the bundle a later export of the

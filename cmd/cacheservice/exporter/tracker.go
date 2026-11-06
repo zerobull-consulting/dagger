@@ -205,6 +205,16 @@ func (t *Tracker) cache(cacheID string, generation uint64) *trackedCache {
 	if generation < c.generation {
 		return nil
 	}
+	if generation > c.generation {
+		// A refusal of a stale generation's export (the index had a
+		// later one) says nothing of this generation's: it may record
+		// the same value, so it is exported again (#59).
+		for _, e := range c.entries {
+			if e.refused != nil && e.refusedMessage == StaleGenerationMessage {
+				e.refused, e.refusedMessage = nil, ""
+			}
+		}
+	}
 	c.generation = generation
 	return c
 }
@@ -396,6 +406,8 @@ type Batch struct {
 	Request Request
 	// values are the root values the batch covers, by number.
 	values map[uint64]*exportedValue
+	// generation is the cache's generation when the batch was claimed.
+	generation uint64
 }
 
 // Due returns the exports due at now: the candidates of sessions that ended
@@ -484,7 +496,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 			continue
 		}
 		if cur == nil || len(cur.Request.Roots) >= maxBatchRoots {
-			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}})
+			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}, generation: c.generation})
 			cur = &batches[len(batches)-1]
 		}
 		e.inFlight = true
@@ -563,6 +575,13 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		settled[n] = true
 	}
 	for _, s := range res.Refused {
+		if s.Message == StaleGenerationMessage && b.generation < c.generation {
+			// The index refused an older generation's export, and a
+			// newer one reported in while it was in flight: that one's
+			// export is accepted, so the refusal is dropped (#59).
+			settled[s.Number] = true
+			continue
+		}
 		if e := entry(s.Number); e != nil {
 			e.refused = b.values[s.Number]
 			e.refusedMessage = s.Message
@@ -632,6 +651,7 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 	if c == nil {
 		return b, nil
 	}
+	b.generation = c.generation
 	for _, n := range req.Roots {
 		if e := c.entries[n]; e != nil && e.inFlight {
 			return Batch{}, fmt.Errorf("root %d is already being exported", n)

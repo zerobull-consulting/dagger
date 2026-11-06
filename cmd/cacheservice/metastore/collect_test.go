@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -512,36 +513,324 @@ func TestCapExpiryRoundsUp(t *testing.T) {
 	}
 }
 
-// Known gap (zerobull-consulting/dagger#59): once a root's entry and its
-// cache mapping are fully collected, a late export of the same engine entry
-// from an older generation of that cache finds nothing to compare against.
-// It is recorded as new, with a fresh root, and the value lives on for
-// another max age. The data is valid (the engine had it), but retention
-// was decided by a stale record.
-func TestKnownGapLateOlderGenerationRevivesCollectedRoot(t *testing.T) {
-	ctx := context.Background()
-	s, clock := newClockedStore(t, NewMemObjects())
-	x, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nx := x.Numbers[1]
-	clock.add(2 * time.Hour)
-	if _, err := s.UpdateIndex(ctx, "s1", func(idx *Index) error {
-		idx.Expire(clock.now().Unix(), 90*time.Minute)
+// expireAt runs GC's expiry over a scope at the clock's time, under maxAge.
+func expireAt(t *testing.T, s *Store, clock *testClock, scope string, maxAge time.Duration) {
+	t.Helper()
+	if _, err := s.UpdateIndex(context.Background(), scope, func(idx *Index) error {
+		idx.Expire(clock.now().Unix(), maxAge)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	idx := mustIndex(t, s, "s1")
-	if idx.Entries[nx] != nil || len(idx.Roots) != 0 {
-		t.Fatalf("setup: X not collected: entry %+v, roots %v", idx.Entries[nx], idx.Roots)
-	}
-	rec, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 1)
+}
+
+// indexJSON returns a scope's index, encoded, to compare it whole.
+func indexJSON(t *testing.T, s *Store, scope string) string {
+	t.Helper()
+	body, err := json.Marshal(mustIndex(t, s, scope))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.Index.Roots) != 1 {
-		t.Fatalf("roots after the late gen-1 export: %v; if it no longer revives X, the gap is fixed: update #59 and this test", rec.Index.Roots)
+	return string(body)
+}
+
+// collectedX records X (engine entry 10 of cache c) at generation 2, and
+// lets GC collect it under a 90 minute max age: its root, entry and mapping
+// go, and the cache's record stays, with its generation.
+func collectedX(t *testing.T) (*Store, *testClock) {
+	t.Helper()
+	s, clock := newClockedStore(t, NewMemObjects())
+	if _, err := s.Record(context.Background(), "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2); err != nil {
+		t.Fatal(err)
+	}
+	clock.add(2 * time.Hour)
+	expireAt(t, s, clock, "s1", 90*time.Minute)
+	idx := mustIndex(t, s, "s1")
+	if len(idx.Entries) != 0 || len(idx.Roots) != 0 {
+		t.Fatalf("setup: X not collected: entries %v, roots %v", idx.Entries, idx.Roots)
+	}
+	if c := idx.Caches["c"]; c == nil || c.Generation != 2 || len(c.Numbers) != 0 {
+		t.Fatalf("setup: cache record %+v, want generation 2 with no mappings", c)
+	}
+	return s, clock
+}
+
+// zerobull-consulting/dagger#59: once GC has collected a root, its entry and
+// its cache mapping, a late export of the same engine entry from an older
+// generation of that cache adds nothing: no number, no entry, no root. The
+// cache's record, which outlives its mappings, still knows the later
+// generation. The export is refused with ErrStaleGeneration, which the
+// exporter doesn't retry.
+func TestLateOlderGenerationDoesNotReviveCollectedRoot(t *testing.T) {
+	ctx := context.Background()
+	s, _ := collectedX(t)
+	before := indexJSON(t, s, "s1")
+	_, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 1)
+	if !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("late gen-1 export: %v, want ErrStaleGeneration", err)
+	}
+	if after := indexJSON(t, s, "s1"); after != before {
+		t.Fatalf("the refused export changed the index:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// The cache's own generation, and a newer one, still record a collected
+// value: the engine really has it.
+func TestSameAndNewerGenerationRecordAfterCollection(t *testing.T) {
+	for _, gen := range []uint64{2, 3} {
+		s, clock := collectedX(t)
+		rec, err := s.Record(context.Background(), "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", gen)
+		if err != nil {
+			t.Fatalf("generation %d: %v", gen, err)
+		}
+		n := rec.Numbers[1]
+		r, ok := rec.Index.Roots[n]
+		if !ok || r.RecordedAtUnix != clock.now().Unix() || rec.Index.Entries[n] == nil {
+			t.Fatalf("generation %d: root %+v (%v), entry %+v", gen, r, ok, rec.Index.Entries[n])
+		}
+		if c := rec.Index.Caches["c"]; c.Generation != gen || c.Numbers[10].Number != n {
+			t.Fatalf("generation %d: cache record %+v", gen, c)
+		}
+	}
+}
+
+// Before GC: a late export from an older generation of values the index
+// holds is recorded as before (no newer record replaced, no root added or
+// refreshed); one that names any value the index doesn't hold, alone or with
+// values it does, is refused whole.
+func TestLateOlderGenerationBeforeCollection(t *testing.T) {
+	ctx := context.Background()
+	s, clock := newClockedStore(t, NewMemObjects())
+	// X (10) is a root at generation 2; Y (11), its dependency, isn't.
+	x, err := s.Record(ctx, "s1", testBundle([]val{{sender: 11, replacements: 1}, {sender: 10, deps: []uint64{1}, replacements: 1}}, root(2, 0)), "c", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordedAt := clock.now().Unix()
+	clock.add(time.Hour)
+
+	// Y alone, as a root, from generation 1: held, so recorded, but no
+	// root added, and no record replaced.
+	rec, err := s.Record(ctx, "s1", testBundle([]val{{sender: 11}}, root(1, 0)), "c", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rec.Index.Roots[x.Numbers[1]]; ok || len(rec.Index.Roots) != 1 {
+		t.Fatalf("roots %v: the late export added one", rec.Index.Roots)
+	}
+	if e := rec.Index.Entries[x.Numbers[1]]; e.Source.Generation != 2 || e.Bundle != x.BundleID {
+		t.Fatalf("Y's entry %+v: replaced by the older generation's", e)
+	}
+	// X from generation 1: its root keeps its time.
+	rec, err = s.Record(ctx, "s1", testBundle([]val{{sender: 11}, {sender: 10, deps: []uint64{1}}}, root(2, 0)), "c", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := rec.Index.Roots[x.Numbers[2]]; r.RecordedAtUnix != recordedAt {
+		t.Fatalf("X's root %+v, want recorded at %d", r, recordedAt)
+	}
+
+	// Z (12), which generation 2 never exported, from generation 1: alone,
+	// or with X as its dependency, refused whole.
+	before := indexJSON(t, s, "s1")
+	for name, b := range map[string]*dagql.ValueBundle{
+		"alone":  testBundle([]val{{sender: 12}}, root(1, 0)),
+		"with X": testBundle([]val{{sender: 11}, {sender: 10, deps: []uint64{1}}, {sender: 12, deps: []uint64{2}}}, root(3, 0), root(2, 0)),
+	} {
+		if _, err := s.Record(ctx, "s1", b, "c", 1); !errors.Is(err, ErrStaleGeneration) {
+			t.Fatalf("%s: %v, want ErrStaleGeneration", name, err)
+		}
+		if after := indexJSON(t, s, "s1"); after != before {
+			t.Fatalf("%s: the refused export changed the index:\nbefore %s\nafter  %s", name, before, after)
+		}
+	}
+}
+
+// A stale generation's export of a value the index still holds, as another
+// root's dependency, whose own root expired, adds no root, even when it
+// writes the value's record: through an exported mapping whose stored
+// record is older still, or by taking over an import with more parts.
+// (Copilot on zerobull-consulting/dagger#109, #59.)
+func TestLateOlderGenerationAddsNoRootToHeldValue(t *testing.T) {
+	bid := func(c string) string { return strings.Repeat(c, 64) }
+	t.Run("exported", func(t *testing.T) {
+		idx := NewIndex()
+		// Gen 1: X (10), a root until 100, and Y (11), a root over it.
+		nums, err := idx.Record(bid("a"), testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0)), "c", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Gen 3 records something else; X's root expires, X stays as Y's
+		// dependency.
+		if _, err := idx.Record(bid("b"), testBundle([]val{{sender: 12}}, root(1, 0)), "c", 3); err != nil {
+			t.Fatal(err)
+		}
+		idx.DropExpired(200)
+		x := nums[1]
+		if _, ok := idx.Roots[x]; ok || idx.Entries[x] == nil {
+			t.Fatalf("setup: X root %v, entry %+v", idx.Roots, idx.Entries[x])
+		}
+		// Gen 2, older than 3 but newer than X's record: the record is
+		// written, as before; no root.
+		if _, err := idx.Record(bid("d"), testBundle([]val{{sender: 10}}, root(1, 0)), "c", 2); err != nil {
+			t.Fatal(err)
+		}
+		if e := idx.Entries[x]; e.Source.Generation != 2 {
+			t.Fatalf("X's entry %+v: want gen 2's record", e)
+		}
+		if r, ok := idx.Roots[x]; ok {
+			t.Fatalf("X got a root back: %+v", r)
+		}
+	})
+	t.Run("imported", func(t *testing.T) {
+		idx := NewIndex()
+		// Cache s: X (10, an fs part), a root until 100, and Y over it.
+		b := testBundle([]val{{sender: 10}, {sender: 11, deps: []uint64{1}}}, root(1, 100), root(2, 0))
+		withParts(b, 1, "fs")
+		nums, err := idx.Record(bid("a"), b, "s", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		x := nums[1]
+		// Cache c imports X on its entry 50 at gen 2; X's root expires.
+		if got := idx.RecordImports("c", 2, []Import{{Number: x, Engine: 50}}); len(got) != 1 {
+			t.Fatalf("imports %v", got)
+		}
+		idx.DropExpired(200)
+		if _, ok := idx.Roots[x]; ok || idx.Caches["c"].Imported[50].Number != x {
+			t.Fatalf("setup: roots %v, cache c %+v", idx.Roots, idx.Caches["c"])
+		}
+		// c's gen 1, with more parts: it takes the entry over, as before,
+		// and adds no root.
+		if _, err := idx.Record(bid("d"), withParts(testBundle([]val{{sender: 50}}, root(1, 0)), 1, "fs", "execMeta"), "c", 1); err != nil {
+			t.Fatal(err)
+		}
+		if e := idx.Entries[x]; e.Source.CacheID != "c" {
+			t.Fatalf("X's entry %+v: want c's record", e)
+		}
+		if r, ok := idx.Roots[x]; ok {
+			t.Fatalf("X got a root back: %+v", r)
+		}
+		if err := idx.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// The cache's record outlives its mappings, and a wipe's ForgetImports: it
+// keeps refusing the stale generation until CacheRecordRetention after its
+// last change, when Expire drops it. That is the bound on what the index
+// keeps to remember generations; a late export after it is recorded as new.
+func TestCacheRecordOutlivesItsMappings(t *testing.T) {
+	ctx := context.Background()
+	s, clock := collectedX(t)
+	// The cache was wiped, after importing something.
+	other, err := s.Record(ctx, "s1", testBundle([]val{{sender: 50}}, root(1, 0)), "other", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordImports(ctx, "s1", "c", 2, []Import{{Number: other.Numbers[1], Engine: 7}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ForgetImports(ctx, "s1", "c"); err != nil {
+		t.Fatal(err)
+	}
+	forgotAt := clock.now().Unix()
+	c := mustIndex(t, s, "s1").Caches["c"]
+	if c == nil || len(c.Imported) != 0 || len(c.Numbers) != 0 || c.Generation != 2 || c.UpdatedAtUnix != forgotAt {
+		t.Fatalf("after the wipe, cache record %+v", c)
+	}
+	stale := testBundle([]val{{sender: 10}}, root(1, 0))
+	if _, err := s.Record(ctx, "s1", stale, "c", 1); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("after the wipe: %v, want ErrStaleGeneration", err)
+	}
+
+	// Kept until CacheRecordRetention after its last change.
+	clock.add(CacheRecordRetention - time.Second)
+	expireAt(t, s, clock, "s1", 90*time.Minute)
+	if mustIndex(t, s, "s1").Caches["c"] == nil {
+		t.Fatal("dropped before CacheRecordRetention")
+	}
+	if _, err := s.Record(ctx, "s1", stale, "c", 1); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("a second before the retention: %v, want ErrStaleGeneration", err)
+	}
+	clock.add(time.Second)
+	expireAt(t, s, clock, "s1", 90*time.Minute)
+	idx := mustIndex(t, s, "s1")
+	if idx.Caches["c"] != nil {
+		t.Fatalf("kept past CacheRecordRetention: %+v", idx.Caches["c"])
+	}
+	// The other cache's mapping went only in the previous expiry, which
+	// stamped its record then: it stays.
+	if o := idx.Caches["other"]; o == nil || len(o.Numbers) != 0 || o.UpdatedAtUnix != clock.now().Unix()-1 {
+		t.Fatalf("other's record %+v", o)
+	}
+	if rec, err := s.Record(ctx, "s1", stale, "c", 1); err != nil || len(rec.Index.Roots) != 1 {
+		t.Fatalf("past the retention: %v, roots %v; want it recorded as new", err, rec.Index.Roots)
+	}
+}
+
+// A cache record is never dropped while it has a mapping, however long ago
+// it last changed, and one GC empties is stamped then: the retention counts
+// from the last mapping going, not the last export.
+func TestCacheRecordRetentionCountsFromLastMapping(t *testing.T) {
+	ctx := context.Background()
+	s, clock := newClockedStore(t, NewMemObjects())
+	// No max age: X lives until its own expiry, past the retention.
+	expires := clock.now().Add(2 * CacheRecordRetention).Unix()
+	if _, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, expires)), "c", 2); err != nil {
+		t.Fatal(err)
+	}
+	clock.add(CacheRecordRetention + time.Hour)
+	expireAt(t, s, clock, "s1", 0)
+	if c := mustIndex(t, s, "s1").Caches["c"]; c == nil || len(c.Numbers) != 1 {
+		t.Fatalf("cache record with a live mapping: %+v", c)
+	}
+	clock.add(CacheRecordRetention)
+	expireAt(t, s, clock, "s1", 0)
+	c := mustIndex(t, s, "s1").Caches["c"]
+	if c == nil || len(c.Numbers) != 0 || c.UpdatedAtUnix != clock.now().Unix() {
+		t.Fatalf("cache record GC just emptied: %+v, want it kept and stamped %d", c, clock.now().Unix())
+	}
+	if _, err := s.Record(ctx, "s1", testBundle([]val{{sender: 10}}, root(1, 0)), "c", 1); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("late gen-1 export: %v, want ErrStaleGeneration", err)
+	}
+}
+
+// A version 3 index reads with every cache record stamped with the reader's
+// clock, so an empty one is kept a whole CacheRecordRetention, and is
+// written back as version 4.
+func TestIndexVersion3Reads(t *testing.T) {
+	ctx := context.Background()
+	objects := NewMemObjects()
+	s, clock := newClockedStore(t, objects)
+	if _, err := s.Record(ctx, "s1", chain(10), "c", 1); err != nil {
+		t.Fatal(err)
+	}
+	body, _, _ := objects.Get(ctx, "team/ns/s1/index.json")
+	var raw map[string]any
+	if err := jsonUnmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["version"] = 3
+	for _, c := range raw["caches"].(map[string]any) {
+		delete(c.(map[string]any), "updatedAtUnix")
+	}
+	if _, err := objects.Put(ctx, "team/ns/s1/index.json", jsonMarshal(t, raw), Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	clock.add(time.Hour)
+	if c := mustIndex(t, s, "s1").Caches["c"]; c.UpdatedAtUnix != clock.now().Unix() {
+		t.Fatalf("cache record %+v, want stamped %d", c, clock.now().Unix())
+	}
+	if _, err := s.UpdateIndex(ctx, "s1", func(*Index) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	body, _, _ = objects.Get(ctx, "team/ns/s1/index.json")
+	if err := jsonUnmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["version"] != float64(IndexVersion) || raw["caches"].(map[string]any)["c"].(map[string]any)["updatedAtUnix"] == nil {
+		t.Fatalf("written back as %s", body)
 	}
 }

@@ -196,8 +196,11 @@ type Report struct {
 	// Stamped are the roots given a recording time; Expired the entries
 	// dropped by their expiry or the max age; SizeRoots and SizeExpired
 	// the roots expired, and entries dropped, for the max size.
-	Stamped     int `json:"stamped,omitempty"`
-	Expired     int `json:"expired,omitempty"`
+	Stamped int `json:"stamped,omitempty"`
+	Expired int `json:"expired,omitempty"`
+	// Caches are the engine cache records dropped: no mappings left for
+	// metastore.CacheRecordRetention.
+	Caches      int `json:"caches,omitempty"`
 	SizeRoots   int `json:"sizeRoots,omitempty"`
 	SizeExpired int `json:"sizeExpired,omitempty"`
 	// LiveBytes is what the namespace keeps after expiry: its index, and
@@ -661,27 +664,31 @@ func (c *Collector) collect(ctx context.Context, ns string, rules []string, rule
 // after.
 func (c *Collector) expire(ctx context.Context, ns string, snap *metastore.Index, lim Limits, now time.Time, rep *Report) (*metastore.Index, *metastore.Index, error) {
 	nowUnix := now.Unix()
-	apply := func(idx *metastore.Index) (stamped, dropped, pruned int) {
+	// caches counts the cache records Expire drops: an index update of its
+	// own, when nothing else changes (#59).
+	apply := func(idx *metastore.Index) (stamped, dropped, caches, pruned int) {
 		stamped = idx.StampRoots(nowUnix)
+		before := len(idx.Caches)
 		dropped = len(idx.Expire(nowUnix, lim.MaxAge))
+		caches = before - len(idx.Caches)
 		pruned = pruneDeletions(idx, now)
 		return
 	}
 	trial := snap.Clone()
-	s, d, p := apply(trial)
-	if s+d+p == 0 {
+	s, d, k, p := apply(trial)
+	if s+d+k+p == 0 {
 		return snap, snap, nil
 	}
 	if c.cfg.DryRun {
-		rep.Stamped, rep.Expired = s, d
+		rep.Stamped, rep.Expired, rep.Caches = s, d, k
 		return snap, trial, nil
 	}
 	idx, err := c.cfg.Meta.UpdateIndex(ctx, ns, func(idx *metastore.Index) error {
-		rep.Stamped, rep.Expired, _ = apply(idx)
+		rep.Stamped, rep.Expired, rep.Caches, _ = apply(idx)
 		return nil
 	})
 	if err != nil {
-		rep.Stamped, rep.Expired = 0, 0
+		rep.Stamped, rep.Expired, rep.Caches = 0, 0, 0
 		return nil, nil, err
 	}
 	c.cfg.Metrics.GCExpired(ns, metrics.ExpiredByExpiry, rep.Expired)

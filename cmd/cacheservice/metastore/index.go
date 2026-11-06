@@ -28,7 +28,22 @@ import (
 // from then) and that no collection has touched. A service that reads only
 // version 2 refuses a version 3 index: it doesn't check GC's deletions when
 // it records an export, so it could name an object GC is deleting.
-const IndexVersion = 3
+//
+// Version 4 added EngineCache.UpdatedAtUnix (#59), required on every cache
+// record: a record with no mappings left is kept until CacheRecordRetention
+// after it, so that it still knows the cache's latest generation, and then
+// dropped. Versions 1 to 3 read with every cache record stamped with the
+// reader's clock. A service that reads only version 3 refuses a version 4
+// index: it would write it back without the times, and drop no record.
+const IndexVersion = 4
+
+// CacheRecordRetention is how long an engine cache's record stays in the
+// index once it has no mappings left, after it last changed
+// (EngineCache.UpdatedAtUnix). Its Generation is what keeps a late export
+// from an older generation of the cache from adding back a value GC
+// collected (see Index.RecordResolvedAt); a late export after this is
+// recorded as new. Each record costs about a hundred bytes of index.
+const CacheRecordRetention = 7 * 24 * time.Hour
 
 // oldestIndexVersion is the oldest index format this package reads.
 const oldestIndexVersion = 1
@@ -137,9 +152,15 @@ type Root struct {
 }
 
 // EngineCache maps one engine cache's entry numbers to service numbers.
+//
+// The record outlives its mappings: once GC has dropped them all, it is kept
+// until CacheRecordRetention after UpdatedAtUnix, for its Generation.
 type EngineCache struct {
 	// Generation is the latest generation the cache was recorded in.
 	Generation uint64 `json:"generation"`
+	// UpdatedAtUnix is when the index last created the record, or added,
+	// updated or dropped one of its mappings. Required (never 0).
+	UpdatedAtUnix int64 `json:"updatedAtUnix"`
 	// Numbers are the service numbers of the entries the cache exported,
 	// by engine entry number: each is the source of its entry.
 	Numbers map[uint64]Mapping `json:"numbers"`
@@ -190,7 +211,9 @@ func NewIndex() *Index {
 	}
 }
 
-func decodeIndex(body []byte) (*Index, error) {
+// decodeIndex decodes and validates an index, read at nowUnix: the time an
+// index from before version 4 stamps its cache records with.
+func decodeIndex(body []byte, nowUnix int64) (*Index, error) {
 	var idx Index
 	if err := json.Unmarshal(body, &idx); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
@@ -199,6 +222,9 @@ func decodeIndex(body []byte) (*Index, error) {
 		return nil, fmt.Errorf("index version %d, this service reads %d to %d", idx.Version, oldestIndexVersion, IndexVersion)
 	}
 	// Version 1 has no resolutions; its records read as naming none.
+	// Before version 4, cache records have no update time: they get
+	// nowUnix, so an empty one is kept a whole CacheRecordRetention.
+	stamp := idx.Version < 4
 	idx.Version = IndexVersion
 	if idx.Entries == nil {
 		idx.Entries = map[uint64]*Entry{}
@@ -215,6 +241,9 @@ func decodeIndex(body []byte) (*Index, error) {
 		}
 		if c.Numbers == nil {
 			c.Numbers = map[uint64]Mapping{}
+		}
+		if stamp {
+			c.UpdatedAtUnix = nowUnix
 		}
 	}
 	if err := idx.Validate(); err != nil {
@@ -291,6 +320,9 @@ func (idx *Index) Validate() error {
 	for id, c := range idx.Caches {
 		if id == "" {
 			return errors.New("a cache with no cacheID")
+		}
+		if c.UpdatedAtUnix <= 0 {
+			return fmt.Errorf("cache %q: no update time", id)
 		}
 		for engineNum, m := range c.Numbers {
 			e, ok := idx.Entries[m.Number]
@@ -460,7 +492,25 @@ func (idx *Index) RecordResolved(bundleID string, bundle *dagql.ValueBundle, cac
 // new: a late export from an older generation, or an import exported back
 // unchanged.
 // So merging stored entries into engines never keeps them alive by itself:
-// only a new record does. nowUnix 0 stamps nothing.
+// only a new record does. nowUnix 0 stamps no root, and the cache's record
+// (EngineCache.UpdatedAtUnix) with the wall clock.
+//
+// A late export from a generation older than the cache's latest recorded
+// one (EngineCache.Generation) adds nothing the index has no mapping for:
+// if any of its values has no stored entry, exported or imported, the whole
+// record is refused with ErrStaleGeneration, and the index is left as it
+// was. The newer generation either never exported that value, or exported
+// it and GC collected it; either way the stale record would be a new entry
+// and root with a fresh recording time, reviving what the namespace's max
+// age expired (#59). The cache's record outlives its mappings for this (see
+// CacheRecordRetention). A bundle is a closure, so it is refused whole rather
+// than recorded in part: the values that are mapped keep their stored
+// records. A stale export whose values are all mapped is recorded as
+// before, and newerThan keeps it from replacing a later record, but it adds
+// no root: a mapped value with no root had its root expired, and a stale
+// record would revive it, whether through an exported mapping or an import
+// it takes over with more parts. A root that is still there is refreshed
+// as before. The cache's own generation and newer ones are never refused.
 func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, cacheID string, generation uint64, nowUnix int64) (map[dagql.TransferOrdinal]uint64, *Resolution, error) {
 	if !bundleIDPattern.MatchString(bundleID) {
 		return nil, nil, fmt.Errorf("invalid bundle ID %q", bundleID)
@@ -471,11 +521,18 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	if err := ValidateBundle(bundle); err != nil {
 		return nil, nil, err
 	}
+	stampUnix := nowUnix
+	if stampUnix <= 0 {
+		stampUnix = time.Now().Unix()
+	}
 	cache := idx.Caches[cacheID]
 	if cache == nil {
 		cache = &EngineCache{Numbers: map[uint64]Mapping{}}
 		idx.Caches[cacheID] = cache
 	}
+	// A late export from an older generation than the latest recorded:
+	// it may add no value the index has no mapping for (see above).
+	stale := generation < cache.Generation
 	cache.Generation = max(cache.Generation, generation)
 
 	// Ordinal order, so numbers are handed out in a stable order.
@@ -498,8 +555,17 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 				continue
 			}
 		}
+		if stale {
+			// Nothing has been changed yet: a stale value is refused
+			// before any number is handed out, and the cache's
+			// generation was already the later one.
+			return nil, nil, fmt.Errorf("cache %q engine entry %d, exported at generation %d, after generation %d was recorded: %w",
+				cacheID, v.SenderNumber, generation, cache.Generation, ErrStaleGeneration)
+		}
 		numbers[v.Ordinal] = idx.allocate()
 	}
+	// Every value is mapped, by this record or before it.
+	cache.UpdatedAtUnix = max(cache.UpdatedAtUnix, stampUnix)
 	res, err := NewResolution(bundleID, cacheID, numbers)
 	if err != nil {
 		return nil, nil, err
@@ -529,6 +595,7 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 						src.Imported = map[uint64]Mapping{}
 					}
 					src.Imported[old.Source.Number] = sm
+					src.UpdatedAtUnix = max(src.UpdatedAtUnix, stampUnix)
 				}
 			}
 			delete(cache.Imported, v.SenderNumber)
@@ -564,13 +631,16 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	for _, r := range bundle.Roots {
 		n := numbers[r.Ordinal]
 		root, existed := idx.Roots[n]
-		if !existed && !written[r.Ordinal] {
+		if !existed && (stale || !written[r.Ordinal]) {
 			// A root is added only with its record. This export didn't
 			// write it (a late export from an older generation, or an
 			// import exported back unchanged): the stored entry stays,
 			// kept alive by whatever keeps it now, and no root, with a
 			// fresh recording time, revives a value whose own root
-			// expired. Merges never keep data alive by themselves.
+			// expired. Merges never keep data alive by themselves. Nor
+			// does a stale generation's export, even when it writes the
+			// record (a later state than the stored one, or an import's
+			// with more parts): the root it would add expired (#59).
 			continue
 		}
 		if !existed || !laterExpiry(root.ExpiresAtUnix, r.ExpiresAtUnix) {
@@ -630,7 +700,14 @@ type Import struct {
 // the cache exported: that entry is the cache's own, and keeps its own
 // service number. A stored entry imported onto another engine entry than
 // before, as when the engine replaced the one it landed on, moves there.
+// It stamps the cache's record (EngineCache.UpdatedAtUnix) with the wall
+// clock; RecordImportsAt takes the time.
 func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Import) []Import {
+	return idx.RecordImportsAt(cacheID, generation, imports, time.Now().Unix())
+}
+
+// RecordImportsAt is RecordImports at nowUnix.
+func (idx *Index) RecordImportsAt(cacheID string, generation uint64, imports []Import, nowUnix int64) []Import {
 	if cacheID == "" {
 		return nil
 	}
@@ -662,6 +739,7 @@ func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Imp
 		}
 		cache.Imported[im.Engine] = Mapping{Number: im.Number, Generation: gen}
 		cache.Generation = max(cache.Generation, generation)
+		cache.UpdatedAtUnix = max(cache.UpdatedAtUnix, nowUnix)
 		recorded = append(recorded, im)
 	}
 	// Only what the index holds now: a later import in the same call can
@@ -680,16 +758,16 @@ func (idx *Index) RecordImports(cacheID string, generation uint64, imports []Imp
 
 // ForgetImports drops the imported mappings of an engine cache, as when the
 // cache was wiped: its engine entries are gone. The entries it exported
-// stay, since other engines may still import them.
-func (idx *Index) ForgetImports(cacheID string) {
+// stay, since other engines may still import them. The cache's record stays
+// too, even with no mappings left, for its generation: Expire drops it
+// CacheRecordRetention after nowUnix, unless it changes meanwhile.
+func (idx *Index) ForgetImports(cacheID string, nowUnix int64) {
 	c := idx.Caches[cacheID]
-	if c == nil {
+	if c == nil || len(c.Imported) == 0 {
 		return
 	}
 	c.Imported = nil
-	if len(c.Numbers) == 0 {
-		delete(idx.Caches, cacheID)
-	}
+	c.UpdatedAtUnix = max(c.UpdatedAtUnix, nowUnix)
 }
 
 // newerThan reports whether a stored entry describes a later state of its
@@ -734,6 +812,11 @@ func (idx *Index) DropExpired(nowUnix int64) []uint64 {
 
 // Expire is DropExpired under a namespace's max age: a root also expires
 // maxAge after it was recorded (see RootExpiry). maxAge 0 is no max age.
+//
+// A cache whose mappings it drops is stamped nowUnix (EngineCache.
+// UpdatedAtUnix), and a cache with no mappings is dropped once that is
+// CacheRecordRetention ago: until then, its Generation refuses a late
+// export from an older generation (see RecordResolvedAt).
 func (idx *Index) Expire(nowUnix int64, maxAge time.Duration) []uint64 {
 	for n, r := range idx.Roots {
 		if expired(CapExpiry(r, maxAge), nowUnix) {
@@ -795,16 +878,26 @@ func (idx *Index) Expire(nowUnix int64, maxAge time.Duration) []uint64 {
 		}
 	}
 	slices.Sort(dropped)
-	for _, c := range idx.Caches {
+	retention := int64(CacheRecordRetention / time.Second)
+	for id, c := range idx.Caches {
+		changed := false
 		for engineNum, m := range c.Numbers {
 			if _, ok := idx.Entries[m.Number]; !ok {
 				delete(c.Numbers, engineNum)
+				changed = true
 			}
 		}
 		for engineNum, m := range c.Imported {
 			if _, ok := idx.Entries[m.Number]; !ok {
 				delete(c.Imported, engineNum)
+				changed = true
 			}
+		}
+		if changed {
+			c.UpdatedAtUnix = max(c.UpdatedAtUnix, nowUnix)
+		}
+		if len(c.Numbers) == 0 && len(c.Imported) == 0 && c.UpdatedAtUnix <= nowUnix-retention {
+			delete(idx.Caches, id)
 		}
 	}
 	return dropped
@@ -936,7 +1029,7 @@ func (s *Store) RecordImports(ctx context.Context, scope, cacheID string, genera
 	}
 	var recorded []Import
 	_, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
-		recorded = idx.RecordImports(cacheID, generation, imports)
+		recorded = idx.RecordImportsAt(cacheID, generation, imports, s.now().Unix())
 		return nil
 	})
 	if err != nil {
@@ -949,7 +1042,7 @@ func (s *Store) RecordImports(ctx context.Context, scope, cacheID string, genera
 // index, as Index.ForgetImports does, in one atomic index update.
 func (s *Store) ForgetImports(ctx context.Context, scope, cacheID string) error {
 	_, err := s.UpdateIndex(ctx, scope, func(idx *Index) error {
-		idx.ForgetImports(cacheID)
+		idx.ForgetImports(cacheID, s.now().Unix())
 		return nil
 	})
 	return err

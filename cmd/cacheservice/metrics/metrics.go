@@ -178,7 +178,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"scope"}),
 		indexCaches: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "index_caches",
-			Help: "Engine caches with mappings in a scope's index, as last read or written.",
+			Help: "Engine cache records in a scope's index, as last read or written, including those with no mappings left, kept for their generation (metastore.CacheRecordRetention).",
 		}, []string{"scope"}),
 		bundleWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "bundle_writes_total",
