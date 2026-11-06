@@ -22,6 +22,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
 | `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `GET /debug/identity` | The service's identity: its base release (or `dev`), the engine versions it accepts and its revision (see [Engine versions](#engine-versions)) |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, without credentials, for a scraper that shouldn't reach the debug API |
 
@@ -37,7 +38,9 @@ On the engine WebSocket, the service:
   and renews (see [Auth and namespaces](#auth-and-namespaces)). Without it,
   it accepts any non-empty token, in the `-scope` namespace. It logs only a
   short SHA-256 fingerprint of a token.
-- reads `hello`, replies `welcome`, and records the engine's cache identity.
+- reads `hello`, refuses an engine whose version it doesn't accept (see
+  [Engine versions](#engine-versions)), replies `welcome` with the
+  service's identity, and records the engine's cache identity.
 - answers WebSocket pings (the library does this; `-v` logs each one).
 - answers `renew` with fresh presigned GETs when the import path is on and
   every layer is stored, and with `{"unavailable": true}` otherwise.
@@ -53,6 +56,99 @@ by default. With `-debug-token-file`, every request needs that token; the
 service refuses to start without one when it has `-tokens-file`, or when
 `-debug-listen` isn't a loopback address (see
 [The debug API](#the-debug-api)).
+
+## Engine versions
+
+Each service release accepts a verified list of engine versions and refuses
+every other engine
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)).
+The list is the manifest [`compat/engines.txt`](compat/engines.txt),
+embedded in the binary:
+
+```
+base v1.0.0-beta.25
+accept v1.0.0-beta.25 sha256:39abecfe… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
+reject v1.0.0-beta.NN zerobull-consulting/dagger#NNN
+```
+
+- **`base`** is the upstream release the service is built from.
+- **`accept`** lines name an engine version, the digest of its stock
+  `registry.dagger.io/engine` image, and the CI run of the e2e and the
+  sidecar demo against that image that verified it. A version is accepted
+  only after such a run is green. The first one is the engine CI's pull
+  requests, the e2e harness and the demo run. At most 100.
+- **`reject`** lines name a version that was tried and fails, and the issue
+  saying why. It is refused like any unlisted version.
+
+The parser is strict: an unknown line, a version on two lines, a malformed
+version, digest, run URL or issue, no `base` or no `accept` line, or more
+than 100 `accept` lines fails the unit tests, and the service at startup.
+Every digest-pinned engine in this README, `hack/remote-cache` and the
+sidecar action is checked against the `accept` lines
+(`TestPinsMatchManifest`), and CI reads its pin from the manifest
+(`hack/remote-cache/engines.sh pin`). To verify a new version, see
+[Engine](../../hack/remote-cache/README.md#engine).
+
+**The match** is an exact string match of the hello's `engineVersion`
+against the `accept` lines: no ranges, prefixes or normalization. An empty
+version, a dev engine's (`v1.0.0-beta.26-dev-<commit>`, `+dirty`), a
+rejected one or any release not listed is refused. It applies to every
+engine, whatever its token or namespace, and before anything else of the
+connection: a refused engine is never registered, owns no cache ID, and
+is never tracked, merged into or exported from.
+
+**A refusal** happens right after the hello, before the welcome:
+
+- an `error` reply to the hello, whose message names the engine's version
+  (quoted, cut at 64 bytes), the service's base and revision, the versions
+  it accepts, and then: for a version on a `reject` line, its issue; for
+  another version of a release's shape (at most 64 bytes), the hint to run
+  `dagger-remote-cache:<engineVersion>` once that version is verified (the
+  image name zerobull-consulting/dagger#117's D4 publishes; until then,
+  `ghcr.io/zerobull-consulting/cacheservice`);
+- then a close with status **4002** (`server.CloseEngineVersionRefused`;
+  4001 is a revoked token) and a short reason, within a close frame's 123
+  bytes;
+- a warning in the service's log, `engine refused: its version is not
+  accepted`, with `engineVersion`, `accept`, `base` and `closeStatus=4002`,
+  and `engine_version_mismatch_total{outcome="refused"}` (no version label:
+  the version is the engine's to choose).
+
+The stock engine logs the refusal at warning level, `remote cache
+connection ended; reconnecting`, with the error reply as its error:
+`hello: hello: engine version "…" is not accepted; this cache service (base
+…, revision …) accepts only …` (should the close frame reach it first, its
+error names status 4002 and the reason instead). Its client treats 4002 as
+any other close: it reconnects with its backoff, from 1s doubling to 30s,
+which an unwelcomed connection never resets, so a refused engine retries
+every 30s or so and is refused each time. Its builds run on without the
+remote cache.
+
+**`-allow-engine-version-mismatch`** is for development only: it welcomes
+an engine of any version. The service logs `ENGINE VERSION CHECK OFF` at
+startup, and `ENGINE VERSION NOT ACCEPTED, welcomed anyway` for each such
+engine, counted as `engine_version_mismatch_total{outcome="allowed"}`;
+`GET /debug/engines` shows it with `"versionAccepted": false`. The e2e
+harness turns it on for `E2E_BUILD_ENGINE=1`, whose engines are built from
+the checkout, and says so in the run's output. The default is strict.
+
+**The service's identity** is its base release, its accept list and its
+revision, not `internal/version/VERSION` (which tracks upstream main):
+
+```json
+{"base": "dev", "accept": ["v1.0.0-beta.25", "v1.0.0-beta.24"], "revision": "<commit>"}
+```
+
+It is in the welcome (`{"service": {...}}`, alongside `protocol.Welcome`'s
+fields, of which there are none; the stock engine doesn't decode the
+welcome's body, so nothing in `engine/` changed for it), at
+`GET /debug/identity`, in refusals and in the startup log line `identity`.
+`base` is the manifest's `base` only in a build stamped as that release
+(the image's `--build-arg RELEASE=<tag>`, which sets `compat.Release`); any
+other build, such as one tracking upstream main, reports `dev`. A build
+stamped as another release than the manifest's `base` refuses to start.
+The revision is the image's `REVISION`, else the build's VCS revision, else
+`dev`.
 
 ## Code layout
 
@@ -2411,6 +2507,7 @@ paths record into them through their metadata store. All are prefixed
 | `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed) or `canceled` (a second signal) |
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
+| `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
 | `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full) or `timeout` (408). Nothing of them is recorded |
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
@@ -2498,7 +2595,11 @@ Docker's default builder).
 The build records the image's revision (`--build-arg REVISION`, which CI
 sets to the commit SHA) in the binary, as the `serviceVersion` of the
 ownership marker an instance of it creates (see
-[Bucket ownership](#bucket-ownership)). An image of another layout refuses
+[Bucket ownership](#bucket-ownership)) and the `revision` of its identity.
+`--build-arg RELEASE=<tag>` stamps it as a build of that upstream release,
+which must be `compat/engines.txt`'s `base`; without it, as for the images
+CI publishes from `feature/remote-cache`, which tracks upstream main, the
+service reports its base as `dev` (see [Engine versions](#engine-versions)). An image of another layout refuses
 a prefix this one created, and the other way round: moving between them is
 [Changing layouts](#changing-layouts).
 
@@ -2529,9 +2630,10 @@ with backoff. To try it, unauthenticated and with no store (export path off):
 docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache
 ```
 
-The engine that connects to it is a stock Dagger release, `v1.0.0-beta.24`
-or later (see [Engine](../../hack/remote-cache/README.md#engine)); the fork
-no longer publishes an engine image of its own.
+The engine that connects to it is a stock Dagger release whose version is
+an `accept` line of the image's manifest (see
+[Engine versions](#engine-versions)); the service refuses any other. The
+fork no longer publishes an engine image of its own.
 
 With a bucket, a pull-request job's instance adds `-export=false` and a
 read-only key (see [Read-only instances](#read-only-instances)). Running it
@@ -2568,13 +2670,11 @@ On GitHub Actions, use the composite action, which does everything below
 ```
 
 Pin the action and the service's image to the same commit of
-`feature/remote-cache`, and the engine to a stock release by digest (the
-example is CI's pin). That pairs a service built from the branch with the
-newest release, which works while the branch's client is the release's (see
-[Engine](../../hack/remote-cache/README.md#engine)) but isn't what the
-lockstep policy will support: once
-[zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)
-lands, the engine is the release the service was built from.
+`feature/remote-cache`, and the engine to a stock release by digest that is
+an `accept` line of that commit's
+[`compat/engines.txt`](compat/engines.txt) (the example is its first, CI's
+pin): the service refuses any other engine (see
+[Engine versions](#engine-versions)).
 The [demo](../../hack/remote-cache/demo/README.md) is a small project that
 shows what the sidecar carries and what it doesn't; CI runs it through the
 action on every pull request (the `sidecar demo` job), so this section, the
@@ -2636,8 +2736,8 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
   its log.
 
 **3. The engine and the CLI.** A stock Dagger engine release, pinned by
-digest (see [Engine](../../hack/remote-cache/README.md#engine) for the
-minimum release), with
+digest (an `accept` line of the service's manifest; see
+[Engine versions](#engine-versions)), with
 the settings `cmd/cacheservice/e2e` starts its engines with:
 
 ```bash

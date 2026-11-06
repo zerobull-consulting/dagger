@@ -44,12 +44,12 @@ does, never wall time:
   writer's stamp; `app` is cold and executes; nothing is exported.
 
 It uses the service's published `:feature-remote-cache` image and the stock
-engine release CI runs (`STOCK_ENGINE` in
-[`remote-cache-tests.yml`](../../../.github/workflows/remote-cache-tests.yml),
-pinned by digest; the `sidecar demo` job fails if `run.sh`'s default differs)
-unless `SERVICE_IMAGE` and `ENGINE_IMAGE` say otherwise, such as a service
-image built from a checkout ([Engine](../README.md#engine) has the minimum
-engine release). On a host behind a
+engine release CI runs (the first accept line of the service's engine
+manifest, [`cmd/cacheservice/compat/engines.txt`](../../../cmd/cacheservice/compat/engines.txt),
+pinned by digest, which `run.sh` reads with `../engines.sh pin`) unless
+`SERVICE_IMAGE` and `ENGINE_IMAGE` say otherwise, such as a service image
+built from a checkout. The service refuses an engine whose version isn't in
+its manifest ([Engine](../README.md#engine)). On a host behind a
 TLS-intercepting proxy, `CA_FILE=<bundle>` gives the engine its CA bundle.
 Each run uses a new prefix, `demo/<run>/`, and leaves its objects there;
 `dev.sh reset` deletes MinIO's data. Logs go to

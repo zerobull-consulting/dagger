@@ -138,7 +138,7 @@ func (h *authHarness) connect(cache *fakeengine.Cache, token string) *engineConn
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{URL: h.srv.URL, Token: token, EngineName: cache.ID})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{EngineVersion: testEngineVersion, URL: h.srv.URL, Token: token, EngineName: cache.ID})
 	}()
 	h.t.Cleanup(func() {
 		cancel()
@@ -296,7 +296,7 @@ func dialAs(t *testing.T, srv *httptest.Server, token string) (*rawEngine, int) 
 
 func (e *rawEngine) helloAs(cacheID string) protocol.Envelope {
 	e.t.Helper()
-	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: cacheID, Generation: 1, EngineName: cacheID})
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: cacheID, Generation: 1, EngineName: cacheID})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestTokenRemovedBeforeHelloNotWelcomed(t *testing.T) {
 		t.Fatalf("upgrade: %d", code)
 	}
 	h.reload("tok-a team-a\n")
-	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-b", Generation: 1})
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "cache-b", Generation: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1251,7 +1251,7 @@ func TestRevocationRacingRegistration(t *testing.T) {
 		if code != http.StatusSwitchingProtocols {
 			t.Fatalf("round %d: upgrade %d", i, code)
 		}
-		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-race-" + strconv.Itoa(i), Generation: 1})
+		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "cache-race-" + strconv.Itoa(i), Generation: 1})
 		if err != nil {
 			t.Fatal(err)
 		}

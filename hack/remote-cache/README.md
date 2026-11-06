@@ -387,22 +387,39 @@ branch carries, so the fork builds no engine image of its own
 The image the fork used to publish, `ghcr.io/zerobull-consulting/dagger-engine`,
 is no longer built; its tags stay where they are, but nothing new is pushed.
 
-**The minimum release is `v1.0.0-beta.24`.** It was checked against the
-release tags' code, not run. The client and its protocol
-(`engine/remotecache`), whose hello carries the engine's version but no
-protocol version, and which the service doesn't gate on, and
-`cmd/engine/remotecache.go` are byte-for-byte the same in every release from
-`v1.0.0-beta.20` to `v1.0.0-beta.25` and on this branch, apart from tests.
-What the client exports and merges, the engine's cache
-(`engine/server/remote_cache*.go`, `dagql/cache*.go`), is the same in
-`v1.0.0-beta.24`, `v1.0.0-beta.25` and this branch (bundle version 3 in all
-of them; the service keeps its own copy, `metastore.BundleVersion`, pinned to
-`dagql`'s capture by a test). `v1.0.0-beta.23` has a different
-`dagql/cache.go`, `dagql/cache_egraph.go` and persistence code, so it isn't
-claimed. CI runs `v1.0.0-beta.25`, the `STOCK_ENGINE` pin in
-[`remote-cache-tests.yml`](../../.github/workflows/remote-cache-tests.yml)'s
-`sidecar` job, and warns when this branch's client differs from it: the job
-compares `engine/remotecache`, `cmd/engine/remotecache.go`,
+**The supported engines are the versions in the service's manifest,
+[`cmd/cacheservice/compat/engines.txt`](../../cmd/cacheservice/compat/engines.txt),**
+and the service enforces it
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)).
+Each `accept` line names an engine version, its stock image's digest and
+the CI run of the e2e and the sidecar demo against that image that verified
+it; a version goes on the list only after such a run is green, never from
+reading the code. The service refuses, before its welcome, every engine
+whose hello names any other version: an exact string match, no ranges, so
+a dev engine (`-dev-<commit>`, `+dirty`) is refused too. A `reject` line
+names a version that was tried, and the issue saying why. See
+[the cache service's README](../../cmd/cacheservice/README.md#engine-versions)
+for the refusal, the escape hatch for development and the service's
+identity.
+
+What the engine releases share, for deciding which version to try next:
+the client and its protocol (`engine/remotecache`), whose hello carries the
+engine's version but no protocol version, and `cmd/engine/remotecache.go`
+are byte-for-byte the same in every release from `v1.0.0-beta.20` to
+`v1.0.0-beta.25` and on this branch, apart from tests. What the client
+exports and merges, the engine's cache (`engine/server/remote_cache*.go`,
+`dagql/cache*.go`), is the same in `v1.0.0-beta.24`, `v1.0.0-beta.25` and
+this branch (bundle version 3 in all of them; the service keeps its own
+copy, `metastore.BundleVersion`, pinned to `dagql`'s capture by a test).
+`v1.0.0-beta.23` has a different `dagql/cache.go`, `dagql/cache_egraph.go`
+and persistence code. That's advice on what to try, not a verification: a
+green run is.
+
+CI's pull requests run the manifest's first accept line (`STOCK_ENGINE`,
+read with [`engines.sh pin`](engines.sh) in each job of
+[`remote-cache-tests.yml`](../../.github/workflows/remote-cache-tests.yml)),
+and warn when this branch's client differs from it: the job compares
+`engine/remotecache`, `cmd/engine/remotecache.go`,
 `engine/server/remote_cache*.go` and the bundle code in `dagql` with the
 release's, ignoring only blank lines. The wider check, over all of
 `dagql/cache*.go`, against an upstream release tag:
@@ -414,13 +431,22 @@ git diff --stat <tag> HEAD -- engine/remotecache cmd/engine/remotecache.go \
 ```
 
 The same client shows only `dagql/cache_transfer_types.go`, with that
-constant. Once
-[zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)
-lands, the supported engine is the release matching the service's own
-version, not any release from the minimum on, and the service enforces it.
-Until then nothing checks the engine's version: the service only logs it.
+constant.
 
-Run it as the engine container, pinned by digest (this is CI's pin), with
+**Verifying a new version.** Run the workflow by hand with
+`candidate-version` and `candidate-digest` (the image index digest:
+`docker buildx imagetools inspect --format '{{.Manifest.Digest}}'
+registry.dagger.io/engine:<version>`). Its e2e and sidecar jobs add the
+candidate as the first accept line, verified by that run
+(`engines.sh candidate`), so the run's service accepts it and the jobs run
+it. Once the run is green, commit the line the run printed as a warning,
+`accept <version> <digest> verified: <run URL>`. If it fails, commit a
+`reject <version> <issue>` line with an issue explaining why. The manifest
+holds at most 100 `accept` lines; its parser and `TestPinsMatchManifest`
+fail the unit tests on anything else, including a digest-pinned engine in
+these docs, scripts or workflows that isn't an accept line.
+
+Run it as the engine container, pinned by digest (this is an accept line), with
 the service's URL, the settings `cmd/cacheservice/e2e` starts its engines
 with (`cmd/cacheservice/e2e/engine.go`):
 
@@ -611,7 +637,7 @@ e2e-down` removes the engines and volumes later.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | The image's build context (`image/`), the CLI copied out of each engine image (`cli/<image ID>/`; another image's copy is removed once unused for a day), the binaries `E2E_BUILD_ENGINE=1` builds (`bin/`), and each run's files (`runs/`) |
-| `E2E_ENGINE_IMAGE` | The workflow's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on |
+| `E2E_ENGINE_IMAGE` | The manifest's first accept line, as CI's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on. A stock image whose version the service doesn't accept fails the run at once, saying so |
 | `E2E_BUILD_ENGINE` | unset | `1` builds the engine, `dagger-init-session` and the CLI from this repo and copies them over `E2E_ENGINE_IMAGE` |
 | `E2E_SKIP_BUILD` | unset | With `E2E_BUILD_ENGINE=1`, `1` reuses the binaries in `E2E_DIR/bin`; without it, the run fails |
 | `E2E_IMAGE` | `dagger-remote-cache-e2e-engine` | The run's engine image's tag. Engines start from the image's ID, so a run building the same tag meanwhile doesn't change a running one's engine |
@@ -651,10 +677,16 @@ release's. Each run logs the CLI's `dagger version` and every engine's
 version from its hello (`engine A connected to main: engine version
 "v1.0.0-beta.25"`), so a log says which engine it tested.
 
-The pin is `DefaultEngineImage` in `cmd/cacheservice/e2e/env.go` and
-`STOCK_ENGINE` in the workflow's top-level `env`; CI passes `STOCK_ENGINE` in
-as `E2E_ENGINE_IMAGE`, and `TestDefaultEngineImageMatchesCI` (in the unit job)
-fails when they differ. Update them together, with `STOCK_ENGINE_TAG`.
+An engine built this way reports a development version, which no accept
+line names, so the run's services welcome it with
+`-allow-engine-version-mismatch` (`AllowEngineVersionMismatch`), and the run
+prints a `::warning::` saying so: CI's job output shows it as an annotation.
+
+The pin is the manifest's first accept line: `DefaultEngineImage` in
+`cmd/cacheservice/e2e/env.go` is read from it, and so is CI's
+`STOCK_ENGINE` (`engines.sh pin`), which CI passes in as `E2E_ENGINE_IMAGE`.
+`TestDefaultEngineImageMatchesCI` (in the unit job) fails when the two
+disagree. To move the pin, reorder the manifest's accept lines.
 
 Notes:
 

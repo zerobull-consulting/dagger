@@ -280,7 +280,7 @@ func TestDrainRefusesNewWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan error, 1)
 	go func() {
-		runDone <- remotecache.Run(ctx, fakeengine.Adapter{Cache: b}, remotecache.Config{URL: h.srv.URL, Token: "engine-token", EngineName: b.ID})
+		runDone <- remotecache.Run(ctx, fakeengine.Adapter{Cache: b}, remotecache.Config{EngineVersion: testEngineVersion, URL: h.srv.URL, Token: "engine-token", EngineName: b.ID})
 	}()
 	defer func() {
 		cancel()
@@ -616,7 +616,7 @@ func TestDrainRefusesHelloOfLateConnection(t *testing.T) {
 		t.Fatalf("dial before the drain: %d", code)
 	}
 	drainFor(h.svc, time.Minute)
-	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "late", Generation: 1, EngineName: "late"})
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "late", Generation: 1, EngineName: "late"})
 	if err != nil {
 		t.Fatal(err)
 	}

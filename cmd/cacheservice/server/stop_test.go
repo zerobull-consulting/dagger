@@ -118,7 +118,7 @@ func TestCloseEnginesRefusesNewEngines(t *testing.T) {
 	defer srv.Close()
 	upgraded := dialRaw(t, srv, "engine-token")
 	svc.CloseEngines()
-	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "late", Generation: 1})
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "late", Generation: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestRevokedHelloDuringDrainIsRevoked(t *testing.T) {
 	}
 	drainFor(h.svc, time.Minute)
 	h.reload("tok-a team-a\n")
-	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-b", Generation: 1})
+	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "cache-b", Generation: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestDrainWelcomesOrRefusesEveryHello(t *testing.T) {
 		for j, e := range raws {
 			wg.Go(func() {
 				<-start
-				env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-" + string(rune('a'+j)), Generation: 1})
+				env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "cache-" + string(rune('a'+j)), Generation: 1})
 				if err != nil {
 					t.Error(err)
 					return

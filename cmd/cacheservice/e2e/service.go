@@ -108,6 +108,11 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := server.New(logger, "")
+	// An engine built from this checkout reports a development version,
+	// which no accept line names.
+	if e.Settings.BuildEngine {
+		svc.AllowEngineVersionMismatch()
+	}
 	s3opts := server.S3Options{
 		Scope:        e.Scope,
 		Tracker:      exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},

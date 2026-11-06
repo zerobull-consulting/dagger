@@ -158,7 +158,7 @@ func (e *rawEngine) closed() websocket.StatusCode {
 func (e *rawEngine) hello() {
 	e.t.Helper()
 	env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{
-		CacheID: "cache-raw", Generation: 9, EngineVersion: "v-raw", EngineName: "raw",
+		CacheID: "cache-raw", Generation: 9, EngineVersion: testEngineVersion, EngineName: "raw",
 	})
 	if err != nil {
 		e.t.Fatal(err)
@@ -184,7 +184,7 @@ func decodeBody[T any](t *testing.T, env protocol.Envelope) T {
 func TestHelloWelcome(t *testing.T) {
 	svc, _, srv := newTestService(t, "")
 	e := dialRaw(t, srv, "tok")
-	env, _ := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "c", Generation: 2})
+	env, _ := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "c", Generation: 2})
 	e.send(env)
 	welcome := e.next()
 	if welcome.Type != protocol.TypeWelcome || welcome.ID != 1 || welcome.Re != 1 {

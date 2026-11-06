@@ -93,7 +93,7 @@ func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore
 	cache := fakeengine.New("cache-a", 4)
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{URL: srv.URL, Token: "engine-token", EngineName: "engine-a"})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{EngineVersion: testEngineVersion, URL: srv.URL, Token: "engine-token", EngineName: "engine-a"})
 	}()
 	t.Cleanup(func() {
 		cancel()

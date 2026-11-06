@@ -51,15 +51,16 @@ func (s *Service) Engines() []EngineInfo {
 	infos := make([]EngineInfo, 0, len(s.conns))
 	for _, c := range s.conns {
 		infos = append(infos, EngineInfo{
-			Conn:          c.id,
-			Remote:        c.remote,
-			Token:         c.token,
-			Namespace:     c.ns.name,
-			ConnectedAt:   c.connectedAt,
-			CacheID:       c.hello.CacheID,
-			Generation:    c.hello.Generation,
-			EngineVersion: c.hello.EngineVersion,
-			EngineName:    c.hello.EngineName,
+			Conn:            c.id,
+			Remote:          c.remote,
+			Token:           c.token,
+			Namespace:       c.ns.name,
+			ConnectedAt:     c.connectedAt,
+			CacheID:         c.hello.CacheID,
+			Generation:      c.hello.Generation,
+			EngineVersion:   c.hello.EngineVersion,
+			VersionAccepted: c.versionAccepted,
+			EngineName:      c.hello.EngineName,
 		})
 	}
 	s.mu.Unlock()

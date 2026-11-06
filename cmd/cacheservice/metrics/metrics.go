@@ -98,6 +98,7 @@ type Metrics struct {
 	exportBundles       prometheus.Counter
 	authRejected        *prometheus.CounterVec
 	tokensRevoked       *prometheus.CounterVec
+	versionMismatch     *prometheus.CounterVec
 	eventsIgnored       *prometheus.CounterVec
 	blobPromotions      *prometheus.CounterVec
 	blobHashedBytes     *prometheus.CounterVec
@@ -265,6 +266,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "connections_revoked_total",
 			Help: "Engine connections closed because their token was removed from its namespace, by scope.",
 		}, []string{"scope"}),
+		versionMismatch: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "engine_version_mismatch_total",
+			Help: "Engine hellos whose version isn't on an accept line of the service's manifest, by outcome: refused (closed before the welcome, status 4002) or allowed (welcomed by -allow-engine-version-mismatch). The version itself is in the log, not a label.",
+		}, []string{"outcome"}),
 		eventsIgnored: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "engine_events_ignored_total",
 			Help: "Engine events dropped because they came with a token other than the engine's, by scope and kind.",
@@ -372,7 +377,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.importBundleCache, m.importResCache, m.importSyncs, m.importSyncDuration,
 		m.exportBatches, m.exportBatchDuration, m.exportBatchRoots,
 		m.exportRoots, m.exportBlobs, m.exportBundles,
-		m.authRejected, m.tokensRevoked, m.eventsIgnored,
+		m.authRejected, m.tokensRevoked, m.versionMismatch, m.eventsIgnored,
 		m.blobPromotions, m.blobHashedBytes, m.blobPromoteDuration,
 		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule, m.gcUnexpectedKeys, m.gcRefused,
@@ -586,6 +591,25 @@ func (m *Metrics) ExportBatch(b ExportBatch) {
 		m.exportBlobs.WithLabelValues("rejected").Add(float64(b.Rejected))
 	}
 	m.exportBundles.Add(float64(b.Bundles))
+}
+
+// Outcomes of an engine hello whose version isn't accepted.
+const (
+	VersionMismatchRefused = "refused"
+	VersionMismatchAllowed = "allowed"
+)
+
+// EngineVersionMismatch counts an engine hello whose version isn't
+// accepted: refused, or allowed by -allow-engine-version-mismatch.
+func (m *Metrics) EngineVersionMismatch(refused bool) {
+	if m == nil {
+		return
+	}
+	outcome := VersionMismatchAllowed
+	if refused {
+		outcome = VersionMismatchRefused
+	}
+	m.versionMismatch.WithLabelValues(outcome).Inc()
 }
 
 // AuthRejected records a request refused for a missing or unknown token.

@@ -12,8 +12,10 @@
 #
 # SERVICE_IMAGE and ENGINE_IMAGE are the images (default: the service's
 # published :feature-remote-cache tag, and the stock engine release CI's
-# sidecar job runs, its STOCK_ENGINE, which that job checks this default
-# against). DEMO_PREFIX is the bucket prefix (default: a
+# sidecar job runs, its STOCK_ENGINE: the first accept line of the service's
+# engine manifest, cmd/cacheservice/compat/engines.txt, read with
+# ../engines.sh pin). The service refuses an engine of any version its
+# manifest doesn't accept. DEMO_PREFIX is the bucket prefix (default: a
 # new one under demo/), and DEMO_DIR where the logs go. CA_FILE, for a host
 # behind a TLS-intercepting proxy, is given to the engine.
 set -euo pipefail
@@ -23,7 +25,10 @@ repo="$(cd "$here/../../.." && pwd)"
 sidecar="$repo/.github/actions/remote-cache-sidecar/sidecar.sh"
 
 : "${SERVICE_IMAGE:=ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache}"
-: "${ENGINE_IMAGE:=registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834}"
+if [[ -z "${ENGINE_IMAGE:-}" ]]; then
+	pin="$("$here/../engines.sh" pin)"
+	ENGINE_IMAGE="$(sed -n 's/^STOCK_ENGINE=//p' <<<"$pin")"
+fi
 run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 : "${DEMO_PREFIX:=demo/$run_id}"
 : "${DEMO_DIR:=${TMPDIR:-/tmp}/remote-cache-demo/$run_id}"

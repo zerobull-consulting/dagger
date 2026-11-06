@@ -2,37 +2,36 @@ package e2e
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dagger/dagger/cmd/cacheservice/compat"
 )
 
-// TestDefaultEngineImageMatchesCI checks that the harness's default engine image
-// is the workflow's STOCK_ENGINE, the stock release CI runs the e2e and the
-// sidecar demo on, and that STOCK_ENGINE_TAG is its tag: so `dev.sh e2e`
-// tests locally the engine CI does. It runs without Docker, in the unit job.
+// TestDefaultEngineImageMatchesCI checks that the harness's default engine
+// image is the one CI runs the e2e and the sidecar demo on: the manifest's
+// first accept line, which the workflow reads as STOCK_ENGINE and
+// STOCK_ENGINE_TAG with engines.sh pin, so `dev.sh e2e` tests locally the
+// engine CI does. It runs without Docker, in the unit job.
 func TestDefaultEngineImageMatchesCI(t *testing.T) {
-	data, err := os.ReadFile("../../../.github/workflows/remote-cache-tests.yml")
+	d := compat.Embedded().Default()
+	if DefaultEngineImage != d.Image() {
+		t.Errorf("DefaultEngineImage %s isn't the manifest's first accept line's image %s", DefaultEngineImage, d.Image())
+	}
+	cmd := exec.Command("../../../hack/remote-cache/engines.sh", "pin")
+	cmd.Env = append(os.Environ(), "ENGINES_FILE=../compat/engines.txt")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("engines.sh pin: %v\n%s", err, out)
 	}
-	setting := func(name string) string {
-		t.Helper()
-		re := regexp.MustCompile(`(?m)^\s*` + name + `:\s*(\S+)\s*$`)
-		m := re.FindAllStringSubmatch(string(data), -1)
-		if len(m) != 1 {
-			t.Fatalf("the workflow sets %s %d times, want once (in its top-level env)", name, len(m))
-		}
-		return strings.Trim(m[0][1], `"'`)
+	if want := "STOCK_ENGINE=" + DefaultEngineImage + "\nSTOCK_ENGINE_TAG=" + d.Version + "\n"; string(out) != want {
+		t.Errorf("engines.sh pin, which CI runs, says\n%s\nwant\n%s", out, want)
 	}
-	if got := setting("STOCK_ENGINE"); got != DefaultEngineImage {
-		t.Errorf("the workflow's STOCK_ENGINE is %s, the harness's DefaultEngineImage %s: update them together", got, DefaultEngineImage)
-	}
-	tag := setting("STOCK_ENGINE_TAG")
-	if !strings.HasPrefix(DefaultEngineImage, "registry.dagger.io/engine:"+tag+"@sha256:") {
-		t.Errorf("STOCK_ENGINE_TAG %s is not DefaultEngineImage's tag (%s)", tag, DefaultEngineImage)
+	if m := stockEngineRE.FindStringSubmatch(DefaultEngineImage); m == nil || m[1] != d.Version || m[2] != "@"+d.Digest {
+		t.Errorf("stockEngineRE doesn't read DefaultEngineImage %s: %q", DefaultEngineImage, m)
 	}
 }
 
