@@ -198,6 +198,6 @@ runs the same with `sidecar.sh`.
 The job builds the service's image from the pull request, but runs the stock
 Dagger engine release in `STOCK_ENGINE`, not an engine built from this
 branch: the engine's remote cache client comes from upstream, and a step of
-the job warns when this branch's differs from that release's. Which engine to
+the job warns when this branch's client differs from that release's. Which engine to
 pin is settled by the lockstep policy, a vX service for vX engines
 ([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)).

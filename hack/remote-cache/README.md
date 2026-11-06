@@ -378,7 +378,11 @@ before stopping the engine.
 
 ## Engine image
 
-The stock engine has no remote cache client. CI publishes one that has it, as
+Stock Dagger engine releases have the remote cache client too: it comes from
+upstream, and CI's sidecar demo runs `v1.0.0-beta.25` as it is. Whether this
+fork keeps its own image is
+[zerobull-consulting/dagger#114](https://github.com/zerobull-consulting/dagger/issues/114).
+CI publishes one built from this branch, as
 `ghcr.io/zerobull-consulting/dagger-engine`
 ([`engine-image.yml`](../../.github/workflows/engine-image.yml)),
 `linux/amd64` only, with the same tags as the

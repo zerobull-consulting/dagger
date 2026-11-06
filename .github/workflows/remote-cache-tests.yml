@@ -201,10 +201,12 @@ jobs:
       # A warning, not a failure: when this branch's engine side of the
       # remote cache (merged from upstream main) differs from the stock
       # engine's, this job doesn't test it, and STOCK_ENGINE should move to
-      # the release that has it once there is one. Only a STOCK_ENGINE_TAG
-      # that isn't STOCK_ENGINE's own tag fails the step; an upstream that
-      # can't be fetched or compared is a warning too, so the required check
-      # never fails on it.
+      # the release that has it once there is one. Only a pin that
+      # contradicts itself fails the step: a STOCK_ENGINE_TAG that isn't
+      # STOCK_ENGINE's own tag, or a digest that isn't the one the registry
+      # gives for that tag (the job runs the digest, and compares the code of
+      # the tag). A registry or upstream that can't be reached, or a compare
+      # that fails, is a warning, so the required check never fails on it.
       - name: Compare the engine's client with the stock engine's
         run: |
           ref="${STOCK_ENGINE%@*}"
@@ -212,13 +214,21 @@ jobs:
             echo "::error::STOCK_ENGINE_TAG ($STOCK_ENGINE_TAG) isn't STOCK_ENGINE's tag (${ref##*:}); update them together"
             exit 1
           fi
+          if digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
+            if [[ "$digest" != "${STOCK_ENGINE##*@}" ]]; then
+              echo "::error::$ref is $digest in the registry, not STOCK_ENGINE's ${STOCK_ENGINE##*@}; update the tag and the digest together"
+              exit 1
+            fi
+          else
+            echo "::warning::couldn't resolve $ref in the registry; STOCK_ENGINE's digest wasn't checked against it"
+          fi
           if ! git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
             echo "::warning::couldn't fetch $STOCK_ENGINE_TAG from dagger/dagger; the engine's client wasn't compared"
             exit 0
           fi
           # The client, its adapter in the engine, and the bundles it moves.
           paths=(
-            engine/remotecache cmd/engine/remotecache.go engine/server/remote_cache_protocol.go
+            engine/remotecache cmd/engine/remotecache.go 'engine/server/remote_cache*.go'
             dagql/cache_transfer_types.go dagql/cache_value_capture.go dagql/cache_value_import.go dagql/cache_stored_bundle.go
             ':!**/*_test.go'
           )
