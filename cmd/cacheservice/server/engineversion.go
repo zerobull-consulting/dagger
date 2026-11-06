@@ -138,7 +138,7 @@ func refusalMessage(v string, id compat.Identity, m *compat.Manifest) string {
 	switch r, rejected := m.Rejected(v); {
 	case rejected:
 		// Tried and failed: no service accepts it until the issue is fixed.
-		fmt.Fprintf(&b, ". Version %s was tried and rejected: see %s. Run an engine of an accepted version", v, r.Issue)
+		fmt.Fprintf(&b, ". Version %q was tried and rejected: see %s. Run an engine of an accepted version", boundVersion(v), r.Issue)
 	case compat.ValidVersion(v) && len(v) <= maxQuotedVersion:
 		// Only a bounded version of a release's shape names an image tag.
 		fmt.Fprintf(&b, ". Run the cache service dagger-remote-cache:%s once that version is verified, or an engine of an accepted version", v)

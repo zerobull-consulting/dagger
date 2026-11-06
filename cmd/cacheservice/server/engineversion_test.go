@@ -129,7 +129,7 @@ func TestEngineVersionRefused(t *testing.T) {
 			switch {
 			case tc.version == "v1.0.0-beta.23":
 				// Rejected: the issue, and no hint to wait for a verification.
-				require.Contains(t, msg, "Version v1.0.0-beta.23 was tried and rejected: see zerobull-consulting/dagger#117")
+				require.Contains(t, msg, `Version "v1.0.0-beta.23" was tried and rejected: see zerobull-consulting/dagger#117`)
 				require.NotContains(t, msg, "dagger-remote-cache:")
 			case compat.ValidVersion(tc.version) && len(tc.version) <= maxQuotedVersion:
 				require.Contains(t, msg, "dagger-remote-cache:"+tc.version+" once that version is verified")
@@ -282,4 +282,22 @@ func TestEngineVersionRefusedStockClient(t *testing.T) {
 	t.Logf("the engine logged: %s", got)
 	require.Contains(t, got, `engine version "v0.0.1"`)
 	require.Contains(t, got, testEngineVersion)
+}
+
+// A long version on a reject line is cut in the refusal as any other is:
+// the reply never repeats a version past maxQuotedVersion bytes.
+func TestEngineVersionRejectedLongBounded(t *testing.T) {
+	long := "v1.0.0-" + strings.Repeat("a", 1000)
+	m, err := compat.Parse([]byte("base v1.0.0-beta.25\naccept v1.0.0-beta.25 " + testDigest + " verified: " + testVerified + "\nreject " + long + " zerobull-consulting/dagger#117\n"))
+	require.NoError(t, err)
+	svc, _, srv := newTestService(t, "")
+	svc.useManifest(m)
+	e := dialRaw(t, srv, "tok")
+	e.send(helloEnvelope(t, long))
+	reply := e.next()
+	require.Equal(t, protocol.TypeError, reply.Type)
+	msg := decodeBody[protocol.Error](t, reply).Message
+	require.Contains(t, msg, "was tried and rejected: see zerobull-consulting/dagger#117")
+	require.NotContains(t, msg, long[:maxQuotedVersion+1])
+	require.Less(t, len(msg), 512)
 }

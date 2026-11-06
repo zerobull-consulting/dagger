@@ -49,11 +49,11 @@ func TestParse(t *testing.T) {
 	require.False(t, ok)
 }
 
-// TestParseRefuses: every malformed manifest is refused, with the line.
-func TestParseRefuses(t *testing.T) {
+// refusedManifests are malformed manifests, and what Parse's error says.
+func refusedManifests() []struct{ name, data, want string } {
 	base := "base v1.0.0-beta.25\n"
 	ok := acceptLine("v1.0.0-beta.25", digestA) + "\n"
-	for _, tc := range []struct{ name, data, want string }{
+	return []struct{ name, data, want string }{
 		{"empty", "", "no base line"},
 		{"no base", ok, "no base line"},
 		{"no accept", base, "no accept line"},
@@ -77,7 +77,12 @@ func TestParseRefuses(t *testing.T) {
 		{"verified: missing colon", base + "accept v1.0.0-beta.25 " + digestA + " verified " + runA + "\n", "want 'accept"},
 		{"reject without issue", base + ok + "reject v1.0.0-beta.24\n", "want 'reject"},
 		{"reject: bare issue number", base + ok + "reject v1.0.0-beta.24 #12\n", "is not an issue"},
-	} {
+	}
+}
+
+// TestParseRefuses: every malformed manifest is refused, with the line.
+func TestParseRefuses(t *testing.T) {
+	for _, tc := range refusedManifests() {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Parse([]byte(tc.data))
 			require.ErrorContains(t, err, tc.want)

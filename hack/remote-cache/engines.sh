@@ -16,9 +16,9 @@
 #       it. The edit is the run's own and is never committed by this
 #       script: a green run is what a commit of that line then cites.
 #
-# Both fail on more than 100 accept lines, and on a line the service's
-# parser (compat.Parse, which TestEnginesScriptMatchesParser keeps this in
-# step with) would refuse in the fields they read.
+# Both check the whole manifest as the service's parser does (compat.Parse;
+# TestEnginesScriptMatchesParser keeps the two in step), and fail on
+# anything it would refuse, more than 100 accept lines included.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,25 +26,62 @@ file="${ENGINES_FILE:-$here/../../cmd/cacheservice/compat/engines.txt}"
 max_accept=100
 version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
 digest_re='^sha256:[0-9a-f]{64}$'
+verified_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[0-9]+)?$'
+issue_re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$'
 
 die() {
 	echo "engines.sh: $*" >&2
 	exit 1
 }
 
-# accepts prints the accept lines' "<version> <digest>", in order.
+# accepts checks the whole manifest as compat.Parse does (each line's
+# keyword, fields and their shapes, one base line, no version twice, at
+# least one and at most max_accept accept lines), and prints the accept
+# lines' "<version> <digest>", in order.
 accepts() {
-	local n=0 kw v d rest
-	# "|| [[ -n $kw ]]": a last line without a newline is a line too, as it
-	# is to compat.Parse.
-	while read -r kw v d rest || [[ -n "$kw" ]]; do
-		[[ "$kw" == accept ]] || continue
-		n=$((n + 1))
-		((n <= max_accept)) || die "$file: more than $max_accept accept lines"
-		[[ "$v" =~ $version_re ]] || die "$file: accept version '$v' is not a release version"
-		[[ "$d" =~ $digest_re ]] || die "$file: accept digest '$d' of $v is not a sha256 digest"
-		echo "$v $d"
+	local n=0 lineno=0 bases=0 line
+	local -a f
+	local -A seen=()
+	# "|| [[ -n $line ]]": a last line without a newline is a line too, as
+	# it is to compat.Parse.
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		lineno=$((lineno + 1))
+		read -r -a f <<<"$line" || true
+		((${#f[@]} > 0)) || continue
+		[[ "${f[0]}" == \#* ]] && continue
+		local where="$file:$lineno"
+		case "${f[0]}" in
+		base)
+			((${#f[@]} == 2)) || die "$where: want 'base <upstream tag>'"
+			((bases == 0)) || die "$where: a second base line"
+			[[ "${f[1]}" =~ $version_re ]] || die "$where: base '${f[1]}' is not a release version"
+			bases=1
+			;;
+		accept)
+			((${#f[@]} == 5)) && [[ "${f[3]}" == verified: ]] || die "$where: want 'accept <version> <digest> verified: <CI run URL>'"
+			[[ "${f[1]}" =~ $version_re ]] || die "$where: accept version '${f[1]}' is not a release version"
+			[[ "${f[2]}" =~ $digest_re ]] || die "$where: accept digest '${f[2]}' of ${f[1]} is not a sha256 digest"
+			[[ "${f[4]}" =~ $verified_re ]] || die "$where: '${f[4]}' is not a GitHub Actions run URL"
+			n=$((n + 1))
+			((n <= max_accept)) || die "$where: more than $max_accept accept lines"
+			;;
+		reject)
+			((${#f[@]} == 3)) || die "$where: want 'reject <version> <owner/repo#issue>'"
+			[[ "${f[1]}" =~ $version_re ]] || die "$where: reject version '${f[1]}' is not a release version"
+			[[ "${f[2]}" =~ $issue_re ]] || die "$where: '${f[2]}' is not an issue such as zerobull-consulting/dagger#117"
+			;;
+		*)
+			die "$where: unknown line '${f[0]}': want base, accept or reject"
+			;;
+		esac
+		[[ "${f[0]}" == base ]] && continue
+		[[ -z "${seen[${f[1]}]:-}" ]] || die "$where: ${f[1]} is on line ${seen[${f[1]}]} already"
+		seen[${f[1]}]=$lineno
+		if [[ "${f[0]}" == accept ]]; then
+			echo "${f[1]} ${f[2]}"
+		fi
 	done <"$file"
+	((bases == 1)) || die "$file: no base line"
 	((n > 0)) || die "$file: no accept line"
 }
 
@@ -64,7 +101,10 @@ candidate)
 	for var in GITHUB_SERVER_URL GITHUB_REPOSITORY GITHUB_RUN_ID; do
 		[[ -n "${!var:-}" ]] || die "$var is not set: a candidate is verified by a CI run"
 	done
-	accepts >/dev/null
+	# The whole manifest is checked first, and the candidate must fit: a
+	# full list is refused before anything is written.
+	count="$(accepts | wc -l)"
+	((count < max_accept)) || die "$file has $max_accept accept lines already: drop one before adding $v"
 	if awk -v v="$v" '($1 == "accept" || $1 == "reject") && $2 == v { found = 1 } END { exit !found }' "$file"; then
 		die "$v is in $file already"
 	fi

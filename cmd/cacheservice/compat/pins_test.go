@@ -207,6 +207,19 @@ func TestEnginesScriptMatchesParser(t *testing.T) {
 	require.NoError(t, err, out)
 	require.Contains(t, out, "STOCK_ENGINE_TAG=v1.0.0-beta.25\n")
 
+	// Everything the parser refuses, the script refuses too.
+	for _, tc := range refusedManifests() {
+		t.Run("parser case: "+tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "engines.txt")
+			require.NoError(t, os.WriteFile(path, []byte(tc.data), 0o644))
+			out, err := runScript(t, path, "pin")
+			require.Error(t, err, "engines.sh pin takes what compat.Parse refuses (%s):\n%s", tc.want, out)
+		})
+	}
+	// A reject line last, and comments and blank lines anywhere, are fine.
+	out, err = runScript(t, write(1, "\n# a comment\n  reject v0.9.0 o/r#1"), "pin")
+	require.NoError(t, err, out)
+
 	for name, path := range map[string]string{
 		"over the cap": write(MaxAccept+1, ""),
 		"no accept":    write(0, ""),
@@ -237,6 +250,19 @@ func TestEnginesScriptCandidate(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, Accepted{Version: "v9.9.9-beta.1", Digest: digestB, Verified: "https://github.com/zerobull-consulting/dagger/actions/runs/123"}, m.Default())
 	require.Equal(t, append([]string{"v9.9.9-beta.1"}, Embedded().Versions()...), m.Versions())
+
+	// A full list takes no candidate, and is left as it was.
+	full := filepath.Join(t.TempDir(), "engines.txt")
+	var b strings.Builder
+	b.WriteString("base v1.0.0-beta.25\n")
+	for i := range MaxAccept {
+		fmt.Fprintln(&b, acceptLine(fmt.Sprintf("v1.0.%d", i), digestA))
+	}
+	require.NoError(t, os.WriteFile(full, []byte(b.String()), 0o644))
+	out, err = runScript(t, full, "candidate", "v9.9.9-beta.1", digestB)
+	require.Error(t, err, out)
+	require.Contains(t, out, "has 100 accept lines already")
+	require.Equal(t, b.String(), string(mustRead(t, full)))
 
 	for name, args := range map[string][]string{
 		"listed":      {"candidate", Embedded().Default().Version, digestB},
