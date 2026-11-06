@@ -7,11 +7,14 @@
 //     engine answers exported: a bundle, if any root survived, and the roots
 //     it skipped, as gone, busy or refused. It holds the bundle's chains
 //     under the reply's exportID until upload.
-//  2. The service works out which layer blobs the bundle's outputs need,
-//     drops those the blob store already has, and sends upload with a
-//     presigned PUT for each of the rest, to staging keys under a new
-//     blobstore.Stage of this try's own. An empty map needs nothing, and
-//     releases the chains.
+//  2. If the scope's index already refuses the bundle as a late export from
+//     an older generation of the cache (metastore.Index.CheckGeneration),
+//     the service releases the chains and settles the roots as refused,
+//     uploading nothing. Otherwise it works out which layer blobs the
+//     bundle's outputs need, drops those the blob store already has, and
+//     sends upload with a presigned PUT for each of the rest, to staging
+//     keys under a new blobstore.Stage of this try's own. An empty map
+//     needs nothing, and releases the chains.
 //  3. The engine PUTs each blob and answers uploaded: which blobs are done,
 //     and which failed.
 //  4. The service verifies each blob the engine reported done, and promotes
@@ -431,6 +434,18 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	survivors := survivingRoots(roots, exported.Skipped)
 
+	// A stale generation's export the index would refuse uploads nothing
+	// (#111): refused here, before any blob is asked for. Only a shortcut:
+	// the check in the index update below decides, since a newer
+	// generation can be recorded in between.
+	if err := x.checkGeneration(ctx, eng, exported.Bundle); err != nil {
+		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
+			return res, nil, false, rerr
+		}
+		x.refuseStale(eng, survivors, err, "before upload", &res)
+		return res, nil, false, nil
+	}
+
 	stripVolatile(exported.Bundle)
 	if err := x.checkMergeSize(ctx, exported.Bundle); err != nil {
 		// Not stored: release the chains, and let the caller split the
@@ -523,15 +538,9 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			return res, survivors, true, nil
 		}
 		if errors.Is(err, metastore.ErrStaleGeneration) {
-			// A late export from an older generation of the cache than
-			// the index recorded, of a value the index no longer holds
-			// (#59). Its generation never changes, so trying again
-			// can't help: the roots are settled as refused, and the
-			// tracker doesn't export this state of them again.
-			x.log.Info("export: older generation than the index's, not recorded", "cacheID", eng.CacheID(), "generation", eng.Generation(), "roots", len(survivors), "error", err)
-			for _, n := range survivors {
-				res.Refused = append(res.Refused, protocol.SkippedRoot{Number: n, Reason: protocol.SkipRefused, Message: StaleGenerationMessage})
-			}
+			// A newer generation was recorded after the early check
+			// (checkGeneration), or that check couldn't read the index.
+			x.refuseStale(eng, survivors, err, "index update", &res)
 			return res, nil, false, nil
 		}
 		res.fail(survivors, fmt.Errorf("publish: %w", err))
@@ -543,6 +552,38 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, false, nil
+}
+
+// checkGeneration returns the index's ErrStaleGeneration refusal of the
+// bundle, as the scope's index reads now (metastore.Index.CheckGeneration),
+// or nil. A failed read returns nil: the export goes on, and the index
+// update's own check decides.
+//
+// It reads the index on every try. Kept generations would save the read,
+// but a stale export reaches the index only from another replica's or an
+// earlier service's engine connection (this service's tracker fences older
+// generations), and what this service kept is what those writes outdate.
+func (x *Exporter) checkGeneration(ctx context.Context, eng Engine, bundle *dagql.ValueBundle) error {
+	idx, err := x.cfg.Meta.Index(ctx, x.cfg.Scope)
+	if err != nil {
+		if ctx.Err() == nil {
+			x.log.Warn("export: reading the index to check the generation failed; checking at the index update", "error", err)
+		}
+		return nil
+	}
+	return idx.CheckGeneration(bundle, eng.CacheID(), eng.Generation())
+}
+
+// refuseStale settles roots as refused, for a late export from an older
+// generation of the cache than the index recorded, of a value the index
+// doesn't hold (#59). Its generation never changes, so trying again can't
+// help: the tracker doesn't export this state of them again, until a newer
+// generation of the cache reports in. check names the check that refused it.
+func (x *Exporter) refuseStale(eng Engine, roots []uint64, err error, check string, res *Result) {
+	x.log.Info("export: older generation than the index's, not recorded", "cacheID", eng.CacheID(), "generation", eng.Generation(), "roots", len(roots), "check", check, "error", err)
+	for _, n := range roots {
+		res.Refused = append(res.Refused, protocol.SkippedRoot{Number: n, Reason: protocol.SkipRefused, Message: StaleGenerationMessage})
+	}
 }
 
 // checkOffered checks, after the fence, that every layer the bundle names

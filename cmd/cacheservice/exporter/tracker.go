@@ -121,6 +121,10 @@ type trackedEntry struct {
 	failedValue *exportedValue
 	// inFlight is set while a batch holds the entry.
 	inFlight bool
+	// recheck is set when a newer generation cleared the entry's
+	// stale-generation refusal (see cache): the next Due or DrainDue
+	// exports it if it is still worth exporting and nothing is scheduled.
+	recheck bool
 	// lastSeen is when a span last named the entry.
 	lastSeen time.Time
 }
@@ -208,10 +212,14 @@ func (t *Tracker) cache(cacheID string, generation uint64) *trackedCache {
 	if generation > c.generation {
 		// A refusal of a stale generation's export (the index had a
 		// later one) says nothing of this generation's: it may record
-		// the same value, so it is exported again (#59).
+		// the same value, so it is exported again (#59). The entry is
+		// rechecked at the next Due or DrainDue, which schedules it as
+		// done does a root whose refusal it dropped (#129): nothing
+		// else would, unless a session of this generation names it.
 		for _, e := range c.entries {
 			if e.refused != nil && e.refusedMessage == StaleGenerationMessage {
 				e.refused, e.refusedMessage = nil, ""
+				e.recheck = true
 			}
 		}
 	}
@@ -365,6 +373,20 @@ func (t *Tracker) Started(cacheID string, generation uint64, wipedCache string) 
 	}
 }
 
+// Connected records an engine's hello: its cache reports in at generation,
+// as a span or event of that generation would. A newer generation clears the
+// cache's stale-generation refusals, which are exported again (see cache),
+// even when no span or event of that generation reaches this service, as
+// when it goes to another replica.
+func (t *Tracker) Connected(cacheID string, generation uint64) {
+	if cacheID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cache(cacheID, generation)
+}
+
 // ImportedValue is a stored value merged into an engine cache: the engine
 // entry it landed on, at what replacement count, with which parts complete
 // or offered.
@@ -410,6 +432,12 @@ type Batch struct {
 	generation uint64
 }
 
+// Generation is the cache's generation when the batch was claimed. An
+// engine connection of an older generation must not export it: the index
+// would refuse what that generation no longer holds, and the refusal would
+// be settled against this generation.
+func (b Batch) Generation() uint64 { return b.generation }
+
 // Due returns the exports due at now: the candidates of sessions that ended
 // or went quiet, and roots due for another try. Each root is in at most one
 // batch until Done is called for it.
@@ -453,6 +481,15 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 			delete(c.sessions, id)
 		}
 		for n, e := range c.entries {
+			if e.recheck {
+				// A cleared stale-generation refusal (see cache): scheduled
+				// now, as done schedules one it drops. One in flight is
+				// scheduled by its done, if still worth exporting.
+				e.recheck = false
+				if e.retryAt.IsZero() && t.wantedLocked(c, n, e, now) {
+					e.retryAt = now
+				}
+			}
 			if !e.retryAt.IsZero() && !now.Before(e.retryAt) {
 				roots[n] = true
 			}
@@ -500,7 +537,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 			cur = &batches[len(batches)-1]
 		}
 		e.inFlight = true
-		e.retryAt = time.Time{}
+		e.retryAt, e.recheck = time.Time{}, false
 		cur.Request.Roots = append(cur.Request.Roots, n)
 		for _, k := range slices.Sorted(maps.Keys(e.parts)) {
 			cur.Request.Outputs = append(cur.Request.Outputs, protocol.ExportOutput{Number: n, Address: e.parts[k]})
@@ -660,7 +697,7 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 	for _, n := range req.Roots {
 		if e := c.entries[n]; e != nil {
 			e.inFlight = true
-			e.retryAt = time.Time{}
+			e.retryAt, e.recheck = time.Time{}, false
 			b.values[n] = e.value()
 		}
 	}
@@ -800,6 +837,9 @@ func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
 			switch {
 			case e.inFlight:
 				st.InFlight++
+			case e.recheck && e.retryAt.IsZero() && t.wantedLocked(c, n, e, now):
+				// Due at the next DrainDue (see cache).
+				st.Retrying++
 			case e.retryAt.IsZero() || !t.wantedLocked(c, n, e, now):
 				continue
 			case !deadline.IsZero() && e.retryAt.After(deadline):

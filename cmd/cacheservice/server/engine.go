@@ -307,6 +307,11 @@ func (c *engineConn) serve(ctx context.Context) error {
 	if err := c.reply(ctx, env, protocol.TypeWelcome, protocol.Welcome{}); err != nil {
 		return err
 	}
+	// The engine reports in at its generation: a newer one clears the
+	// cache's stale-generation refusals, to be exported from it (#129).
+	if c.ns.tracker != nil {
+		c.ns.tracker.Connected(c.hello.CacheID, c.hello.Generation)
+	}
 	// The import sync loop ends with the connection.
 	importCtx, stopImports := context.WithCancel(ctx)
 	defer stopImports()

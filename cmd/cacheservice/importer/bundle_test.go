@@ -66,7 +66,7 @@ func chainBundle(first uint64, recipes ...string) *dagql.ValueBundle {
 
 func record(t *testing.T, idx *metastore.Index, id string, b *dagql.ValueBundle, cacheID string) map[dagql.TransferOrdinal]uint64 {
 	t.Helper()
-	numbers, res, err := idx.RecordResolved(id, b, cacheID, 1)
+	numbers, res, err := idx.RecordResolvedAt(id, b, cacheID, 1, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func movedImportsFixture(t *testing.T) (idx *metastore.Index, cID string, cBundl
 	idx = metastore.NewIndex()
 	aNumbers := record(t, idx, testBundleID("a"), chainBundle(10, "base", "exec"), "cache-a")
 	baseN, execN := aNumbers[1], aNumbers[2]
-	idx.RecordImports("cache-c", 1, []metastore.Import{{Number: baseN, Engine: 6}, {Number: execN, Engine: 7}})
+	idx.RecordImportsAt("cache-c", 1, []metastore.Import{{Number: baseN, Engine: 6}, {Number: execN, Engine: 7}}, testNowUnix)
 	cID = testBundleID("c")
 	cBundle = chainBundle(6, "base", "exec", "test")
 	cNumbers := record(t, idx, cID, cBundle, "cache-c")
@@ -391,7 +391,7 @@ func TestBundleOfMovedImportsMerges(t *testing.T) {
 	checkMerges(t, idx, cID, cBundle, want, "before the imports move")
 
 	// C prunes them, restarts, and has them merged again, on 20 and 21.
-	idx.RecordImports("cache-c", 2, []metastore.Import{{Number: want[1], Engine: 20}, {Number: want[2], Engine: 21}})
+	idx.RecordImportsAt("cache-c", 2, []metastore.Import{{Number: want[1], Engine: 20}, {Number: want[2], Engine: 21}}, testNowUnix)
 	if _, ok := idx.Caches["cache-c"].Imported[6]; ok {
 		t.Fatal("the import didn't move")
 	}
@@ -435,7 +435,7 @@ func TestLegacyBundleResolvesThroughCurrentMappings(t *testing.T) {
 	if mb.Numbers[1] != want[1] || mb.Numbers[2] != want[2] {
 		t.Fatalf("numbers %v, want %v", mb.Numbers, want)
 	}
-	idx.RecordImports("cache-c", 2, []metastore.Import{{Number: want[1], Engine: 20}, {Number: want[2], Engine: 21}})
+	idx.RecordImportsAt("cache-c", 2, []metastore.Import{{Number: want[1], Engine: 20}, {Number: want[2], Engine: 21}}, testNowUnix)
 	if _, err := BuildMerge(context.Background(), idx, cID, cBundle, nil, []uint64{testN}, testSigner, "team"); err == nil || !strings.Contains(err.Error(), "no longer stored") {
 		t.Fatalf("after the imports moved: %v, want the pre-resolution failure", err)
 	}
@@ -458,7 +458,7 @@ func TestPlanSplitsByResolution(t *testing.T) {
 	stored.Roots = append(stored.Roots, dagql.TransferredRoot{Ordinal: 3, ExpiresAtUnix: 10})
 	stored.Values[0].SenderReplacements = 1
 	stored.Values[1].SenderReplacements = 1
-	first, res1, err := idx.RecordResolved(id, stored, "cache-a", 2)
+	first, res1, err := idx.RecordResolvedAt(id, stored, "cache-a", 2, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func TestPlanSplitsByResolution(t *testing.T) {
 	stored.Roots[1].ExpiresAtUnix = 0
 	stored.Values[0].SenderReplacements = 0
 	stored.Values[1].SenderReplacements = 0
-	second, res2, err := idx.RecordResolved(id, stored, "cache-a", 2)
+	second, res2, err := idx.RecordResolvedAt(id, stored, "cache-a", 2, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,3 +492,6 @@ func TestPlanSplitsByResolution(t *testing.T) {
 		}
 	}
 }
+
+// testNowUnix is the time tests record the index at.
+const testNowUnix = 10

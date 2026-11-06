@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dagger/dagger/dagql"
 )
@@ -28,10 +30,10 @@ func importChain(t *testing.T) *Index {
 	for o := dagql.TransferOrdinal(1); o <= 3; o++ {
 		withParts(b, o, "fs")
 	}
-	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
-	n := len(idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 100}, {Number: 2, Engine: 101}, {Number: 3, Engine: 102}}))
+	n := len(idx.RecordImportsAt("cache-b", 1, []Import{{Number: 1, Engine: 100}, {Number: 2, Engine: 101}, {Number: 3, Engine: 102}}, testNowUnix))
 	if n != 3 {
 		t.Fatalf("recorded %d imports, want 3", n)
 	}
@@ -53,7 +55,7 @@ func TestRecordReusesImports(t *testing.T) {
 	for o := dagql.TransferOrdinal(1); o <= 3; o++ {
 		withParts(b, o, "fs")
 	}
-	nums, err := idx.Record(strings.Repeat("b", 64), b, "cache-b", 1)
+	nums, err := idx.Record(strings.Repeat("b", 64), b, "cache-b", 1, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +71,7 @@ func TestRecordReusesImports(t *testing.T) {
 
 	// A new entry over them: one new number, depending on the originals.
 	b2 := testBundle([]val{{sender: 100}, {sender: 101, deps: []uint64{1}}, {sender: 102, deps: []uint64{2, 1}}, {sender: 103, deps: []uint64{3}}}, root(4, 0))
-	nums, err = idx.Record(strings.Repeat("c", 64), b2, "cache-b", 1)
+	nums, err = idx.Record(strings.Repeat("c", 64), b2, "cache-b", 1, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,14 +129,14 @@ func TestRecordImportWithMoreParts(t *testing.T) {
 	}
 	// cache-a's later export of the same value, with fewer parts, keeps
 	// cache-b's record, even from a later generation.
-	if _, err := idx.Record(strings.Repeat("c", 64), withParts(testBundle([]val{{sender: 10}}, root(1, 0)), 1, "fs"), "cache-a", 5); err != nil {
+	if _, err := idx.Record(strings.Repeat("c", 64), withParts(testBundle([]val{{sender: 10}}, root(1, 0)), 1, "fs"), "cache-a", 5, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	if idx.Entries[1].Source.CacheID != "cache-b" || idx.NextNumber != 4 {
 		t.Fatalf("entry 1 %+v, next %d", idx.Entries[1], idx.NextNumber)
 	}
 	// A record with other parts, not more, doesn't replace it either.
-	if _, err := idx.Record(strings.Repeat("d", 64), withParts(testBundle([]val{{sender: 10}}, root(1, 0)), 1, "fs", "other"), "cache-a", 5); err != nil {
+	if _, err := idx.Record(strings.Repeat("d", 64), withParts(testBundle([]val{{sender: 10}}, root(1, 0)), 1, "fs", "other"), "cache-a", 5, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	if idx.Entries[1].Source.CacheID != "cache-b" {
@@ -148,18 +150,18 @@ func TestRecordImportWithMoreParts(t *testing.T) {
 func TestRecordImportsSkips(t *testing.T) {
 	idx := importChain(t)
 	// Not stored, the cache's own export, and onto an exported engine entry.
-	if _, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 200}}, root(1, 0)), "cache-b", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 200}}, root(1, 0)), "cache-b", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
-	n := len(idx.RecordImports("cache-b", 1, []Import{{Number: 99, Engine: 300}, {Number: 4, Engine: 301}, {Number: 1, Engine: 200}}))
+	n := len(idx.RecordImportsAt("cache-b", 1, []Import{{Number: 99, Engine: 300}, {Number: 4, Engine: 301}, {Number: 1, Engine: 200}}, testNowUnix))
 	if n != 0 {
 		t.Fatalf("recorded %d", n)
 	}
-	if n := len(idx.RecordImports("cache-a", 1, []Import{{Number: 1, Engine: 10}})); n != 0 {
+	if n := len(idx.RecordImportsAt("cache-a", 1, []Import{{Number: 1, Engine: 10}}, testNowUnix)); n != 0 {
 		t.Fatalf("recorded an import of cache-a's own entry")
 	}
 	// An import that landed elsewhere moves.
-	if n := len(idx.RecordImports("cache-b", 2, []Import{{Number: 1, Engine: 150}})); n != 1 {
+	if n := len(idx.RecordImportsAt("cache-b", 2, []Import{{Number: 1, Engine: 150}}, testNowUnix)); n != 1 {
 		t.Fatalf("recorded %d", n)
 	}
 	c := idx.Caches["cache-b"]
@@ -212,7 +214,7 @@ func TestDropExpiredAndForgetImports(t *testing.T) {
 	}
 	// A wiped cache that exported too keeps its exports.
 	idx = importChain(t)
-	if _, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 200}}, root(1, 0)), "cache-b", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("b", 64), testBundle([]val{{sender: 200}}, root(1, 0)), "cache-b", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	idx.ForgetImports("cache-b", 1000)
@@ -258,7 +260,7 @@ func TestRecordKnownGapImportWithOtherParts(t *testing.T) {
 	idx := importChain(t) // stored records hold "fs"
 	b := withParts(testBundle([]val{{sender: 100}}, root(1, 0)), 1, "execMeta")
 	before := *idx.Entries[1]
-	nums, err := idx.Record(strings.Repeat("b", 64), b, "cache-b", 1)
+	nums, err := idx.Record(strings.Repeat("b", 64), b, "cache-b", 1, testNowUnix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,13 +286,13 @@ func TestRecordKnownGapImportWithOtherParts(t *testing.T) {
 func TestRecordImportKeepsRecordExpiry(t *testing.T) {
 	idx := NewIndex()
 	b := withParts(testBundle([]val{{sender: 10, expires: 100}}, root(1, 150)), 1, "fs")
-	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
-	idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 100}})
+	idx.RecordImportsAt("cache-b", 1, []Import{{Number: 1, Engine: 100}}, testNowUnix)
 
 	later := withParts(testBundle([]val{{sender: 100, expires: 200}}, root(1, 300)), 1, "fs")
-	if _, err := idx.Record(strings.Repeat("b", 64), later, "cache-b", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("b", 64), later, "cache-b", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	if e := idx.Entries[1]; e.ExpiresAtUnix != 100 || e.Source.CacheID != "cache-a" {
@@ -308,7 +310,7 @@ func TestRecordImportKeepsRecordExpiry(t *testing.T) {
 
 	// With more parts, the record replaces the stored one, expiry and all.
 	more := withParts(testBundle([]val{{sender: 100, expires: 200}}, root(1, 300)), 1, "fs", "execMeta")
-	if _, err := idx.Record(strings.Repeat("c", 64), more, "cache-b", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("c", 64), more, "cache-b", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
 	if e := idx.Entries[1]; e.ExpiresAtUnix != 200 || e.Source.CacheID != "cache-b" {
@@ -330,22 +332,22 @@ func cloneIndex(t *testing.T, idx *Index) *Index {
 	return cp
 }
 
-// RecordImports returns only the imports the index holds after the call:
+// RecordImportsAt returns only the imports the index holds after the call:
 // one that a later import in the same call replaced isn't reported as
 // recorded, so the importer doesn't tell the export path a value is the
 // import of an engine entry that maps to another one.
 func TestRecordImportsReportsOnlyWhatItKept(t *testing.T) {
 	idx := NewIndex()
 	b := testBundle([]val{{sender: 10}, {sender: 11}}, root(1, 0), root(2, 0))
-	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1); err != nil {
+	if _, err := idx.Record(strings.Repeat("a", 64), b, "cache-a", 1, testNowUnix); err != nil {
 		t.Fatal(err)
 	}
-	got := idx.RecordImports("cache-b", 1, []Import{
+	got := idx.RecordImportsAt("cache-b", 1, []Import{
 		{Number: 1, Engine: 100}, // replaced: 2 lands on 100 too
 		{Number: 2, Engine: 100},
 		{Number: 1, Engine: 101}, // 1 moves on, from 100 (already replaced) to 101
 		{Number: 2, Engine: 102}, // and 2 moves on to 102, leaving 100
-	})
+	}, testNowUnix)
 	want := []Import{{Number: 1, Engine: 101}, {Number: 2, Engine: 102}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("recorded %v, want %v", got, want)
@@ -357,11 +359,67 @@ func TestRecordImportsReportsOnlyWhatItKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The same engine entry twice in one call: only the last stays.
-	got = idx.RecordImports("cache-b", 1, []Import{{Number: 1, Engine: 200}, {Number: 2, Engine: 200}})
+	got = idx.RecordImportsAt("cache-b", 1, []Import{{Number: 1, Engine: 200}, {Number: 2, Engine: 200}}, testNowUnix)
 	if !slices.Equal(got, []Import{{Number: 2, Engine: 200}}) {
 		t.Fatalf("recorded %v", got)
 	}
 	if err := idx.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// racingObjects runs race once, before the first conditional write of an
+// index: another writer that gets in first, so the update tries again.
+type racingObjects struct {
+	*MemObjects
+	mu    sync.Mutex
+	raced bool
+	race  func()
+}
+
+func (r *racingObjects) Put(ctx context.Context, key string, body []byte, cond Condition) (string, error) {
+	r.mu.Lock()
+	run := !r.raced && cond.IfMatch != "" && strings.HasSuffix(key, "/index.json")
+	r.raced = r.raced || run
+	r.mu.Unlock()
+	if run {
+		r.race()
+	}
+	return r.MemObjects.Put(ctx, key, body, cond)
+}
+
+// Store.RecordImports reads its clock on each try of the index update, as
+// RecordFenced does: a try after losing to another writer stamps the cache's
+// record with its own time, not the first try's.
+func TestStoreRecordImportsStampsEachTry(t *testing.T) {
+	ctx := context.Background()
+	objects := &racingObjects{MemObjects: NewMemObjects(), raced: true}
+	s, clock := newClockedStore(t, objects)
+	rec, err := s.Record(ctx, "s1", chain(10), "cache-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := New(Config{Objects: objects.MemObjects, Prefix: "team", Now: clock.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects.race = func() {
+		clock.add(time.Hour)
+		if _, err := other.Record(ctx, "s1", chain(50), "cache-c", 1); err != nil {
+			t.Error(err)
+		}
+	}
+	objects.mu.Lock()
+	objects.raced = false
+	objects.mu.Unlock()
+	if got, err := s.RecordImports(ctx, "s1", "cache-b", 1, []Import{{Number: rec.Numbers[1], Engine: 100}}); err != nil || len(got) != 1 {
+		t.Fatalf("record imports: %v, %v", got, err)
+	}
+	idx := mustIndex(t, s, "s1")
+	if idx.Caches["cache-c"] == nil {
+		t.Fatal("the racing writer's record is missing: no retry was tested")
+	}
+	if got, want := idx.Caches["cache-b"].UpdatedAtUnix, clock.now().Unix(); got != want {
+		t.Fatalf("cache-b stamped %d, want the retry's time %d", got, want)
 	}
 }
