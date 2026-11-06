@@ -489,14 +489,17 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 // which a namespace's max age counts from, when this export wrote the
 // root's record: a root new to the index with its record, a later state of
 // the value from its own engine, or an imported value's record with more
-// parts (see Record).
+// parts (see Record). So does a root of its own engine's value whose stored
+// record this export kept because that record holds a part the bundle lacks
+// (#133): the engine exported the value as a root, and the stored record is
+// of that same value.
 //
-// A root whose record this export did not write keeps its time, or none
-// (a root from before version 3, which GC stamps), and is not added when
-// new: a late export from an older generation, or an import exported back
-// unchanged.
+// A root whose record this export did not write, or keep that way, keeps
+// its time, or none (a root from before version 3, which GC stamps), and is
+// not added when new: a late export from an older generation, or an import
+// exported back unchanged.
 // So merging stored entries into engines never keeps them alive by itself:
-// only a new record does. The cache's record is stamped with nowUnix too
+// only an export of the value from its own engine does. The cache's record is stamped with nowUnix too
 // (EngineCache.UpdatedAtUnix). nowUnix must be positive: the index is
 // stamped with the caller's clock only, so its logic follows an injected
 // one (#111).
@@ -573,8 +576,8 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	parts := bundleParts(bundle)
 	written := map[dagql.TransferOrdinal]bool{}
 	// current are the values whose stored record this export kept because
-	// it describes the same value with more parts: for their roots, as if
-	// written.
+	// the stored record is of the same value and holds a part the bundle
+	// lacks: for their roots, as if written.
 	current := map[dagql.TransferOrdinal]bool{}
 	for _, v := range values {
 		n := numbers[v.Ordinal]

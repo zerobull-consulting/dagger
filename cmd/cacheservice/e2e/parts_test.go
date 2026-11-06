@@ -36,17 +36,22 @@ func (s *state) parts(t *testing.T) {
 	const stdoutPath, filePath = "container.from.withExec.stdout", "container.from.withExec.file.contents"
 	readW := `{ ` + v + `withExec(args: ["sh", "-c", "cat /v > /w; echo w-$(cat /proc/sys/kernel/random/uuid) >> /w"]) { file(path: "/w") { contents } } } } } }`
 
-	// executed returns the engine number of the one withExec span after
-	// mark that A executed.
-	executed := func(mark int, what string) uint64 {
+	// executed waits for A's span of the one call named name it executed
+	// after mark, and returns its engine number. Spans arrive over OTLP,
+	// after the query returns.
+	executed := func(mark int, name, what string) uint64 {
 		var nums []uint64
-		for _, sp := range s.main.Logs.CacheSpans(mark, cacheA, "Container.withExec") {
-			if sp.Attr("outcome") == "executed" {
-				nums = append(nums, uint64(atoi(sp.Attr("result"))))
+		env.WaitFor(30*time.Second, fmt.Sprintf("A's executed %s span (%s)", name, what), func() (bool, error) {
+			nums = nil
+			for _, sp := range s.main.Logs.CacheSpans(mark, cacheA, name) {
+				if sp.Attr("outcome") == "executed" {
+					nums = append(nums, uint64(atoi(sp.Attr("result"))))
+				}
 			}
-		}
+			return len(nums) > 0, nil
+		})
 		if len(nums) != 1 {
-			t.Fatalf("%s: A executed %d withExec calls (%v), want 1", what, len(nums), nums)
+			t.Fatalf("%s: A executed %d %s calls (%v), want 1", what, len(nums), name, nums)
 		}
 		return nums[0]
 	}
@@ -56,6 +61,9 @@ func (s *state) parts(t *testing.T) {
 			t.Fatalf("A's entry %d is not in the index", engineNum)
 		}
 		e := idx.Entries[m.Number]
+		if e == nil {
+			t.Fatalf("A's entry %d maps to service number %d, which isn't stored", engineNum, m.Number)
+		}
 		_, root := idx.Roots[m.Number]
 		return partsRecord{service: m.Number, bundle: e.Bundle, parts: e.Parts, root: root}
 	}
@@ -79,7 +87,7 @@ func (s *state) parts(t *testing.T) {
 	mark := s.main.Logs.Mark()
 	res, _ := s.a.Query("parts-v-a", readV)
 	stdoutA, fileA := strings.TrimSpace(Field(res, stdoutPath)), strings.TrimSpace(Field(res, filePath))
-	engineV := executed(mark, "session one")
+	engineV := executed(mark, "Container.withExec", "session one")
 	s.waitStored(s.main, s.a, "A's entries after session one")
 	idx1 := env.Index()
 	env.Save("parts-index-1", idx1)
@@ -93,7 +101,7 @@ func (s *state) parts(t *testing.T) {
 	t.Log("session two on A: exec W over V, so W's bundle holds V's record, not as a root")
 	mark = s.main.Logs.Mark()
 	s.a.Query("parts-w-a", readW)
-	engineW := executed(mark, "session two")
+	engineW := executed(mark, "Container.withExec", "session two")
 	s.waitStored(s.main, s.a, "A's entries after session two")
 	idx2 := env.Index()
 	env.Save("parts-index-2", idx2)
@@ -101,8 +109,9 @@ func (s *state) parts(t *testing.T) {
 	t.Logf("V after: service number %d, bundle %s, parts %v; W: service number %d, bundle %s, parts %v",
 		r2.service, Short(r2.bundle), r2.parts, rw.service, Short(rw.bundle), rw.parts)
 	var inW []string
-	for _, o := range env.Bundle(rw.bundle).Outputs {
-		for _, val := range env.Bundle(rw.bundle).Values {
+	wb := env.Bundle(rw.bundle)
+	for _, o := range wb.Outputs {
+		for _, val := range wb.Values {
 			if val.Ordinal == o.Ordinal && val.SenderNumber == engineV {
 				inW = append(inW, metastore.PartKey(o.Address))
 			}
@@ -122,11 +131,8 @@ func (s *state) parts(t *testing.T) {
 	mark = s.main.Logs.Mark()
 	res, _ = s.a.Query("parts-y-a", readY)
 	stdoutY := strings.TrimSpace(Field(res, yPath))
-	engineY := executed(mark, "session three")
-	var engineX uint64
-	for _, sp := range s.main.Logs.CacheSpans(mark, cacheA, "Container.withEnvVariable") {
-		engineX = uint64(atoi(sp.Attr("result")))
-	}
+	engineY := executed(mark, "Container.withExec", "session three")
+	engineX := executed(mark, "Container.withEnvVariable", "session three")
 	s.waitStored(s.main, s.a, "A's entries after session three")
 	idx3 := env.Index()
 	env.Save("parts-index-3", idx3)
@@ -171,13 +177,13 @@ func (s *state) parts(t *testing.T) {
 		"F1, which imported before session two, read A's V as a cache hit (%d hit, %d executed)", hit1, ran1)
 	Check(t, stdout2 == stdoutA && file2 == fileA && ran2 == 0 && hit2 > 0,
 		"F2, which imported after session two, read A's V as a cache hit (%d hit, %d executed)", hit2, ran2)
-	Check(t, engineX != 0 && !rx.root && len(rx.parts) == 0 && rx.bundle == ry.bundle && len(ry.parts) > 0,
+	Check(t, !rx.root && len(rx.parts) == 0 && rx.bundle == ry.bundle && len(ry.parts) > 0,
 		"the store holds X only in Y's bundle, without parts (root %v, parts %v), and Y with parts %v", rx.root, rx.parts, ry.parts)
 	Check(t, fileX == "x-"+n,
 		"a partial import is safe: F2, which imported X without its parts, read X's variable without failing (%q, as A set it)", fileX)
 	Check(t, stdoutYF2 == stdoutY && stdoutY == "x-"+n && ranY == 0 && hitY > 0,
 		"F2 read A's Y as a cache hit (%d hit, %d executed), its stdout %q", hitY, ranY, stdoutYF2)
 	if t.Failed() {
-		t.Log(fmt.Sprintf("A's V: stdout %q, /v %q", stdoutA, fileA))
+		t.Logf("A's V: stdout %q, /v %q", stdoutA, fileA)
 	}
 }

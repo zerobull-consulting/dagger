@@ -626,9 +626,13 @@ changed on every service restart would make engines re-key everything. So:
   its outputs, named by no entry, was collected (`TestDependencyKeepsItsBundle`).
   A record of a new value (more replacements) replaces the stored one
   whatever its parts. A record with other parts, neither more nor fewer, keeps
-  the stored one too: an entry names one record, and the tracker's next
-  export of the value holds every part it has seen
-  (`TestRecordSameValueOtherPartsKeepsStored`). The kept record keeps its
+  the stored one too: an entry names one record
+  (`TestRecordSameValueOtherPartsKeepsStored`). The new part reaches the
+  index once an export holds both. While the tracker tracks the value, its
+  next export does, since it keeps every part it has seen; after a service
+  restart it knows only the parts the engine's spans report again, and an
+  engine that no longer has the stored part leaves the new one out of the
+  index, as with imports (#37). The kept record keeps its
   expiry, as an imported value's does (see below).
 - A late export from a generation older than the cache's latest recorded one
   adds nothing the index has no mapping for: if any of its values has no
