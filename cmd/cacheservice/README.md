@@ -2506,7 +2506,7 @@ On GitHub Actions, use the composite action, which does everything below
     s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
 - run: dagger call build                # any dagger command: the action set up the CLI
 - if: always()
-  timeout-minutes: 12                   # above the drain timeout (10m) plus 25s
+  timeout-minutes: 12                   # the drain timeout (10m) plus 2 minutes
   uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
 
@@ -2662,9 +2662,11 @@ ends the linger at once, and the engine's last event goes undelivered.
   most `-drain-timeout` plus `-drain-linger` (15s) plus 5s (see
   [Stopping and draining](#stopping-and-draining)). The waits above, and the
   CI step's own timeout, must be above that, or the service is cut off
-  mid-drain. With `10m`, the action waits up to 625s for the service in all,
-  and the step needs 12 minutes: the action's stop bounds every wait, and
-  the caller sets the step's `timeout-minutes`.
+  mid-drain. With `10m`, the action waits up to 625s for the service in all.
+  The engine's stop (up to 30s, cut off at 90s) comes after the drain's wait,
+  so the step needs `-drain-timeout` plus 2 minutes, 12 for `10m`: the
+  action's stop bounds every wait, and the caller sets the step's
+  `timeout-minutes`.
 - **Exit codes:** 0 for a clean stop; 1 when the bound cut work off (logged
   as `the shutdown's bound passed with work still running`, with what was
   running), when a signal arrived during the shutdown, or when an HTTP

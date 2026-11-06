@@ -54,8 +54,9 @@ inputs:
   drain-timeout:
     description: >-
       How long the stop lets the service finish its exports (-drain-timeout).
-      Give the stop step a timeout-minutes above this plus 25s, with room for
-      the engine's stop (up to 30s).
+      Give the stop step a timeout-minutes of at least this plus 2 minutes:
+      the drain's wait (this plus 5s), then the engine's stop (cut off at 90s),
+      then the cleanup.
     required: false
     default: "10m"
   name:

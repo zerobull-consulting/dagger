@@ -28,7 +28,7 @@ jobs:
           s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
       - run: dagger call build
       - if: always()
-        # Above drain-timeout (10m) plus the engine's stop and the linger.
+        # drain-timeout (10m) plus 2 minutes: the drain, the engine's stop, the cleanup.
         timeout-minutes: 12
         uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
@@ -180,8 +180,12 @@ logs (with presigned URLs' credentials and signatures redacted), and
 removes the containers, the engine's state volume and the network. With
 nothing to drain, the stop takes about 10s, most of it the engine's.
 
-Give the step a `timeout-minutes` above `drain-timeout` plus 25s, with room
-for the engine's 30s: 12 for `10m`. The start passes the service
+The steps run one after another, so the whole stop takes at most the drain's
+wait (`drain-timeout` plus 5s), then the engine's stop (30s, its `docker
+stop` cut off at 90s), then the wait for the service (which has exited by
+then, unless it overran its own bound) and the cleanup, which take seconds.
+Give the step a `timeout-minutes` of at least `drain-timeout` plus 2
+minutes: 12 for `10m`. The start passes the service
 `-drain-linger`, which a service image from before the linger doesn't take:
 pin the images to the action's commit, as above.
 
