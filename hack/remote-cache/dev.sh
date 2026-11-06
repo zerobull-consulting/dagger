@@ -107,13 +107,20 @@ use_store() {
 # don't (see README.md, "Pointing an engine at the service and MinIO"), with a
 # read-only user of the demo's own, for its prefix, demo/.
 demo_store() {
-	if [[ "$MINIO_BIND_ADDR" == 127.0.0.1 ]]; then
-		MINIO_BIND_ADDR="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
-		[[ "$MINIO_BIND_ADDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
-			{ echo "dev.sh: the Docker bridge has no IPv4 gateway ('$MINIO_BIND_ADDR')" >&2; exit 1; }
-		host="$MINIO_BIND_ADDR"
+	# Containers reach neither this host's loopback nor "localhost": on
+	# loopback (the default), bind to the gateway instead; on 0.0.0.0, which
+	# includes the gateway, keep the bind and address the gateway.
+	case "$MINIO_BIND_ADDR" in
+	127.0.0.1 | 0.0.0.0)
+		local gw
+		gw="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
+		[[ "$gw" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
+			{ echo "dev.sh: the Docker bridge has no IPv4 gateway ('$gw')" >&2; exit 1; }
+		[[ "$MINIO_BIND_ADDR" == 127.0.0.1 ]] && MINIO_BIND_ADDR="$gw"
+		host="$gw"
 		export MINIO_BIND_ADDR
-	fi
+		;;
+	esac
 	up >/dev/null
 	READONLY_PREFIX=demo READONLY_USER=dagger-demo-readonly READONLY_PASSWORD=dagger-demo-readonly-secret \
 		READONLY_POLICY=cacheservice-demo-readonly compose run --rm create-readonly-user >/dev/null

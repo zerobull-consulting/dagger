@@ -181,6 +181,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      # sidecar.sh's validation and stop, against a fake docker.
+      - name: Test the action's script
+        run: ./.github/actions/remote-cache-sidecar/sidecar_test.sh
       # As cacheservice-image.yml and engine-image.yml build them; the engine's
       # CLI provisions this same image by default.
       - name: Build the images

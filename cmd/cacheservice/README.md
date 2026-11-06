@@ -2414,8 +2414,10 @@ service, and no inherited trace:
 
 ```bash
 docker cp remote-cache-engine:/usr/local/bin/dagger ./dagger
-env -u TRACEPARENT -u TRACESTATE \
-  _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://remote-cache-engine \
+# As cmd/cacheservice/e2e runs its CLI: no inherited trace, and no OTEL_* or
+# DAGGER_* settings of the caller's.
+unset $(compgen -e | grep -E '^(TRACEPARENT|TRACESTATE|OTEL_|DAGGER_|_EXPERIMENTAL_DAGGER_)')
+env _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://remote-cache-engine \
   DAGGER_CLOUD_URL="$url" DAGGER_CLOUD_TOKEN=sidecar-cli \
   ./dagger call build
 ```

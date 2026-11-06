@@ -45,9 +45,10 @@ finish() {
 
 # The service's log, whole, then from line $2 on (1-based). Read whole
 # before grep: grep -q stopping early would fail the pipeline (pipefail).
-service_log() { docker logs "$1" 2>&1 || true; }
-log_from() { docker logs "$1" 2>&1 | tail -n +"$2"; }
-log_lines() { docker logs "$1" 2>&1 | wc -l; }
+# Each read is bounded, so CHECK_TIMEOUT bounds the waits.
+service_log() { timeout 30 docker logs "$1" 2>&1 || true; }
+log_from() { service_log "$1" | tail -n +"$2"; }
+log_lines() { service_log "$1" | wc -l; }
 
 # withExec cache spans in a piece of the log: "<hit> <executed> <cache IDs>".
 exec_spans() {
@@ -111,14 +112,15 @@ stored() {
 	local log="$1"
 	[[ -f "$log" ]] || { fail "no service log at $log"; finish; }
 	local exports roots
+	# No export line is a failure to report, not a grep to exit on.
 	exports="$(grep -c 'msg="export stored"' "$log" || true)"
-	roots="$(grep 'msg="export stored"' "$log" | sed -nE 's/.* roots=([0-9]+).*/\1/p' | awk '{n += $1} END {print n + 0}')"
+	roots="$({ grep 'msg="export stored"' "$log" || true; } | sed -nE 's/.* roots=([0-9]+).*/\1/p' | awk '{n += $1} END {print n + 0}')"
 	((exports >= 1 && roots >= 1)) && ok "the writer stored $exports export(s), $roots root(s)" ||
 		fail "the writer stored no export ($exports exports, $roots roots)"
 	grep -q 'msg="drain: done" outcome=complete' "$log" && ok "the writer's drain completed" ||
 		fail "the writer's log has no completed drain (was the stop skipped, or cut off?)"
 	if grep -q 'msg="drain: left unexported"' "$log"; then
-		fail "the writer's drain left roots unexported: $(grep 'msg="drain: left unexported"' "$log" | head -n 3)"
+		fail "the writer's drain left roots unexported: $(grep 'msg="drain: left unexported"' "$log" | head -n 3 || true)"
 	fi
 	finish
 }

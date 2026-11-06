@@ -62,6 +62,18 @@ valid_namespace() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && "$1" != *..
 # not an option.
 valid_image() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,254}$ ]]; }
 
+# A bucket prefix: key segments of letters, digits, '.', '_' and '-',
+# separated by '/', none of them '.' or '..'; or empty (the whole bucket).
+valid_prefix() {
+	local p="$1" seg
+	[[ -z "$p" ]] && return 0
+	[[ ${#p} -le 256 && "$p" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || return 1
+	IFS=/ read -r -a segs <<<"$p"
+	for seg in "${segs[@]}"; do
+		[[ "$seg" != . && "$seg" != .. ]] || return 1
+	done
+}
+
 # A Go duration of hours, minutes and seconds, in that order, such as 10m,
 # 90s or 1h30m; or 0.
 duration_seconds() {
@@ -151,6 +163,16 @@ start() {
 	[[ -z "$debug_port" || ("$debug_port" =~ ^[0-9]{1,5}$ && "$debug_port" -ge 1 && "$debug_port" -le 65535) ]] ||
 		die "debug-port '$debug_port' isn't a port number"
 	[[ "$wait" =~ ^[0-9]{1,4}$ ]] || die "SIDECAR_START_TIMEOUT '$wait' isn't a number of seconds"
+	valid_prefix "${CACHESERVICE_S3_PREFIX:-}" ||
+		die "s3-prefix '${CACHESERVICE_S3_PREFIX:-}' isn't valid: segments of letters, digits, '.', '_' or '-', separated by '/', none '.' or '..', at most 256 characters"
+	case "${CACHESERVICE_S3_PATH_STYLE:-}" in
+	"" | true | false) ;;
+	*) die "s3-path-style must be true, false or empty, not '$CACHESERVICE_S3_PATH_STYLE'" ;;
+	esac
+	case "${SIDECAR_VERBOSE:-false}" in
+	true | false | "") ;;
+	*) die "verbose must be true or false, not '$SIDECAR_VERBOSE'" ;;
+	esac
 	local var
 	for var in ENDPOINT REGION BUCKET ACCESS_KEY_ID SECRET_ACCESS_KEY; do
 		[[ -n "$(printenv "CACHESERVICE_S3_$var" || true)" ]] || die "the S3 setting CACHESERVICE_S3_$var is empty: pass it from the caller's secrets or variables"
@@ -229,13 +251,14 @@ start() {
 
 	# Up once it listens: it checked the bucket's ownership before that, and
 	# exits 1 or 2 on a refusal or a bad flag.
-	local i
-	for ((i = 0; i < wait; i++)); do
+	# Deadlines by the clock, not by tries: each try reads the log.
+	local deadline=$((SECONDS + wait)) up=false
+	while ((SECONDS < deadline)); do
 		running "$service" || { show_log "$service" 200; die "the service exited at startup (code $(docker inspect -f '{{.State.ExitCode}}' "$service"))"; }
-		log_has "$service" 'msg=listening addr=:8090' && break
+		log_has "$service" 'msg=listening addr=:8090' && { up=true; break; }
 		sleep 1
 	done
-	((i < wait)) || { show_log "$service" 200; die "the service didn't listen within ${wait}s"; }
+	[[ "$up" == true ]] || { show_log "$service" 200; die "the service didn't listen within ${wait}s"; }
 	echo "remote-cache-sidecar: the service listens at $url"
 
 	# GC off, as cmd/cacheservice/e2e runs its engines: the engine's state
@@ -253,6 +276,11 @@ start() {
 		mounts+=(-v "$SIDECAR_ENGINE_CA_FILE:/etc/ssl/certs/ca-certificates.crt:ro")
 	fi
 	echo "remote-cache-sidecar: starting the engine ($engine_image)"
+	# A new volume: never reuse (and then delete) one that is already there,
+	# such as a crashed job's on a self-hosted runner.
+	if timeout 30 docker volume inspect "$volume" >/dev/null 2>&1; then
+		die "the engine's state volume $volume already exists: remove it (docker volume rm $volume), or give this sidecar another name"
+	fi
 	timeout 60 docker volume create --label remote-cache-sidecar="$name" "$volume" >/dev/null ||
 		die "creating the volume $volume failed"
 	# The engine's settings, as cmd/cacheservice/e2e/engine.go starts it: the
@@ -265,13 +293,14 @@ start() {
 		-e DAGGER_CLOUD_URL="$url" \
 		-e DAGGER_CLOUD_TOKEN=sidecar-engine \
 		"$engine_image" --debug >/dev/null || die "starting the engine failed"
-	for ((i = 0; i < wait; i++)); do
+	deadline=$((SECONDS + wait)) up=false
+	while ((SECONDS < deadline)); do
 		running "$service" || { show_log "$service" 200; die "the service exited while the engine started"; }
 		running "$engine" || { show_log "$engine" 200; die "the engine exited at startup"; }
-		log_has "$service" 'msg="engine connected"' && break
+		log_has "$service" 'msg="engine connected"' && { up=true; break; }
 		sleep 1
 	done
-	((i < wait)) || { show_log "$engine" 100; show_log "$service" 100; die "the engine didn't connect to the service within ${wait}s"; }
+	[[ "$up" == true ]] || { show_log "$engine" 100; show_log "$service" 100; die "the engine didn't connect to the service within ${wait}s"; }
 	echo "remote-cache-sidecar: the engine is connected"
 
 	# The engine image's own CLI, which matches the engine.
@@ -289,9 +318,9 @@ start() {
 	cat >"$bin/dagger" <<EOF
 #!/usr/bin/env bash
 # Written by remote-cache-sidecar (.github/actions/remote-cache-sidecar).
-if [[ "\$(docker inspect -f '{{.State.Running}}' $q_service 2>/dev/null)" != true ]]; then
+if [[ "\$(timeout 30 docker inspect -f '{{.State.Running}}' $q_service 2>/dev/null)" != true ]]; then
 	echo "remote-cache-sidecar: the cache service $q_service isn't running" >&2
-	docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2
+	timeout 30 docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2
 	exit 1
 fi
 for v in \$(compgen -e); do
@@ -342,7 +371,7 @@ stop() {
 	fi
 	local failed=""
 
-	local was_running=false code="" started=false
+	local was_running=false code="" started=false still_running=false
 	[[ -f "$(dirname "$state")/started" ]] && started=true
 	if running "$st_service"; then
 		was_running=true
@@ -350,6 +379,12 @@ stop() {
 		# Bounded twice: docker stop sends SIGKILL at its --time, and the
 		# command itself can't outlive that by more than a minute.
 		timeout $((st_stop_seconds + 60)) docker stop --time "$st_stop_seconds" "$st_service" >/dev/null 2>&1 || true
+		# A docker stop that gave up (or was cut off) leaves the service
+		# running, with the exit code of a container that hasn't exited:
+		# never take that for a clean stop.
+		if running "$st_service"; then
+			still_running=true
+		fi
 	fi
 	if docker container inspect "$st_service" >/dev/null 2>&1; then
 		code="$(docker inspect -f '{{.State.ExitCode}}' "$st_service")"
@@ -374,7 +409,9 @@ stop() {
 		echo "remote-cache-sidecar: the drain, from the service's log:"
 		grep -E 'msg="?(stopping|drain|stopped|export stored)' "$st_logs/service.log" | tail -n 20 || true
 	fi
-	if [[ -z "$code" && "$started" != true ]]; then
+	if [[ "$still_running" == true ]]; then
+		failed="the service was still running after docker stop gave up: it was killed, and what it was exporting is lost"
+	elif [[ -z "$code" && "$started" != true ]]; then
 		# The start failed before it ran the service; its step said why.
 		echo "remote-cache-sidecar: the start didn't get as far as the service; cleaned up what it left"
 		return 0
@@ -402,6 +439,9 @@ stop() {
 	fi
 	echo "remote-cache-sidecar: stopped cleanly (exit 0). Logs: $st_logs"
 }
+
+# Sourced (by sidecar_test.sh), it only defines the functions.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case "${1:-}" in
 start) start ;;

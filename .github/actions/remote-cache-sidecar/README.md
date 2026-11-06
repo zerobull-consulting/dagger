@@ -46,8 +46,8 @@ takes, and the service and engine speak that commit's protocol.
 | `engine-image` | yes | | The engine image with the remote cache client, by the same SHA. Its own `dagger` CLI is the one set up. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
 | `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. |
-| `s3-prefix` | no | empty: the whole bucket | The prefix the service [owns](../../../cmd/cacheservice/README.md#bucket-ownership): nothing else may write under it. |
-| `s3-path-style` | no | the service's | `true` for path-style addressing, such as MinIO's. |
+| `s3-prefix` | no | empty: the whole bucket | The prefix the service [owns](../../../cmd/cacheservice/README.md#bucket-ownership): nothing else may write under it. Segments of letters, digits, `.`, `_` and `-`, separated by `/`, none of them `.` or `..`, with no leading or trailing `/`. |
+| `s3-path-style` | no | the service's | `true` for path-style addressing, such as MinIO's, or `false`. |
 | `namespace` | no | `default` | The namespace entries are stored in and imported from (`-scope`). Writers and readers that should share a cache use the same one. |
 | `drain-timeout` | no | `10m` | How long the stop lets the service finish its exports (`-drain-timeout`): hours, minutes and seconds, such as `10m` or `1h30m`. |
 | `name` | no | `remote-cache` | Prefix of the containers (`<name>-service`, `<name>-engine`), the engine's state volume and the network. Set another one to run a second sidecar in the same job after the first is stopped, and pass the same to `stop`. |
@@ -56,7 +56,8 @@ takes, and the service and engine speak that commit's protocol.
 | `verbose` | no | `false` | `true`: the service logs every cache span (`-v`); CI's demo counts them. |
 
 Every input that becomes a container name, a namespace, a path or a flag is
-validated before it is used. The S3 settings reach the service as
+validated before anything is created ([`sidecar_test.sh`](sidecar_test.sh)
+tests it). The S3 settings reach the service as
 environment variables passed by name, never on a command line, and the key
 is masked in the job's log.
 
