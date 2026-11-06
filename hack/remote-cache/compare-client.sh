@@ -14,7 +14,8 @@
 # the one the registry gives for that tag (the jobs run the digest, and this
 # compares the code of the tag). A registry or upstream that can't be
 # reached, or a compare that fails, is a warning, so a required check never
-# fails on it. The calling step bounds its time.
+# fails on it. The lookup and the fetch are bounded (2 and 5 minutes), and
+# the calling step bounds the whole.
 set -euo pipefail
 
 job="${1:?usage: compare-client.sh <job>}"
@@ -25,7 +26,7 @@ if [[ "${ref##*:}" != "$STOCK_ENGINE_TAG" ]]; then
   echo "::error::STOCK_ENGINE_TAG ($STOCK_ENGINE_TAG) isn't STOCK_ENGINE's tag (${ref##*:}); update them together"
   exit 1
 fi
-if digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
+if digest="$(timeout 120 docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
   if [[ "$digest" != "${STOCK_ENGINE##*@}" ]]; then
     echo "::error::$ref is $digest in the registry, not STOCK_ENGINE's ${STOCK_ENGINE##*@}; update the tag and the digest together"
     exit 1
@@ -33,7 +34,7 @@ if digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$
 else
   echo "::warning::couldn't resolve $ref in the registry; STOCK_ENGINE's digest wasn't checked against it"
 fi
-if ! git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
+if ! timeout 300 git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
   echo "::warning::couldn't fetch $STOCK_ENGINE_TAG from dagger/dagger; the engine's client wasn't compared"
   exit 0
 fi

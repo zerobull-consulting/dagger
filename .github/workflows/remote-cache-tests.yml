@@ -141,7 +141,7 @@ jobs:
       # STOCK_ENGINE's (run `E2E_BUILD_ENGINE=1 dev.sh e2e` to test it);
       # fails only on a pin that contradicts itself. See the script.
       - name: Compare the engine's client with the stock engine's
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: ./hack/remote-cache/compare-client.sh "the e2e"
       - name: Setup Go
         id: setup-go
@@ -228,7 +228,7 @@ jobs:
       # STOCK_ENGINE's; fails only on a pin that contradicts itself. See the
       # script.
       - name: Compare the engine's client with the stock engine's
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: ./hack/remote-cache/compare-client.sh "the sidecar demo"
       - name: Build the service's image, pull the engine's
         env:

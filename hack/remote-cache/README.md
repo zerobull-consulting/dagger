@@ -593,7 +593,7 @@ e2e-down` removes the engines and volumes later.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | The image's build context (`image/`), the CLI copied out of each engine image (`cli/<image ID>/`; another image's copy is removed once unused for a day), the binaries `E2E_BUILD_ENGINE=1` builds (`bin/`), and each run's files (`runs/`) |
-| `E2E_ENGINE_IMAGE` | `registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe…`, the workflow's `STOCK_ENGINE` | The release image the run's engine image is built on |
+| `E2E_ENGINE_IMAGE` | The workflow's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on |
 | `E2E_BUILD_ENGINE` | unset | `1` builds the engine, `dagger-init-session` and the CLI from this repo and copies them over `E2E_ENGINE_IMAGE` |
 | `E2E_SKIP_BUILD` | unset | With `E2E_BUILD_ENGINE=1`, `1` reuses the binaries in `E2E_DIR/bin`; without it, the run fails |
 | `E2E_IMAGE` | `dagger-remote-cache-e2e-engine` | The run's engine image's tag |
