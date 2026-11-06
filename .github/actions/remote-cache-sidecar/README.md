@@ -130,7 +130,8 @@ plus 10s: the service's whole stop takes at most `drain-timeout` plus 5s
 (see [Stopping and draining](../../../cmd/cacheservice/README.md#stopping-and-draining)).
 Then it stops the engine (within 30s: the engine's own stop waits to send
 its last cache event to the service, which is gone by then, so it is
-usually killed at 30s; its state goes with the job), keeps both logs (with presigned URLs' credentials
+usually killed at 30s; its state goes with the job:
+[zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)), keeps both logs (with presigned URLs' credentials
 and signatures redacted), and removes the containers, the engine's state
 volume and the network. Give the step a `timeout-minutes` above
 `drain-timeout` plus 5s, with room for the engine's 30s: 12 for `10m`.
@@ -148,6 +149,10 @@ Known gaps in the service's exit code and log:
 [zerobull-consulting/dagger#80](https://github.com/zerobull-consulting/dagger/issues/80)
 and
 [zerobull-consulting/dagger#81](https://github.com/zerobull-consulting/dagger/issues/81).
+Of the action: a read-only start doesn't wait for the service's first merge
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)),
+and the leads in
+[zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
 
 The stop's step summary has the exit code, and its log the drain's lines
 (`drain: stored`, `drain: done outcome=...`). The logs name the bucket and

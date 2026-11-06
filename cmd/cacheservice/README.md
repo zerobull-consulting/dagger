@@ -2447,7 +2447,8 @@ docker stop remote-cache-engine
 The engine's stop then waits to send its last cache event (`engine.stop`) to
 the service, which is gone, so `docker stop` kills it after its timeout
 (10s by default; the action gives it 30s). Its state is thrown away with the
-runner, so this costs only the time.
+runner, so this costs only the time
+([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
 
 - **The bound:** the service's whole stop, from SIGTERM to exit, takes at
   most `-drain-timeout` plus 5s (see
@@ -2479,7 +2480,8 @@ startup, exit 1, rather than running as a writer. Its drain has nothing to
 flush, so the stop is quick. The service merges what is stored as the
 engine connects, within a second or two; there's no signal for when that
 first merge is done, so a build that starts at once can miss what it hasn't
-merged yet.
+merged yet
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 
 - **DigitalOcean Spaces' `Read` key** hasn't been run against the service
   yet: this work's walk-through had no Spaces key, and CI's Spaces jobs use a
