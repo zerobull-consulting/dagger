@@ -398,9 +398,11 @@ bundle version, 3 in all of them). `v1.0.0-beta.23` has a different
 `dagql/cache.go`, `dagql/cache_egraph.go` and persistence code, so it isn't
 claimed. CI runs `v1.0.0-beta.25`, the `STOCK_ENGINE` pin in
 [`remote-cache-tests.yml`](../../.github/workflows/remote-cache-tests.yml)'s
-`sidecar` job, and warns when this branch's `engine/remotecache` or
-`cmd/engine/remotecache.go` differs from it; it doesn't diff the engine's
-cache files. The full check, against an upstream release tag:
+`sidecar` job, and warns when this branch's client differs from it: the job
+compares `engine/remotecache`, `cmd/engine/remotecache.go`,
+`engine/server/remote_cache*.go` and the bundle code in `dagql` with the
+release's, ignoring that constant. The wider check, over all of
+`dagql/cache*.go`, against an upstream release tag:
 
 ```bash
 git fetch --depth=1 https://github.com/dagger/dagger "refs/tags/<tag>:refs/tags/<tag>"
