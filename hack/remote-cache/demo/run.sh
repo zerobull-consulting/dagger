@@ -10,8 +10,10 @@
 # demo`, which starts MinIO where containers reach it. See README.md in this
 # directory.
 #
-# SERVICE_IMAGE and ENGINE_IMAGE are the images (default: the published
-# :feature-remote-cache tags). DEMO_PREFIX is the bucket prefix (default: a
+# SERVICE_IMAGE and ENGINE_IMAGE are the images (default: the service's
+# published :feature-remote-cache tag, and the stock engine release CI's
+# sidecar job runs, its STOCK_ENGINE, which that job checks this default
+# against). DEMO_PREFIX is the bucket prefix (default: a
 # new one under demo/), and DEMO_DIR where the logs go. CA_FILE, for a host
 # behind a TLS-intercepting proxy, is given to the engine.
 set -euo pipefail
@@ -21,7 +23,7 @@ repo="$(cd "$here/../../.." && pwd)"
 sidecar="$repo/.github/actions/remote-cache-sidecar/sidecar.sh"
 
 : "${SERVICE_IMAGE:=ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache}"
-: "${ENGINE_IMAGE:=ghcr.io/zerobull-consulting/dagger-engine:feature-remote-cache}"
+: "${ENGINE_IMAGE:=registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834}"
 run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 : "${DEMO_PREFIX:=demo/$run_id}"
 : "${DEMO_DIR:=${TMPDIR:-/tmp}/remote-cache-demo/$run_id}"

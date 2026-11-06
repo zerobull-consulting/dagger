@@ -172,29 +172,105 @@ jobs:
   # (the action, the demo, the stop, which drains), then a read-only phase on
   # a fresh engine (-export=false and MinIO's read-only user). check.sh counts
   # cache spans in the service's log: the cacheable step must be a hit with
-  # 0 executed, and the cache-volume step must rerun. Both images are built
-  # from this checkout, so a pull request tests its own code.
+  # 0 executed, and the cache-volume step must rerun. The service's image is
+  # built from this checkout, so a pull request tests its own service; the
+  # engine is a stock Dagger release (STOCK_ENGINE), whose remote cache
+  # client is the one users run.
   sidecar:
     name: sidecar demo
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # The release's multi-platform index, pinned by digest; update the tag
+      # and the digest together, and STOCK_ENGINE_TAG, demo/run.sh's default
+      # ENGINE_IMAGE and the docs' examples with them (a step below checks
+      # those).
+      #
+      # Temporary: this pairs the branch's service (internal/version/VERSION,
+      # v1.0.0-beta.26 in development) with the v1.0.0-beta.25 engine, a
+      # combination the lockstep policy doesn't support (a vX service serves
+      # only vX engines). It holds until zerobull-consulting/dagger#117, which
+      # repins this to the service's own release and adds a development
+      # override for branches that track main.
+      STOCK_ENGINE: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+      STOCK_ENGINE_TAG: v1.0.0-beta.25
     steps:
       - name: Checkout
         uses: actions/checkout@v5
       # sidecar.sh's validation and stop, against a fake docker.
       - name: Test the action's script
         run: ./.github/actions/remote-cache-sidecar/sidecar_test.sh
-      # As cacheservice-image.yml and engine-image.yml build them; the engine's
-      # CLI provisions this same image by default.
-      - name: Build the images
+      # A warning, not a failure: when this branch's engine side of the
+      # remote cache (merged from upstream main) differs from the stock
+      # engine's, this job doesn't test it, and STOCK_ENGINE should move to
+      # the release that has it once there is one. Only a pin that
+      # contradicts itself fails the step: a STOCK_ENGINE_TAG that isn't
+      # STOCK_ENGINE's own tag, or a digest that isn't the one the registry
+      # gives for that tag (the job runs the digest, and compares the code of
+      # the tag). A registry or upstream that can't be reached, or a compare
+      # that fails, is a warning, so the required check never fails on it.
+      - name: Compare the engine's client with the stock engine's
+        run: |
+          ref="${STOCK_ENGINE%@*}"
+          if [[ "${ref##*:}" != "$STOCK_ENGINE_TAG" ]]; then
+            echo "::error::STOCK_ENGINE_TAG ($STOCK_ENGINE_TAG) isn't STOCK_ENGINE's tag (${ref##*:}); update them together"
+            exit 1
+          fi
+          if digest="$(timeout 120 docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"; then
+            if [[ "$digest" != "${STOCK_ENGINE##*@}" ]]; then
+              echo "::error::$ref is $digest in the registry, not STOCK_ENGINE's ${STOCK_ENGINE##*@}; update the tag and the digest together"
+              exit 1
+            fi
+          else
+            echo "::warning::couldn't resolve $ref in the registry; STOCK_ENGINE's digest wasn't checked against it"
+          fi
+          if ! timeout 300 git fetch -q --depth=1 https://github.com/dagger/dagger "refs/tags/$STOCK_ENGINE_TAG:refs/tags/$STOCK_ENGINE_TAG"; then
+            echo "::warning::couldn't fetch $STOCK_ENGINE_TAG from dagger/dagger; the engine's client wasn't compared"
+            exit 0
+          fi
+          # The client, its adapter in the engine, and the bundles it moves.
+          paths=(
+            engine/remotecache cmd/engine/remotecache.go 'engine/server/remote_cache*.go'
+            dagql/cache_transfer_types.go dagql/cache_value_capture.go dagql/cache_value_import.go dagql/cache_stored_bundle.go
+            ':!**/*_test.go'
+          )
+          # Ignored: the fork's export of the bundle version
+          # (zerobull-consulting/dagger#116), and blank lines. The blank-line
+          # pattern can't match an empty string: one that could would ignore
+          # every change.
+          ignore='ValueBundleVersion|store of bundles checks it|^[[:space:]]+$'
+          rc=0
+          git diff --quiet -I"$ignore" "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}" || rc=$?
+          case "$rc" in
+          0) echo "the engine's side of the remote cache is $STOCK_ENGINE_TAG's" ;;
+          1)
+            echo "::warning::the engine's side of the remote cache differs from $STOCK_ENGINE_TAG's, which this job runs:"
+            git diff --stat -I"$ignore" "$STOCK_ENGINE_TAG" HEAD -- "${paths[@]}" || true
+            ;;
+          *) echo "::warning::couldn't compare the engine's client with $STOCK_ENGINE_TAG's (git diff exited $rc)" ;;
+          esac
+      # dev.sh demo runs the engine this job does: run.sh's default is this
+      # pin, as one literal line. Every digest-pinned stock engine the remote
+      # cache's docs and scripts name is this pin too, so a bump can't leave
+      # an example behind.
+      - name: Check the demo's default engine and the docs' examples are STOCK_ENGINE
+        run: |
+          want=": \"\${ENGINE_IMAGE:=$STOCK_ENGINE}\""
+          grep -qxF "$want" hack/remote-cache/demo/run.sh ||
+            { echo "::error file=hack/remote-cache/demo/run.sh::its default ENGINE_IMAGE isn't STOCK_ENGINE ($STOCK_ENGINE)"; exit 1; }
+          stale="$(grep -rnoE 'registry\.dagger\.io/engine:[^ "`)]*@sha256:[0-9a-f]{64}' \
+            hack/remote-cache cmd/cacheservice .github/actions/remote-cache-sidecar | grep -vF ":$STOCK_ENGINE" || true)"
+          [[ -z "$stale" ]] || { echo "::error::pinned engines other than STOCK_ENGINE ($STOCK_ENGINE):"; echo "$stale"; exit 1; }
+      # The service as cacheservice-image.yml builds it; the engine pulled
+      # alongside, bounded as the action's own pull is (15 minutes).
+      - name: Build the service's image, pull the engine's
         env:
           REVISION: ${{ github.sha }}
         run: |
+          timeout 900 docker pull -q "$STOCK_ENGINE" &
           docker build -f cmd/cacheservice/Dockerfile \
             --build-arg REVISION="$REVISION" -t cacheservice:ci .
-          docker build -f hack/remote-cache/engine.Dockerfile \
-            --build-arg REVISION="$REVISION" --build-arg ENGINE_IMAGE=dagger-engine:ci \
-            -t dagger-engine:ci .
+          wait $!
       # MinIO on the Docker bridge gateway, where the sidecar's containers
       # reach it, with a read-only user for the demo's prefix (demo/). The
       # credentials are MinIO's committed dev ones.
@@ -208,7 +284,7 @@ jobs:
           role: writer
           name: demo-writer
           service-image: cacheservice:ci
-          engine-image: dagger-engine:ci
+          engine-image: ${{ env.STOCK_ENGINE }}
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
@@ -256,7 +332,7 @@ jobs:
           role: read-only
           name: demo-reader
           service-image: cacheservice:ci
-          engine-image: dagger-engine:ci
+          engine-image: ${{ env.STOCK_ENGINE }}
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
