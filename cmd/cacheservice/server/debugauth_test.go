@@ -263,7 +263,7 @@ func TestDebugTokenFileRefused(t *testing.T) {
 			if strings.Contains(err.Error(), "tok-a-is-also") {
 				t.Fatalf("the error shows the token: %v", err)
 			}
-			if svc.DebugTokenSet() {
+			if svc.debug.hash.Load() != nil {
 				t.Fatal("a refused file set a token")
 			}
 		})

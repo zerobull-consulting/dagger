@@ -1566,11 +1566,15 @@ admin token guards it
 - **Never an engine token.** A debug token that the tokens file maps too is
   refused at startup and on reload, and refused per request if a later
   tokens reload adds it.
-- **When it is required.** The service refuses to start (exit 2, naming
-  `-debug-token-file`) without one when `-tokens-file` is set, since an
-  authenticated service shouldn't have an unauthenticated side door, or when
-  `-debug-listen` isn't a loopback address (`127.0.0.1`, `::1`, `localhost`;
-  `:8091` and `0.0.0.0:8091` are every interface). A loopback
+- **When it is required.** With `-tokens-file`, since an authenticated
+  service shouldn't have an unauthenticated side door: the service refuses
+  to start (exit 2, naming `-debug-token-file`) with an explicit
+  `-debug-listen` and no token, and with the default one turns the debug API
+  off, logging `debug API off`, so a service that never used it keeps
+  starting. And when `-debug-listen` isn't loopback: a loopback IP, or a
+  name, such as `localhost`, that resolves to loopback IPs only (`:8091`
+  and `0.0.0.0:8091` are every interface); it refuses to start without a
+  token. A loopback
   `-debug-listen` without `-tokens-file` may stay open, for local
   development; the service then logs a warning,
   `UNAUTHENTICATED debug API on 127.0.0.1:8091`. In-process, a service with
@@ -1581,14 +1585,15 @@ admin token guards it
   the token loaded before, logging an error: it never turns the check off.
   Errors never show the file's content.
 - **Refusals** are logged with the method, path and remote address, never
-  the token: at warning level at most once a minute per remote host, and 10
-  times a minute in all, then at debug level. `auth_rejected_total{endpoint="debug"}`
+  the token: at warning level at most once a minute per remote host and
+  reason, and 10 times a minute in all, then at debug level. `auth_rejected_total{endpoint="debug"}`
   counts them all.
 - **Rotation.** Write the new token to the file and send SIGHUP: from then
   on the new one works, and the old one doesn't.
 
 ```bash
-curl -s -H "Authorization: Bearer $(cat debug-token)" localhost:8091/debug/engines
+# The header from a file descriptor, so the token is on no command line.
+curl -s -H @<(printf 'Authorization: Bearer %s\n' "$(cat debug-token)") localhost:8091/debug/engines
 ```
 
 An admin sees every namespace: there is no per-namespace debug access.
@@ -2649,7 +2654,7 @@ For a local S3-compatible store (MinIO), see
    ```
 
    With `-debug-token-file`, add the token to each request:
-   `curl -s -H "Authorization: Bearer $(cat debug-token)" localhost:8091/debug/engines`.
+   `curl -s -H @<(printf 'Authorization: Bearer %s\n' "$(cat debug-token)") localhost:8091/debug/engines`.
 
    Take entry numbers from the `result` fields of the `cache span` log lines.
    Cache spans arrive only when the CLI itself has Cloud telemetry configured,

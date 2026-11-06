@@ -257,7 +257,9 @@ start() {
 		# mounted read-only, never on a command line or in the container's
 		# environment. The file is readable by the service's UID (65532);
 		# its directory only by this user.
-		local secrets="$dir/secrets" token
+		# Absolute: docker takes a relative -v source for a volume name.
+		local secrets token
+		secrets="$(cd "$dir" && pwd)/secrets"
 		token_file="$secrets/debug-token"
 		[[ "$token_file" != *:* ]] || die "the sidecar's directory $dir has a ':'"
 		mkdir -p "$secrets" && chmod 700 "$secrets" || die "creating $secrets failed"

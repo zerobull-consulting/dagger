@@ -260,6 +260,11 @@ check "debug-port: published on the host's loopback only" grep -qxF -- "127.0.0.
 check "debug-port: the token is on no command line" not grep -qF -- "$dbg_token" <<<"$dbg_args"
 check "debug-port: nor in the start's output" not grep -qF -- "$dbg_token" <<<"$debug_out"
 check "without debug-port: no token" bash -c "$(declare -f fake_start); tmp='$tmp'; source '$here/sidecar.sh'; set +e; fake_start dbgbin SIDECAR_NAME=nodebug >/dev/null; ! grep -q -- -debug-token-file '$tmp/dbgbin.fake/service.args' && [ ! -e '$tmp/dbgbin.sc/nodebug/secrets' ]"
+relative_dir_absolute() {
+	(cd "$tmp" && fake_start dbgbin SIDECAR_NAME=rel SIDECAR_DIR=rel.sc SIDECAR_DEBUG_PORT=8091) >/dev/null
+	grep -qxF -- "$tmp/rel.sc/rel/secrets/debug-token:/run/secrets/debug-token:ro" "$tmp/dbgbin.fake/service.args"
+}
+check "debug-port: a relative SIDECAR_DIR still mounts the token by an absolute path" relative_dir_absolute
 # The stop removes the token.
 mkdir -p "$tmp/sc/t/secrets" && echo x >"$tmp/sc/t/secrets/debug-token"
 stop_with false 0

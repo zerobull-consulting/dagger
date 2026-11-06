@@ -75,12 +75,18 @@ docker network create "$net" >/dev/null
 # only. :8091 isn't loopback in the container, so an image that knows
 # -debug-token-file requires one: a token for this run, in a file mounted
 # read-only (readable by the image's UID, 65532), never on a command line.
+# The help is read whole before it is searched: grep -q stopping early
+# could fail the pipeline (pipefail), and make a new image look old.
 token_args=() auth=()
-if docker run --rm "$service_image" -h 2>&1 | grep -q -- -debug-token-file; then
+help="$(docker run --rm "$service_image" -h 2>&1 || true)"
+if grep -q -- -debug-token-file <<<"$help"; then
 	chmod 700 "$secrets"
 	(umask 022 && od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$secrets/debug-token")
 	token_args=(-v "$secrets/debug-token:/run/secrets/debug-token:ro")
-	auth=(-H "Authorization: Bearer $(cat "$secrets/debug-token")")
+	# curl reads the header from a file, so the token is on no command
+	# line (printf is a builtin).
+	printf 'Authorization: Bearer %s\n' "$(cat "$secrets/debug-token")" >"$secrets/auth-header"
+	auth=(-H "@$secrets/auth-header")
 fi
 docker run -d --name "$service" --network "$net" -p 127.0.0.1::8091 "${token_args[@]}" \
 	"$service_image" -debug-listen :8091 ${token_args:+-debug-token-file /run/secrets/debug-token} >/dev/null ||

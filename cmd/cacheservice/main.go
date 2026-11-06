@@ -42,10 +42,11 @@
 //     lists the connected engines and sends a request to one, to probe
 //     what the engine answers. With -debug-token-file, every request to it
 //     must carry that file's token as `Authorization: Bearer <token>` (401
-//     otherwise); SIGHUP reloads it. The service refuses to start without
-//     one when -tokens-file is set, or when -debug-listen isn't a loopback
-//     address. Only a loopback -debug-listen without -tokens-file may be
-//     left open, with a warning. See README.md, "The debug API".
+//     otherwise); SIGHUP reloads it. Without one, with -tokens-file, the
+//     default -debug-listen is off and an explicit one is refused; a
+//     -debug-listen that isn't loopback is refused too. Only a loopback
+//     -debug-listen without -tokens-file may be left open, with a warning.
+//     See README.md, "The debug API".
 //
 //     GET  /debug/engines
 //     POST /debug/engines/{conn}/request?type=export   (body: the request body)
@@ -150,7 +151,7 @@ func main() {
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
 	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the debug API (empty: off); a non-loopback address needs -debug-token-file")
-	flag.StringVar(&debugToken, "debug-token-file", "", "file holding the debug API's admin token, required as 'Authorization: Bearer <token>'; SIGHUP reloads it. Required with -tokens-file, or a non-loopback -debug-listen (empty: the debug API is open, on loopback only)")
+	flag.StringVar(&debugToken, "debug-token-file", "", "file holding the debug API's admin token, required as 'Authorization: Bearer <token>'; SIGHUP reloads it. Required for a non-loopback -debug-listen; with -tokens-file and none, the default -debug-listen is off and an explicit one is refused (empty: the debug API is open, on loopback only)")
 	flag.StringVar(&metricsListen, "metrics-listen", "", "address serving only the Prometheus metrics at /metrics (empty: off; the debug API serves them too)")
 	flag.StringVar(&dumpDir, "dump-dir", "", "write every envelope and engine event body to this directory")
 	flag.BoolVar(&verbose, "v", false, "log pings and every cache span")
@@ -197,7 +198,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := checkDebugListen(debugListen, debugToken, tokensFile); err != nil {
+	debugListen, err := checkDebugListen(debugListen, debugToken, tokensFile, explicitFlags()["debug-listen"], logger)
+	if err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
 	}
@@ -497,42 +499,60 @@ func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, time
 	<-done
 }
 
-// checkDebugListen refuses a debug API that would be open where it
-// shouldn't be: with -tokens-file, since an authenticated service has no
-// unauthenticated side door, or on an address that isn't loopback. It also
-// refuses -debug-token-file without -debug-listen, which would do nothing.
-func checkDebugListen(debugListen, debugToken, tokensFile string) error {
+// checkDebugListen returns the debug address to listen on, and refuses a
+// debug API that would be open where it shouldn't be: with -tokens-file,
+// since an authenticated service has no unauthenticated side door, or on an
+// address that isn't loopback. With -tokens-file and the default address
+// (explicit false), it turns the debug API off with a warning instead, so
+// a service that never used the debug API keeps starting. It also refuses
+// -debug-token-file without -debug-listen, which would do nothing.
+func checkDebugListen(debugListen, debugToken, tokensFile string, explicit bool, logger *slog.Logger) (string, error) {
 	if debugListen == "" {
 		if debugToken != "" {
-			return errors.New("-debug-token-file without -debug-listen: the debug API is off; drop -debug-token-file, or set -debug-listen")
+			return "", errors.New("-debug-token-file without -debug-listen: the debug API is off; drop -debug-token-file, or set -debug-listen")
 		}
-		return nil
+		return "", nil
 	}
 	if debugToken != "" {
-		return nil
+		return debugListen, nil
 	}
 	if tokensFile != "" {
-		return errors.New("-tokens-file without -debug-token-file: the debug API would be open on a service that authenticates engines; set -debug-token-file, or turn the debug API off with -debug-listen=")
+		if !explicit {
+			logger.Warn("debug API off: -tokens-file is set and -debug-token-file isn't, and an authenticated service has no unauthenticated debug API. " +
+				"Set -debug-token-file to turn it on.")
+			return "", nil
+		}
+		return "", errors.New("-tokens-file without -debug-token-file: the debug API would be open on a service that authenticates engines; set -debug-token-file, or turn the debug API off with -debug-listen=")
 	}
 	if !loopbackAddr(debugListen) {
-		return fmt.Errorf("-debug-listen %q isn't a loopback address, and there is no -debug-token-file: anything that reaches it could run exports, imports and garbage collection; set -debug-token-file, or listen on 127.0.0.1", debugListen)
+		return "", fmt.Errorf("-debug-listen %q isn't a loopback address, and there is no -debug-token-file: anything that reaches it could run exports, imports and garbage collection; set -debug-token-file, or listen on 127.0.0.1", debugListen)
 	}
-	return nil
+	return debugListen, nil
 }
 
 // loopbackAddr reports whether a listen address binds only loopback: a
-// loopback IP, or localhost. An empty host is every interface; any other
-// name may resolve to anything.
+// loopback IP, or a name, such as localhost, that resolves to loopback IPs
+// only. An empty host is every interface.
 func loopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
+	if err != nil || host == "" {
 		return false
 	}
-	if host == "localhost" {
-		return true
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if !ip.IP.IsLoopback() {
+			return false
+		}
+	}
+	return true
 }
 
 // explicitFlags returns the flags set on the command line, by name.

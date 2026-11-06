@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,29 +31,20 @@ const (
 
 // debugToken is the admin token of the debug API, kept as its SHA-256 hash.
 type debugToken struct {
-	// mu serializes UseDebugTokenFile and ReloadDebugToken, and guards
-	// the fields.
-	mu   sync.Mutex
-	path string
-	hash *[sha256.Size]byte
+	// loadMu serializes UseDebugTokenFile and ReloadDebugToken, and guards
+	// path. Requests never take it: they read hash, so a reload blocked on
+	// its file holds up no request.
+	loadMu sync.Mutex
+	path   string
+	hash   atomic.Pointer[[sha256.Size]byte]
 	// rejections rate-limits the logs of refused debug requests, by remote
-	// host.
+	// host and reason.
 	rejections rejectionLog
 }
 
-// ParseDebugToken reads the content of a debug token file: one token, with
+// parseDebugToken reads the content of a debug token file: one token, with
 // white space around it ignored, of at least MinDebugTokenLength printable
-// ASCII characters and no white space. It returns the token's SHA-256 hash.
-// Errors never include the file's content.
-func ParseDebugToken(data []byte) ([sha256.Size]byte, error) {
-	token, err := parseDebugToken(data)
-	if err != nil {
-		return [sha256.Size]byte{}, err
-	}
-	return sha256.Sum256(token), nil
-}
-
-// parseDebugToken is ParseDebugToken, returning the token itself.
+// ASCII characters and no white space. Errors never include the content.
 func parseDebugToken(data []byte) ([]byte, error) {
 	if len(data) > MaxDebugTokenFileSize {
 		return nil, fmt.Errorf("debug token file: over %d bytes; it holds one token", MaxDebugTokenFileSize)
@@ -72,17 +64,8 @@ func parseDebugToken(data []byte) ([]byte, error) {
 	return token, nil
 }
 
-// LoadDebugTokenFile reads a debug token file (see ParseDebugToken), at most
+// readDebugToken reads a debug token file (see parseDebugToken), at most
 // MaxDebugTokenFileSize bytes of it.
-func LoadDebugTokenFile(path string) ([sha256.Size]byte, error) {
-	token, err := readDebugToken(path)
-	if err != nil {
-		return [sha256.Size]byte{}, err
-	}
-	return sha256.Sum256(token), nil
-}
-
-// readDebugToken is LoadDebugTokenFile, returning the token itself.
 func readDebugToken(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -103,13 +86,14 @@ func readDebugToken(path string) ([]byte, error) {
 // refused: the debug API is never left open, or opened by an engine token,
 // because of it.
 func (s *Service) UseDebugTokenFile(path string) error {
-	s.debug.mu.Lock()
-	defer s.debug.mu.Unlock()
+	s.debug.loadMu.Lock()
+	defer s.debug.loadMu.Unlock()
 	hash, err := s.loadDebugToken(path)
 	if err != nil {
 		return err
 	}
-	s.debug.path, s.debug.hash = path, &hash
+	s.debug.path = path
+	s.debug.hash.Store(&hash)
 	s.logger.Info("debug token loaded", "file", path)
 	return nil
 }
@@ -118,8 +102,8 @@ func (s *Service) UseDebugTokenFile(path string) error {
 // token works from now on, and the old one no longer does. A file that can't
 // be read or parsed changes nothing: the token loaded before stays.
 func (s *Service) ReloadDebugToken() error {
-	s.debug.mu.Lock()
-	defer s.debug.mu.Unlock()
+	s.debug.loadMu.Lock()
+	defer s.debug.loadMu.Unlock()
 	if s.debug.path == "" {
 		return errors.New("the service has no debug token file")
 	}
@@ -128,7 +112,7 @@ func (s *Service) ReloadDebugToken() error {
 		s.logger.Error("debug token not reloaded; the token loaded before stays", "file", s.debug.path, "error", err)
 		return err
 	}
-	s.debug.hash = &hash
+	s.debug.hash.Store(&hash)
 	s.logger.Info("debug token reloaded", "file", s.debug.path)
 	return nil
 }
@@ -160,13 +144,6 @@ func (s *Service) isEngineToken(token string) bool {
 	return ok
 }
 
-// DebugTokenSet reports whether the debug API requires a token.
-func (s *Service) DebugTokenSet() bool {
-	s.debug.mu.Lock()
-	defer s.debug.mu.Unlock()
-	return s.debug.hash != nil
-}
-
 // debugAuth requires the debug token on every request to next. Without a
 // debug token, it lets every request through, unless the service checks
 // engine tokens: an authenticated service has no unauthenticated side door,
@@ -174,9 +151,7 @@ func (s *Service) DebugTokenSet() bool {
 // `WWW-Authenticate: Bearer` and no detail, and reaches nothing.
 func (s *Service) debugAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.debug.mu.Lock()
-		want := s.debug.hash
-		s.debug.mu.Unlock()
+		want := s.debug.hash.Load()
 		if want == nil {
 			if !s.authenticated() {
 				next.ServeHTTP(w, r)
@@ -220,16 +195,17 @@ func bearerToken(r *http.Request) (string, bool) {
 }
 
 // rejectDebug answers 401 to a debug request. Refusals are logged at warning
-// level at most once a minute per remote host, and rejectionWarnings times a
-// minute in all; the others at debug level. The log names the route and the
-// remote address, never the token.
+// level at most once a minute per remote host and reason (msg), so a probe
+// doesn't hide a lockout's reason, and rejectionWarnings times a minute in
+// all; the others at debug level. The log names the route and the remote
+// address, never the token.
 func (s *Service) rejectDebug(w http.ResponseWriter, r *http.Request, msg string) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	level := slog.LevelDebug
-	if s.debug.rejections.allow(host, time.Now()) {
+	if s.debug.rejections.allow(msg+"\x00"+host, time.Now()) {
 		level = slog.LevelWarn
 	}
 	s.logger.Log(r.Context(), level, msg, "endpoint", endpointDebug, "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)

@@ -114,7 +114,9 @@ the `debug-token-file` output is the file's path. The stop removes the file.
   env:
     PORT: "8091"
     TOKEN_FILE: ${{ steps.sidecar.outputs.debug-token-file }}
-  run: curl -fsS -H "Authorization: Bearer $(cat "$TOKEN_FILE")" "http://127.0.0.1:$PORT/debug/engines"
+  # curl reads the header from a file descriptor, so the token is on no
+  # command line (printf is a bash builtin).
+  run: curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")") "http://127.0.0.1:$PORT/debug/engines"
 ```
 
 A request without the token, or with another, gets 401. Before this,
