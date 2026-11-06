@@ -2295,8 +2295,231 @@ An engine that connects to it is published next to it, as
 
 With a bucket, a pull-request job's instance adds `-export=false` and a
 read-only key (see [Read-only instances](#read-only-instances)). Running it
-as a sidecar next to an engine in CI is
-[#75](https://github.com/zerobull-consulting/dagger/issues/75).
+as a sidecar next to an engine in CI is the next section.
+
+## Running it as a sidecar
+
+On an ephemeral CI runner, each job runs the service next to its own engine,
+unauthenticated, on the runner's private Docker network, talking to the
+bucket directly
+([zerobull-consulting/dagger#75](https://github.com/zerobull-consulting/dagger/issues/75)).
+There's no endpoint to host. Concurrent jobs are replicas of each other,
+which the service is safe for.
+
+On GitHub Actions, use the composite action, which does everything below
+([`.github/actions/remote-cache-sidecar`](../../.github/actions/remote-cache-sidecar/README.md)):
+
+```yaml
+- uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar@<commit SHA>
+  with:
+    role: writer                    # read-only in pull-request jobs
+    service-image: ghcr.io/zerobull-consulting/cacheservice:<commit SHA>
+    engine-image: ghcr.io/zerobull-consulting/dagger-engine:<commit SHA>
+    s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
+    s3-region: ${{ vars.CACHE_S3_REGION }}
+    s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
+    s3-prefix: cache
+    s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
+    s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
+- run: dagger call build                # any dagger command: the action set up the CLI
+- if: always()
+  timeout-minutes: 12                   # above the drain timeout (10m) plus 5s
+  uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
+```
+
+Pin the action and both images to the same commit of `feature/remote-cache`.
+The [demo](../../hack/remote-cache/demo/README.md) is a small project that
+shows what the sidecar carries and what it doesn't; CI runs it through the
+action on every pull request (the `sidecar demo` job), so this section, the
+action and the demo stay in agreement. Locally, `hack/remote-cache/dev.sh
+demo` runs it against MinIO.
+
+Elsewhere, these are the steps the action runs
+([`sidecar.sh`](../../.github/actions/remote-cache-sidecar/sidecar.sh) is the
+action's script, and runs outside GitHub too).
+
+**1. The network.** One Docker network for the service and the engine.
+The service's port is published on the network's gateway, a host address
+only this runner reaches, so the engine (in a container) and the CLI (on the
+runner) reach it at the same URL. They must: the engine sends the session's
+spans to the CLI's `DAGGER_CLOUD_URL` (see
+[ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md#who-publishes-them-and-where)).
+
+```bash
+docker network create remote-cache-net
+gw="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' remote-cache-net)"
+```
+
+**2. The service**, by tag, with the bucket's `CACHESERVICE_S3_*` variables
+passed by name (`-e NAME`, so their values aren't on a command line):
+
+```bash
+export CACHESERVICE_S3_ENDPOINT=... CACHESERVICE_S3_REGION=... CACHESERVICE_S3_BUCKET=...
+export CACHESERVICE_S3_PREFIX=cache CACHESERVICE_S3_ACCESS_KEY_ID=... CACHESERVICE_S3_SECRET_ACCESS_KEY=...
+export CACHESERVICE_S3_PATH_STYLE=true   # MinIO; leave it unset for Spaces or AWS
+docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::8090" \
+  -e CACHESERVICE_S3_ENDPOINT -e CACHESERVICE_S3_REGION -e CACHESERVICE_S3_BUCKET \
+  -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
+  -e CACHESERVICE_S3_PATH_STYLE \
+  ghcr.io/zerobull-consulting/cacheservice:<commit SHA> \
+  -scope default -drain-timeout 10m -gc-interval=0
+url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
+```
+
+- **No `-tokens-file`**: the service is unauthenticated, and every engine is
+  in the `-scope` namespace. That is fine on a runner's private network, and
+  only there: anything that reaches the port can read and add to the
+  namespace. Its OTLP bodies are bounded either way (see
+  [OTLP limits](#otlp-limits)); `cacheservice_otlp_refused_total` should stay
+  at 0 for a sidecar's engines.
+- **`-gc-interval=0`** on writers: scheduled GC belongs to a job of its own
+  ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
+- **`-drain-timeout 10m`**: the stop's chance to store what the job built
+  (see step 4).
+- **The debug API**, when wanted: `-debug-listen :8091` with
+  `-p 127.0.0.1:8091:8091`, on the runner's loopback only. It is
+  unauthenticated.
+- It is up once it logs `msg=listening addr=:8090`: it checked the prefix's
+  ownership before that, and exits 1 (a store error, such as a prefix it
+  doesn't own) or 2 (a flag error) instead. Fail the job if it exits, with
+  its log.
+
+**3. The engine and the CLI.** The engine image with the remote cache client
+(see [Engine image](../../hack/remote-cache/README.md#engine-image)), with
+the settings `cmd/cacheservice/e2e` starts its engines with:
+
+```bash
+echo '{"gc": {"enabled": false}, "registries": {"docker.io": {"mirrors": ["mirror.gcr.io"]}}}' >engine.json
+docker run -d --privileged --name remote-cache-engine --network remote-cache-net \
+  -v remote-cache-engine-state:/var/lib/dagger -v "$PWD/engine.json:/etc/dagger/engine.json:ro" \
+  -e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
+  -e DAGGER_CLOUD_URL="$url" \
+  -e DAGGER_CLOUD_TOKEN=sidecar-engine \
+  ghcr.io/zerobull-consulting/dagger-engine:<commit SHA> --debug
+```
+
+- `DAGGER_CLOUD_TOKEN` is a placeholder (any string but `oidc`): without a
+  token the remote cache client stays off. `DAGGER_CLOUD_URL` sends the
+  engine's cache events to the service too.
+- **The engine's GC is off**: its state ends with the job, and with GC on it
+  can prune entries right after their session, before the service exports
+  them. That happened in this work's walk-through, on a host whose disk
+  looked full: the cacheable step's entry was pruned, and the read-only
+  phase missed it. The job's disk bounds the engine instead.
+- The service logs `msg="engine connected"` when the engine is connected.
+
+Then the CLI: the engine image's own, which matches the engine, with the
+Cloud settings that make the engine publish the session's spans to the
+service, and no inherited trace:
+
+```bash
+docker cp remote-cache-engine:/usr/local/bin/dagger ./dagger
+# As cmd/cacheservice/e2e runs its CLI: no inherited trace, and no OTEL_* or
+# DAGGER_* settings of the caller's.
+unset $(compgen -e | grep -E '^(TRACEPARENT|TRACESTATE|OTEL_|DAGGER_|_EXPERIMENTAL_DAGGER_)')
+env _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://remote-cache-engine \
+  DAGGER_CLOUD_URL="$url" DAGGER_CLOUD_TOKEN=sidecar-cli \
+  ./dagger call build
+```
+
+**A CLI without `DAGGER_CLOUD_URL` and `DAGGER_CLOUD_TOKEN`, or one that
+inherits an unsampled `TRACEPARENT`, exports nothing, silently.** The
+service learns entries only from session spans (see
+[ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md)). Some CI runners and sandboxes
+export `TRACEPARENT=00-…-00` to every process; the CLI continues that
+unsampled trace, records no span, and the service never hears of an entry
+(see [Real-engine run](#real-engine-run)). The action puts a `dagger` first
+on `PATH` that unsets `TRACEPARENT`, `TRACESTATE`, `OTEL_*`, `DAGGER_*` and
+`_EXPERIMENTAL_DAGGER_*`, then sets the three variables, whatever a later step's environment holds. Any other CLI
+needs the same.
+
+**4. The stop**, at the end of the job, whatever happened before it
+(`if: always()`): the service first, then the engine. The drain's exports
+run over the engine's connection, and the engine uploads the layers itself,
+so an engine stopped first takes them with it.
+
+```bash
+docker stop --time 610 remote-cache-service    # above -drain-timeout (10m) plus 5s
+docker inspect -f '{{.State.ExitCode}}' remote-cache-service
+docker stop remote-cache-engine
+```
+
+The engine's stop then waits to send its last cache event (`engine.stop`) to
+the service, which is gone, so `docker stop` kills it after its timeout
+(10s by default; the action gives it 30s). Its state is thrown away with the
+runner, so this costs only the time
+([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
+
+- **The bound:** the service's whole stop, from SIGTERM to exit, takes at
+  most `-drain-timeout` plus 5s (see
+  [Stopping and draining](#stopping-and-draining)). `docker stop --time`, and
+  the CI step's own timeout, must be above that, or the service is killed
+  mid-drain (exit 137). With `10m`, give `docker stop` 610s, and the step
+  12 minutes: the action's stop does both, and the caller sets the step's
+  `timeout-minutes`.
+- **Exit codes:** 0 for a clean stop; 1 when the bound cut work off (logged
+  as `the shutdown's bound passed with work still running`, with what was
+  running), when a signal arrived during the shutdown, or when an HTTP
+  server failed; 137 when `docker stop` killed it. The action's stop fails
+  the step on anything but 0, and on a service that exited before the stop,
+  with the service's log. Known gaps:
+  [zerobull-consulting/dagger#80](https://github.com/zerobull-consulting/dagger/issues/80)
+  (a server failure racing the stop's end can leave 0), and
+  [zerobull-consulting/dagger#81](https://github.com/zerobull-consulting/dagger/issues/81)
+  (an unclean stop is always logged as the bound passing).
+- The drain logs what it stored (`drain: stored`) and its outcome
+  (`drain: done outcome=complete`). Most exports are stored before it:
+  within about 2s of each session's end.
+
+**Pull-request jobs:** the same, with `-export=false` instead of
+`-gc-interval=0` (GC is off anyway, and an explicit nonzero `-gc-interval`
+is refused), and a read-only key (see
+[A read-only key](#a-read-only-key)): `s3:GetObject` and `s3:ListBucket` on
+the prefix. A job that forgets `-export=false` with that key fails at
+startup, exit 1, rather than running as a writer. Its drain has nothing to
+flush, so the stop is quick. The service merges what is stored as the
+engine connects, within a second or two; there's no signal for when that
+first merge is done, so a build that starts at once can miss what it hasn't
+merged yet
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
+
+- **DigitalOcean Spaces' `Read` key** hasn't been run against the service
+  yet: this work's walk-through had no Spaces key, and CI's Spaces jobs use a
+  read/write one. What MinIO confirms of the read-only key, and what
+  Spaces documents, is in [A read-only key](#a-read-only-key).
+
+**The prefix is the service's** (see [Bucket ownership](#bucket-ownership)):
+nothing else may write under `CACHESERVICE_S3_PREFIX`, including another
+service on a prefix nested inside it, or a console folder placeholder. The
+first writer on an empty prefix claims it (`<prefix>/cacheservice.json`); a
+read-only instance on an empty one starts, logs `no store exists under the
+prefix yet`, and imports nothing. Every instance refuses, with exit 1, a
+prefix of another layout or one holding keys and no marker. Across a layout
+change, wipe the prefix or use a new one (see
+[Changing layouts](#changing-layouts)).
+
+**What the remote cache doesn't carry: cache volumes.** It stores cache
+entries, the layers of a step's result; the contents of cache volumes
+(`withMountedCache`) stay on the engine that wrote them. So a step that
+relies on another step's cache-volume state reruns that work on a fresh
+runner, even when the step that filled the volume is a cache hit: the hit
+means it never ran there, and the volume is empty. The sample
+implementation's Android build measured it
+([zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1),
+"What the runs measured"): with the native layer from the remote cache, a
+JS-only build on a fresh runner took 14.7–21.8 minutes of Gradle time
+against 1.9–2.7 on the warm writer, and 60–67% of what the warm state saved
+was CMake tasks recompiling with an empty ccache, the rest mostly Gradle
+build-cache misses with an empty Gradle user home, both cache volumes.
+Unchanged builds were fully served. **What to do instead:** make that state
+an output of a cacheable step (a directory in its container, which the
+remote cache carries) rather than a cache volume. The demo's cache-volume
+step shows the limit, and CI checks that it reruns.
+
+The service's and the engine's logs name the bucket and the prefix, and the
+engine's can hold presigned URLs; the action's stop redacts their
+credentials and signatures from the logs it keeps, but treat them as
+internal.
 
 ## Running it against a local engine
 

@@ -28,6 +28,8 @@ the settings. Data persists in the `dagger-remote-cache_minio-data` volume.
 | `dev.sh test` | Start MinIO and run the Go tests against it, or any bucket with `CACHESERVICE_TEST_EXTERNAL=1` ([Testing against a real bucket](#testing-against-a-real-bucket)). |
 | `dev.sh e2e` | Start MinIO and run the remote cache with real engines, and its scenarios (`cmd/cacheservice/e2e`). See [Real engines](#real-engines-devsh-e2e). |
 | `dev.sh e2e-down` | Remove the engine containers and volumes a run with `E2E_KEEP=1` left. |
+| `dev.sh demo` | Start MinIO where containers reach it and run the sidecar demo through both phases, writer then read-only. See [`demo/`](demo/README.md). |
+| `dev.sh demo-store` | Start MinIO where containers reach it, with the demo's read-only user, and print its settings as `key=value` lines (CI's `sidecar demo` job uses them). |
 
 It needs Docker with Compose v2.
 
