@@ -683,13 +683,17 @@ hack/remote-cache/check-fork-paths.sh       # needs network access to github.com
 hack/remote-cache/check-fork-paths_test.sh  # the check's own tests, offline
 ```
 
+Both need git, Go (for `go mod edit -json`) and jq.
+
 **The base** is the merge base of `HEAD` with upstream `main`, which the fork
 tracks. Upstream tags releases on `main`, so after a merge from a release tag
 the base is that tag's commit (or a newer `main` commit). The script fetches
 upstream shallowly and deepens both histories in bounded steps until it finds
-the base, and prints the commit it picked. If `HEAD` contains a `v1.*` tag
-from off `main`, there's no single base, and the check stops: set
-`FORK_BASE` to the commit to measure against. A release tag isn't the base
+the base, and prints the commit it picked. If `HEAD` contains an upstream
+`v*` tag from off `main`, there's no single base, and the check stops: set
+`FORK_BASE` to the full id of the commit to measure against (in CI, the
+`FORK_PATHS_BASE` repository variable; clear it once upstream `main` is
+merged again). A release tag isn't the base
 on its own: the fork tracks `main`, so diffing against a tag would count
 every upstream change since that tag as the fork's.
 

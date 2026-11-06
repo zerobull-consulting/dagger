@@ -58,18 +58,12 @@ g -C "$fork" commit -qm 'fork 1'
 forkbase=$(g -C "$fork" rev-parse HEAD)
 
 pass=0 fail=0
-# expect <name> <0|1|2> <output pattern> [-- <commands to run in the fork first>]
-expect() {
-  local name=$1 want=$2 pattern=$3 out rc
-  shift 3
-  g -C "$fork" checkout -q -B "case-$pass-$fail" "$forkbase"
-  if (($#)); then
-    (cd "$fork" && eval "$*") >/dev/null
-    g -C "$fork" add -A
-    g -C "$fork" commit -qm "$name" --allow-empty
-  fi
-  rc=0
-  out=$(cd "$fork" && UPSTREAM_URL=$up FORK_PATHS_FILE=cmd/cacheservice/allow.txt "$check" 2>&1) || rc=$?
+# assert <name> <0|1|2> <output pattern> <dir> [VAR=value...]: runs the check
+# in <dir> against the fake upstream.
+assert() {
+  local name=$1 want=$2 pattern=$3 dir=$4 out rc=0
+  shift 4
+  out=$(cd "$dir" && env UPSTREAM_URL="$up" FORK_PATHS_FILE=cmd/cacheservice/allow.txt "$@" "$check" 2>&1) || rc=$?
   if [[ $rc == "$want" ]] && grep -qE -- "$pattern" <<<"$out"; then
     pass=$((pass + 1))
     echo "ok   $name"
@@ -78,6 +72,20 @@ expect() {
     echo "FAIL $name: exit $rc, want $want and /$pattern/"
     sed 's/^/     | /' <<<"$out"
   fi
+}
+
+# expect <name> <0|1|2> <output pattern> [<commands to run in the fork first>]:
+# commits the commands' changes on a branch from $forkbase, then asserts.
+expect() {
+  local name=$1 want=$2 pattern=$3
+  shift 3
+  g -C "$fork" checkout -q -B "case-$pass-$fail" "$forkbase"
+  if (($#)); then
+    (cd "$fork" && eval "$*") >/dev/null
+    g -C "$fork" add -A
+    g -C "$fork" commit -qm "$name" --allow-empty
+  fi
+  assert "$name" "$want" "$pattern" "$fork"
 }
 
 expect 'the fork as it is passes' 0 'OK: every path'
@@ -112,6 +120,51 @@ expect 'an entry nothing needs fails' 1 'entries no changed path needs.*|any \.g
   'echo "any .gitignore not changed" >>cmd/cacheservice/allow.txt'
 expect 'an unknown rule is refused' 2 "unknown rule 'maybe'" \
   'echo "maybe engine/ hmm" >>cmd/cacheservice/allow.txt'
+expect 'a .. segment is refused' 2 'must not have \. or \.\. segments' \
+  'echo "any cmd/../engine/ nope" >>cmd/cacheservice/allow.txt'
+expect 'two dots inside a name are fine' 0 'OK' \
+  'echo x >notes..md && echo "any notes..md a file with two dots" >>cmd/cacheservice/allow.txt'
+expect 'a non-ASCII path under an allowed directory passes' 0 'OK' \
+  'echo x >cmd/cacheservice/café.txt'
+expect 'a go.mod it cannot read fails, never passes' 1 "go\.mod: couldn't read it as a go\.mod" \
+  'echo "this is not go.mod syntax {" >>go.mod'
+g -C "$fork" checkout -q --detach "$forkbase"
+mkdir -p "$work/nojq"
+for t in bash git go timeout; do ln -sf "$(command -v "$t")" "$work/nojq/$t"; done
+assert 'without jq it refuses to run' 2 'needs jq' "$fork" PATH="$work/nojq"
+assert 'an unreachable upstream stops it' 2 "couldn't fetch" "$fork" UPSTREAM_URL="$work/missing"
+
+# CI's path: a shallow clone of the fork, deepened until the base turns up.
+# The fork's own remote is a bare repository with its commits.
+g -C "$up" commit -qm 'upstream 1b' --allow-empty
+g -C "$up" commit -qm 'upstream 1c' --allow-empty
+g -C "$fork" fetch -q origin main
+g -C "$fork" checkout -q -B shallow-src "$forkbase"
+g -C "$fork" merge -q --no-edit origin/main
+for i in 1 2 3; do g -C "$fork" commit -qm "fork $i more" --allow-empty; done
+forkremote=$work/fork-remote.git
+g init -q --bare "$forkremote"
+g -C "$forkremote" config uploadpack.allowAnySHA1InWant true
+g -C "$fork" push -q "$forkremote" shallow-src:refs/heads/feature/remote-cache
+shallow=$work/shallow
+g clone -q --depth=1 -b feature/remote-cache "file://$forkremote" "$shallow"
+assert 'a shallow clone deepens until it finds the base' 0 'No merge base yet; deepening' "$shallow" \
+  UPSTREAM_URL="file://$up" FETCH_DEPTH=1 DEEPEN_STEP=2 DEEPEN_TRIES=5
+rm -rf "$shallow"
+g clone -q --depth=1 -b feature/remote-cache "file://$forkremote" "$shallow"
+g -C "$shallow" commit -qm 'local only' --allow-empty
+assert 'a local commit deepens through the fork branch' 0 'No merge base yet; deepening' "$shallow" \
+  UPSTREAM_URL="file://$up" FETCH_DEPTH=1 DEEPEN_STEP=2 DEEPEN_TRIES=5
+rm -rf "$shallow"
+g clone -q --depth=1 -b feature/remote-cache "file://$forkremote" "$shallow"
+assert 'it gives up after DEEPEN_TRIES' 2 'no merge base .* after 1 deepenings' "$shallow" \
+  UPSTREAM_URL="file://$up" FETCH_DEPTH=1 DEEPEN_STEP=1 DEEPEN_TRIES=1
+rm -rf "$shallow"
+g clone -q --depth=1 -b feature/remote-cache "file://$forkremote" "$shallow"
+up1=$(g -C "$up" rev-parse 'HEAD~2')
+assert 'FORK_BASE fetches a base the clone lacks, and measures against it' 0 \
+  "Fetching FORK_BASE $up1" "$shallow" \
+  UPSTREAM_URL="file://$up" FORK_BASE="$up1"
 
 # Upstream moves on, and the fork merges it: the base moves to the merge.
 echo 'package engine // 2' >"$up/engine/engine.go"
@@ -140,13 +193,13 @@ g -C "$up" checkout -q -b release v1.0.0-beta.1
 echo 'package engine // hotfix' >"$up/engine/hotfix.go"
 g -C "$up" add -A
 g -C "$up" commit -qm 'hotfix'
-g -C "$up" tag v1.0.0-beta.2
+g -C "$up" tag -a -m 'beta 2' v1.0.0-beta.2
 g -C "$up" checkout -q main
 g -C "$fork" checkout -q --detach "$forkbase"
 g -C "$fork" fetch -q origin tag v1.0.0-beta.2
 g -C "$fork" merge -q --no-edit v1.0.0-beta.2
 forkbase=$(g -C "$fork" rev-parse HEAD)
-expect 'a tag merged from off main stops the check' 2 'no single base contains'
+expect 'an annotated tag merged from off main stops the check' 2 'no single base contains'
 
 echo "$pass passed, $fail failed"
 ((fail == 0))

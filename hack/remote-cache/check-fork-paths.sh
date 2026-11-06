@@ -8,14 +8,19 @@
 # The base is the merge base of HEAD with upstream main: the upstream commit
 # the fork last merged. Upstream tags its releases on main, so after a merge
 # from a release tag the merge base is that tag's commit, or a newer main
-# commit if main was merged since. A v1.* tag merged from off main would make
+# commit if main was merged since. A v* tag merged from off main would make
 # two unrelated bases; the check stops and says so rather than guess.
+#
+# Needs git, go (for go mod edit -json) and jq.
 #
 # Environment (all optional):
 #   UPSTREAM_URL     upstream repository (default https://github.com/dagger/dagger)
 #   UPSTREAM_BRANCH  upstream branch the fork tracks (default main)
 #   FORK_REMOTE      remote to deepen this checkout from when it's shallow (default origin)
-#   FORK_BASE        skip finding the base and use this commit
+#   FORK_BRANCH      its branch to deepen when HEAD isn't on it (default $GITHUB_BASE_REF,
+#                    else feature/remote-cache)
+#   FORK_BASE        skip finding the base and use this commit (a full id, fetched
+#                    from upstream if it isn't here)
 #   FORK_PATHS_FILE  the allowlist (default hack/remote-cache/fork-paths.txt)
 #   FETCH_DEPTH      first fetch depth of upstream (default 200)
 #   DEEPEN_STEP      commits added per deepening (default 500)
@@ -26,6 +31,7 @@ set -euo pipefail
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/dagger/dagger}
 UPSTREAM_BRANCH=${UPSTREAM_BRANCH:-main}
 FORK_REMOTE=${FORK_REMOTE:-origin}
+FORK_BRANCH=${FORK_BRANCH:-${GITHUB_BASE_REF:-feature/remote-cache}}
 FETCH_DEPTH=${FETCH_DEPTH:-200}
 DEEPEN_STEP=${DEEPEN_STEP:-500}
 DEEPEN_TRIES=${DEEPEN_TRIES:-4}
@@ -40,16 +46,19 @@ upstream_ref=refs/fork-paths/upstream
 die() { echo "check-fork-paths: $*" >&2; exit 2; }
 net() { timeout --kill-after=10 "$FETCH_TIMEOUT" "$@"; }
 
+for tool in git go jq timeout; do
+  command -v "$tool" >/dev/null || die "needs $tool"
+done
 head=$(git rev-parse --verify HEAD^{commit})
 
 # --- The base ------------------------------------------------------------
 
 find_base() {
-  local depth_flag=(--depth="$FETCH_DEPTH")
-  if [[ $(git rev-parse --is-shallow-repository) == false ]]; then
-    # A full clone has the base already if upstream's history is in it; a
-    # shallow upstream fetch would make the repository shallow, so fetch the
-    # branch as it is.
+  local shallow depth_flag=(--depth="$FETCH_DEPTH")
+  shallow=$(git rev-parse --is-shallow-repository)
+  if [[ $shallow == false ]]; then
+    # A full clone: fetch upstream in full too, rather than make the
+    # repository shallow. Deepening can't help it, so there's no loop.
     depth_flag=()
   fi
   echo "Fetching $UPSTREAM_URL $UPSTREAM_BRANCH ${depth_flag[*]}" >&2
@@ -63,6 +72,9 @@ find_base() {
       echo "$base"
       return
     fi
+    if [[ $shallow == false ]]; then
+      die "HEAD has no merge base with $UPSTREAM_URL $UPSTREAM_BRANCH; is UPSTREAM_URL right?"
+    fi
     if ((try >= DEEPEN_TRIES)); then
       die "no merge base with $UPSTREAM_URL $UPSTREAM_BRANCH within the fetched history after $DEEPEN_TRIES deepenings of $DEEPEN_STEP; merge upstream, raise DEEPEN_TRIES, or set FORK_BASE"
     fi
@@ -70,42 +82,46 @@ find_base() {
     net git fetch --quiet --no-tags --deepen="$DEEPEN_STEP" "$UPSTREAM_URL" \
       "+refs/heads/$UPSTREAM_BRANCH:$upstream_ref" >&2 \
       || die "couldn't deepen $UPSTREAM_URL within ${FETCH_TIMEOUT}s"
-    if [[ $(git rev-parse --is-shallow-repository) == true ]]; then
-      # By commit, so a pull request's merge commit deepens too; a local
-      # commit the remote doesn't have falls back to the base branch.
-      net git fetch --quiet --no-tags --deepen="$DEEPEN_STEP" "$FORK_REMOTE" "$head" >&2 \
-        || net git fetch --quiet --no-tags --deepen="$DEEPEN_STEP" "$FORK_REMOTE" feature/remote-cache >&2 \
-        || die "couldn't deepen $FORK_REMOTE within ${FETCH_TIMEOUT}s"
-    fi
+    # By commit, so a pull request's merge commit deepens too; a local
+    # commit the remote doesn't have falls back to the fork's branch.
+    net git fetch --quiet --no-tags --deepen="$DEEPEN_STEP" "$FORK_REMOTE" "$head" >&2 2>/dev/null \
+      || net git fetch --quiet --no-tags --deepen="$DEEPEN_STEP" "$FORK_REMOTE" "$FORK_BRANCH" >&2 \
+      || die "couldn't deepen $FORK_REMOTE $FORK_BRANCH within ${FETCH_TIMEOUT}s"
   done
 }
 
-# Upstream v1.* release tags HEAD contains. Each is a base candidate: on
-# main it's an ancestor of the merge base and drops out below; from off main
-# it stays, and the check stops.
-merged_tags() {
-  net git ls-remote --tags --refs "$UPSTREAM_URL" 'refs/tags/v1.*' \
-    || die "couldn't list $UPSTREAM_URL's tags within ${FETCH_TIMEOUT}s"
-}
-
 if [[ -n ${FORK_BASE:-} ]]; then
-  base=$(git rev-parse --verify "$FORK_BASE^{commit}") || die "FORK_BASE $FORK_BASE isn't a commit here"
-  echo "Base: $base (FORK_BASE)"
+  if ! git cat-file -e "$FORK_BASE^{commit}" 2>/dev/null; then
+    # Only its tree is needed, not its history.
+    echo "Fetching FORK_BASE $FORK_BASE from $UPSTREAM_URL" >&2
+    net git fetch --quiet --no-tags --depth=1 "$UPSTREAM_URL" "$FORK_BASE" >&2 \
+      || die "FORK_BASE $FORK_BASE isn't a commit here, and couldn't be fetched from $UPSTREAM_URL (a full commit id is needed)"
+  fi
+  base=$(git rev-parse --verify "$FORK_BASE^{commit}") || die "FORK_BASE $FORK_BASE isn't a commit"
+  echo "Base: $(git log -1 --format='%H (%cs) %s' "$base") (FORK_BASE)"
 else
   base=$(find_base)
+  # Upstream's release tags HEAD contains. Each is a base candidate: on main
+  # it's an ancestor of the merge base and drops out below; from off main it
+  # stays, and the check stops. Without --refs, so an annotated tag's
+  # peeled commit (the "^{}" line) is listed; its tag object, never fetched,
+  # is skipped.
+  tags=$(net git ls-remote --tags "$UPSTREAM_URL" 'refs/tags/v*') \
+    || die "couldn't list $UPSTREAM_URL's tags within ${FETCH_TIMEOUT}s"
   candidates=("$base")
   while read -r sha ref; do
-    [[ $ref == refs/tags/v1.* ]] || continue
+    [[ -n $sha ]] || continue
     git cat-file -e "$sha^{commit}" 2>/dev/null || continue
     git merge-base --is-ancestor "$sha" "$head" || continue
     candidates+=("$sha")
-  done < <(merged_tags)
+  done <<<"$tags"
   mapfile -t independent < <(git merge-base --independent "${candidates[@]}")
   if ((${#independent[@]} != 1)); then
     {
       echo "check-fork-paths: HEAD merged upstream commits no single base contains:"
       for c in "${independent[@]}"; do git log -1 --format='  %H %s' "$c"; done
-      echo "A release tag from off $UPSTREAM_BRANCH? Set FORK_BASE to the base to measure against."
+      echo "A release tag from off $UPSTREAM_BRANCH? Set FORK_BASE to the full id of the base to"
+      echo "measure against (in CI, the FORK_PATHS_BASE repository variable)."
     } >&2
     exit 2
   fi
@@ -128,7 +144,8 @@ while IFS= read -r line || [[ -n $line ]]; do
     *) die "$FORK_PATHS_FILE:$lineno: unknown rule '$rule'" ;;
   esac
   [[ -n ${reason:-} ]] || die "$FORK_PATHS_FILE:$lineno: '$path' has no reason"
-  [[ $path != /* && $path != *'*'* && $path != *..* ]] || die "$FORK_PATHS_FILE:$lineno: '$path' must be a plain relative path, no globs"
+  [[ $path != /* && $path != *[*?[]* ]] || die "$FORK_PATHS_FILE:$lineno: '$path' must be a plain relative path, no globs"
+  [[ /$path/ != */../* && /$path/ != */./* ]] || die "$FORK_PATHS_FILE:$lineno: '$path' must not have . or .. segments"
   if [[ $path == */ && $rule != any ]]; then
     die "$FORK_PATHS_FILE:$lineno: '$rule' takes a file, not a directory"
   fi
@@ -143,10 +160,14 @@ check_go_mod() {
   local path=$1 status=$2 tmp diff
   [[ $status == M ]] || { echo "the fork ${status_word[$status]:-changes} it; only additions to its requirements are allowed"; return 1; }
   tmp=$(mktemp -d)
-  git show "$base:$path" >"$tmp/base.mod"
-  git show "$head:$path" >"$tmp/head.mod"
-  go mod edit -json "$tmp/base.mod" >"$tmp/base.json"
-  go mod edit -json "$tmp/head.mod" >"$tmp/head.json"
+  # Fails closed: any step that fails is reported, never read as "no change".
+  if ! { git show "$base:$path" >"$tmp/base.mod" && git show "$head:$path" >"$tmp/head.mod" \
+    && go mod edit -json "$tmp/base.mod" >"$tmp/base.json" \
+    && go mod edit -json "$tmp/head.mod" >"$tmp/head.json"; } 2>"$tmp/err"; then
+    echo "couldn't read it as a go.mod: $(head -c 300 "$tmp/err" | tr '\n' ' ')"
+    rm -rf "$tmp"
+    return 1
+  fi
   diff=$(jq -rn --slurpfile b "$tmp/base.json" --slurpfile h "$tmp/head.json" '
     ($b[0]) as $b | ($h[0]) as $h
     | ([$h.Require[]? | {(.Path): .Version}] | add // {}) as $hv
@@ -155,7 +176,7 @@ check_go_mod() {
         | "requires \(.Path) \($hv[.Path] // "(removed)") where upstream requires \(.Version)"]
       + [[$bd, $hd | keys[]] | unique[] | select($bd[.] != $hd[.])
         | "changes its \(.) directive"]
-    | .[]')
+    | .[]') || { echo "couldn't compare it with upstream's (jq failed)"; rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
   [[ -z $diff ]] || { echo "$diff" | paste -sd ';' - | sed 's/;/; /g'; return 1; }
 }
@@ -164,7 +185,9 @@ check_go_mod() {
 check_add_lines() {
   local path=$1 status=$2 removed
   [[ $status == M ]] || { echo "the fork ${status_word[$status]:-changes} it; only added lines are allowed"; return 1; }
-  removed=$(git diff --no-ext-diff --numstat "$base" "$head" -- "$path" | cut -f2)
+  removed=$(git diff --no-ext-diff --numstat "$base" "$head" -- "$path") \
+    || { echo "couldn't diff it"; return 1; }
+  removed=$(cut -f2 <<<"$removed")
   [[ $removed =~ ^[0-9]+$ ]] || { echo "is binary; only added lines of a text file are allowed"; return 1; }
   ((removed == 0)) || { echo "removes or changes $removed of upstream's lines; only added lines are allowed"; return 1; }
 }
@@ -172,7 +195,15 @@ check_add_lines() {
 declare -A status_word=([A]=adds [D]=deletes [M]=changes [T]="changes the type of")
 
 offending=()
-while IFS=$'\t' read -r status path; do
+# Each check returns non-zero with its reason; a check that fails without
+# one still fails the path.
+run_check() {
+  local why rc=0
+  why=$("$@") || rc=$?
+  if ((rc != 0)); then echo "${why:-its check failed without a reason}"; fi
+}
+
+while IFS= read -r -d '' status && IFS= read -r -d '' path; do
   status=${status:0:1}
   match=-
   for i in "${!paths[@]}"; do
@@ -191,18 +222,18 @@ while IFS=$'\t' read -r status path; do
   case ${rules[$match]} in
     any) ;;
     deleted) [[ $status == D ]] || why="the entry allows deleting it, and the fork ${status_word[$status]:-changes} it" ;;
-    go-mod) why=$(check_go_mod "$path" "$status") || true ;;
-    add-lines) why=$(check_add_lines "$path" "$status") || true ;;
+    go-mod) why=$(run_check check_go_mod "$path" "$status") ;;
+    add-lines) why=$(run_check check_add_lines "$path" "$status") ;;
   esac
   [[ -z $why ]] || offending+=("$path: $why")
-done < <(git diff --no-renames --name-status "$base" "$head")
+done < <(git -c core.quotePath=false diff --no-renames --name-status -z "$base" "$head")
 
 stale=()
 for i in "${!paths[@]}"; do
   ((used[i])) || stale+=("${rules[$i]} ${paths[$i]}")
 done
 
-changed=$(git diff --no-renames --name-only "$base" "$head" | wc -l)
+changed=$(git diff --no-renames --name-only -z "$base" "$head" | tr -cd '\0' | wc -c)
 echo "Changed paths: $changed; allowlist entries: ${#paths[@]}"
 
 if ((${#offending[@]} == 0 && ${#stale[@]} == 0)); then

@@ -43,4 +43,8 @@ jobs:
         run: hack/remote-cache/check-fork-paths_test.sh
       - name: Check the fork's paths
         timeout-minutes: 10
+        env:
+          # Empty unless set: only for a release tag merged from off upstream
+          # main, when the check can't pick one base (see the README).
+          FORK_BASE: ${{ vars.FORK_PATHS_BASE }}
         run: hack/remote-cache/check-fork-paths.sh
