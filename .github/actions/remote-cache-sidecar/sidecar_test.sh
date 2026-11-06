@@ -265,10 +265,28 @@ relative_dir_absolute() {
 	grep -qxF -- "$tmp/rel.sc/rel/secrets/debug-token:/run/secrets/debug-token:ro" "$tmp/dbgbin.fake/service.args"
 }
 check "debug-port: a relative SIDECAR_DIR still mounts the token by an absolute path" relative_dir_absolute
-# The stop removes the token.
-mkdir -p "$tmp/sc/t/secrets" && echo x >"$tmp/sc/t/secrets/debug-token"
-stop_with false 0
-check "the stop removes the debug token" [ ! -e "$tmp/sc/t/secrets" ]
+check "debug-port: the state records the token, for the stop" grep -qx created=debug-token "$tmp/dbgbin.sc/remote-cache/state"
+# The stop removes the token only when the state says this start wrote it,
+# and nothing else in its directory.
+stop_secrets() {
+	local created="$1"
+	rm -rf "$tmp/st" && mkdir -p "$tmp/st/fake" "$tmp/st/sc/t/logs" "$tmp/st/sc/t/secrets"
+	echo x >"$tmp/st/sc/t/secrets/debug-token"
+	[[ "$2" == other ]] && echo y >"$tmp/st/sc/t/secrets/other"
+	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
+		stop_seconds=20 "logs=$tmp/st/sc/t/logs" role=writer $created >"$tmp/st/sc/t/state"
+	(
+		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/st/fake" SIDECAR_DIR="$tmp/st/sc" SIDECAR_NAME=t
+		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		stop
+	) >/dev/null 2>&1
+}
+stop_secrets created=debug-token none
+check "the stop removes the token this start wrote, and its empty directory" [ ! -e "$tmp/st/sc/t/secrets" ]
+stop_secrets created=debug-token other
+check "... but not another file next to it" [ ! -e "$tmp/st/sc/t/secrets/debug-token" -a -e "$tmp/st/sc/t/secrets/other" ]
+stop_secrets "" none
+check "a start that wrote no token: the stop leaves the file" [ -e "$tmp/st/sc/t/secrets/debug-token" ]
 
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="drain: done" outcome=complete' >"$tmp/no-exports.log"

@@ -1563,7 +1563,7 @@ admin token guards it
   sends the engine nothing. The service keeps only the token's SHA-256 hash,
   and compares it in constant time. Generate one with
   `openssl rand -hex 32 > debug-token`.
-- **Never an engine token.** A debug token that the tokens file maps too is
+- **Never an engine token.** A debug token that is also an engine token in the tokens file is
   refused at startup and on reload, and refused per request if a later
   tokens reload adds it.
 - **When it is required.** With `-tokens-file`, since an authenticated
@@ -1584,8 +1584,10 @@ admin token guards it
   or an engine token) is refused at startup (exit 1), and on SIGHUP keeps
   the token loaded before, logging an error: it never turns the check off.
   Errors never show the file's content.
-- **Refusals** are logged with the method, path and remote address, never
-  the token: at warning level at most once a minute per remote host and
+- **Refusals** are logged with the route they matched (its pattern, such as
+  `POST /debug/gc`, or `unmatched`) and the remote address, never the
+  request's own path, query or method, where a client could put the token,
+  and never the token: at warning level at most once a minute per remote host and
   reason, and 10 times a minute in all, then at debug level. `auth_rejected_total{endpoint="debug"}`
   counts them all.
 - **Rotation.** Write the new token to the file and send SIGHUP: from then

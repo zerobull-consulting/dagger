@@ -149,35 +149,50 @@ func (s *Service) isEngineToken(token string) bool {
 // engine tokens: an authenticated service has no unauthenticated side door,
 // so it then refuses every request. A refused request gets 401 with
 // `WWW-Authenticate: Bearer` and no detail, and reaches nothing.
-func (s *Service) debugAuth(next http.Handler) http.Handler {
+//
+// Refusals are logged with the route mux matched, never the request's own
+// path or method: a client can put anything there, the token included.
+func (s *Service) debugAuth(mux *http.ServeMux) http.Handler {
+	next := http.Handler(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		want := s.debug.hash.Load()
+		reject := func(msg string) { s.rejectDebug(w, r, debugRoute(mux, r), msg) }
 		if want == nil {
 			if !s.authenticated() {
 				next.ServeHTTP(w, r)
 				return
 			}
-			s.rejectDebug(w, r, "request refused: the service checks engine tokens and has no debug token (-debug-token-file)")
+			reject("request refused: the service checks engine tokens and has no debug token (-debug-token-file)")
 			return
 		}
 		token, ok := bearerToken(r)
 		if !ok {
-			s.rejectDebug(w, r, "request refused: no debug token")
+			reject("request refused: no debug token")
 			return
 		}
 		got := sha256.Sum256([]byte(token))
 		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-			s.rejectDebug(w, r, "request refused: wrong debug token")
+			reject("request refused: wrong debug token")
 			return
 		}
 		// The debug token is checked against the engine tokens when it is
 		// loaded; engine tokens can change after that.
 		if s.isEngineToken(token) {
-			s.rejectDebug(w, r, "request refused: the debug token is also an engine token; give the debug API a token of its own")
+			reject("request refused: the debug token is also an engine token; give the debug API a token of its own")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// debugRoute names a debug request's route for logs: the pattern mux
+// registered it under, such as "POST /debug/engines/{conn}/export", or
+// "unmatched". Never the request's own path, query or method.
+func debugRoute(mux *http.ServeMux, r *http.Request) string {
+	if _, pattern := mux.Handler(r); pattern != "" {
+		return pattern
+	}
+	return "unmatched"
 }
 
 // bearerToken returns the token of a request's one Authorization header, of
@@ -197,9 +212,9 @@ func bearerToken(r *http.Request) (string, bool) {
 // rejectDebug answers 401 to a debug request. Refusals are logged at warning
 // level at most once a minute per remote host and reason (msg), so a probe
 // doesn't hide a lockout's reason, and rejectionWarnings times a minute in
-// all; the others at debug level. The log names the route and the remote
-// address, never the token.
-func (s *Service) rejectDebug(w http.ResponseWriter, r *http.Request, msg string) {
+// all; the others at debug level. The log names the route (debugRoute) and
+// the remote address, never the token or anything else from the request.
+func (s *Service) rejectDebug(w http.ResponseWriter, r *http.Request, route, msg string) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -208,7 +223,7 @@ func (s *Service) rejectDebug(w http.ResponseWriter, r *http.Request, msg string
 	if s.debug.rejections.allow(msg+"\x00"+host, time.Now()) {
 		level = slog.LevelWarn
 	}
-	s.logger.Log(r.Context(), level, msg, "endpoint", endpointDebug, "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+	s.logger.Log(r.Context(), level, msg, "endpoint", endpointDebug, "route", route, "remote", r.RemoteAddr)
 	s.metrics.AuthRejected(endpointDebug)
 	w.Header().Set("WWW-Authenticate", `Bearer realm="cacheservice-debug"`)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)

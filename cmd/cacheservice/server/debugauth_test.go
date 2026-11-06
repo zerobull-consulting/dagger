@@ -346,12 +346,43 @@ func TestDebugRefusalsLoggedBounded(t *testing.T) {
 	if n := strings.Count(out, "level=DEBUG msg=\"request refused: wrong debug token\""); n != 19 {
 		t.Errorf("%d debug-level refusals, want 19", n)
 	}
-	if !strings.Contains(out, "path=/debug/gc") || !strings.Contains(out, "remote=127.0.0.1:") {
+	if !strings.Contains(out, `route="POST /debug/gc"`) || !strings.Contains(out, "remote=127.0.0.1:") {
 		t.Errorf("the refusal doesn't name the route and the remote address:\n%s", out)
 	}
 	for _, secret := range []string{testDebugToken, testDebugToken2} {
 		if strings.Contains(out, secret) {
 			t.Fatalf("the log shows a token:\n%s", out)
+		}
+	}
+}
+
+// A token a client puts in the request's path, query or method never reaches
+// the log: refusals name the matched route, or "unmatched".
+func TestDebugRefusalLogsNoRequestData(t *testing.T) {
+	var logs bytes.Buffer
+	svc := New(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})), "")
+	if err := svc.UseDebugTokenFile(writeDebugToken(t, testDebugToken)); err != nil {
+		t.Fatal(err)
+	}
+	debug := httptest.NewServer(svc.DebugHandler())
+	defer debug.Close()
+	for _, tc := range []struct{ method, path string }{
+		{"GET", "/" + testDebugToken},
+		{"GET", "/debug/engines?token=" + testDebugToken},
+		{"POST", "/debug/engines/" + testDebugToken + "/export"},
+		{testDebugToken, "/debug/engines"},
+	} {
+		if code, _, _ := debugRequest(t, debug.URL, tc.method, tc.path, ""); code != http.StatusUnauthorized {
+			t.Errorf("%s %s: %d, want 401", tc.method, tc.path, code)
+		}
+	}
+	out := logs.String()
+	if strings.Contains(out, testDebugToken) {
+		t.Fatalf("the log shows a token put in the request:\n%s", out)
+	}
+	for _, want := range []string{"route=unmatched", `route="POST /debug/engines/{conn}/export"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the log has no %s:\n%s", want, out)
 		}
 	}
 }

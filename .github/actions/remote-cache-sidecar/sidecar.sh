@@ -116,7 +116,7 @@ read_state() {
 		role) st_role="$value" ;;
 		# What this sidecar's start created, one line each as it did: the
 		# stop touches nothing else.
-		created) case "$value" in service | engine | volume | network) st_created+=" $value " ;; esac ;;
+		created) case "$value" in service | engine | volume | network | debug-token) st_created+=" $value " ;; esac ;;
 		esac
 	done <"$file"
 	valid_name "$st_service" && valid_name "$st_engine" && valid_name "$st_volume" &&
@@ -266,6 +266,9 @@ start() {
 		token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
 		[[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "generating the debug token failed"
 		[[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::add-mask::$token"
+		# Recorded first: the stop removes the token file only when this
+		# start wrote it.
+		echo "created=debug-token" >>"$state"
 		(umask 022 && printf '%s\n' "$token" >"$token_file") || die "writing $token_file failed"
 		chmod 644 "$token_file"
 		token_mount=(-v "$token_file:/run/secrets/debug-token:ro")
@@ -448,8 +451,12 @@ stop() {
 	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || true; }
 	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || true; }
 	rm -f "$state"
-	# The debug token, if start generated one: it opened only this service.
-	rm -rf -- "$(sidecar_dir)/$name/secrets"
+	# The debug token, if this start generated it: it opened only this
+	# service. Its directory goes only if nothing else is in it.
+	if created debug-token; then
+		rm -f -- "$(sidecar_dir)/$name/secrets/debug-token"
+		rmdir -- "$(sidecar_dir)/$name/secrets" 2>/dev/null || true
+	fi
 	[[ -n "${GITHUB_OUTPUT:-}" ]] && echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
 
 	if [[ -f "$st_logs/service.log" ]]; then
