@@ -1,8 +1,10 @@
 # e2e: the remote cache with real engines
 
-`TestRealEngines` runs the remote cache end to end: engines built from this
-repo, in Docker containers, get cache hits from what another engine stored
-in MinIO. It skips unless `CACHESERVICE_E2E=1`; run it with:
+`TestRealEngines` runs the remote cache end to end: engines of a stock Dagger
+release (`DefaultEngineImage`, or `E2E_ENGINE_IMAGE`), in Docker containers,
+get cache hits from what another engine stored in MinIO, through the service
+built from this checkout. With `E2E_BUILD_ENGINE=1` the engines and the CLI
+are built from this repo instead, over the same release image. It skips unless `CACHESERVICE_E2E=1`; run it with:
 
 ```bash
 ./hack/remote-cache/dev.sh e2e
@@ -37,8 +39,8 @@ from it.
 | Cache service (`Service`, `StartService`) | In the test process, on the Docker bridge gateway | `server.Service`'s Go API: `Engines`, `Entries`, `Imports`, `Export`, `Import`. A recording `slog` handler (`LogRecorder`) keeps what it logs: cache spans, envelopes, engine events, exports and merges. |
 | S3 proxy (`S3Proxy`) | In the test process, on the gateway | The services' S3 endpoint, so presigned URLs point at it too. It records every request (method, key, query, time, status) instead of tracing MinIO, and injects faults (`Fault`): S3 errors or stalls for the requests they match, or a rewrite of their body before MinIO gets it. An engine's blob requests (`S3Request.IsBlob`) are its uploads, PUTs to staging keys (`ns/<ns>/staging/<stage>/<alg>/<hex>`), and its downloads, GETs of digest keys (`ns/<ns>/blobs/<alg>/<hex>`); the service's own (HEADs, and a promotion's copies and reads) are not. |
 | MinIO, or any bucket | `hack/remote-cache/compose.yaml`, on loopback; or the bucket in `CACHESERVICE_S3_*` with `CACHESERVICE_TEST_EXTERNAL=1` | Through the proxy for the services and engines; directly (`Env.S3`, `Env.Meta`) to read the index and bundles and delete blobs, so the test's own reads aren't recorded as the engines'. On an HTTPS or virtual-hosted endpoint the proxy checks each signature and signs again for the store (`Upstream`). |
-| Engines (`Engine`, `StartEngines`, `StartEnginesWithTokens`) | Docker containers from an image built for the run | The `docker` CLI: start, restart, remove, logs (`Engine.Logs`). Each authenticates with `Engine.Token`: its host name, or the token it was started with. |
-| Client (`Engine.CLI`, `Engine.Query`) | The `dagger` CLI built for the run | With a clean environment. The CLI's Cloud settings come from the environment, which is process-wide, so it runs as its own process rather than as the engine client in this one. Its token is `e2e-cli`, or its engine's when the engine was started with a token: session spans reach the service under the CLI's token, which must be in the engine's namespace. |
+| Engines (`Engine`, `StartEngines`, `StartEnginesWithTokens`) | Docker containers from the run's image: `E2E_ENGINE_IMAGE` with GC off, the `mirror.gcr.io` mirror and `E2E_CA_FILE`, and with `E2E_BUILD_ENGINE=1` the binaries built from this repo (`Env.build`) | The `docker` CLI: start, restart, remove, logs (`Engine.Logs`). Each authenticates with `Engine.Token`: its host name, or the token it was started with. |
+| Client (`Engine.CLI`, `Engine.Query`) | The `dagger` CLI copied out of the run's image (`Env.copyCLI`), which matches its engine | With a clean environment. The CLI's Cloud settings come from the environment, which is process-wide, so it runs as its own process rather than as the engine client in this one. Its token is `e2e-cli`, or its engine's when the engine was started with a token: session spans reach the service under the CLI's token, which must be in the engine's namespace. |
 
 Each run has its own bucket prefix, scope, engine names and volumes, so runs
 don't need MinIO reset and don't see each other's entries. Services are
