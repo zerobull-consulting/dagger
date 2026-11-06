@@ -180,8 +180,12 @@ logs (with presigned URLs' credentials and signatures redacted), and
 removes the containers, the engine's state volume and the network. With
 nothing to drain, the stop takes about 10s, most of it the engine's.
 
-The steps run one after another, so the whole stop takes at most the drain's
-wait (`drain-timeout` plus 5s), then the engine's stop (30s, its `docker
+The steps run one after another, so the whole stop takes at most its probe
+of the service (whether it is still running: about 10s in all, against a
+Docker daemon that doesn't answer, and a probe that gets no answer is never
+taken for the service's exit;
+[zerobull-consulting/dagger#125](https://github.com/zerobull-consulting/dagger/issues/125)),
+then the drain's wait (`drain-timeout` plus 5s), then the engine's stop (30s, its `docker
 stop` cut off at 90s), then the wait for the service (which has exited by
 then, unless it overran its own bound) and the cleanup, which take seconds.
 Give the step a `timeout-minutes` of at least `drain-timeout` plus 2
@@ -205,11 +209,8 @@ and
 [zerobull-consulting/dagger#81](https://github.com/zerobull-consulting/dagger/issues/81).
 Of the action: a read-only start doesn't wait for the service's first merge
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)),
-the leads in
-[zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104),
-and the probe of the service before the stop's SIGTERM, which the step's
-bound doesn't count
-([zerobull-consulting/dagger#125](https://github.com/zerobull-consulting/dagger/issues/125)).
+and the leads in
+[zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
 
 The stop's step summary has the exit code, and its log the drain's and the
 linger's lines (`drain: stored`, `drain: done outcome=...`, `linger: done

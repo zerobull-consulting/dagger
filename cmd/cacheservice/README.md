@@ -2209,10 +2209,12 @@ under a running engine), isn't waited for: the service can't tell it from
 an engine whose events go elsewhere. Its `engine.stop` then finds the
 service gone. Known gap, pinned by `TestKnownGapLingerMissesEngineNotSeenYet`
 ([zerobull-consulting/dagger#124](https://github.com/zerobull-consulting/dagger/issues/124)).
-Past 8 generations of one cache ID welcomed at the drain's start, an
-`engine.stop` isn't recorded and the linger waits out its bound, pinned by
-`TestKnownGapLingerStoppedGenerationsCapped`
-([zerobull-consulting/dagger#126](https://github.com/zerobull-consulting/dagger/issues/126)).
+The `engine.stop` of every generation of a cache ID welcomed at the
+drain's start is recorded, however many there are; a token's `engine.stop`
+for other generations is remembered for at most 8 of them per cache, which
+bounds the service's memory
+(`TestLingerStoppedGenerationsInSnapshotNotCapped`,
+[zerobull-consulting/dagger#126](https://github.com/zerobull-consulting/dagger/issues/126)).
 An engine killed during its "stop engine events" phase, which is where it
 waits for the service that the linger keeps up, loses its cache on a kept
 state volume
@@ -2649,16 +2651,27 @@ arrived.
 
 ```bash
 since="$(($(date +%s) - 1))"
-docker kill -s TERM remote-cache-service
-# Wait, bounded, for the drain to be done (or the service to be gone).
-for _ in $(seq 1200); do
-  docker logs --since "$since" remote-cache-service 2>&1 | grep -q 'msg="drain: done"' && break
-  [ "$(docker inspect -f '{{.State.Running}}' remote-cache-service)" = true ] || break
+timeout 30 docker kill -s TERM remote-cache-service
+# Wait for the drain to be done, or the service to have exited, for at most
+# -drain-timeout plus 5s. Every docker call is bounded by what is left of
+# that (at most 10s, at least 1s), and one that fails or times out prints
+# nothing: only docker's "false" means the service has exited, so a failing
+# docker never stops the engine mid-drain.
+end=$((SECONDS + 605))
+left() { t=$((end - SECONDS)); [ "$t" -gt 10 ] && t=10; [ "$t" -lt 1 ] && t=1; echo "$t"; }
+while [ "$SECONDS" -lt "$end" ]; do
+  log="$(timeout "$(left)" docker logs --since "$since" remote-cache-service 2>&1 || true)"
+  grep -q 'msg="drain: done"' <<<"$log" && break
+  [ "$(timeout "$(left)" docker inspect -f '{{.State.Running}}' remote-cache-service 2>/dev/null)" = false ] && break
   sleep 0.5
 done
-docker stop --time 30 remote-cache-engine
-timeout 30 docker wait remote-cache-service    # it exits once engine.stop arrived, or 15s after its drain
-docker inspect -f '{{.State.ExitCode}}' remote-cache-service
+timeout 90 docker stop --time 30 remote-cache-engine
+# It exits once engine.stop arrived, or 15s after its drain. docker wait
+# prints the exit code; nothing means it hadn't exited (or docker failed),
+# which is never a clean stop.
+code="$(timeout 30 docker wait remote-cache-service 2>/dev/null || true)"
+echo "the service's exit code: ${code:-unknown (still running?)}"
+[ "$code" = 0 ]
 ```
 
 Don't shorten the engine's `docker stop --time`: an engine killed before its
