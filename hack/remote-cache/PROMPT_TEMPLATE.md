@@ -1,6 +1,6 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#99](https://github.com/zerobull-consulting/dagger/pull/99)
+**Version:** [zerobull-consulting/dagger#106](https://github.com/zerobull-consulting/dagger/pull/106)
 
 Every work item's prompt for the remote cache work
 ([zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1))
