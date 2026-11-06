@@ -165,23 +165,25 @@ action, the stop, the demo's local run and the README all run one script,
 It stops the service first: a SIGTERM, then a wait for `drain: done` in its
 log, for up to `drain-timeout` plus 5s. Then the engine, with `docker stop
 --time 30`: the service, done draining, still answers the engine's events
-for up to 15s (its default `-drain-linger`), so the engine's own stop
+for up to 15s (the `-drain-linger` the start passes), so the engine's own stop
 delivers its last cache event (`engine.stop`) and ends in seconds, cleanly
 ([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
 Then it waits for the service to exit, which it does once that event
 arrived, up to `drain-timeout` plus 25s from the SIGTERM in all: the
 service's whole stop takes at most `drain-timeout` plus its linger plus 5s
 (see [Stopping and draining](../../../cmd/cacheservice/README.md#stopping-and-draining)).
-A service still running then is stopped, and fails the step. Every wait is
-bounded, and a wait that runs out doesn't skip the rest: the stop keeps both
+A service still running then is stopped, and fails the step. A `docker
+inspect` that fails during a wait is never taken for the service's exit:
+the engine isn't stopped before the drain is done. Every wait is bounded,
+and a wait that runs out doesn't skip the rest: the stop keeps both
 logs (with presigned URLs' credentials and signatures redacted), and
 removes the containers, the engine's state volume and the network. With
 nothing to drain, the stop takes about 10s, most of it the engine's.
 
 Give the step a `timeout-minutes` above `drain-timeout` plus 25s, with room
-for the engine's 30s: 12 for `10m`. A service image from before the linger
-exits right after its drain, and the engine's stop is then held 30s, as it
-was.
+for the engine's 30s: 12 for `10m`. The start passes the service
+`-drain-linger`, which a service image from before the linger doesn't take:
+pin the images to the action's commit, as above.
 
 **Exit codes**, the service's:
 
@@ -189,7 +191,8 @@ was.
 | --- | --- | --- |
 | 0 | A clean stop: everything ended within the bound. | passes |
 | 1 | The bound cut the shutdown off with work still running (logged as `the shutdown's bound passed with work still running`, with what was running), a signal arrived during the shutdown, or an HTTP server failed. | fails |
-| 137 | Killed: still stopping past the stop's bound, `drain-timeout` plus 25s. What it was exporting is lost. | fails |
+| 137 | Killed before its stop ended, not by the stop (such as out of memory). What it was exporting is lost. | fails |
+| any | Still running past the stop's bound, `drain-timeout` plus 25s: the stop stopped it. | fails |
 | any | The service had exited before the stop. | fails |
 
 Known gaps in the service's exit code and log:

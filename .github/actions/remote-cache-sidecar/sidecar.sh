@@ -89,10 +89,10 @@ duration_seconds() {
 	echo $((10#$h * 3600 + 10#$m * 60 + 10#$s))
 }
 
-# The service's -drain-linger, its default, which the action leaves as it
-# is: how long, after its drain, it keeps answering the engine's events, so
-# that the engine's stop delivers its last one (engine.stop) and ends in
-# seconds. It ends sooner, once that event arrived.
+# The service's -drain-linger, which start passes: how long, after its
+# drain, it keeps answering the engine's events at most, so that the engine's
+# stop delivers its last one (engine.stop) and ends in seconds. It ends
+# sooner, once that event arrived. 15s is the service's default too.
 linger_seconds=15
 
 # --- state, kept between start and stop ---
@@ -135,17 +135,22 @@ read_state() {
 
 running() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]; }
 
+# Whether docker says a container has stopped. Unlike ! running, a docker
+# that fails or doesn't answer says nothing: a wait on it goes on.
+exited() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == false ]]; }
+
 # Whether this sidecar's start created a resource (service, engine, volume,
 # network), from the state it read.
 created() { [[ "$st_created" == *" $1 "* ]]; }
 
 # Waits until the service's log since a Unix time says its drain is done, or
-# the service is no longer running, for at most a number of seconds; returns
-# 1 when that bound passed first.
+# docker says the service has stopped, for at most a number of seconds;
+# returns 1 when that bound passed first. A docker that fails meanwhile ends
+# nothing: the engine must not be stopped before the drain is done.
 wait_drained() {
 	local container="$1" since="$2" end=$((SECONDS + $3)) log
 	while ((SECONDS < end)); do
-		running "$container" || return 0
+		exited "$container" && return 0
 		log="$(timeout 10 docker logs --since "$since" "$container" 2>&1 || true)"
 		grep -q 'msg="drain: done"' <<<"$log" && return 0
 		sleep 0.5
@@ -153,15 +158,16 @@ wait_drained() {
 	return 1
 }
 
-# Waits until a container is no longer running, for at most a number of
-# seconds (at least 1); returns 1 when that bound passed first.
+# Waits until docker says a container has stopped, for at most a number of
+# seconds (at least 1); returns 1 when that bound passed first, a docker that
+# failed throughout included.
 wait_exited() {
 	local container="$1" end=$((SECONDS + ($2 > 1 ? $2 : 1)))
 	while ((SECONDS < end)); do
-		running "$container" || return 0
+		exited "$container" && return 0
 		sleep 0.5
 	done
-	! running "$container"
+	exited "$container"
 }
 
 # Whether a container's log has a line matching a pattern. The log is read
@@ -275,7 +281,7 @@ start() {
 	gateway="$(timeout 30 docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$network")"
 	[[ "$gateway" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "the network $network has no IPv4 gateway ('$gateway')"
 
-	local flags=(-scope "$namespace" -drain-timeout "$drain")
+	local flags=(-scope "$namespace" -drain-timeout "$drain" -drain-linger "${linger_seconds}s")
 	if [[ "$role" == writer ]]; then
 		# Scheduled GC belongs to its own job (zerobull-consulting/dagger#61).
 		flags+=(-gc-interval=0)
@@ -449,7 +455,9 @@ stop() {
 	valid_name "$name" || die "name '$name' isn't valid"
 	local state
 	state="$(sidecar_dir)/$name/state"
-	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_linger_seconds="$linger_seconds" st_logs="" st_role="" st_created=" "
+	# A state without linger_seconds is a start's from before the linger,
+	# whose stop_seconds has no room for one.
+	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_linger_seconds=0 st_logs="" st_role="" st_created=" "
 	if ! read_state "$state"; then
 		echo "remote-cache-sidecar: nothing to stop: no state at $state (did the start step run?)"
 		return 0
@@ -536,7 +544,7 @@ stop() {
 	elif [[ "$overran" == true ]]; then
 		failed="the service was still stopping after ${st_stop_seconds}s, past its own bound, and was stopped (exit $code): what it was exporting is lost"
 	elif [[ "$code" == 137 ]]; then
-		failed="the service was still stopping after ${st_stop_seconds}s, and docker killed it (137): what it was exporting is lost"
+		failed="the service was killed (137) before its stop ended, not by this stop (such as out of memory): what it was exporting is lost"
 	elif [[ "$code" != 0 ]]; then
 		failed="the service's stop wasn't clean (exit $code): the shutdown's bound cut work off, or a server failed; see its log"
 	fi

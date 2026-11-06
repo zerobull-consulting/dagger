@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -279,18 +280,66 @@ func TestLingerEngineStopOnlyFromItsEngine(t *testing.T) {
 }
 
 // The caches remembered sending events here are bounded: a token naming
-// cache IDs without end doesn't grow the service's memory without end.
+// cache IDs without end doesn't grow the service's memory without end. Past
+// the bound, a new cache replaces the one heard from least recently that has
+// no live connection, so a long-lived service still waits for the engines it
+// met last; while draining, none is replaced.
 func TestLingerEventCachesBounded(t *testing.T) {
-	n := &namespace{name: "ns"}
-	for i := range maxEventCaches + 10 {
-		n.sawEvent("cache-"+string(rune(i)), false)
+	now := time.Unix(1_000_000, 0)
+	n := &namespace{name: "ns", owners: map[string]*owner{}, now: func() time.Time { return now }}
+	id := func(i int) string { return "cache-" + strconv.Itoa(i) }
+	// cache-0, the oldest, has a live connection.
+	n.own(id(0), tokenKey{})
+	for i := range maxEventCaches {
+		n.sawEvent(id(i), false, false)
+		now = now.Add(time.Second)
 	}
+	n.sawEvent(id(maxEventCaches), false, false)
 	if got := len(n.eventCaches); got != maxEventCaches {
 		t.Fatalf("%d caches remembered, want %d", got, maxEventCaches)
 	}
+	if seen, _ := n.eventState(id(maxEventCaches)); !seen {
+		t.Fatal("a new cache past the bound wasn't remembered: the linger would never wait for it")
+	}
+	if seen, _ := n.eventState(id(0)); !seen {
+		t.Fatal("the cache with a live connection was replaced")
+	}
+	if seen, _ := n.eventState(id(1)); seen {
+		t.Fatal("the cache heard from least recently, with no live connection, is still remembered")
+	}
+	// While draining, the caches a linger may wait for stay.
+	n.sawEvent("cache-new", false, true)
+	if seen, _ := n.eventState("cache-new"); seen {
+		t.Fatal("a cache was replaced while draining")
+	}
 	// One already remembered is still marked stopped.
-	n.sawEvent("cache-"+string(rune(0)), true)
-	if _, stopped := n.eventState("cache-" + string(rune(0))); !stopped {
+	n.sawEvent(id(2), true, true)
+	if _, stopped := n.eventState(id(2)); !stopped {
 		t.Fatal("a remembered cache's engine.stop wasn't recorded")
+	}
+}
+
+// An engine connected when the drain started, whose stop closed its
+// connection before the linger began (an orchestrator stopping both at once,
+// or the sidecar stopping the engine the moment the drain is done), is still
+// waited for: its engine.stop comes after its disconnect.
+func TestLingerWaitsForAnEngineThatLeftDuringTheDrain(t *testing.T) {
+	l := newLingerTest(t)
+	e := welcomedRaw(t, l.srv, "cache-a")
+	waitEngines(t, l.svc, 1)
+	l.event("cache-a", telemetryattrs.EngineEventStart)
+	if rep := l.svc.Drain(context.Background()); rep.Outcome != "complete" {
+		t.Fatalf("the drain ended %q", rep.Outcome)
+	}
+	_ = e.conn.CloseNow()
+	waitEngines(t, l.svc, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	l.done = make(chan LingerReport, 1)
+	go func() { l.done <- l.svc.Linger(ctx) }()
+	l.still(300*time.Millisecond, "with the engine gone before the linger, its engine.stop still due")
+	l.event("cache-a", telemetryattrs.EngineEventStop)
+	if rep := l.ended(2 * time.Second); rep.Outcome != LingerStopped || len(rep.Caches) != 1 {
+		t.Fatalf("report %+v, want cache-a stopped", rep)
 	}
 }

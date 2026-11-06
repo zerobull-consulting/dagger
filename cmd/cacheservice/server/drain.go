@@ -43,6 +43,9 @@ type drainState struct {
 	// started; it welcomes none after.
 	engines int
 	ended   *DrainReport
+	// conns are the engine caches welcomed when the drain started: those a
+	// linger may wait for (lingerWaits).
+	conns []lingerWait
 	// linger is the linger that followed the drain, once it started.
 	linger *LingerReport
 }
@@ -147,6 +150,10 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	s.mu.Lock()
 	s.draining.Store(true)
 	s.drain.engines = len(s.conns)
+	s.drain.conns = make([]lingerWait, 0, len(s.conns))
+	for _, c := range s.conns {
+		s.drain.conns = append(s.drain.conns, lingerWait{ns: c.ns, cacheID: c.hello.CacheID})
+	}
 	s.mu.Unlock()
 	s.drain.mu.Unlock()
 	s.metrics.DrainStarted()

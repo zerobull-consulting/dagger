@@ -49,8 +49,8 @@ type namespace struct {
 	// eventCaches are the engine caches whose engine events arrived here,
 	// each marked once its engine.stop arrived while draining: a linger
 	// waits for engine.stop only from these (Service.Linger). At most
-	// maxEventCaches of them.
-	eventCaches map[string]bool
+	// maxEventCaches of them (sawEvent).
+	eventCaches map[string]*eventCache
 	// now is the clock; tests replace it.
 	now func() time.Time
 }

@@ -2545,7 +2545,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
   ghcr.io/zerobull-consulting/cacheservice:<commit SHA> \
-  -scope default -drain-timeout 10m -gc-interval=0
+  -scope default -drain-timeout 10m -drain-linger 15s -gc-interval=0
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
 
@@ -2558,7 +2558,8 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 - **`-gc-interval=0`** on writers: scheduled GC belongs to a job of its own
   ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
 - **`-drain-timeout 10m`**: the stop's chance to store what the job built
-  (see step 4).
+  (see step 4); **`-drain-linger 15s`** (its default) lets the engine's stop
+  deliver its last event after the drain.
 - **The debug API**, when wanted: `-debug-listen :8091` with
   `-p 127.0.0.1:8091:8091`, on the runner's loopback only, and
   `-debug-token-file` with a token generated for the job and mounted
@@ -2660,7 +2661,8 @@ ends the linger at once, and the engine's last event goes undelivered.
 - **Exit codes:** 0 for a clean stop; 1 when the bound cut work off (logged
   as `the shutdown's bound passed with work still running`, with what was
   running), when a signal arrived during the shutdown, or when an HTTP
-  server failed; 137 when `docker stop` killed it. The action's stop fails
+  server failed; 137 when it was killed (by `docker stop` past its
+  `--time`, or out of memory). The action's stop fails
   the step on anything but 0, and on a service that exited before the stop,
   with the service's log. Known gaps:
   [zerobull-consulting/dagger#80](https://github.com/zerobull-consulting/dagger/issues/80)

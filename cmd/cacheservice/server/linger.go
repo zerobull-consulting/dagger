@@ -14,8 +14,8 @@ import (
 const (
 	// LingerStopped: every engine the linger waited for sent engine.stop.
 	LingerStopped = "stopped"
-	// LingerNothing: no connected engine's events come here, so there was
-	// nothing to wait for.
+	// LingerNothing: no engine connected when the drain started sends its
+	// events here, so there was nothing to wait for.
 	LingerNothing = "nothing"
 	// LingerDeadline: it ended at its bound (-drain-linger).
 	LingerDeadline = "deadline"
@@ -29,8 +29,9 @@ const maxLingerPoll = 100 * time.Millisecond
 
 // maxEventCaches bounds the engine caches a namespace remembers sending
 // engine events here (namespace.eventCaches): any token of a namespace can
-// name any cache ID in an event. A cache past the bound isn't remembered, and
-// a linger doesn't wait for it.
+// name any cache ID in an event. Past the bound, a new cache takes the place
+// of the one heard from least recently that has no live connection; while
+// draining, none is replaced, and a new one isn't remembered.
 const maxEventCaches = 4096
 
 // maxEventCacheID bounds the cache IDs remembered; an engine's is a UUID.
@@ -74,8 +75,8 @@ func (r LingerReport) stopped() int {
 // (30s) runs out. See README.md, "Stopping and draining".
 //
 // It waits for engine.stop from each engine cache with a welcomed connection
-// when it starts whose engine events reach this service (an event about it
-// arrived here). An engine closes its connection in the first phase of its
+// when the drain started, connected still or not, whose engine events reach
+// this service (an event about it arrived here). An engine closes its connection in the first phase of its
 // own stop, before it sends engine.stop, so a disconnect ends nothing: the
 // linger ends once every such cache's engine.stop arrived, or ctx ends,
 // whose deadline is its bound, or which a second signal cancels. With no
@@ -99,7 +100,7 @@ func (s *Service) Linger(ctx context.Context) LingerReport {
 	s.drain.linger = &LingerReport{Caches: caches}
 	s.drain.mu.Unlock()
 	if len(waits) == 0 {
-		s.logger.Info("linger: nothing to wait for: no connected engine sends its events here")
+		s.logger.Info("linger: nothing to wait for: no engine connected at the drain's start sends its events here")
 		return s.endLinger(start, LingerNothing, caches)
 	}
 	attrs := []any{"engines", len(waits)}
@@ -140,17 +141,17 @@ type lingerWait struct {
 }
 
 // lingerWaits are the engine caches a linger waits for: those with a
-// welcomed connection whose engine events reach this service.
+// welcomed connection when the drain started, connected still or not, whose
+// engine events reach this service. A drain welcomes no new engine, so these
+// are every engine that may still send engine.stop, an engine whose stop
+// already closed its connection included: that comes first in an engine's
+// stop, before its engine.stop.
 func (s *Service) lingerWaits() []lingerWait {
-	s.mu.Lock()
-	conns := make([]*engineConn, 0, len(s.conns))
-	for _, c := range s.conns {
-		conns = append(conns, c)
-	}
-	s.mu.Unlock()
+	s.drain.mu.Lock()
+	candidates := slices.Clone(s.drain.conns)
+	s.drain.mu.Unlock()
 	var out []lingerWait
-	for _, c := range conns {
-		w := lingerWait{ns: c.ns, cacheID: c.hello.CacheID}
+	for _, w := range candidates {
 		if seen, _ := w.ns.eventState(w.cacheID); seen && !slices.Contains(out, w) {
 			out = append(out, w)
 		}
@@ -214,23 +215,65 @@ func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache strin
 	if s.authenticated() && !ns.ownerAccepts(cacheID, key) {
 		return
 	}
-	ns.sawEvent(cacheID, kind == telemetryattrs.EngineEventStop && s.draining.Load())
+	draining := s.draining.Load()
+	ns.sawEvent(cacheID, kind == telemetryattrs.EngineEventStop && draining, draining)
+}
+
+// eventCache is what a namespace remembers of an engine cache whose events
+// arrive here.
+type eventCache struct {
+	// last is when its latest event arrived.
+	last time.Time
+	// stopped is set once its engine.stop arrived while draining.
+	stopped bool
 }
 
 // sawEvent records that an engine event about cacheID arrived, and with
 // stop, that it was engine.stop, while draining. It remembers at most
-// maxEventCaches caches.
-func (n *namespace) sawEvent(cacheID string, stop bool) {
+// maxEventCaches caches: past that, a new cache replaces the one heard from
+// least recently that has no live connection, unless draining is set, when
+// the caches a linger may wait for must stay, and the new one isn't
+// remembered.
+func (n *namespace) sawEvent(cacheID string, stop, draining bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	stopped, ok := n.eventCaches[cacheID]
-	if !ok && len(n.eventCaches) >= maxEventCaches {
+	now := n.now()
+	if c := n.eventCaches[cacheID]; c != nil {
+		c.last = now
+		c.stopped = c.stopped || stop
 		return
 	}
-	if n.eventCaches == nil {
-		n.eventCaches = map[string]bool{}
+	if len(n.eventCaches) >= maxEventCaches {
+		if draining || !n.evictEventCacheLocked() {
+			return
+		}
 	}
-	n.eventCaches[cacheID] = stopped || stop
+	if n.eventCaches == nil {
+		n.eventCaches = map[string]*eventCache{}
+	}
+	n.eventCaches[cacheID] = &eventCache{last: now, stopped: stop}
+}
+
+// evictEventCacheLocked forgets the remembered cache heard from least
+// recently that has no live connection, and reports whether there was one.
+func (n *namespace) evictEventCacheLocked() bool {
+	var (
+		oldest string
+		at     time.Time
+	)
+	for id, c := range n.eventCaches {
+		if o := n.owners[id]; o != nil && o.live > 0 {
+			continue
+		}
+		if oldest == "" || c.last.Before(at) {
+			oldest, at = id, c.last
+		}
+	}
+	if oldest == "" {
+		return false
+	}
+	delete(n.eventCaches, oldest)
+	return true
 }
 
 // eventState reports whether an engine event about cacheID arrived (seen),
@@ -238,6 +281,9 @@ func (n *namespace) sawEvent(cacheID string, stop bool) {
 func (n *namespace) eventState(cacheID string) (seen, stopped bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	stopped, seen = n.eventCaches[cacheID]
-	return seen, stopped
+	c := n.eventCaches[cacheID]
+	if c == nil {
+		return false, false
+	}
+	return true, c.stopped
 }

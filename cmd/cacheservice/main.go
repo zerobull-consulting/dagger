@@ -504,49 +504,40 @@ const DefaultDrainLinger = 15 * time.Second
 
 // drain runs svc's drain for at most timeout, while the servers still serve:
 // the engines stay connected, and the spans of the sessions it tracks still
-// arrive. A second signal cancels it: it returns once the drain did, which
-// is at once, and reports false. Only this goroutine reads sigs meanwhile,
-// so a further signal stays queued for the shutdown that follows, which
-// exits on it.
+// arrive. A second signal cancels it, and it reports false.
 func drain(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) bool {
+	return untilSignal(logger, sigs, timeout, "drain", func(ctx context.Context) { svc.Drain(ctx) })
+}
+
+// linger runs svc's linger for at most timeout, after its drain: the
+// servers still serve, so an engine stopped now delivers its engine.stop. A
+// second signal ends it at once.
+func linger(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) {
+	untilSignal(logger, sigs, timeout, "linger", func(ctx context.Context) { svc.Linger(ctx) })
+}
+
+// untilSignal runs step (the drain or the linger, named what) with a context
+// that ends after timeout, or at once on a signal. It returns once step did,
+// which, on a signal, is at once, and reports whether no signal came. Only
+// this goroutine reads sigs meanwhile, so a further signal stays queued for
+// the shutdown that follows, which exits on it.
+func untilSignal(logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration, what string, step func(context.Context)) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		svc.Drain(ctx)
+		step(ctx)
 	}()
 	select {
 	case <-done:
 		return true
 	case sig := <-sigs:
-		logger.Warn("second signal: stopping without finishing the drain", "signal", sig.String())
+		logger.Warn("second signal: stopping without finishing the "+what, "signal", sig.String())
 		cancel()
 	}
 	<-done
 	return false
-}
-
-// linger runs svc's linger for at most timeout, after its drain: the
-// servers still serve, so an engine stopped now delivers its engine.stop. A
-// second signal ends it at once; as in drain, a further one stays queued for
-// the shutdown.
-func linger(svc *server.Service, logger *slog.Logger, sigs <-chan os.Signal, timeout time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		svc.Linger(ctx)
-	}()
-	select {
-	case <-done:
-		return
-	case sig := <-sigs:
-		logger.Warn("second signal: stopping without finishing the linger", "signal", sig.String())
-		cancel()
-	}
-	<-done
 }
 
 // checkDebugListen returns the debug address to listen on, and refuses a

@@ -78,6 +78,8 @@ check "start refuses a missing secret key" start_refuses CACHESERVICE_S3_SECRET_
 #                 only on docker stop
 #   FAKE_ENGINE   stops, or hangs: docker stop fails, and it keeps running
 #   FAKE_EXIT     the service's exit code
+#   FAKE_FLAKY    true: after the SIGTERM, docker inspect of the service
+#                 fails its first 3 times
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
@@ -87,6 +89,11 @@ case "$1 $2" in
 "inspect -f")
 	f="$eng"
 	[[ "$4" == *-service ]] && f="$svc"
+	if [[ "$FAKE_FLAKY" == true && "$4" == *-service && -f "$FAKE_DIR/signaled" ]]; then
+		fails=$(($(cat "$FAKE_DIR/fails" 2>/dev/null || echo 0) + 1))
+		echo "$fails" >"$FAKE_DIR/fails"
+		((fails <= 3)) && exit 1
+	fi
 	case "$3" in
 	*Running*) [[ -f "$f" ]] && echo true || echo false ;;
 	*ExitCode*) [[ -f "$f" ]] && echo 0 || echo "$FAKE_EXIT" ;;
@@ -94,6 +101,7 @@ case "$1 $2" in
 	;;
 "container inspect") exit 0 ;;
 "kill -s")
+	: >"$FAKE_DIR/signaled"
 	if [[ "$FAKE_SERVICE" == by-itself ]]; then
 		(sleep 1 && rm -f "$svc") >/dev/null 2>&1 &
 	fi
@@ -133,8 +141,11 @@ chmod +x "$tmp/bin/docker"
 # output in $tmp/stop.out, the calls in $tmp/fake/calls, and how long it
 # took, in seconds, in $tmp/stop.took.
 stop_with() {
-	local code="$1"
+	local code="$1" state_linger="linger_seconds=1" stop_seconds=14
 	shift
+	# A start from before the linger wrote no linger_seconds, and a
+	# stop_seconds of the drain plus 10s.
+	[[ "${1:-}" == old-state ]] && { state_linger="" stop_seconds=13; shift; }
 	rm -rf "$tmp/fake" "$tmp/sc"
 	local t=$SECONDS rc
 	(
@@ -146,7 +157,7 @@ stop_with() {
 		: >"$FAKE_DIR/service.running"
 		: >"$FAKE_DIR/engine.running"
 		printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-			stop_seconds=14 linger_seconds=1 "logs=$SIDECAR_DIR/t/logs" role=writer \
+			"stop_seconds=$stop_seconds" $state_linger "logs=$SIDECAR_DIR/t/logs" role=writer \
 			created=network created=service created=volume created=engine >"$SIDECAR_DIR/t/state"
 		stop
 	) >"$tmp/stop.out" 2>&1
@@ -189,6 +200,12 @@ check "... after waiting for it only up to the bound" took_at_most 18
 check "... it was stopped" called "stop --time 5 t-service"
 check "... says why" grep -q "past its own bound" "$tmp/stop.out"
 check "... and cleans up" cleaned_up
+
+check "a docker inspect that fails during the drain isn't taken for the service's exit" stop_with 0 FAKE_FLAKY=true
+check "... the engine is still stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+
+check "a state from a start before the linger: the stop passes" stop_with 0 old-state
+check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"
 
 check "an engine that won't stop: the stop still passes once the service exits" stop_with 0 FAKE_ENGINE=hangs FAKE_SERVICE=by-itself
 check "... says so" grep -q "the engine was still running after docker stop" "$tmp/stop.out"
@@ -342,6 +359,9 @@ check "debug-port: its file is readable by the service's UID" [ "$(stat -c %a "$
 check "debug-port: its directory only by this user" [ "$(stat -c %a "$dbg_dir")" = 700 ]
 check "debug-port: the service gets the file, read-only" grep -qxF -- "$dbg_dir/debug-token:/run/secrets/debug-token:ro" <<<"$dbg_args"
 check "debug-port: and -debug-token-file" grep -qxF -- "-debug-token-file" <<<"$dbg_args"
+check "start passes the linger the stop's bounds assume" grep -qx -- "-drain-linger" <<<"$dbg_args"
+check "... 15s" bash -c 'grep -A1 -x -- "-drain-linger" <<<"$1" | tail -1 | grep -qx 15s' _ "$dbg_args"
+check "... and records it for the stop" grep -qx linger_seconds=15 "$tmp/dbgbin.sc/remote-cache/state"
 check "debug-port: published on the host's loopback only" grep -qxF -- "127.0.0.1:8091:8091" <<<"$dbg_args"
 check "debug-port: the token is on no command line" not grep -qF -- "$dbg_token" <<<"$dbg_args"
 check "debug-port: nor in the start's output" not grep -qF -- "$dbg_token" <<<"$debug_out"
