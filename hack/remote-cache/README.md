@@ -392,9 +392,9 @@ protocol version, and which the service doesn't gate on, and
 `v1.0.0-beta.20` to `v1.0.0-beta.25` and on this branch, apart from tests.
 What the client exports and merges, the engine's cache
 (`engine/server/remote_cache*.go`, `dagql/cache*.go`), is the same in
-`v1.0.0-beta.24`, `v1.0.0-beta.25` and this branch, except for one exported
-constant this fork added for the service, `dagql.ValueBundleVersion` (the
-bundle version, 3 in all of them). `v1.0.0-beta.23` has a different
+`v1.0.0-beta.24`, `v1.0.0-beta.25` and this branch (bundle version 3 in all
+of them; the service keeps its own copy, `metastore.BundleVersion`, pinned to
+`dagql`'s capture by a test). `v1.0.0-beta.23` has a different
 `dagql/cache.go`, `dagql/cache_egraph.go` and persistence code, so it isn't
 claimed. CI runs `v1.0.0-beta.25`, the `STOCK_ENGINE` pin in
 [`remote-cache-tests.yml`](../../.github/workflows/remote-cache-tests.yml)'s

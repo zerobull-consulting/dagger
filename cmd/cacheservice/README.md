@@ -539,7 +539,8 @@ records into it. Each scope (a team, a tenant) has:
   `dagql.ValueBundle`. The ID is the SHA-256 of the bundle's JSON, so a bundle
   is written once (`If-None-Match: *`) and never changes. Storing it again
   writes nothing. Reading it checks its content against the ID. Only bundles
-  of the version this engine imports (`dagql.ValueBundleVersion`) are stored.
+  of the version the engine imports are stored: the service's own
+  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture writes.
 - **resolutions**, at `<prefix>/ns/<scope>/resolutions/<id>.json`: one per
   export, the service number each of the bundle's values resolved to when
   the export was recorded, which merges of that bundle send (see

@@ -17,6 +17,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
@@ -250,7 +251,7 @@ func (c *Cache) Capture(req protocol.Export) (Capture, error) {
 	for i, n := range order {
 		ordinal[n] = dagql.TransferOrdinal(i + 1)
 	}
-	b := &dagql.ValueBundle{Version: dagql.ValueBundleVersion}
+	b := &dagql.ValueBundle{Version: metastore.BundleVersion}
 	for _, n := range order {
 		e := c.entries[n]
 		v := dagql.TransferredValue{

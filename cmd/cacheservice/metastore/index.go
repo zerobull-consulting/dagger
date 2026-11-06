@@ -376,6 +376,12 @@ func (idx *Index) allocate() uint64 {
 	return n
 }
 
+// BundleVersion is the only dagql.ValueBundle version the service stores: the
+// version the engine it serves writes and imports. Under the lockstep policy
+// (zerobull-consulting/dagger#117) that engine is this module's dagql, and
+// TestBundleVersionMatchesEngineCapture pins the two together.
+const BundleVersion = 3
+
 // ValidateBundle checks what Record relies on in a bundle: it has roots,
 // its ordinals run from 1 to the number of values, each value names its
 // sender's number, and every dependency, root and output names one of its
@@ -384,8 +390,8 @@ func ValidateBundle(bundle *dagql.ValueBundle) error {
 	if bundle == nil {
 		return errors.New("nil bundle")
 	}
-	if bundle.Version != dagql.ValueBundleVersion {
-		return fmt.Errorf("unsupported bundle version %d, want %d", bundle.Version, dagql.ValueBundleVersion)
+	if bundle.Version != BundleVersion {
+		return fmt.Errorf("unsupported bundle version %d, want %d", bundle.Version, BundleVersion)
 	}
 	if len(bundle.Roots) == 0 {
 		return errors.New("bundle has no roots")

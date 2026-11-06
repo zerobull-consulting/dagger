@@ -740,7 +740,7 @@ func TestExportKnownGapImportWithOtherParts(t *testing.T) {
 	ctx := context.Background()
 	// Another cache's record of the value, with fs and execMeta parts.
 	stored := &dagql.ValueBundle{
-		Version: dagql.ValueBundleVersion,
+		Version: metastore.BundleVersion,
 		Roots:   []dagql.TransferredRoot{{Ordinal: 1}},
 		Values:  []dagql.TransferredValue{{Ordinal: 1, SenderNumber: 5, Record: dagql.PersistedRecord{ResultID: 5}}},
 		Outputs: []dagql.TransferredOutput{
