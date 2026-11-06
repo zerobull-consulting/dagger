@@ -141,16 +141,24 @@ running() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/
 exited() { [[ "$(timeout "${2:-30}" docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == false ]]; }
 
 # A container's state, as docker gives it: running, stopped, or unknown when
-# docker fails or doesn't answer three times in a row.
+# docker fails or doesn't answer three times in a row. A second argument
+# bounds the three tries and the pauses between them, in seconds (default
+# 10, at least 3): each try gets its share of what is left
+# (zerobull-consulting/dagger#125). A try cut off by that bound prints
+# nothing, so it reads as unknown, never as stopped.
 container_state() {
-	local tries v
+	local budget="${2:-10}" tries v b end
+	((budget < 3)) && budget=3
+	end=$((SECONDS + budget))
 	for tries in 1 2 3; do
-		v="$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)"
+		b=$(((end - SECONDS) / (4 - tries)))
+		((b < 1)) && b=1
+		v="$(timeout "$b" docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)"
 		case "$v" in
 		true) echo running && return ;;
 		false) echo stopped && return ;;
 		esac
-		((tries < 3)) && sleep 1
+		((tries < 3 && SECONDS < end)) && sleep 1
 	done
 	echo unknown
 }
@@ -502,9 +510,11 @@ stop() {
 	# it doesn't eat into the service's time.
 	local deadline=$((SECONDS + st_stop_seconds))
 	# A docker that fails here says nothing about the service: it is taken
-	# for running, so the engine still waits for the drain.
+	# for running, so the engine still waits for the drain. The probe is
+	# bounded at about 10s in all, so a daemon that hangs here keeps the
+	# step inside its documented bound (zerobull-consulting/dagger#125).
 	local service_state=""
-	created service && service_state="$(container_state "$st_service")"
+	created service && service_state="$(container_state "$st_service" 10)"
 	[[ "$service_state" == unknown ]] && echo "remote-cache-sidecar: docker didn't say whether the service is running; stopping it as if it is" >&2
 	if [[ "$service_state" == running || "$service_state" == unknown ]]; then
 		was_running=true

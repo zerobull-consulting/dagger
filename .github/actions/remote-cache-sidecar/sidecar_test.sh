@@ -96,7 +96,9 @@ case "$1 $2" in
 	if [[ "$4" == *-service && ("$FAKE_FLAKY" == early || ("$FAKE_FLAKY" == true && -f "$FAKE_DIR/signaled")) ]]; then
 		fails=$(($(cat "$FAKE_DIR/fails" 2>/dev/null || echo 0) + 1))
 		echo "$fails" >"$FAKE_DIR/fails"
-		((fails <= 3)) && { [[ -n "${FAKE_PROBE_SLEEP:-}" && ! -f "$FAKE_DIR/signaled" ]] && sleep "$FAKE_PROBE_SLEEP"; exit 1; }
+		# The sleep's output goes nowhere: a docker cut off by timeout
+		# leaves no process holding the caller's pipe open.
+		((fails <= 3)) && { [[ -n "${FAKE_PROBE_SLEEP:-}" && ! -f "$FAKE_DIR/signaled" ]] && sleep "$FAKE_PROBE_SLEEP" >/dev/null 2>&1 </dev/null; exit 1; }
 	fi
 	case "$3" in
 	*Running*) [[ -f "$f" ]] && echo true || echo false ;;
@@ -212,15 +214,33 @@ check "... the engine is stopped only once the drain is done" called "ENGINE STO
 check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
 check "a slow probe before the SIGTERM doesn't eat the service's time: it isn't stopped by force" stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=5 FAKE_SERVICE=by-itself FAKE_EXIT_AFTER=3
 check "... no second signal" not called "stop --time 5 t-service"
-# Known gap (zerobull-consulting/dagger#125): the probe before the SIGTERM
-# isn't bounded by the step's budget. Three failing 2s probes and the pauses
-# between them come before the SIGTERM, on top of the stop's own time. When
-# the gap is fixed, turn this around.
-probe_adds_time() {
-	stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=2 FAKE_SERVICE=after-engine || return 1
-	[[ "$(cat "$tmp/stop.took")" -ge 7 ]]
+# zerobull-consulting/dagger#125: a daemon that hangs during the probe
+# before the SIGTERM. Each of its three inspects would hang 60s; the probe is
+# bounded at about 10s in all, so the whole stop, cleanup included, takes
+# that plus its usual seconds, well inside its documented bound. A probe cut
+# off by its bound is never taken for the service's exit: the service is
+# still signaled, and the engine still waits for its drain.
+check "a daemon that hangs during the probe: the stop passes (zerobull-consulting/dagger#125)" \
+	stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=60
+check "... its probe is bounded: the whole stop takes at most 10s plus its usual seconds" took_at_most 14
+check "... the probe isn't taken for the service's exit: it's signaled, and its drain waited for" \
+	in_order "kill -s TERM t-service" "logs --since" "stop --time 30 t-engine"
+check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
+check "... and cleans up" cleaned_up
+# container_state alone, against a docker that never answers: its budget
+# bounds the three tries and the pauses between them, and the answer is
+# unknown, never stopped.
+mkdir -p "$tmp/hangbin"
+printf '#!/bin/sh\nexec sleep 60 >/dev/null 2>&1 </dev/null\n' >"$tmp/hangbin/docker"
+chmod +x "$tmp/hangbin/docker"
+probe_bounded() {
+	local t=$SECONDS v
+	v="$(PATH="$tmp/hangbin:$PATH" container_state x-service "$1")"
+	[[ "$v" == unknown && $((SECONDS - t)) -le $(($1 + 1)) ]]
 }
-check "known gap: the probe before the SIGTERM adds to the stop's time (zerobull-consulting/dagger#125)" probe_adds_time
+check "the probe's bound: three hung tries take at most their budget, and say unknown" probe_bounded 6
+check "... the stop's budget, 10s" probe_bounded 10
 
 check "a state from a start before the linger: the stop passes" stop_with 0 old-state
 check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"
