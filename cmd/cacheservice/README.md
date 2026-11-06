@@ -614,6 +614,30 @@ changed on every service restart would make engines re-key everything. So:
 - A record replaces the stored one unless the stored one is newer: from a
   later generation, or from the same generation with more replacements. So a
   late export from an older generation never overwrites a newer record.
+- A record of the same value (as many replacements, from the same generation
+  or a later one: engines keep replacement counts across a clean restart)
+  replaces the stored one only if its bundle holds outputs of every part the
+  stored record does. Otherwise the stored record stays, and a root the
+  bundle has of it is refreshed as recorded (#133). A bundle carries outputs
+  for its roots only (the tracker asks for their parts alone), so a stored
+  value carried again as a dependency of a later root, which is how most
+  values are seen again, holds fewer parts there; without this rule its
+  entry moved to the later bundle with fewer parts, and the bundle holding
+  its outputs, named by no entry, was collected (`TestDependencyKeepsItsBundle`).
+  The kept entry's dependencies become those of both records: an engine can
+  find more dependencies of a value at the same replacement count, and a merge
+  of the later bundle sends its own record of the value, which names them
+  (`TestRecordKeptRecordKeepsNewDependencies`).
+  A record of a new value (more replacements) replaces the stored one
+  whatever its parts. A record with other parts, neither more nor fewer, keeps
+  the stored one too: an entry names one record
+  (`TestRecordSameValueOtherPartsKeepsStored`). The new part reaches the
+  index once an export holds both. While the tracker tracks the value, its
+  next export does, since it keeps every part it has seen; after a service
+  restart it knows only the parts the engine's spans report again, and an
+  engine that no longer has the stored part leaves the new one out of the
+  index, as with imports (#37). The kept record keeps its
+  expiry, as an imported value's does (see below).
 - A late export from a generation older than the cache's latest recorded one
   adds nothing the index has no mapping for: if any of its values has no
   stored entry, the whole record is refused (`metastore.ErrStaleGeneration`,

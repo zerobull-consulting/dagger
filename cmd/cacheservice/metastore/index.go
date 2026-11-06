@@ -462,7 +462,11 @@ func retentionDeps(bundle *dagql.ValueBundle, v dagql.TransferredValue) []uint64
 // A value whose engine entry already maps to a stored entry keeps that
 // service number. Its record replaces the stored one, unless the stored one
 // is newer: from a later generation, or from the same generation with more
-// replacements. A value whose engine entry is imported (see RecordImportsAt)
+// replacements; or unless it is the same value (as many replacements, which
+// engines keep across a clean restart) and the bundle lacks a part the
+// stored record holds, as when the value is a dependency of the bundle's
+// roots, which carries no outputs (#133). A value whose engine entry is
+// imported (see RecordImportsAt)
 // takes the imported entry's number, so the same value isn't stored twice.
 // Its record replaces the stored one only if the bundle holds every part the
 // stored record does, and more; the entry's source then becomes this cache,
@@ -485,14 +489,17 @@ func (idx *Index) Record(bundleID string, bundle *dagql.ValueBundle, cacheID str
 // which a namespace's max age counts from, when this export wrote the
 // root's record: a root new to the index with its record, a later state of
 // the value from its own engine, or an imported value's record with more
-// parts (see Record).
+// parts (see Record). So does a root of its own engine's value whose stored
+// record this export kept because that record holds a part the bundle lacks
+// (#133): the engine exported the value as a root, and the stored record is
+// of that same value.
 //
-// A root whose record this export did not write keeps its time, or none
-// (a root from before version 3, which GC stamps), and is not added when
-// new: a late export from an older generation, or an import exported back
-// unchanged.
+// A root whose record this export did not write, or keep that way, keeps
+// its time, or none (a root from before version 3, which GC stamps), and is
+// not added when new: a late export from an older generation, or an import
+// exported back unchanged.
 // So merging stored entries into engines never keeps them alive by itself:
-// only a new record does. The cache's record is stamped with nowUnix too
+// only an export of the value from its own engine does. The cache's record is stamped with nowUnix too
 // (EngineCache.UpdatedAtUnix). nowUnix must be positive: the index is
 // stamped with the caller's clock only, so its logic follows an injected
 // one (#111).
@@ -568,6 +575,10 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	}
 	parts := bundleParts(bundle)
 	written := map[dagql.TransferOrdinal]bool{}
+	// current are the values whose stored record this export kept because
+	// the stored record is of the same value and holds a part the bundle
+	// lacks: for their roots, as if written.
+	current := map[dagql.TransferOrdinal]bool{}
 	for _, v := range values {
 		n := numbers[v.Ordinal]
 		if imported[v.Ordinal] {
@@ -597,17 +608,31 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 				Number:     n,
 				Generation: max(generation, cache.Numbers[v.SenderNumber].Generation),
 			}
-			if old, ok := idx.Entries[n]; ok && newerThan(old, generation, v.SenderReplacements) {
-				continue
+			if old, ok := idx.Entries[n]; ok {
+				if newerThan(old, generation, v.SenderReplacements) {
+					continue
+				}
+				if old.Replacements == v.SenderReplacements && !holdsParts(parts[v.Ordinal], old.Parts) {
+					// The same value, recorded without a part the stored
+					// record holds: as a dependency in another root's
+					// closure, which carries no outputs, or by an earlier,
+					// slower export finishing late (#133). The stored
+					// record stays, so its parts aren't lost; the value's
+					// root, if this bundle has it, is refreshed as one
+					// whose record was written. The entry keeps alive what
+					// either record depends on: the engine can find more
+					// dependencies of a value at the same replacement count,
+					// and this bundle's record of it, which merges of its
+					// roots send, names them.
+					kept := *old
+					kept.Deps = slices.Compact(slices.Sorted(slices.Values(append(slices.Clone(old.Deps), valueDeps(bundle, v, numbers)...))))
+					idx.Entries[n] = &kept
+					current[v.Ordinal] = true
+					continue
+				}
 			}
 		}
-		vdeps := retentionDeps(bundle, v)
-		deps := make([]uint64, 0, len(vdeps))
-		for _, d := range vdeps {
-			deps = append(deps, numbers[dagql.TransferOrdinal(d)])
-		}
-		slices.Sort(deps)
-		deps = slices.Compact(deps)
+		deps := valueDeps(bundle, v, numbers)
 		written[v.Ordinal] = true
 		idx.Entries[n] = &Entry{
 			Bundle:        bundleID,
@@ -623,7 +648,8 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 	for _, r := range bundle.Roots {
 		n := numbers[r.Ordinal]
 		root, existed := idx.Roots[n]
-		if !existed && (stale || !written[r.Ordinal]) {
+		recorded := written[r.Ordinal] || current[r.Ordinal]
+		if !existed && (stale || !recorded) {
 			// A root is added only with its record. This export didn't
 			// write it (a late export from an older generation, or an
 			// import exported back unchanged): the stored entry stays,
@@ -641,12 +667,24 @@ func (idx *Index) RecordResolvedAt(bundleID string, bundle *dagql.ValueBundle, c
 		// Only with its record: a root this export added, or whose record
 		// it wrote. A root from before version 3 (no time) that this
 		// export didn't write keeps none; GC stamps it.
-		if written[r.Ordinal] {
+		if recorded {
 			root.RecordedAtUnix = max(root.RecordedAtUnix, nowUnix)
 		}
 		idx.Roots[n] = root
 	}
 	return numbers, res, nil
+}
+
+// valueDeps returns the service numbers of the entries a value of the bundle
+// keeps alive (retentionDeps), sorted, without repeats.
+func valueDeps(bundle *dagql.ValueBundle, v dagql.TransferredValue, numbers map[dagql.TransferOrdinal]uint64) []uint64 {
+	vdeps := retentionDeps(bundle, v)
+	deps := make([]uint64, 0, len(vdeps))
+	for _, d := range vdeps {
+		deps = append(deps, numbers[dagql.TransferOrdinal(d)])
+	}
+	slices.Sort(deps)
+	return slices.Compact(deps)
 }
 
 // bundleParts returns the parts each value has outputs of in a bundle, by
@@ -665,9 +703,12 @@ func bundleParts(bundle *dagql.ValueBundle) map[dagql.TransferOrdinal][]string {
 
 // morePartsThan reports whether parts holds every one of old, and more.
 func morePartsThan(parts, old []string) bool {
-	if len(parts) <= len(old) {
-		return false
-	}
+	return len(parts) > len(old) && holdsParts(parts, old)
+}
+
+// holdsParts reports whether parts holds every one of old. Both are sorted
+// PartKeys, as bundleParts returns them.
+func holdsParts(parts, old []string) bool {
 	for _, k := range old {
 		if _, found := slices.BinarySearch(parts, k); !found {
 			return false
