@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -247,12 +248,20 @@ func TestS3ProxyGuard(t *testing.T) {
 // of the record.
 func TestS3ProxyGuardDoesNotHoldTheProxy(t *testing.T) {
 	target := startFakeStore(t, func() {})
-	p := StartS3ProxyWith(t, "127.0.0.1", target, ProxyOptions{Guard: s3test.NewGuard("bkt", "test/run", false)})
+	inGuard := make(chan struct{})
+	var once sync.Once
+	p := StartS3ProxyWith(t, "127.0.0.1", target, ProxyOptions{
+		Guard: s3test.NewGuard("bkt", "test/run", false),
+		onGuard: func(r *http.Request) {
+			if r.Method == http.MethodPost {
+				once.Do(func() { close(inGuard) })
+			}
+		},
+	})
 
-	// A bulk delete whose body stops partway. The part sent is larger than
-	// the sockets' buffers, so once it is written the proxy is reading the
-	// body: inside the guard.
-	head := []byte("<Delete>" + strings.Repeat(" ", 4<<20))
+	// A bulk delete whose body stops partway: once the guard has it, it
+	// waits on the rest of the body.
+	head := []byte("<Delete>")
 	tail := []byte("<Object><Key>test/run/k</Key></Object></Delete>")
 	conn, err := net.Dial("tcp", strings.TrimPrefix(p.URL, "http://"))
 	if err != nil {
@@ -263,6 +272,11 @@ func TestS3ProxyGuardDoesNotHoldTheProxy(t *testing.T) {
 	fmt.Fprintf(conn, "POST /bkt?delete HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n", strings.TrimPrefix(p.URL, "http://"), len(head)+len(tail))
 	if _, err := conn.Write(head); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-inGuard:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bulk delete didn't reach the guard")
 	}
 
 	done := make(chan int, 1)

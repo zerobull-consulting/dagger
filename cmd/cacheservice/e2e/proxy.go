@@ -92,6 +92,10 @@ type ProxyOptions struct {
 	// Guard, when set, answers 403 to requests it refuses, which don't reach
 	// the store. Guard.Refused and Guard.Touched say what it saw.
 	Guard *s3test.Guard
+
+	// onGuard, when set, is called with each request just before the guard
+	// checks it: a test's way to know the guard has a request.
+	onGuard func(*http.Request)
 }
 
 // Fault makes the proxy answer some requests itself instead of passing them
@@ -247,6 +251,9 @@ func StartS3ProxyWith(t *testing.T, host, target string, opts ProxyOptions) *S3P
 		// up every other request and the test's reads of the record.
 		var refused error
 		if p.guard != nil {
+			if opts.onGuard != nil {
+				opts.onGuard(r)
+			}
 			refused = p.guard.CheckRecord(r)
 		}
 		p.mu.Lock()

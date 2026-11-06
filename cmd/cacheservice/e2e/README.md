@@ -16,7 +16,8 @@ each store did, see
 [Testing against a real bucket](../../../hack/remote-cache/README.md#testing-against-a-real-bucket).
 A run needs `CACHESERVICE_S3_PREFIX`, works under `<prefix>/e2e/<run>/`, and
 fails if the proxy or its direct client refused a request: one that would
-change something outside it, or a bulk delete whose body it couldn't read.
+change something outside it, or a bulk delete whose body it couldn't read
+or that is over `s3test.MaxBulkDeleteBytes`.
 Reads outside it are let through: they change nothing. That
 prefix is new for each run, so the first service's startup check finds it
 empty and claims it with the ownership marker (see
