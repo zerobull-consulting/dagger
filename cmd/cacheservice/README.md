@@ -2117,7 +2117,9 @@ returns at once, and logs `drain: nothing to export (read-only:
    deadline run on until the shutdown cuts them off.
 
 It ends when nothing is left that it could export, or `-drain-timeout`
-(30s) passes. A shutdown follows, **bounded at 5s** as a whole: it cuts off
+(30s) passes. A **linger** follows, of at most `-drain-linger` (15s; see
+[The linger](#the-linger)), so that an engine stopped after the drain can
+deliver its last cache event. Then a shutdown, **bounded at 5s** as a whole: it cuts off
 what is still in flight (exports, import syncs, GC runs, those asked for
 with `POST /debug/gc` included) by canceling their context, closes the
 engine connections (each gets a close frame, 1001 going away, all at once;
@@ -2126,9 +2128,10 @@ gets 503, and one upgraded before is closed with 1001 at its hello, so an
 engine reconnecting meanwhile isn't welcomed), shuts down its HTTP
 servers, and waits for their requests and for what it cut off to end. So
 the whole stop, from the first signal to the exit, takes at most
-`-drain-timeout` plus 5s, even with engines that don't answer and work that
-ignores cancellation (GC's finish update and a promotion's cleanup run on
-after a cancel, against a store that may not answer).
+`-drain-timeout` plus `-drain-linger` plus 5s, even with engines that don't
+answer and work that ignores cancellation (GC's finish update and a
+promotion's cleanup run on after a cancel, against a store that may not
+answer).
 
 - **Exit codes.** 0 when everything ended within the bound: a clean stop.
   1 when the bound cut the shutdown off, with work still running (an HTTP
@@ -2139,15 +2142,89 @@ after a cancel, against a store that may not answer).
   failed during the drain or the shutdown. A
   process manager, and the tests, can tell a clean stop from a cut-off one
   (`TestMinIOBinaryStopBoundedExitsOne`, `TestMinIOBinaryCleanStopExitsZero`).
-- **Signals.** A second signal during the drain ends the drain at once; the
-  shutdown follows, and exits 0 if it ends within its bound. A signal during
-  the shutdown (the second with `-drain-timeout 0`, or after the drain
-  ended) exits at once, with 1, logging `signal during the shutdown: exiting
-  at once` and what was still running
+- **Signals.** A second signal during the drain ends the drain at once, and
+  skips the linger; during the linger, it ends the linger at once
+  (`TestMinIOBinarySecondSIGTERMEndsLinger`). The shutdown follows, and
+  exits 0 if it ends within its bound. A signal during the shutdown (the
+  second with `-drain-timeout 0`, or after the drain and the linger ended)
+  exits at once, with 1, logging `signal during the shutdown: exiting at
+  once` and what was still running
   (`TestMinIOBinarySignalDuringShutdownExitsAtOnce`).
 
-`-drain-timeout 0` stops without a drain, with the same bounded shutdown. A
-CI job sets it long, such as `10m`.
+`-drain-timeout 0` stops without a drain and without a linger, with the same
+bounded shutdown. A CI job sets it long, such as `10m`.
+
+| Flag | Default | |
+|------|---------|---|
+| `-drain-timeout` | `30s` | How long the drain may take (0: no drain, and no linger). A negative one is refused at startup |
+| `-drain-linger` | `15s` | After the drain, at most how long the service keeps answering the engines' OTLP requests, so each connected engine whose events come here can deliver `engine.stop` (0: none; see [The linger](#the-linger)). A negative one is refused at startup |
+
+### The linger
+
+An engine whose `DAGGER_CLOUD_URL` points at the service sends its cache
+events here, and its own graceful stop sends the last one, `engine.stop`,
+then waits up to 30s (`engineEventShutdownTimeout`) for it to be delivered.
+A service already gone answers nothing, so an engine stopped after the
+service, as the stop order below requires, used to retry against a closed
+port for those 30s, and a `docker stop --time 30` then killed it (exit 137;
+[#102](https://github.com/zerobull-consulting/dagger/issues/102)). So after
+its drain the service lingers (`server.Service.Linger`):
+
+- **It still answers the engines' OTLP requests** on `-listen`, as during
+  the drain: engine events are logged and taken as usual (`engine.stop`
+  included, which is logged like any other and deletes nothing), and spans
+  of sessions it doesn't track are answered 200 and dropped. The engine
+  connections stay open, and new ones are still refused.
+- **It starts nothing and stores nothing.** The context the export, import
+  and GC paths run on ends as the linger starts, as the shutdown would end
+  it: an export the drain's deadline left in flight is cut off then, and
+  publishes nothing (`TestMinIOBinaryLingerStoresNothing`).
+- **It ends once every engine it waits for sent `engine.stop`**: each engine
+  cache with a connection when it starts whose engine events reach this
+  service (some event about it arrived since the service started). An
+  engine whose events go elsewhere isn't waited for, and with none to wait
+  for the linger ends at once. A disconnect ends nothing: an engine closes
+  its remote cache connection in the first phase of its stop ("stop remote
+  cache integration"), and sends `engine.stop` only later, once its cache
+  closed ("close dagql cache", then "stop engine events"). With tokens,
+  `engine.stop` is taken only from the cache's own engine's token, as its
+  other events are, and only one sent while draining counts.
+- **It is bounded.** At `-drain-linger` it ends whatever is left, logging the
+  caches whose `engine.stop` didn't come (`linger: no engine.stop`, a
+  warning); a second signal ends it at once. `-drain-linger 0` stops right
+  after the drain, as before (`TestMinIOBinaryNoLinger`).
+
+The default, 15s, comes from the engine's measured stop: on an engine that
+had just run the demo's build, `engine.stop` arrived 0.3s after the engine's
+SIGTERM (it disconnected at 0.0s; "close dagql cache" took 0.31s), and its
+whole stop took 7.1s, 6.8s of it closing its network providers after the
+event was sent. The linger ends as soon as the event arrives, so its bound
+only costs time when an engine whose events come here isn't stopped, or its
+stop stalls, such as the service restarting under engines that run on. Set
+`-drain-linger 0` there.
+
+**An engine not heard from yet.** One whose events come here, but none of
+which arrived since the service started (such as after a service restart
+under a running engine), isn't waited for: the service can't tell it from
+an engine whose events go elsewhere. Its `engine.stop` then finds the
+service gone. Known gap, pinned by `TestKnownGapLingerMissesEngineNotSeenYet`
+([zerobull-consulting/dagger#124](https://github.com/zerobull-consulting/dagger/issues/124)).
+Past 8 generations of one cache ID welcomed at the drain's start, an
+`engine.stop` isn't recorded and the linger waits out its bound, pinned by
+`TestKnownGapLingerStoppedGenerationsCapped`
+([zerobull-consulting/dagger#126](https://github.com/zerobull-consulting/dagger/issues/126)).
+An engine killed during its "stop engine events" phase, which is where it
+waits for the service that the linger keeps up, loses its cache on a kept
+state volume
+([zerobull-consulting/dagger#127](https://github.com/zerobull-consulting/dagger/issues/127)).
+
+It logs `linger: started` with the engines it waits for (`linger: waiting
+for engine.stop`, by namespace and cache ID), and `linger: done` with its
+outcome: `stopped` (every engine sent `engine.stop`), `nothing` (none to
+wait for), `deadline` or `canceled`. `GET /debug/drain` shows it under
+`linger`. Tests: `TestLinger*` in [`server`](server), and
+`TestMinIOBinaryLinger*`, `TestMinIOBinaryLingersUntilEngineStop` and
+`TestMinIOBinaryNoLinger` here.
 
 The drain logs, when it starts, what each engine cache (by cache ID, never
 the token) has pending, in flight and waiting for a retry, and when it ends,
@@ -2160,12 +2237,18 @@ it runs, and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
 
 **Stop order.** Stop the service first, then the engine: the drain's exports
 run over the engine's connection, and the engine uploads the layers itself.
-An engine stopped first takes its pending exports with it.
+An engine stopped first takes its pending exports with it. Stop the engine
+once the drain is done (`drain: done` in the service's log), while the
+service lingers, then wait for the service to exit: the engine's stop then
+delivers its `engine.stop` and takes seconds. The sidecar action does this
+(see [Running it as a sidecar](#running-it-as-a-sidecar)).
 
 **Process managers.** The process manager's stop timeout must be longer than
-`-drain-timeout` plus 5s, the shutdown's bound after the drain, or it can
-kill the service mid-drain or mid-shutdown: with the default 30s, give
-it more than 35s, and with `10m`, more than `10m5s`. `docker stop --time`
+`-drain-timeout` plus `-drain-linger` plus 5s, the linger's and the
+shutdown's bounds after the drain, or it can kill the service mid-drain or
+mid-shutdown: with the defaults (30s and 15s), give it more than 50s, and
+with a `10m` drain, more than `10m20s`. A process manager that sends SIGTERM
+again at its own stop timeout ends the linger at once. `docker stop --time`
 (10s by default), `docker compose`'s `stop_grace_period` (10s by default) and
 Kubernetes' `terminationGracePeriodSeconds` (30s by default) all send SIGKILL
 when theirs runs out. Readiness probes and Kubernetes integration are out of
@@ -2432,7 +2515,7 @@ On GitHub Actions, use the composite action, which does everything below
     s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
 - run: dagger call build                # any dagger command: the action set up the CLI
 - if: always()
-  timeout-minutes: 12                   # above the drain timeout (10m) plus 5s
+  timeout-minutes: 12                   # the drain timeout (10m) plus 2 minutes
   uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
 
@@ -2478,7 +2561,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
   ghcr.io/zerobull-consulting/cacheservice:<commit SHA> \
-  -scope default -drain-timeout 10m -gc-interval=0
+  -scope default -drain-timeout 10m -drain-linger 15s -gc-interval=0
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
 
@@ -2491,7 +2574,8 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 - **`-gc-interval=0`** on writers: scheduled GC belongs to a job of its own
   ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
 - **`-drain-timeout 10m`**: the stop's chance to store what the job built
-  (see step 4).
+  (see step 4); **`-drain-linger 15s`** (its default) lets the engine's stop
+  deliver its last event after the drain.
 - **The debug API**, when wanted: `-debug-listen :8091` with
   `-p 127.0.0.1:8091:8091`, on the runner's loopback only, and
   `-debug-token-file` with a token generated for the job and mounted
@@ -2554,33 +2638,49 @@ on `PATH` that unsets `TRACEPARENT`, `TRACESTATE`, `OTEL_*`, `DAGGER_*` and
 needs the same.
 
 **4. The stop**, at the end of the job, whatever happened before it
-(`if: always()`): the service first, then the engine. The drain's exports
-run over the engine's connection, and the engine uploads the layers itself,
-so an engine stopped first takes them with it.
+(`if: always()`): SIGTERM the service, which drains; once its drain is done,
+stop the engine; then wait for the service to exit. The drain's exports run
+over the engine's connection, and the engine uploads the layers itself, so
+an engine stopped before the drain is done takes them with it. After the
+drain, the service [lingers](#the-linger): it still answers the engine's
+events, so the engine's stop delivers its last one (`engine.stop`) and
+takes seconds (about 7s, measured), and the service exits once that event
+arrived.
 
 ```bash
-docker stop --time 610 remote-cache-service    # above -drain-timeout (10m) plus 5s
+since="$(($(date +%s) - 1))"
+docker kill -s TERM remote-cache-service
+# Wait, bounded, for the drain to be done (or the service to be gone).
+for _ in $(seq 1200); do
+  docker logs --since "$since" remote-cache-service 2>&1 | grep -q 'msg="drain: done"' && break
+  [ "$(docker inspect -f '{{.State.Running}}' remote-cache-service)" = true ] || break
+  sleep 0.5
+done
+docker stop --time 30 remote-cache-engine
+timeout 30 docker wait remote-cache-service    # it exits once engine.stop arrived, or 15s after its drain
 docker inspect -f '{{.State.ExitCode}}' remote-cache-service
-docker stop remote-cache-engine
 ```
 
-The engine's stop then waits to send its last cache event (`engine.stop`) to
-the service, which is gone, so `docker stop` kills it after its timeout
-(10s by default; the action gives it 30s). Its state is thrown away with the
-runner, so this costs only the time
-([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
+Don't shorten the engine's `docker stop --time`: an engine killed before its
+"close dagql cache" phase ended leaves its store unclean, which wipes the
+engine's cache at its next start on a host that keeps the state volume.
+Don't `docker stop` the service again while it lingers either: its SIGTERM
+ends the linger at once, and the engine's last event goes undelivered.
 
 - **The bound:** the service's whole stop, from SIGTERM to exit, takes at
-  most `-drain-timeout` plus 5s (see
-  [Stopping and draining](#stopping-and-draining)). `docker stop --time`, and
-  the CI step's own timeout, must be above that, or the service is killed
-  mid-drain (exit 137). With `10m`, give `docker stop` 610s, and the step
-  12 minutes: the action's stop does both, and the caller sets the step's
+  most `-drain-timeout` plus `-drain-linger` (15s) plus 5s (see
+  [Stopping and draining](#stopping-and-draining)). The waits above, and the
+  CI step's own timeout, must be above that, or the service is cut off
+  mid-drain. With `10m`, the action waits up to 625s for the service in all.
+  The engine's stop (up to 30s, cut off at 90s) comes after the drain's wait,
+  so the step needs `-drain-timeout` plus 2 minutes, 12 for `10m`: the
+  action's stop bounds every wait, and the caller sets the step's
   `timeout-minutes`.
 - **Exit codes:** 0 for a clean stop; 1 when the bound cut work off (logged
   as `the shutdown's bound passed with work still running`, with what was
   running), when a signal arrived during the shutdown, or when an HTTP
-  server failed; 137 when `docker stop` killed it. The action's stop fails
+  server failed; 137 when it was killed (by `docker stop` past its
+  `--time`, or out of memory). The action's stop fails
   the step on anything but 0, and on a service that exited before the stop,
   with the service's log. Known gaps:
   [zerobull-consulting/dagger#80](https://github.com/zerobull-consulting/dagger/issues/80)

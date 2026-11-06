@@ -46,6 +46,11 @@ type namespace struct {
 	// speaks for its cache across a reconnect, and at most
 	// maxIdleOwners of them are kept (see own).
 	owners map[string]*owner
+	// eventCaches are the engine caches whose engine events arrived here,
+	// each marked once its engine.stop arrived while draining: a linger
+	// waits for engine.stop only from these (Service.Linger). At most
+	// maxEventCaches of them (sawEvent).
+	eventCaches map[string]*eventCache
 	// now is the clock; tests replace it.
 	now func() time.Time
 }

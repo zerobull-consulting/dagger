@@ -43,6 +43,11 @@ type drainState struct {
 	// started; it welcomes none after.
 	engines int
 	ended   *DrainReport
+	// conns are the engine caches welcomed when the drain started: those a
+	// linger may wait for (lingerWaits).
+	conns []lingerWait
+	// linger is the linger that followed the drain, once it started.
+	linger *LingerReport
 }
 
 // DrainLeft is what a drain left unexported of one engine cache.
@@ -145,6 +150,10 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	s.mu.Lock()
 	s.draining.Store(true)
 	s.drain.engines = len(s.conns)
+	s.drain.conns = make([]lingerWait, 0, len(s.conns))
+	for _, c := range s.conns {
+		s.drain.conns = append(s.drain.conns, lingerWait{ns: c.ns, cacheID: c.hello.CacheID, generation: c.hello.Generation})
+	}
 	s.mu.Unlock()
 	s.drain.mu.Unlock()
 	s.metrics.DrainStarted()
@@ -345,6 +354,9 @@ type DrainStatus struct {
 	Left []DrainLeft `json:"left,omitempty"`
 	// Report is the drain's, once it ended.
 	Report *DrainReport `json:"report,omitempty"`
+	// Linger is the linger after the drain, once it started (Service.Linger):
+	// the engine caches it waits for, and its outcome once it ended.
+	Linger *LingerReport `json:"linger,omitempty"`
 }
 
 // DrainStatus reports whether the service drains, and how far it got.
@@ -355,6 +367,11 @@ func (s *Service) DrainStatus() DrainStatus {
 	}
 	s.drain.mu.Lock()
 	started, deadline, ended := s.drain.started, s.drain.deadline, s.drain.ended
+	if l := s.drain.linger; l != nil {
+		cp := *l
+		cp.Caches = slices.Clone(l.Caches)
+		st.Linger = &cp
+	}
 	s.drain.mu.Unlock()
 	if !started.IsZero() {
 		st.Started = &started

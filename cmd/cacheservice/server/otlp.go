@@ -118,6 +118,7 @@ func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportL
 					s.dump(fmt.Sprintf("%06d-event-%s.json", s.dumpSeq.Add(1), kind), []byte(body))
 				}
 				s.trackEvent(ns, key, kind, cache, body)
+				s.noteEngineEvent(ns, key, kind, cache)
 			}
 		}
 	}
