@@ -142,16 +142,18 @@ exited() { [[ "$(timeout "${2:-30}" docker inspect -f '{{.State.Running}}' "$1" 
 
 # A container's state, as docker gives it: running, stopped, or unknown when
 # docker fails or doesn't answer three times in a row. A second argument
-# bounds the three tries and the pauses between them, in seconds (default
-# 10, at least 3): each try gets its share of what is left
-# (zerobull-consulting/dagger#125). A try cut off by that bound prints
-# nothing, so it reads as unknown, never as stopped.
+# bounds the three tries and the 1s pauses between them, in seconds
+# (default 10, at least 5; zerobull-consulting/dagger#125). The first try
+# gets all of it but 2s for each later try and its pause (6s of 10), so a
+# daemon that is slow but answers is still heard; the later ones, for a
+# docker that failed at once, get at least 1s each. A try cut off by that
+# bound prints nothing, so it reads as unknown, never as stopped.
 container_state() {
 	local budget="${2:-10}" tries v b end
-	((budget < 3)) && budget=3
+	((budget < 5)) && budget=5
 	end=$((SECONDS + budget))
 	for tries in 1 2 3; do
-		b=$(((end - SECONDS) / (4 - tries)))
+		b=$((end - SECONDS - 2 * (3 - tries)))
 		((b < 1)) && b=1
 		v="$(timeout "$b" docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)"
 		case "$v" in

@@ -230,17 +230,24 @@ check "... says so" grep -q "docker didn't say whether the service is running" "
 check "... and cleans up" cleaned_up
 # container_state alone, against a docker that never answers: its budget
 # bounds the three tries and the pauses between them, and the answer is
-# unknown, never stopped.
-mkdir -p "$tmp/hangbin"
-printf '#!/bin/sh\nexec sleep 60 >/dev/null 2>&1 </dev/null\n' >"$tmp/hangbin/docker"
-chmod +x "$tmp/hangbin/docker"
+# unknown, never stopped. SECONDS counts whole seconds, so allow 2s more.
+mkdir -p "$tmp/probehang"
+printf '#!/bin/sh\nexec sleep 60 >/dev/null 2>&1 </dev/null\n' >"$tmp/probehang/docker"
+chmod +x "$tmp/probehang/docker"
 probe_bounded() {
 	local t=$SECONDS v
-	v="$(PATH="$tmp/hangbin:$PATH" container_state x-service "$1")"
-	[[ "$v" == unknown && $((SECONDS - t)) -le $(($1 + 1)) ]]
+	v="$(PATH="$tmp/probehang:$PATH" container_state x-service "$1")"
+	[[ "$v" == unknown && $((SECONDS - t)) -le $(($1 + 2)) ]]
 }
 check "the probe's bound: three hung tries take at most their budget, and say unknown" probe_bounded 6
 check "... the stop's budget, 10s" probe_bounded 10
+# A daemon that is slow but answers (4s) is still heard within the stop's
+# budget: the first try gets most of it.
+mkdir -p "$tmp/probeslow"
+printf '#!/bin/sh\nsleep 4\necho false\n' >"$tmp/probeslow/docker"
+chmod +x "$tmp/probeslow/docker"
+check "... a daemon that answers in 4s is still heard: the service has stopped" \
+	[ "$(PATH="$tmp/probeslow:$PATH" container_state x-service 10)" = stopped ]
 
 check "a state from a start before the linger: the stop passes" stop_with 0 old-state
 check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"
