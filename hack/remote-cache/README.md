@@ -701,3 +701,57 @@ Notes:
 - Where Docker Hub rate-limits pulls, pull the MinIO image through
   `mirror.gcr.io` and tag it as the name in `compose.yaml`. The engines pull
   `alpine` through `mirror.gcr.io` already.
+
+## The fork's paths
+
+The fork changes upstream only where the service needs it, so merges from
+upstream don't conflict and the service can move to a project of its own
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117),
+D7). `check-fork-paths.sh` enforces this: it diffs `HEAD` against the
+upstream commit the fork last merged and fails on any changed path
+`fork-paths.txt` doesn't allow, listing each one and how to fix it.
+
+```sh
+hack/remote-cache/check-fork-paths.sh       # needs network access to github.com/dagger/dagger
+hack/remote-cache/check-fork-paths_test.sh  # the check's own tests, offline
+```
+
+Both need git, Go (for `go mod edit -json`), jq and coreutils' `timeout`.
+
+**The base** is the merge base of `HEAD` with upstream `main`, which the fork
+tracks. Upstream tags releases on `main`, so after a merge from a release tag
+the base is that tag's commit (or a newer `main` commit). The script fetches
+upstream shallowly and deepens both histories in bounded steps until it finds
+the base, and prints the commit it picked. If `HEAD` contains an upstream
+`v*` tag from off `main`, there's no single base, and the check stops: set
+`FORK_BASE` to the full id of the commit to measure against (in CI, the
+`FORK_PATHS_BASE` repository variable; clear it once upstream `main` is
+merged again). A release tag isn't the base
+on its own: the fork tracks `main`, so diffing against a tag would count
+every upstream change since that tag as the fork's.
+
+**The allowlist**, `fork-paths.txt`, has one entry per line:
+`<rule> <path> <reason>`. A path is a file, or a directory ending in `/`; no
+globs. The rules:
+
+- `any`: the fork may add, change or delete it. The service
+  (`cmd/cacheservice/`), its tooling (`hack/remote-cache/`), the sidecar
+  action, and the fork's own workflows, each named.
+- `deleted`: the fork deletes this upstream file and does nothing else to it
+  (`.github/workflows/changelog.yml`).
+- `go-mod`: the fork only adds requirements to this `go.mod`; upstream's keep
+  their versions and every other directive is unchanged.
+- `add-lines`: the fork only adds lines (`go.sum`, `.gitignore`).
+
+Every entry needs a reason, and an entry no changed path needs fails the
+check, so the list stays small. To change it, edit `fork-paths.txt` in the
+pull request that needs it and say why there. Prefer moving the change under
+the service's paths, or upstreaming it, to a new entry.
+
+The `fork paths` job of `.github/workflows/remote-cache-fork-paths.yml` runs
+the tests and the check on every pull request into `feature/remote-cache`
+and every push to it. On a pull request it runs the base branch's checker,
+so a pull request can't weaken the check that measures it; a change to the
+checker takes effect once merged. The allowlist is the pull request's, since
+that's where an entry is added, and the job flags any change to it with a
+warning for the reviewer.
