@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -299,10 +300,10 @@ func TestLingerEventCachesBounded(t *testing.T) {
 	// cache-0, the oldest, has a live connection.
 	n.own(id(0), tokenKey{})
 	for i := range maxEventCaches {
-		n.sawEvent(id(i), 1, false, false)
+		n.sawEvent(id(i), 1, false, false, false)
 		now = now.Add(time.Second)
 	}
-	n.sawEvent(id(maxEventCaches), 1, false, false)
+	n.sawEvent(id(maxEventCaches), 1, false, false, false)
 	if got := len(n.eventCaches); got != maxEventCaches {
 		t.Fatalf("%d caches remembered, want %d", got, maxEventCaches)
 	}
@@ -316,12 +317,12 @@ func TestLingerEventCachesBounded(t *testing.T) {
 		t.Fatal("the cache heard from least recently, with no live connection, is still remembered")
 	}
 	// While draining, the caches a linger may wait for stay.
-	n.sawEvent("cache-new", 1, false, true)
+	n.sawEvent("cache-new", 1, false, false, true)
 	if seen, _ := n.eventState("cache-new"); seen {
 		t.Fatal("a cache was replaced while draining")
 	}
 	// One already remembered is still marked stopped.
-	n.sawEvent(id(2), 1, true, true)
+	n.sawEvent(id(2), 1, true, false, true)
 	if _, stopped := n.eventState(id(2)); !stopped {
 		t.Fatal("a remembered cache's engine.stop wasn't recorded")
 	}
@@ -390,11 +391,14 @@ func TestKnownGapLingerMissesEngineNotSeenYet(t *testing.T) {
 	l.event("cache-a", telemetryattrs.EngineEventStop)
 }
 
-// Known gap (zerobull-consulting/dagger#126): past maxStoppedGenerations
-// generations of one cache ID welcomed at the drain's start, an engine.stop
-// isn't recorded, and the linger waits out its bound though every stop
-// arrived. When the gap is fixed, this test fails: turn it around.
-func TestKnownGapLingerStoppedGenerationsCapped(t *testing.T) {
+// zerobull-consulting/dagger#126: past maxStoppedGenerations generations of
+// one cache ID welcomed at the drain's start, every engine.stop of a
+// generation in the drain's snapshot is still recorded, so the linger ends
+// on the last one rather than at its bound. The cap holds only for
+// generations outside the snapshot: a token sending engine.stop for any
+// generation, before the welcomed ones', neither grows the cache's memory
+// past it nor keeps a welcomed generation's stop from being recorded.
+func TestLingerStoppedGenerationsInSnapshotNotCapped(t *testing.T) {
 	l := newLingerTest(t)
 	gens := maxStoppedGenerations + 1
 	for g := 1; g <= gens; g++ {
@@ -410,14 +414,49 @@ func TestKnownGapLingerStoppedGenerationsCapped(t *testing.T) {
 	}
 	waitEngines(t, l.svc, gens)
 	l.event("cache-a", telemetryattrs.EngineEventStart)
-	const bound = 700 * time.Millisecond
-	l.linger(bound)
+	l.linger(time.Minute)
+	// Generations no connection said hello with, past the cap, first.
+	others := maxStoppedGenerations + 4
+	for g := 1000; g < 1000+others; g++ {
+		if code := postEngineEventGen(t, l.srv, "engine-token", "cache-a/"+strconv.Itoa(g), telemetryattrs.EngineEventStop, `{"clean":true}`); code != http.StatusOK {
+			t.Fatalf("engine.stop of generation %d: %d", g, code)
+		}
+	}
+	l.still(300*time.Millisecond, "after engine.stop of generations outside the snapshot only")
 	for g := 1; g <= gens; g++ {
 		if code := postEngineEventGen(t, l.srv, "engine-token", "cache-a/"+strconv.Itoa(g), telemetryattrs.EngineEventStop, `{"clean":true}`); code != http.StatusOK {
 			t.Fatalf("engine.stop of generation %d: %d", g, code)
 		}
 	}
-	if rep := l.ended(bound + 2*time.Second); rep.Outcome != LingerDeadline {
-		t.Fatalf("outcome %q: the gap is fixed, turn this test around", rep.Outcome)
+	rep := l.ended(5 * time.Second)
+	if rep.Outcome != LingerStopped {
+		t.Fatalf("outcome %q, want %q: an engine.stop of a generation in the drain's snapshot wasn't recorded", rep.Outcome, LingerStopped)
+	}
+	if rep.Took > 3*time.Second {
+		t.Fatalf("the linger took %s after every engine.stop arrived", rep.Took)
+	}
+
+	l.svc.drain.mu.Lock()
+	ns := l.svc.drain.conns[0].ns
+	l.svc.drain.mu.Unlock()
+	ns.mu.Lock()
+	c := ns.eventCaches["cache-a"]
+	var stopped []uint64
+	var outside int
+	if c != nil {
+		stopped = slices.Clone(c.stopped)
+		outside = c.others
+	}
+	ns.mu.Unlock()
+	if outside != maxStoppedGenerations {
+		t.Fatalf("%d generations outside the snapshot remembered, want the cap, %d", outside, maxStoppedGenerations)
+	}
+	if want := gens + maxStoppedGenerations; len(stopped) != want {
+		t.Fatalf("%d stopped generations remembered, want %d (the snapshot's %d plus the cap)", len(stopped), want, gens)
+	}
+	for g := 1000 + maxStoppedGenerations; g < 1000+others; g++ {
+		if slices.Contains(stopped, uint64(g)) {
+			t.Fatalf("generation %d, outside the snapshot and past the cap, was remembered", g)
+		}
 	}
 }

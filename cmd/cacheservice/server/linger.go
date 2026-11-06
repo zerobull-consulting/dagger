@@ -219,7 +219,17 @@ func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache strin
 		return
 	}
 	draining := s.draining.Load()
-	ns.sawEvent(cacheID, generation, kind == telemetryattrs.EngineEventStop && draining, draining)
+	stop := kind == telemetryattrs.EngineEventStop && draining
+	ns.sawEvent(cacheID, generation, stop, stop && s.inDrainSnapshot(ns, cacheID, generation), draining)
+}
+
+// inDrainSnapshot reports whether cacheID's generation, in ns, had a welcomed
+// connection when the drain started (drain.conns): a linger may wait for it,
+// so its engine.stop is recorded whatever maxStoppedGenerations says.
+func (s *Service) inDrainSnapshot(ns *namespace, cacheID string, generation uint64) bool {
+	s.drain.mu.Lock()
+	defer s.drain.mu.Unlock()
+	return slices.Contains(s.drain.conns, lingerWait{ns: ns, cacheID: cacheID, generation: generation})
 }
 
 // eventCache is what a namespace remembers of an engine cache whose events
@@ -228,28 +238,35 @@ type eventCache struct {
 	// last is when its latest event arrived.
 	last time.Time
 	// stopped are the generations whose engine.stop arrived while
-	// draining, at most maxStoppedGenerations of them.
+	// draining: each one in the drain's snapshot (drain.conns), and at most
+	// maxStoppedGenerations others.
 	stopped []uint64
+	// others is how many of stopped aren't in the drain's snapshot.
+	others int
 }
 
-// maxStoppedGenerations bounds the generations an eventCache remembers
-// stopping: a token can send engine.stop for any generation.
+// maxStoppedGenerations bounds the generations outside the drain's snapshot
+// an eventCache remembers stopping: a token can send engine.stop for any
+// generation. Those in the snapshot, which a linger may wait for, are always
+// remembered; they are bounded by the connections welcomed before the drain
+// (zerobull-consulting/dagger#126).
 const maxStoppedGenerations = 8
 
 // sawEvent records that an engine event about cacheID arrived, and with
-// stop, that it was engine.stop of generation, while draining. It remembers at most
+// stop, that it was engine.stop of generation, while draining; inSnapshot is
+// whether that generation is in the drain's snapshot. It remembers at most
 // maxEventCaches caches: past that, a new cache replaces the one heard from
 // least recently that has no live connection, unless draining is set, when
 // the caches a linger may wait for must stay, and the new one isn't
 // remembered.
-func (n *namespace) sawEvent(cacheID string, generation uint64, stop, draining bool) {
+func (n *namespace) sawEvent(cacheID string, generation uint64, stop, inSnapshot, draining bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	now := n.now()
 	if c := n.eventCaches[cacheID]; c != nil {
 		c.last = now
 		if stop {
-			c.stop(generation)
+			c.stop(generation, inSnapshot)
 		}
 		return
 	}
@@ -263,15 +280,22 @@ func (n *namespace) sawEvent(cacheID string, generation uint64, stop, draining b
 	}
 	c := &eventCache{last: now}
 	if stop {
-		c.stop(generation)
+		c.stop(generation, inSnapshot)
 	}
 	n.eventCaches[cacheID] = c
 }
 
-// stop records generation's engine.stop.
-func (c *eventCache) stop(generation uint64) {
-	if slices.Contains(c.stopped, generation) || len(c.stopped) >= maxStoppedGenerations {
+// stop records generation's engine.stop: always when inSnapshot, else only
+// while fewer than maxStoppedGenerations others are recorded.
+func (c *eventCache) stop(generation uint64, inSnapshot bool) {
+	if slices.Contains(c.stopped, generation) {
 		return
+	}
+	if !inSnapshot {
+		if c.others >= maxStoppedGenerations {
+			return
+		}
+		c.others++
 	}
 	c.stopped = append(c.stopped, generation)
 }
