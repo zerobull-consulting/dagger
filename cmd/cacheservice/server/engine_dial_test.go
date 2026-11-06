@@ -23,13 +23,19 @@ import (
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
+// dialed is one WebSocket the engine opened, with the request that opened it.
+type dialed struct {
+	req  *http.Request
+	conn *websocket.Conn
+}
+
 // dialServer accepts WebSockets at protocol.EnginePath and hands each to the
 // test with the request that opened it. refuse, when set, says whether to
-// refuse the n-th upgrade (from 1) with 401.
-func dialServer(t *testing.T, refuse func(n int64) bool) (*httptest.Server, <-chan *http.Request, <-chan *websocket.Conn) {
+// refuse the n-th upgrade (from 1) with 401. The connections are closed when
+// the test ends.
+func dialServer(t *testing.T, refuse func(n int64) bool) (*httptest.Server, <-chan dialed) {
 	t.Helper()
-	reqs := make(chan *http.Request, 4)
-	conns := make(chan *websocket.Conn, 4)
+	conns := make(chan dialed, 4)
 	done := make(chan struct{})
 	var n atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,18 +47,14 @@ func dialServer(t *testing.T, refuse func(n int64) bool) (*httptest.Server, <-ch
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		select {
-		case reqs <- r:
-		default:
-		}
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
+		defer conn.CloseNow()
 		select {
-		case conns <- conn:
+		case conns <- dialed{req: r, conn: conn}:
 		default:
-			conn.CloseNow()
 			return
 		}
 		<-done
@@ -61,7 +63,7 @@ func dialServer(t *testing.T, refuse func(n int64) bool) (*httptest.Server, <-ch
 		close(done)
 		srv.Close()
 	})
-	return srv, reqs, conns
+	return srv, conns
 }
 
 // runEngine runs remotecache.Run against url until the test ends, and fails
@@ -82,14 +84,14 @@ func runEngine(t *testing.T, cfg remotecache.Config) {
 	})
 }
 
-func takeConn(t *testing.T, conns <-chan *websocket.Conn) *websocket.Conn {
+func takeConn(t *testing.T, conns <-chan dialed) dialed {
 	t.Helper()
 	select {
-	case c := <-conns:
-		return c
+	case d := <-conns:
+		return d
 	case <-time.After(10 * time.Second):
 		t.Fatal("the engine did not connect")
-		return nil
+		return dialed{}
 	}
 }
 
@@ -124,15 +126,14 @@ func writeEnvelope(t *testing.T, c *websocket.Conn, env protocol.Envelope) {
 func TestEngineDialsEnginePath(t *testing.T) {
 	for _, suffix := range []string{"", "/"} {
 		t.Run("suffix="+suffix, func(t *testing.T) {
-			srv, reqs, conns := dialServer(t, nil)
+			srv, conns := dialServer(t, nil)
 			runEngine(t, remotecache.Config{URL: srv.URL + suffix, Token: "engine-token", EngineName: "e"})
-			c := takeConn(t, conns)
-			r := <-reqs
-			user, pass, ok := r.BasicAuth()
+			d := takeConn(t, conns)
+			user, pass, ok := d.req.BasicAuth()
 			require.True(t, ok)
 			require.Equal(t, "engine-token", user)
 			require.Empty(t, pass)
-			hello := readEnvelope(t, c)
+			hello := readEnvelope(t, d.conn)
 			require.Equal(t, protocol.TypeHello, hello.Type)
 		})
 	}
@@ -140,18 +141,18 @@ func TestEngineDialsEnginePath(t *testing.T) {
 
 // A refused upgrade fails that dial, and the engine dials again.
 func TestEngineRedialsAfterRefusedUpgrade(t *testing.T) {
-	srv, _, conns := dialServer(t, func(n int64) bool { return n == 1 })
+	srv, conns := dialServer(t, func(n int64) bool { return n == 1 })
 	runEngine(t, remotecache.Config{URL: srv.URL, Token: "t"})
-	c := takeConn(t, conns)
+	c := takeConn(t, conns).conn
 	require.Equal(t, protocol.TypeHello, readEnvelope(t, c).Type)
 }
 
 // Over a real WebSocket, the engine says hello, skips binary messages, and
 // once welcomed answers the service's requests in text.
 func TestEngineServesOverWebSocket(t *testing.T) {
-	srv, _, conns := dialServer(t, nil)
+	srv, conns := dialServer(t, nil)
 	runEngine(t, remotecache.Config{URL: srv.URL, Token: "t", EngineName: "e"})
-	c := takeConn(t, conns)
+	c := takeConn(t, conns).conn
 
 	hello := readEnvelope(t, c)
 	require.Equal(t, protocol.TypeHello, hello.Type)

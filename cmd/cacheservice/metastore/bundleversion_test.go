@@ -21,13 +21,19 @@ func (*versionTestRoot) Type() *ast.Type { return &ast.Type{NamedType: "Query", 
 // The service's bundle version is its own constant, not the engine's: this
 // test pins the two together by exporting a value through dagql's real
 // capture path (Cache.WithExportedValues, what the engine runs for an
-// export) and checking the version the bundle carries. When a merge from
-// upstream bumps the engine's bundle version, it fails in that merge.
+// export), checking the version the bundle carries, and merging it into a
+// second cache through dagql's real import (Cache.MergeValues), which refuses
+// any version but its own. When a merge from upstream bumps the version the
+// engine writes or imports, it fails in that merge.
 func TestBundleVersionMatchesEngineCapture(t *testing.T) {
 	ctx := engine.ContextWithClientMetadata(t.Context(), &engine.ClientMetadata{ClientID: "bundle-version-test", SessionID: "test-session"})
-	cache, err := dagql.NewCache(ctx, filepath.Join(t.TempDir(), "cache.db"), nil, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, cache.CloseDiscardingPersistence()) })
+	newCache := func() *dagql.Cache {
+		c, err := dagql.NewCache(ctx, filepath.Join(t.TempDir(), "cache.db"), nil, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, c.CloseDiscardingPersistence()) })
+		return c
+	}
+	cache := newCache()
 	srv, err := dagql.NewServer(ctx, &versionTestRoot{})
 	require.NoError(t, err)
 	ctx = dagql.ContextWithCache(ctx, cache)
@@ -52,4 +58,11 @@ func TestBundleVersionMatchesEngineCapture(t *testing.T) {
 			"then set metastore.BundleVersion to %d",
 		bundle.Version, metastore.BundleVersion, bundle.Version)
 	require.NoError(t, metastore.ValidateBundle(&bundle), "the service refuses the bundle the engine's capture writes")
+
+	// The engine's import accepts the version the service stores.
+	importer := newCache()
+	reply, err := importer.MergeValues(dagql.ContextWithCache(ctx, importer), dagql.CloudCacheID, bundle)
+	require.NoError(t, err, "the engine's dagql refuses to import a version-%d bundle, the version the service stores: "+
+		"check what changed in the bundle format and update the service and metastore.BundleVersion", metastore.BundleVersion)
+	require.Len(t, reply.Imported(), len(bundle.Roots))
 }

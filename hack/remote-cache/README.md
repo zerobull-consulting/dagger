@@ -401,7 +401,7 @@ claimed. CI runs `v1.0.0-beta.25`, the `STOCK_ENGINE` pin in
 `sidecar` job, and warns when this branch's client differs from it: the job
 compares `engine/remotecache`, `cmd/engine/remotecache.go`,
 `engine/server/remote_cache*.go` and the bundle code in `dagql` with the
-release's, ignoring that constant. The wider check, over all of
+release's, ignoring only blank lines. The wider check, over all of
 `dagql/cache*.go`, against an upstream release tag:
 
 ```bash
