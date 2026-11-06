@@ -15,11 +15,13 @@ To run it against a real bucket, its safety guarantees, its variables and what
 each store did, see
 [Testing against a real bucket](../../../hack/remote-cache/README.md#testing-against-a-real-bucket).
 A run needs `CACHESERVICE_S3_PREFIX`, works under `<prefix>/e2e/<run>/`, and
-fails if the proxy or its direct client refused a request: one that would
-change something outside it, or a bulk delete whose body it couldn't check:
-unreadable, not valid `DeleteObjects` XML, or over
-`s3test.MaxBulkDeleteBytes`.
-Reads outside it are let through: they change nothing. That
+fails if the proxy or its direct client refused any request. The guard
+(`s3test.Guard`) refuses a write, delete or abort of a key outside the
+prefix, any change to the bucket's configuration, and a bulk delete whose
+body it can't check (unreadable, not valid `DeleteObjects` XML, or over
+`s3test.MaxBulkDeleteBytes`); the full rules are in
+[What keeps a shared bucket safe](../../../hack/remote-cache/README.md#what-keeps-a-shared-bucket-safe).
+Reads are let through: they change nothing. That
 prefix is new for each run, so the first service's startup check finds it
 empty and claims it with the ownership marker (see
 [Bucket ownership](../README.md#bucket-ownership)); `Env.CheckConsistent`
