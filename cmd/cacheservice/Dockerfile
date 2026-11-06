@@ -14,6 +14,11 @@ ARG TARGETARCH
 # Recorded in the ownership marker this image creates (README, "Bucket
 # ownership").
 ARG REVISION=""
+# The upstream release this build is (compat.Release), reported as its base
+# in its identity. It must be cmd/cacheservice/compat/engines.txt's base line,
+# or the service refuses to start. Empty, as for a build that tracks
+# upstream main, the service reports its base as "dev".
+ARG RELEASE=""
 WORKDIR /src
 COPY . .
 # The cache mounts keep modules and build results between local builds; on a
@@ -21,7 +26,7 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w -X github.com/dagger/dagger/cmd/cacheservice/ownership.ServiceVersion=${REVISION}" \
+    go build -trimpath -ldflags="-s -w -X github.com/dagger/dagger/cmd/cacheservice/ownership.ServiceVersion=${REVISION} -X github.com/dagger/dagger/cmd/cacheservice/compat.Release=${RELEASE}" \
       -o /out/cacheservice ./cmd/cacheservice
 
 # CA certificates, tzdata, and user 65532 (nonroot); no shell.

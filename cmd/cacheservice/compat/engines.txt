@@ -1,0 +1,29 @@
+# The engines this cache service accepts (zerobull-consulting/dagger#117,
+# D1-D3). The service refuses, before its welcome, every engine whose
+# version (protocol.Hello.EngineVersion) isn't exactly one of the accept
+# lines below. This file is embedded in the binary (compat.go) and is the
+# single source of truth: CI's engine pin, the e2e harness's default, the
+# demo's default and the docs' examples all come from it or are checked
+# against it (compat_test.go, hack/remote-cache/engines.sh).
+#
+#   base <upstream tag>
+#       The upstream Dagger release the service is built from. A build
+#       reports it as its base only when stamped as that release (see
+#       compat.Release); every other build reports "dev".
+#   accept <engine version> <image index digest> verified: <CI run URL>
+#       An engine version the service accepts, the digest of the stock
+#       registry.dagger.io/engine image of that version, and the CI run of
+#       the e2e and the sidecar demo against that image that verified it.
+#       A version is accepted only after such a run is green: reading the
+#       code isn't enough. The first accept line is the one CI's pull
+#       requests, the e2e harness and the demo run by default. At most 100.
+#   reject <engine version> <issue>
+#       A version that was tried and fails, and the issue explaining why.
+#       A rejected version is refused like any other unlisted one.
+#
+# Blank lines and lines starting with # are ignored. Anything else fails
+# the build's tests (and the service, at startup).
+
+base v1.0.0-beta.25
+
+accept v1.0.0-beta.25 sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834 verified: https://github.com/zerobull-consulting/dagger/actions/runs/42287640433

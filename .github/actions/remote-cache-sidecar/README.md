@@ -35,17 +35,20 @@ jobs:
 
 Pin both actions and the service's image to the same commit of
 `feature/remote-cache`: the action passes flags that commit's service
-takes. The engine is a stock Dagger release, pinned by digest: the example
-is the release CI's `sidecar demo` job runs (`STOCK_ENGINE` in
-[`remote-cache-tests.yml`](../../workflows/remote-cache-tests.yml)). The
-minimum release with a compatible client is `v1.0.0-beta.24`; how that was
-checked is in
-[Engine](../../../hack/remote-cache/README.md#engine). Nothing checks the
-engine's version yet: under the lockstep policy
-([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117))
-the engine will be the release the service was built from, and one version
-input will replace both image inputs. The fork no longer publishes an engine
-image of its own.
+takes. The engine is a stock Dagger release, pinned by digest, whose
+version is an `accept` line of the service's engine manifest,
+[`cmd/cacheservice/compat/engines.txt`](../../../cmd/cacheservice/compat/engines.txt),
+at that commit: each service release accepts a verified list of engine
+versions and refuses every other engine before its welcome
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117);
+see [Engine versions](../../../cmd/cacheservice/README.md#engine-versions)).
+The example is the manifest's first accept line, the release CI's `sidecar
+demo` job runs. A refused engine logs why (`engine version "…" is not
+accepted`), retries with its backoff, and runs its builds without the
+remote cache. The `engine-image` input's description still names the
+older minimum-release rule; a later step of
+zerobull-consulting/dagger#117 replaces both image inputs with one version
+input. The fork no longer publishes an engine image of its own.
 
 ## Inputs
 
@@ -228,8 +231,9 @@ one with it), then a read-only phase on a fresh engine with a read-only key. Loc
 runs the same with `sidecar.sh`.
 
 The job builds the service's image from the pull request, but runs the stock
-Dagger engine release in `STOCK_ENGINE`, not an engine built from this
-branch: the engine's remote cache client comes from upstream, and a step of
-the job warns when this branch's client differs from that release's. Which engine to
-pin is settled by the lockstep policy, a vX service for vX engines
+Dagger engine release in `STOCK_ENGINE`, the first accept line of the
+service's engine manifest, not an engine built from this branch: the
+engine's remote cache client comes from upstream, and a step of the job
+warns when this branch's client differs from that release's. The service
+refuses an engine whose version isn't an accept line
 ([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117)).

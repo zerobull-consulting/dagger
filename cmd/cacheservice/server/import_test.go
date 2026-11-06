@@ -48,7 +48,7 @@ func (h *exportHarness) connectEngine(cache *fakeengine.Cache) *engineConn {
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{URL: h.srv.URL, Token: "engine-token", EngineName: cache.ID})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{EngineVersion: testEngineVersion, URL: h.srv.URL, Token: "engine-token", EngineName: cache.ID})
 	}()
 	h.t.Cleanup(func() {
 		cancel()

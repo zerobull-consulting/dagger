@@ -27,6 +27,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/compat"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -40,11 +41,14 @@ const EnvEnable = "CACHESERVICE_E2E"
 
 // DefaultEngineImage is the engine image runs use unless E2E_ENGINE_IMAGE
 // says otherwise: a stock Dagger release, its multi-platform index pinned by
-// digest. It is the workflow's STOCK_ENGINE (.github/workflows/
-// remote-cache-tests.yml), which CI passes in as E2E_ENGINE_IMAGE;
-// TestDefaultEngineImageMatchesCI keeps the two the same, so update both
-// together.
-const DefaultEngineImage = "registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834"
+// digest. It is the service's engine manifest's first accept line
+// (cmd/cacheservice/compat/engines.txt), as the workflow's STOCK_ENGINE is
+// (hack/remote-cache/engines.sh pin), which CI passes in as
+// E2E_ENGINE_IMAGE; TestDefaultEngineImageMatchesCI checks the two agree.
+var DefaultEngineImage = compat.Embedded().Default().Image()
+
+// stockEngineRE is a stock engine image reference, with its version.
+var stockEngineRE = regexp.MustCompile(`^registry\.dagger\.io/engine:([^@]+)(@sha256:[0-9a-f]{64})?$`)
 
 // Settings are the run's knobs, from E2E_* variables.
 type Settings struct {
@@ -57,7 +61,9 @@ type Settings struct {
 	EngineImage string
 	// BuildEngine builds the engine, init-session and the CLI from this
 	// repo, and copies them over EngineImage: for work on the engine's
-	// client itself.
+	// client itself. Such an engine reports a development version, which no
+	// accept line names, so the run's services welcome it with
+	// -allow-engine-version-mismatch's check off, and the run says so.
 	BuildEngine bool
 	// Image is the run's engine image's tag.
 	Image string
@@ -117,6 +123,11 @@ func SettingsFromEnv(t *testing.T) Settings {
 	}
 	if s.SkipBuild && !s.BuildEngine {
 		t.Fatal("E2E_SKIP_BUILD=1 reuses the binaries of E2E_BUILD_ENGINE=1, which is not set: without it nothing is built")
+	}
+	// A stock engine the service doesn't accept would be refused at every
+	// hello: say so now, rather than as every scenario's timeout.
+	if m := stockEngineRE.FindStringSubmatch(s.EngineImage); m != nil && !s.BuildEngine && !compat.Embedded().Accepts(m[1]) {
+		t.Fatalf("E2E_ENGINE_IMAGE=%s: the service doesn't accept engine %s (it accepts %v; cmd/cacheservice/compat/engines.txt). To verify that version, add it as the first accept line locally, as engines.sh candidate does in CI", s.EngineImage, m[1], compat.Embedded().Versions())
 	}
 	return s
 }
@@ -194,6 +205,13 @@ func New(t *testing.T) *Env {
 		t.Fatal(err)
 	}
 	t.Logf("run %s: logs and results in %s", e.RunID, e.RunDir)
+	m := compat.Embedded()
+	if e.Settings.BuildEngine {
+		// CI's job output shows it as a warning annotation.
+		fmt.Printf("::warning::E2E_BUILD_ENGINE=1: the engines are built from this checkout and report a development version, so the run's services welcome them with -allow-engine-version-mismatch (they accept only %v)\n", m.Versions())
+	} else {
+		t.Logf("engine %s; the service accepts %v (cmd/cacheservice/compat/engines.txt)", e.Settings.EngineImage, m.Versions())
+	}
 
 	gw, err := Docker(context.Background(), "network", "inspect", "bridge", "-f", "{{(index .IPAM.Config 0).Gateway}}")
 	if err != nil {

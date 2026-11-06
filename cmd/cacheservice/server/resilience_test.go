@@ -286,7 +286,7 @@ func (r *restartable) connect(cache *fakeengine.Cache) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{URL: r.srv.URL, Token: "engine-token", EngineName: cache.ID})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: cache}, remotecache.Config{EngineVersion: testEngineVersion, URL: r.srv.URL, Token: "engine-token", EngineName: cache.ID})
 	}()
 	r.t.Cleanup(func() {
 		cancel()

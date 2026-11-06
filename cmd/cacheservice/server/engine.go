@@ -94,6 +94,10 @@ type Service struct {
 	// was read, before it is registered or refused.
 	testHookHello func()
 
+	// engines is the engine accept list and the service's identity
+	// (engineversion.go).
+	engines *enginePolicy
+
 	// registry holds metrics, which records the storage costs.
 	registry *prometheus.Registry
 	metrics  *metrics.Metrics
@@ -119,6 +123,7 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 		registry:   reg,
 		metrics:    newMetrics(reg),
 		otlp:       defaultOTLPLimits(),
+		engines:    defaultEnginePolicy(),
 	}
 }
 
@@ -184,6 +189,9 @@ type engineConn struct {
 
 	lastID atomic.Uint64
 	hello  protocol.Hello
+	// versionAccepted is set when the hello's version is on an accept line;
+	// it is unset for an engine welcomed by -allow-engine-version-mismatch.
+	versionAccepted bool
 
 	mu sync.Mutex
 	// stopImports ends the import sync loop; set once it starts.
@@ -286,6 +294,11 @@ func (c *engineConn) serve(ctx context.Context) error {
 	if h := c.svc.testHookHello; h != nil {
 		h()
 	}
+	// Before register: a refused engine is never registered, tracked,
+	// merged into or exported from.
+	if !c.checkEngineVersion(ctx, env) {
+		return errEngineVersionRefused
+	}
 	switch c.svc.register(c) {
 	case registered:
 	case refusedDraining:
@@ -304,7 +317,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 		c.closeRevoked()
 		return errors.New("token revoked before welcome")
 	}
-	if err := c.reply(ctx, env, protocol.TypeWelcome, protocol.Welcome{}); err != nil {
+	if err := c.reply(ctx, env, protocol.TypeWelcome, welcome{Service: c.svc.Identity()}); err != nil {
 		return err
 	}
 	// The engine reports in at its generation: a newer one clears the
@@ -678,6 +691,7 @@ func (s *Service) DebugHandler() http.Handler {
 	mux.HandleFunc("GET /debug/engines/{conn}/imports", s.serveImports)
 	mux.HandleFunc("POST /debug/gc", s.serveGC)
 	mux.HandleFunc("GET /debug/drain", s.serveDrain)
+	mux.HandleFunc("GET /debug/identity", s.serveIdentity)
 	mux.Handle("GET /metrics", s.MetricsHandler())
 	return s.debugAuth(mux)
 }
@@ -693,7 +707,16 @@ type EngineInfo struct {
 	CacheID       string    `json:"cacheID"`
 	Generation    uint64    `json:"generation"`
 	EngineVersion string    `json:"engineVersion"`
-	EngineName    string    `json:"engineName"`
+	// VersionAccepted is false for an engine whose version isn't accepted,
+	// welcomed by -allow-engine-version-mismatch.
+	VersionAccepted bool   `json:"versionAccepted"`
+	EngineName      string `json:"engineName"`
+}
+
+// serveIdentity answers with the service's identity: its base release (or
+// "dev"), the engine versions it accepts and its revision.
+func (s *Service) serveIdentity(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, s.Identity())
 }
 
 func (s *Service) listEngines(w http.ResponseWriter, _ *http.Request) {

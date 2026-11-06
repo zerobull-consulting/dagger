@@ -222,7 +222,7 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: b.cache}, remotecache.Config{URL: b.url, Token: "engine-token", EngineName: b.cache.ID})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: b.cache}, remotecache.Config{EngineVersion: testEngineVersion, URL: b.url, Token: "engine-token", EngineName: b.cache.ID})
 	}()
 	t.Cleanup(func() {
 		cancel()

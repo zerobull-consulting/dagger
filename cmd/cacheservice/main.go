@@ -125,6 +125,7 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/compat"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
@@ -157,6 +158,7 @@ func main() {
 		gcMaxDeletes  int
 		drainTimeout  time.Duration
 		drainLinger   time.Duration
+		allowVersions bool
 	)
 	flag.StringVar(&listen, "listen", ":8090", "address of the engine WebSocket and the OTLP receivers")
 	flag.StringVar(&debugListen, "debug-listen", "127.0.0.1:8091", "address of the debug API (empty: off); a non-loopback address needs -debug-token-file")
@@ -182,6 +184,7 @@ func main() {
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
 	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once, with no drain and no linger); -drain-linger and a shutdown of at most 5s follow, so the process manager's stop timeout must be longer than this plus -drain-linger plus 5s")
 	flag.DurationVar(&drainLinger, "drain-linger", DefaultDrainLinger, "after the drain, at most how long to keep answering the engines' OTLP requests, storing nothing, so that each engine connected when the drain started whose events come here can deliver its engine.stop when it is stopped next; it ends once they all did, or at a second signal (0: stop right after the drain)")
+	flag.BoolVar(&allowVersions, "allow-engine-version-mismatch", false, "DEVELOPMENT ONLY: welcome engines whose version isn't on an accept line of the service's manifest (cmd/cacheservice/compat/engines.txt), logging each; by default they are refused before the welcome (close status 4002)")
 	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
@@ -233,7 +236,18 @@ func main() {
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 
+	// A build stamped as another release than its manifest's base would
+	// report a false identity.
+	if _, err := compat.BuildBase(compat.Embedded()); err != nil {
+		logger.Error(err.Error())
+		os.Exit(2)
+	}
 	svc := server.New(logger, dumpDir)
+	id := svc.Identity()
+	logger.Info("identity", "base", id.Base, "accept", id.Accept, "revision", id.Revision)
+	if allowVersions {
+		svc.AllowEngineVersionMismatch()
+	}
 	// The namespace of every engine without tokens, with a store or not.
 	if err := svc.SetDefaultNamespace(scope); err != nil {
 		logger.Error("scope", "error", err)

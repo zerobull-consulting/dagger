@@ -85,7 +85,7 @@ func TestEngineConnectsAndReconnects(t *testing.T) {
 		done <- remotecache.Run(ctx, fakeAdapter{}, remotecache.Config{
 			URL:           srv.URL,
 			Token:         "secret-token",
-			EngineVersion: "v-test",
+			EngineVersion: testEngineVersion,
 			EngineName:    "engine-test",
 		})
 	}()
@@ -163,7 +163,7 @@ func TestDebugRequest(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go remotecache.Run(ctx, fakeAdapter{}, remotecache.Config{URL: srv.URL, Token: "t"})
+	go remotecache.Run(ctx, fakeAdapter{}, remotecache.Config{EngineVersion: testEngineVersion, URL: srv.URL, Token: "t"})
 	c := waitEngines(t, svc, 1)[0]
 
 	resp, err := http.Get(debug.URL + "/debug/engines")

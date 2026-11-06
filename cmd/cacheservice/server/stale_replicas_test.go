@@ -84,7 +84,7 @@ func testStaleRefusalClearedAcrossReplicas(t *testing.T, eventFirst bool) {
 	r1done := make(chan struct{})
 	go func() {
 		defer close(r1done)
-		_ = remotecache.Run(r1ctx, fakeengine.Adapter{Cache: restarted}, remotecache.Config{URL: r1URL, Token: "engine-token", EngineName: "engine-a"})
+		_ = remotecache.Run(r1ctx, fakeengine.Adapter{Cache: restarted}, remotecache.Config{EngineVersion: testEngineVersion, URL: r1URL, Token: "engine-token", EngineName: "engine-a"})
 	}()
 	// Cleanups run last first: this one before replica 1's, which waits
 	// for its connections to end, even when the test fails before stopR1.
@@ -199,7 +199,7 @@ func TestOlderGenerationConnectingLaterDoesNotTakeExports(t *testing.T) {
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: old}, remotecache.Config{URL: h.srv.URL, Token: "engine-token", EngineName: "engine-old"})
+		done <- remotecache.Run(ctx, fakeengine.Adapter{Cache: old}, remotecache.Config{EngineVersion: testEngineVersion, URL: h.srv.URL, Token: "engine-token", EngineName: "engine-old"})
 	}()
 	t.Cleanup(func() {
 		cancel()

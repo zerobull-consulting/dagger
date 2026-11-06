@@ -57,6 +57,11 @@ type Store interface {
 // build's VCS revision, or "dev".
 var ServiceVersion = ""
 
+// Revision is the revision this binary reports, in its markers and its
+// identity (compat.Identity): ServiceVersion, else the build's VCS
+// revision, else "dev".
+func Revision() string { return serviceVersion() }
+
 func serviceVersion() string {
 	if ServiceVersion != "" {
 		return ServiceVersion

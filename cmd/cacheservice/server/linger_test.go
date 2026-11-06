@@ -403,7 +403,7 @@ func TestLingerStoppedGenerationsInSnapshotNotCapped(t *testing.T) {
 	gens := maxStoppedGenerations + 1
 	for g := 1; g <= gens; g++ {
 		e := dialRaw(t, l.srv, "engine-token")
-		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{CacheID: "cache-a", Generation: uint64(g), EngineName: "cache-a"})
+		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: "cache-a", Generation: uint64(g), EngineName: "cache-a"})
 		if err != nil {
 			t.Fatal(err)
 		}
