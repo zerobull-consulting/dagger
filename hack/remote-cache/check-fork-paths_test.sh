@@ -110,6 +110,8 @@ expect 'go.mod: changing the go version fails' 1 'changes its Go directive' \
   'sed -i "s#^go 1.22#go 1.23#" go.mod'
 expect 'go.mod: dropping // indirect passes' 0 'OK' \
   'sed -i "s#example.com/b v1.0.0 // indirect#example.com/b v1.0.0#" go.mod'
+expect 'add-lines: a mode change fails' 1 'go\.sum: changes its mode' \
+  'chmod +x go.sum'
 expect 'go.sum: removing an upstream line fails' 1 'go\.sum: removes or changes 1 of upstream' \
   'sed -i "/example.com\/b/d" go.sum'
 expect 'an entry without a reason is refused' 2 "'cmd/cacheservice/' has no reason" \
@@ -187,8 +189,10 @@ g -C "$fork" fetch -q origin tag v1.0.0-beta.3
 g -C "$fork" merge -q --no-edit v1.0.0-beta.3
 forkbase=$(g -C "$fork" rev-parse HEAD)
 expect 'after merging a release tag on main, the base is the tag' 0 "Base: $tag3"
+forkbase0=$forkbase
 
-# A release tag from off main, merged into the fork: two bases, so it stops.
+# A release tag from off main, merged into the fork: the base doesn't
+# contain it, so it stops.
 g -C "$up" checkout -q -b release v1.0.0-beta.1
 echo 'package engine // hotfix' >"$up/engine/hotfix.go"
 g -C "$up" add -A
@@ -199,7 +203,22 @@ g -C "$fork" checkout -q --detach "$forkbase"
 g -C "$fork" fetch -q origin tag v1.0.0-beta.2
 g -C "$fork" merge -q --no-edit v1.0.0-beta.2
 forkbase=$(g -C "$fork" rev-parse HEAD)
-expect 'an annotated tag merged from off main stops the check' 2 'no single base contains'
+expect 'an annotated tag merged from off main stops the check' 2 'release tags from off main'
+
+# A release branch cut at main's tip: its tag descends from the merge base,
+# and still isn't main's.
+g -C "$fork" checkout -q --detach "$forkbase0"
+g -C "$up" checkout -q -b release2 main
+echo 'package engine // hotfix 2' >"$up/engine/hotfix2.go"
+g -C "$up" add -A
+g -C "$up" commit -qm 'hotfix 2'
+g -C "$up" tag v1.0.0-beta.9
+g -C "$up" checkout -q main
+g -C "$fork" fetch -q origin main tag v1.0.0-beta.9
+g -C "$fork" merge -q --no-edit origin/main
+g -C "$fork" merge -q --no-edit v1.0.0-beta.9
+forkbase=$(g -C "$fork" rev-parse HEAD)
+expect "a tag off a branch cut at main's tip stops the check" 2 'v1\.0\.0-beta\.9'
 
 echo "$pass passed, $fail failed"
 ((fail == 0))

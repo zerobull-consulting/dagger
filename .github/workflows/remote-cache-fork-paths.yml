@@ -41,10 +41,39 @@ jobs:
       - name: Test the check
         timeout-minutes: 5
         run: hack/remote-cache/check-fork-paths_test.sh
+      # On a pull request, the checker comes from the base branch, so a pull request can't weaken the check it's
+      # measured by. The allowlist comes from the pull request: an entry is
+      # meant to be added there, with its reason, and the job flags it for
+      # review. Until the base branch has a checker, the pull request's runs.
       - name: Check the fork's paths
         timeout-minutes: 10
         env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # Empty unless set: only for a release tag merged from off upstream
           # main, when the check can't pick one base (see the README).
           FORK_BASE: ${{ vars.FORK_PATHS_BASE }}
-        run: hack/remote-cache/check-fork-paths.sh
+          # The branch to deepen when HEAD isn't fetchable by itself.
+          FORK_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          check=hack/remote-cache/check-fork-paths.sh
+          allow=hack/remote-cache/fork-paths.txt
+          if [ "$EVENT" = pull_request ]; then
+            git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+              || timeout 120 git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"
+            if git cat-file -e "$BASE_SHA:$check" 2>/dev/null; then
+              git show "$BASE_SHA:$check" >"$RUNNER_TEMP/check-fork-paths.sh"
+              chmod +x "$RUNNER_TEMP/check-fork-paths.sh"
+              check=$RUNNER_TEMP/check-fork-paths.sh
+              echo "Running the base branch's checker ($(git rev-parse --short "$BASE_SHA"))."
+              git diff --quiet "$BASE_SHA" HEAD -- hack/remote-cache/check-fork-paths.sh \
+                || echo "::notice::This pull request changes the checker; its new version runs once merged."
+            else
+              echo "The base branch has no checker yet; running this pull request's."
+            fi
+            if ! git diff --quiet "$BASE_SHA" HEAD -- "$allow"; then
+              echo "::warning file=$allow::This pull request changes the fork's allowlist. Review each new entry and its reason."
+              git diff "$BASE_SHA" HEAD -- "$allow"
+            fi
+          fi
+          "$check"

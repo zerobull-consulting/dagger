@@ -683,7 +683,7 @@ hack/remote-cache/check-fork-paths.sh       # needs network access to github.com
 hack/remote-cache/check-fork-paths_test.sh  # the check's own tests, offline
 ```
 
-Both need git, Go (for `go mod edit -json`) and jq.
+Both need git, Go (for `go mod edit -json`), jq and coreutils' `timeout`.
 
 **The base** is the merge base of `HEAD` with upstream `main`, which the fork
 tracks. Upstream tags releases on `main`, so after a merge from a release tag
@@ -717,4 +717,8 @@ the service's paths, or upstreaming it, to a new entry.
 
 The `fork paths` job of `.github/workflows/remote-cache-fork-paths.yml` runs
 the tests and the check on every pull request into `feature/remote-cache`
-and every push to it.
+and every push to it. On a pull request it runs the base branch's checker,
+so a pull request can't weaken the check that measures it; a change to the
+checker takes effect once merged. The allowlist is the pull request's, since
+that's where an entry is added, and the job flags any change to it with a
+warning for the reviewer.

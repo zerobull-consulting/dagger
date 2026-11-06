@@ -101,31 +101,32 @@ if [[ -n ${FORK_BASE:-} ]]; then
   echo "Base: $(git log -1 --format='%H (%cs) %s' "$base") (FORK_BASE)"
 else
   base=$(find_base)
-  # Upstream's release tags HEAD contains. Each is a base candidate: on main
-  # it's an ancestor of the merge base and drops out below; from off main it
-  # stays, and the check stops. Without --refs, so an annotated tag's
-  # peeled commit (the "^{}" line) is listed; its tag object, never fetched,
-  # is skipped.
+  # Upstream's release tags HEAD contains. A tag on main that HEAD contains
+  # is common to both histories, so it's an ancestor of the merge base (or
+  # the base itself). Any other is off main, even one cut at main's tip,
+  # and the merge base doesn't account for it: the check stops. Without
+  # --refs, so an annotated tag's peeled commit (the "^{}" line) is listed;
+  # its tag object, never fetched, is skipped.
   tags=$(net git ls-remote --tags "$UPSTREAM_URL" 'refs/tags/v*') \
     || die "couldn't list $UPSTREAM_URL's tags within ${FETCH_TIMEOUT}s"
-  candidates=("$base")
+  off_main=()
   while read -r sha ref; do
     [[ -n $sha ]] || continue
     git cat-file -e "$sha^{commit}" 2>/dev/null || continue
     git merge-base --is-ancestor "$sha" "$head" || continue
-    candidates+=("$sha")
+    git merge-base --is-ancestor "$sha" "$base" && continue
+    off_main+=("$sha ${ref%^\{\}}")
   done <<<"$tags"
-  mapfile -t independent < <(git merge-base --independent "${candidates[@]}")
-  if ((${#independent[@]} != 1)); then
+  if ((${#off_main[@]})); then
     {
-      echo "check-fork-paths: HEAD merged upstream commits no single base contains:"
-      for c in "${independent[@]}"; do git log -1 --format='  %H %s' "$c"; done
-      echo "A release tag from off $UPSTREAM_BRANCH? Set FORK_BASE to the full id of the base to"
-      echo "measure against (in CI, the FORK_PATHS_BASE repository variable)."
+      echo "check-fork-paths: HEAD merged upstream release tags from off $UPSTREAM_BRANCH, which"
+      echo "the merge base $(git rev-parse --short "$base") doesn't contain:"
+      for t in "${off_main[@]}"; do echo "  ${t#* } (${t%% *})"; done
+      echo "Set FORK_BASE to the full id of the base to measure against (in CI, the"
+      echo "FORK_PATHS_BASE repository variable)."
     } >&2
     exit 2
   fi
-  base=${independent[0]}
   echo "Base: $(git log -1 --format='%H (%cs) %s' "$base")"
   echo "      the merge base with $UPSTREAM_URL $UPSTREAM_BRANCH, $(git rev-parse --short "$upstream_ref") as fetched"
 fi
@@ -185,6 +186,8 @@ check_go_mod() {
 check_add_lines() {
   local path=$1 status=$2 removed
   [[ $status == M ]] || { echo "the fork ${status_word[$status]:-changes} it; only added lines are allowed"; return 1; }
+  [[ $(git ls-tree "$base" -- "$path" | cut -d' ' -f1) == $(git ls-tree "$head" -- "$path" | cut -d' ' -f1) ]] \
+    || { echo "changes its mode; only added lines are allowed"; return 1; }
   removed=$(git diff --no-ext-diff --numstat "$base" "$head" -- "$path") \
     || { echo "couldn't diff it"; return 1; }
   removed=$(cut -f2 <<<"$removed")
