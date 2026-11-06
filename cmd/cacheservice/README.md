@@ -2653,14 +2653,16 @@ arrived.
 since="$(($(date +%s) - 1))"
 timeout 30 docker kill -s TERM remote-cache-service
 # Wait for the drain to be done, or the service to have exited, for at most
-# -drain-timeout plus 5s. Every docker call is bounded, and one that fails
-# or times out prints nothing: only docker's "false" means the service has
-# exited, so a failing docker never stops the engine mid-drain.
+# -drain-timeout plus 5s. Every docker call is bounded by what is left of
+# that (at most 10s, at least 1s), and one that fails or times out prints
+# nothing: only docker's "false" means the service has exited, so a failing
+# docker never stops the engine mid-drain.
 end=$((SECONDS + 605))
+left() { t=$((end - SECONDS)); [ "$t" -gt 10 ] && t=10; [ "$t" -lt 1 ] && t=1; echo "$t"; }
 while [ "$SECONDS" -lt "$end" ]; do
-  log="$(timeout 10 docker logs --since "$since" remote-cache-service 2>&1 || true)"
+  log="$(timeout "$(left)" docker logs --since "$since" remote-cache-service 2>&1 || true)"
   grep -q 'msg="drain: done"' <<<"$log" && break
-  [ "$(timeout 10 docker inspect -f '{{.State.Running}}' remote-cache-service 2>/dev/null)" = false ] && break
+  [ "$(timeout "$(left)" docker inspect -f '{{.State.Running}}' remote-cache-service 2>/dev/null)" = false ] && break
   sleep 0.5
 done
 timeout 90 docker stop --time 30 remote-cache-engine
