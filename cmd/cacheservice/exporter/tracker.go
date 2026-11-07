@@ -384,6 +384,10 @@ func (t *Tracker) Observe(o Observation, now time.Time) bool {
 	}
 	if changed {
 		e.changedAt = now
+		// A carrier speeds up the value it saw. This span changes it: it
+		// settles as any change does, unless its own session's carrier
+		// then speeds it up again (accelerateIfInLocked, below).
+		e.accel = false
 		if e.dirtySince.IsZero() || settled {
 			e.dirtySince = now
 		}

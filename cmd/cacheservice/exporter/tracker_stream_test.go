@@ -804,3 +804,27 @@ func TestTrackerPrunedImportExported(t *testing.T) {
 		t.Fatalf("after its import was dropped: %v", got)
 	}
 }
+
+// A carrier's speed-up belongs to the value it saw: a later span that changes
+// the value, from a session whose carrier hasn't come, settles as any change
+// does (Copilot's round-1 finding on zerobull-consulting/dagger#153).
+func TestTrackerSpeedUpClearedByLaterChange(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.Due(at(testSettle))
+	tr.Done(b[0], Result{Stored: []uint64{1}}, at(testSettle))
+	// Session s2 names the stored value unchanged and ends: sped up, though
+	// not worth exporting. No Due pass runs before the next span.
+	again := state(1, 20, fsPart)
+	again.Session = "s2"
+	tr.Observe(again, at(2*time.Second))
+	tr.SessionEnded("c", 1, "s2", 1, at(2*time.Second))
+	// Session s3, still running, adds a part.
+	tr.Observe(Observation{CacheID: "c", Generation: 1, Session: "s3", Number: 1, Parts: []string{metaPart}}, at(2100*time.Millisecond))
+	if got := roots(tr.Due(at(2100 * time.Millisecond))); len(got) != 0 {
+		t.Fatalf("due at once by a stale speed-up: %v", got)
+	}
+	if got := roots(tr.Due(at(2100*time.Millisecond + testSettle))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("on Settle: %v", got)
+	}
+}
