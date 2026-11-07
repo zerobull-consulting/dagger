@@ -43,13 +43,18 @@ does, never wall time:
   engine's cache isn't the writer's; `build` is a hit with 0 executed and the
   writer's stamp; `app` is cold and executes; nothing is exported.
 
-It uses the service's published `:feature-remote-cache` image and the stock
-engine release CI runs (the first accept line of the service's engine
-manifest, [`cmd/cacheservice/compat/engines.txt`](../../../cmd/cacheservice/compat/engines.txt),
-pinned by digest, which `run.sh` reads with `../engines.sh pin`) unless
-`SERVICE_IMAGE` and `ENGINE_IMAGE` say otherwise, such as a service image
-built from a checkout. The service refuses an engine whose version isn't in
-its manifest ([Engine](../README.md#engine)). On a host behind a
+`VERSION` picks both images, as the sidecar action's `version` input does:
+the stock engine of that version, pinned by the digest in the service's
+engine manifest,
+[`cmd/cacheservice/compat/engines.txt`](../../../cmd/cacheservice/compat/engines.txt),
+and the published service image that accepts it,
+`ghcr.io/zerobull-consulting/dagger-remote-cache:<version>`. Its default is
+the manifest's first accept line, the release CI runs. The two can't
+disagree; `SERVICE_IMAGE` overrides the service (such as an image built
+from a checkout), and the start then fails, with the service's reason, if
+that service refuses the engine
+([zerobull-consulting/dagger#146](https://github.com/zerobull-consulting/dagger/issues/146)).
+`ENGINE_IMAGE` is gone: `run.sh` refuses it. On a host behind a
 TLS-intercepting proxy, `CA_FILE=<bundle>` gives the engine its CA bundle.
 Each run uses a new prefix, `demo/<run>/`, and leaves its objects there;
 `dev.sh reset` deletes MinIO's data. Logs go to

@@ -30,8 +30,8 @@ any       .github/actions/remote-cache-sidecar/          the sidecar action that
 
 # The fork's own workflows, by name. Upstream's workflows aren't the fork's.
 any       .github/workflows/cacheservice-image.yml       builds and smoke-tests the service image on pull requests
-any       .github/workflows/cacheservice-publish.yml     publishes the service image on pushes to feature/remote-cache
-any       .github/workflows/remote-cache-tests.yml       the service's unit, MinIO, e2e and sidecar jobs
+any       .github/workflows/cacheservice-publish.yml     builds the service's release image on pushes to feature/remote-cache, verifies it against every accept line, then publishes it and moves its engine-version tags
+any       .github/workflows/remote-cache-tests.yml       the service's unit, MinIO, e2e and sidecar jobs, and the release matrix's e2e and sidecar runs
 any       .github/workflows/remote-cache-spaces.yml      the service's DigitalOcean Spaces jobs
 any       .github/workflows/remote-cache-fork-paths.yml  runs this check
 

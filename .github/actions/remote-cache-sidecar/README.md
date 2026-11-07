@@ -1,8 +1,8 @@
 # remote-cache-sidecar
 
-Runs the remote cache service (`cmd/cacheservice`) and an engine with its
-client side by side on a GitHub Actions runner, and sets up the `dagger` CLI
-for the job's later steps. A second action, [`stop`](stop/action.yml), stops
+Runs the remote cache service (`cmd/cacheservice`) and a stock engine of
+one accepted version side by side on a GitHub Actions runner, and sets up
+the `dagger` CLI for the job's later steps. A second action, [`stop`](stop/action.yml), stops
 them at the end of the job, after the service drains its exports. What each
 step does, and how to run the same outside GitHub, is in
 [Running it as a sidecar](../../../cmd/cacheservice/README.md#running-it-as-a-sidecar).
@@ -18,8 +18,7 @@ jobs:
           # A job on the default branch. A pull-request job's is the same,
           # with role: read-only and a read-only key.
           role: writer
-          service-image: ghcr.io/zerobull-consulting/cacheservice:<commit SHA>
-          engine-image: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+          version: v1.0.0-beta.25   # the engine; optional, see below
           s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
           s3-region: ${{ vars.CACHE_S3_REGION }}
           s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -33,30 +32,66 @@ jobs:
         uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
 
-Pin both actions and the service's image to the same commit of
-`feature/remote-cache`: the action passes flags that commit's service
-takes. The engine is a stock Dagger release, pinned by digest, whose
-version is an `accept` line of the service's engine manifest,
-[`cmd/cacheservice/compat/engines.txt`](../../../cmd/cacheservice/compat/engines.txt),
-at that commit: each service release accepts a verified list of engine
-versions and refuses every other engine before its welcome
-([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117);
-see [Engine versions](../../../cmd/cacheservice/README.md#engine-versions)).
-The example is the manifest's first accept line, the release CI's `sidecar
-demo` job runs. A refused engine logs why (`engine version "…" is not
-accepted`), retries with its backoff, and runs its builds without the
-remote cache. The `engine-image` input's description still names the
-older minimum-release rule; a later step of
-zerobull-consulting/dagger#117 replaces both image inputs with one version
-input. The fork no longer publishes an engine image of its own.
+Pin both actions to the same commit of `feature/remote-cache`.
+
+**`version`** is the engine version, and selects both images
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117),
+D4):
+
+- the engine: the stock `registry.dagger.io/engine` image of that version,
+  pinned by the digest in the service's engine manifest,
+  [`cmd/cacheservice/compat/engines.txt`](../../../cmd/cacheservice/compat/engines.txt),
+  at the action's commit. Its own `dagger` CLI is the one set up;
+- the service: `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>`,
+  a floating tag on the newest service build that accepts that engine,
+  verified against it (see
+  [Image](../../../cmd/cacheservice/README.md#image)).
+
+It must be an `accept` line of that manifest; without it, the action runs
+the first one, the release CI's `sidecar demo` job runs. Any other version
+fails the step before anything is created or pulled. Each service release
+accepts a verified list of engine versions and refuses every other engine
+(see [Engine versions](../../../cmd/cacheservice/README.md#engine-versions)),
+so the two images the version selects always agree.
+
+**The start is ready once the service has welcomed the engine.** The
+service logs `engine welcomed` after the hello, or `engine refused: its
+version is not accepted`; the start waits for one or the other, for up to
+120s, and fails the step on a refusal, with the service's reason
+([zerobull-consulting/dagger#146](https://github.com/zerobull-consulting/dagger/issues/146)).
+A refused engine would run the job's builds without the remote cache, and
+at the start, a refusal is a misconfiguration: a `service-image` that
+doesn't accept the version. The service's own rule, that a refusal leaves
+builds running, is for a fleet whose engines change under a running
+service; to keep a job going without the cache, give this step
+`continue-on-error: true`. A service that neither welcomes nor refuses the
+engine fails the step too, at that bound: a service image from before the
+`version` input logs no welcome.
+
+**Overrides:**
+
+- `service-image` replaces the service image, such as one built in the job
+  or `dagger-remote-cache:<commit SHA>` to pin one build; `version` still
+  selects the engine. CI's `sidecar demo` job uses it to test the pull
+  request's own build.
+- `engine-image` is **deprecated**, and will be removed: the engine image,
+  as before `version`. It is taken only with `service-image` and without
+  `version` (both images as given, with a warning); with `version`, or
+  without `service-image`, the step fails.
+
+The images were `ghcr.io/zerobull-consulting/cacheservice:<commit SHA>`
+before; that name is still published for a transition, with the same
+digests, and its tags are never deleted. The fork publishes no engine image
+of its own.
 
 ## Inputs
 
 | Input | Required | Default | What it is |
 | --- | --- | --- | --- |
 | `role` | yes | | `writer`: exports what the job builds, with `-gc-interval=0` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
-| `service-image` | yes | | The cache service image, by SHA tag. |
-| `engine-image` | yes | | A stock Dagger engine release, `v1.0.0-beta.24` or later, pinned by digest (`registry.dagger.io/engine:<release>@sha256:<digest>`). Its own `dagger` CLI is the one set up. |
+| `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.25`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
+| `service-image` | no | `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>` | Overrides the service image. The step fails if it refuses the engine. |
+| `engine-image` | no | | Deprecated: the engine image, only with `service-image` and without `version`; warns. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
 | `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. |
 | `s3-prefix` | no | empty: the whole bucket | The prefix the service [owns](../../../cmd/cacheservice/README.md#bucket-ownership): nothing else may write under it. Segments of letters, digits, `.`, `_` and `-`, separated by `/`, none of them `.` or `..`, with no leading or trailing `/`. |
@@ -87,6 +122,7 @@ fills, pass an `engine-config` with GC on.
 | Output | What it is |
 | --- | --- |
 | `dagger` | The CLI set up for the sidecar. It is also first on `PATH` for later steps. |
+| `version`, `service-image`, `engine-image` | What the sidecar runs (`version` is empty with the deprecated `engine-image`). |
 | `runner-host` | The engine, as `_EXPERIMENTAL_DAGGER_RUNNER_HOST` (`docker-container://<name>-engine`). |
 | `service-url` | The service, as the engine and the CLI reach it: on the sidecar network's gateway, which only this runner reaches. |
 | `service-container`, `engine-container` | The containers. |
@@ -141,8 +177,10 @@ needs the header.
 - **Start:** the step fails, with the service's log, when the service exits
   at startup (exit 1: a store error, such as a prefix it doesn't own or a
   read-only key on a writer; exit 2: a flag error) or doesn't listen within
-  120s, and, with the engine's log, when the engine exits or doesn't connect
-  within 120s. Pulls are bounded at 15 minutes each.
+  120s, and, with the engine's log, when the engine exits, or the service
+  refuses it or doesn't welcome it within 120s. A `version` the manifest
+  doesn't accept, or a misuse of the deprecated `engine-image`, fails it
+  before anything is created. Pulls are bounded at 15 minutes each.
 - **During the job:** every `dagger` run through the wrapper fails if the
   service has exited.
 - **Stop:** fails when the service exited before the stop, or its stop

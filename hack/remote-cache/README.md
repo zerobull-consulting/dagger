@@ -400,7 +400,19 @@ a dev engine (`-dev-<commit>`, `+dirty`) is refused too. A `reject` line
 names a version that was tried, and the issue saying why. See
 [the cache service's README](../../cmd/cacheservice/README.md#engine-versions)
 for the refusal, the escape hatch for development and the service's
-identity.
+identity. There is no minimum release: a version is supported only while
+it is an `accept` line.
+
+**Pick the service by the engine's version.** Each release build of the
+service is published as
+`ghcr.io/zerobull-consulting/dagger-remote-cache:<commit SHA>`, and
+`:<engine version>` is a floating tag on the newest build that accepts that
+engine, moved only once that build passed the e2e and the sidecar demo
+against every one of its `accept` lines
+([Image](../../cmd/cacheservice/README.md#image)). So for an engine
+`v1.0.0-beta.25`, run `dagger-remote-cache:v1.0.0-beta.25`. The sidecar
+action's `version` input, and the demo's `VERSION`, pick both images this
+way.
 
 What the engine releases share, for deciding which version to try next:
 the client and its protocol (`engine/remotecache`), whose hello carries the
@@ -444,7 +456,10 @@ it. Once the run is green, commit the line the run printed as a warning,
 `reject <version> <issue>` line with an issue explaining why. The manifest
 holds at most 100 `accept` lines; its parser and `TestPinsMatchManifest`
 fail the unit tests on anything else, including a digest-pinned engine in
-these docs, scripts or workflows that isn't an accept line.
+these docs, scripts or workflows that isn't an accept line. Once the line
+is on `feature/remote-cache`, its push's release run verifies it again,
+with the whole accept list, and moves the version's
+`dagger-remote-cache:<version>` tag to that build.
 
 Run it as the engine container, pinned by digest (this is an accept line), with
 the service's URL, the settings `cmd/cacheservice/e2e` starts its engines
