@@ -980,7 +980,8 @@ required check counts as passed). **A gap:** a required status check is
 matched by name, so a PR from a branch of this repository (its author has
 write access) can add a `pull_request` workflow with its own job named
 `accept line only`. Requiring this workflow through the ruleset's "Require
-workflows to pass", rather than as a status check, closes that. It fails an
+workflows to pass", rather than as a status check, closes that
+([zerobull-consulting/dagger#164](https://github.com/zerobull-consulting/dagger/issues/164)). It fails an
 accept PR unless, from
 its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
 one added line (no mode change, no rename), that line is
@@ -999,9 +1000,11 @@ workflow. Off `feature/remote-cache` it is always a dry run, which can't
 reach the bots' environments: it polls, prints the plan, and prints each
 push, PR and issue the outcome would make, after a real, local merge. On
 `feature/remote-cache`, `dry-run` (default on) does the same. In a dry run:
-- `verify` also runs the real verification (about an hour), on the dry
-  run's own branch, so a branch's dry run tests that branch's service; it
-  changes no file in the repository;
+- `verify` also runs the real verification, on the dry run's own branch, so
+  a branch's dry run tests that branch's service in the e2e; it changes no
+  file in the repository. The bundle test still builds on
+  `feature/remote-cache` (a known gap,
+  [zerobull-consulting/dagger#162](https://github.com/zerobull-consulting/dagger/issues/162));
 - `version` checks a chosen release, listed or not. For an accepted one,
   `engines.sh candidate` moves its own line first, with its digest, so the
   run runs it.

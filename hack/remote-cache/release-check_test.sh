@@ -57,6 +57,8 @@ EOF
 cat >"$tmp/bin/go" <<'EOF'
 #!/usr/bin/env bash
 echo "go $*" >>"$FAKE/go-calls"
+# The tree it runs in: the merge's first parent, the branch it built on.
+echo "built on $(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)" >>"$FAKE/go-calls"
 [[ -z "${FAKE_GO_FAIL:-}" ]]
 EOF
 # gh: the API calls the script makes, against JSON state in $FAKE. Every
@@ -109,6 +111,8 @@ case "$method $path" in
 "POST repos/o/r/actions/workflows/"*/dispatches)
 	wf="${path#repos/o/r/actions/workflows/}"; wf="${wf%/dispatches}"
 	echo "$input" >"$FAKE/dispatch-$wf-$(n dispatch-$wf)"
+	# Whether the advisory diff was written before this dispatch.
+	[[ -f "$FAKE/notes/advisory.md" ]] && echo "$wf" >>"$FAKE/advisory-before-dispatch"
 	[[ -n "${FAKE_NO_RUN_ID:-}" ]] && exit 0
 	id=$((5000 + $(n run)))
 	c="$(head -n1 "$FAKE/conclusions" 2>/dev/null || echo success)"
@@ -488,6 +492,29 @@ jq 'map(.state = "closed")' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE
 run plan
 check "stuck: a branch with no open PR fails the run" test "$status" -ne 0
 check "stuck: naming the branch" has "$tmp/out" "release-check/reject/v1.0.0-beta.26"
+
+echo "--- known gaps"
+# Known gap, zerobull-consulting/dagger#162: a dry run's bundle test builds
+# on the branch, not on RELEASE_CHECK_TEST_REF as its e2e does. The fix
+# flips this test.
+setup
+git -C "$work" checkout -q -b other
+echo "# other" >>"$work/$manifest"
+git -C "$work" commit -qam other && git -C "$work" push -q origin other
+other="$(git -C "$work" rev-parse HEAD)"
+git -C "$work" checkout -q feature/remote-cache
+main="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN RELEASE_CHECK_TEST_REF=other
+check "known gap (bundle on the dry run's ref, zerobull-consulting/dagger#162): it builds on the branch" has "$FAKE/go-calls" "built on $main"
+check "known gap (bundle on the dry run's ref, zerobull-consulting/dagger#162): not on the dry run's ref" not has "$FAKE/go-calls" "built on $other"
+
+# Known gap, zerobull-consulting/dagger#163: verify fetches the tags and
+# writes the advisory diff before it dispatches, which eats into the step's
+# timeout. The fix flips this test.
+setup
+echo success >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "known gap (advisory before the dispatch, zerobull-consulting/dagger#163)" has "$FAKE/advisory-before-dispatch" "remote-cache-tests.yml"
 
 echo "--- a tag that conflicts"
 setup
