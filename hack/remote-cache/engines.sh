@@ -109,7 +109,8 @@ pin)
 		read -r v d <<<"$list"
 	else
 		want="$2" v="" d=""
-		[[ "$want" =~ $version_re ]] || die "'$want' is not a release version such as v1.0.0-beta.25"
+		# Not repeated: it may be anything a caller passed.
+		[[ "$want" =~ $version_re ]] || die "the version given is not a release version such as v1.0.0-beta.25"
 		while read -r lv ld; do
 			[[ "$lv" == "$want" ]] && { v="$lv" d="$ld"; break; }
 		done <<<"$list"

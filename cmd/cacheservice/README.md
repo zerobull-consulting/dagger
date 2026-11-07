@@ -2607,11 +2607,14 @@ pull paths.
    line);
 3. only once the whole matrix is green, the image is pushed as
    `:<commit SHA>`;
-4. then each `:<engine version>` tag, one per `accept` line of the
-   **branch head's** manifest, moves to the head's image. The job runs one
-   at a time across pushes and moves the tags to the head only if the
-   head's `:<commit SHA>` is there, that is, once the head's own matrix was
-   green; so the tags never move backwards, nor onto an unverified build.
+4. then each `:<engine version>` tag moves to the **newest verified
+   build**: the newest commit of the branch (first parents, from its head)
+   whose `:<commit SHA>` is pushed, one tag per `accept` line of that
+   commit's own manifest
+   ([`hack/remote-cache/release-tags.sh`](../../hack/remote-cache/release-tags.sh)).
+   The job runs one at a time across pushes and always looks from the
+   head, so the tags never move backwards, nor onto an unverified build,
+   and a red head leaves them on the newest green commit before it.
 
 A `workflow_dispatch` of the workflow on another branch is a dry run: it
 builds, smoke-tests and runs the matrix, and pushes nothing.

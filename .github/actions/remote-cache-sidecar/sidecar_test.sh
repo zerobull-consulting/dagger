@@ -435,6 +435,7 @@ cat >"$tmp/okbin/docker" <<'EOF2'
 case "$1 $2" in
 "container inspect" | "volume inspect" | "network inspect") exit 1 ;;
 "image inspect" | "network create" | "volume create") exit 0 ;;
+"pull -q") echo "$3" >>"$FAKE_DIR/pulls" ;;
 "run -d")
 	echo "$*" >>"$FAKE_DIR/runs"
 	[[ " $* " == *" --privileged "* ]] && : >"$FAKE_DIR/engine.started"
@@ -484,15 +485,30 @@ v_last="${accepted[-1]}"
 hello_start welcome SIDECAR_SERVICE_IMAGE= SIDECAR_VERSION="$v_last" >/dev/null
 check "version $v_last: the start runs its service image" grep -qF -- " ghcr.io/zerobull-consulting/dagger-remote-cache:$v_last -scope " <<<"$(runs)"
 check "... and its engine, by digest" grep -qF -- " $(pin_of "$v_last") --debug" <<<"$(runs)"
+pulls() { cat "$tmp/okbin.fake/pulls" 2>/dev/null; }
+hello_start welcome SIDECAR_SERVICE_IMAGE= >/dev/null
+check "the version's floating service tag is pulled even when it is here: it moves" \
+	[ "$(pulls)" = "ghcr.io/zerobull-consulting/dagger-remote-cache:$first_version" ]
+hello_start welcome >/dev/null
+check "a service image given explicitly, and the engine by digest, aren't pulled when here" [ -z "$(pulls)" ]
 check "a refused engine fails the start (zerobull-consulting/dagger#146)" not hello_start refused
 check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
-check "... says why, with the refusal" grep -q "refused the engine .*engineVersion=v1.0.0-beta.24 accept=\[v1.0.0-beta.25\] base=dev" "$tmp/hello.out"
+check "... says why, with the refusal" grep -q 'refused the engine .*msg="engine refused: its version is not accepted" conn=1 engineVersion=v1.0.0-beta.24 accept=\[v1.0.0-beta.25\] base=dev' "$tmp/hello.out"
+check "a refused engine fails the start with the version's own service image too" not hello_start refused SIDECAR_SERVICE_IMAGE=
+check "... at once" took_hello_at_most 3
 check "... at once, not at the timeout" took_hello_at_most 3
 check "... and shows both logs" grep -q "LOG OF remote-cache-engine" "$tmp/hello.out"
-check "a service that never welcomes nor refuses: the start fails" not hello_start silent
+check "a service that never welcomes nor refuses: the start fails" not hello_start silent SIDECAR_SERVICE_IMAGE=
 check "... within its timeout (5s) and a little" took_hello_at_most 9
 check "... says so" grep -q "neither welcomed nor refused it within 5s" "$tmp/hello.out"
 check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "... even with a long grace: the version's own image always logs the welcome" not hello_start silent SIDECAR_SERVICE_IMAGE= SIDECAR_WELCOME_GRACE=1
+# A service image given explicitly may be from before the welcome line.
+check "an explicitly given service that logs no welcome: ready after the grace" hello_start silent SIDECAR_WELCOME_GRACE=2
+check "... with a warning that says why" grep -q "warning: the service (s) logged neither a welcome nor a refusal 2s after the engine connected" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "... but not before the grace: a refusal comes first" not hello_start refused SIDECAR_WELCOME_GRACE=0
+check "... and a grace longer than the start's timeout still fails at the timeout" not hello_start silent SIDECAR_WELCOME_GRACE=60
 check "an engine that never connects: the start fails" not hello_start none
 check "... says so" grep -q "the engine didn't connect to the service within 5s" "$tmp/hello.out"
 

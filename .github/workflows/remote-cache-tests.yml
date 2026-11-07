@@ -95,6 +95,11 @@ jobs:
       # protocol: every test in these packages.
       - name: Service, client and protocol
         run: go test -race -count=1 -cover ./cmd/cacheservice/... ./engine/remotecache/...
+      # How the release workflow moves the image's engine-version tags
+      # (cacheservice-publish.yml), against a fake registry.
+      - name: Release tags
+        timeout-minutes: 5
+        run: ./hack/remote-cache/release-tags_test.sh
       # The engine's side of the remote cache: its adapter, configuration and
       # fixtures, in packages shared with other engine code.
       - name: Engine integration
@@ -171,6 +176,8 @@ jobs:
       # entry (workflow_call), which must be an accept line. See the top of
       # this file.
       - name: The engine pin, from the manifest
+        # Explicit, for pipefail: the tee mustn't hide a refused version.
+        shell: bash
         env:
           CANDIDATE_VERSION: ${{ inputs.candidate-version }}
           CANDIDATE_DIGEST: ${{ inputs.candidate-digest }}
@@ -269,6 +276,8 @@ jobs:
       # entry (workflow_call), which must be an accept line. See the top of
       # this file.
       - name: The engine pin, from the manifest
+        # Explicit, for pipefail: the tee mustn't hide a refused version.
+        shell: bash
         env:
           CANDIDATE_VERSION: ${{ inputs.candidate-version }}
           CANDIDATE_DIGEST: ${{ inputs.candidate-digest }}

@@ -45,7 +45,17 @@ D4):
 - the service: `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>`,
   a floating tag on the newest service build that accepts that engine,
   verified against it (see
-  [Image](../../../cmd/cacheservice/README.md#image)).
+  [Image](../../../cmd/cacheservice/README.md#image)). It is pulled on
+  every start, since it moves: a copy left on a self-hosted runner would
+  be stale.
+
+So the service can be a newer build than the action's commit. The action
+passes the service only flags every build has kept (`-scope`,
+`-drain-timeout`, `-drain-linger`, `-gc-interval`, `-export`, `-v`,
+`-debug-listen`, `-debug-token-file`); removing or renaming one of them is
+a breaking change for pinned actions. To run one exact build, set
+`service-image` to `dagger-remote-cache:<commit SHA>`, such as the action's
+own commit.
 
 It must be an `accept` line of that manifest; without it, the action runs
 the first one, the release CI's `sidecar demo` job runs. Any other version
@@ -65,8 +75,11 @@ doesn't accept the version. The service's own rule, that a refusal leaves
 builds running, is for a fleet whose engines change under a running
 service; to keep a job going without the cache, give this step
 `continue-on-error: true`. A service that neither welcomes nor refuses the
-engine fails the step too, at that bound: a service image from before the
-`version` input logs no welcome.
+engine fails the step too, at that bound. One exception: a `service-image`
+given explicitly may be from before the welcome line, so when it logs
+neither line 10s after the engine connected, the start goes on with a
+warning that it can't tell whether the engine was refused (a refusal comes
+within milliseconds of the connection, so one is still caught).
 
 **Overrides:**
 

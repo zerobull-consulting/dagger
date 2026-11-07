@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -316,4 +317,22 @@ func TestEngineVersionRejectedLongBounded(t *testing.T) {
 	require.Contains(t, msg, "was tried and rejected: see zerobull-consulting/dagger#117")
 	require.NotContains(t, msg, long[:maxQuotedVersion+1])
 	require.Less(t, len(msg), 512)
+}
+
+// TestSidecarWaitsForTheseLines: the sidecar action's start decides from
+// these two log lines whether the service welcomed or refused its engine
+// (zerobull-consulting/dagger#146). It matches them as the text handler
+// writes them, msg="...": a renamed message here would leave it waiting
+// until its timeout.
+func TestSidecarWaitsForTheseLines(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/actions/remote-cache-sidecar/sidecar.sh")
+	require.NoError(t, err)
+	var b strings.Builder
+	slog.New(slog.NewTextHandler(&b, nil)).Info(LogEngineWelcomed)
+	slog.New(slog.NewTextHandler(&b, nil)).Warn(LogEngineRefused)
+	for _, msg := range []string{LogEngineWelcomed, LogEngineRefused} {
+		quoted := `msg="` + msg + `"`
+		require.Contains(t, b.String(), quoted, "the text handler doesn't write %q so", msg)
+		require.True(t, strings.Contains(string(data), `'`+quoted+`'`), "sidecar.sh doesn't wait for %s", quoted)
+	}
 }

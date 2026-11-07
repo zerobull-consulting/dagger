@@ -323,7 +323,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// The line the sidecar action's start waits for, or for the refusal's
 	// (zerobull-consulting/dagger#146): "engine connected" is logged at the
 	// upgrade, before the hello says whether the engine is accepted.
-	c.logger.Info("engine welcomed", "engineVersion", boundVersion(c.hello.EngineVersion),
+	c.logger.Info(LogEngineWelcomed, "engineVersion", boundVersion(c.hello.EngineVersion),
 		"versionAccepted", c.versionAccepted)
 	// The engine reports in at its generation: a newer one clears the
 	// cache's stale-generation refusals, to be exported from it (#129).

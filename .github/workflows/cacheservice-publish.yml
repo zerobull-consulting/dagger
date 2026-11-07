@@ -15,8 +15,9 @@ name: Cache service image publish
 #      ghcr.io/zerobull-consulting/cacheservice:<commit SHA>, for the
 #      transition;
 #   4. engine-tags: moves each floating :<engine version> tag, one per
-#      accept line of the branch head's manifest, to the head's image, and
-#      the old name's :feature-remote-cache with them. There is no :latest.
+#      accept line, to the newest verified build (the newest commit of the
+#      branch whose commit tag is pushed), and the old name's
+#      :feature-remote-cache with them. There is no :latest.
 #
 # A workflow_dispatch on another branch is a dry run: steps 1 and 2 run, and
 # nothing is pushed. Pull requests build and smoke-test the image in
@@ -154,21 +155,22 @@ jobs:
 
   # Moves the floating tags, after a publish pushed its commit's tag.
   # :<engine version> is the newest verified build that accepts that engine:
-  # the branch head's, for each accept line of the head's manifest. A
-  # version the head no longer accepts keeps its tag on the last build that
-  # did. Publishes of different commits can overlap, and this job's group
-  # runs one at a time across them, so its checks and retags can't
-  # interleave with another's. GitHub keeps only the newest pending job of
-  # a group, and jobs arrive in the order their publishes finish, not their
-  # commits' order; so it moves the tags to the branch's head at the time it
-  # runs, if that head's commit tag is pushed (its matrix was green), not to
-  # its own commit. The head's own run moves them after its push, so they
-  # end on the newest verified head, and never move backwards.
+  # the newest commit of the branch (first parents, from its head as it is
+  # when this job runs) whose commit tag is pushed, which only a green
+  # matrix leads to; each accept line of that commit's manifest. A version
+  # it no longer accepts keeps its tag on the last build that did.
+  # Publishes of different commits can overlap, and this job's group runs
+  # one at a time across them, so its lookups and retags can't interleave
+  # with another's. GitHub keeps only the newest pending job of a group, and
+  # jobs arrive in the order their publishes finish, not their commits'; so
+  # each run looks from the head, not from its own commit: a run never moves
+  # a tag to an older build than the one an earlier run chose, and a red
+  # head leaves the tags on the newest green commit before it.
   engine-tags:
     name: release image engine-version tags
     needs: publish
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     concurrency:
       group: ${{ github.workflow }}-engine-tags
       cancel-in-progress: false
@@ -176,37 +178,24 @@ jobs:
       contents: read
       packages: write
     steps:
-      # The head as it is now, its manifest with it.
+      # The head as it is now, with its recent history.
       - name: Checkout the branch head
         uses: actions/checkout@v5
         with:
           ref: feature/remote-cache
+          fetch-depth: 50
       - name: Log in to GHCR
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      # Registry-side copies of the head's manifest, with the same digest:
-      # nothing is pulled or rebuilt.
-      - name: Move the engine-version tags to the branch head
-        run: |
-          head="$(git rev-parse HEAD)"
-          if ! out="$(timeout 60 docker buildx imagetools inspect "$IMAGE:$head" 2>&1)"; then
-            if grep -q 'not found' <<<"$out"; then
-              echo "$IMAGE:$head isn't pushed (yet): its own run moves the tags once its matrix is green" | tee -a "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "$out" >&2
-            exit 1
-          fi
-          # Each version matched the manifest's version pattern, so it is a
-          # valid tag.
-          versions="$(./hack/remote-cache/engines.sh versions | tr -d '[]"' | tr ',' ' ')"
-          for v in $versions; do
-            timeout 300 docker buildx imagetools create --prefer-index=false -t "$IMAGE:$v" "$IMAGE:$head"
-            echo "$IMAGE:$v -> $head" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
-          timeout 300 docker buildx imagetools create --prefer-index=false -t "$OLD_IMAGE:feature-remote-cache" "$IMAGE:$head"
-          echo "$OLD_IMAGE:feature-remote-cache -> $head" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Registry-side copies of the chosen build's manifest, with the same
+      # digest: nothing is pulled or rebuilt.
+      # hack/remote-cache/release-tags.sh, tested offline in the unit job
+      # (release-tags_test.sh).
+      - name: Move the engine-version tags to the newest verified build
+        # Explicit, for pipefail: the tee mustn't hide the script's failure.
+        shell: bash
+        run: ./hack/remote-cache/release-tags.sh | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io
