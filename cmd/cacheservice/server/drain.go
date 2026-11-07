@@ -102,25 +102,27 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //     An engine is either welcomed before the drain starts, and counted in
 //     its report (DrainReport.Engines), or refused. Spans and
 //     session ends of the sessions it tracks are still taken: a session that
-//     ended just before the drain still sends spans within EndGrace. The
+//     ended just before the drain, with some of the cache spans it counted
+//     still on their way, sends them within its tracker's Settle. The
 //     connected engines stay connected, since exports run over them. The
 //     import sync loops and scheduled GC stop, and a GC run under way is
 //     canceled; GC is idempotent, and the next run finishes it.
-//  2. Every tracked session is due now: one that hasn't ended at once,
-//     without waiting out the quiet period, and one that ended once its spans
-//     are all in, or EndGrace passed. Roots waiting for another try are due
-//     at once too; one that fails again retries on its normal backoff.
-//     Drain runs those exports and waits for them, their uploads included.
-//     Roots of an engine that is no longer connected are left: it can't
-//     reconnect to a draining service.
+//  2. Every changed entry is due now, without waiting for it to settle, and
+//     so are roots waiting for another try; one that fails again retries on
+//     its normal backoff. A session that hasn't ended is no longer tracked,
+//     and one that ended with spans missing is waited for until they are in,
+//     or Settle (at most 2s) passed with none of them. Drain runs those exports, one at a
+//     time per engine cache as the scheduler does, and waits for them, their
+//     uploads included. Roots of an engine that is no longer connected are
+//     left: it can't reconnect to a draining service.
 //  3. It starts no export past its deadline, or once ctx was canceled: each
 //     pass checks both before it schedules anything, so a drain whose
 //     deadline passed before it began starts nothing. A retry due by the
-//     deadline is waited for, and started if a pass (every 100ms at most)
-//     finds it due before the deadline; one due in the last pass's interval
-//     is left. One due after the deadline isn't waited for, and is reported
-//     left (DrainState.Later). Exports started before
-//     the deadline run on until the stop that follows cuts them off.
+//     deadline is waited for, and started if a pass (when an export ends,
+//     and every 100ms at most) finds it due before the deadline; one due in
+//     the last pass's interval is left. One due after the deadline isn't
+//     waited for, and is reported left (DrainState.Later). Exports started
+//     before the deadline run on until the stop that follows cuts them off.
 //
 // Drain deletes nothing, and publishes nothing an export didn't verify. It
 // logs what it found to do when it starts, and what it stored and left when
@@ -217,11 +219,15 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		}
 		for _, ns := range s.namespacesNow() {
 			s.startBatches(p.ctx, ns, ns.tracker.DrainDue(now))
+			s.metrics.ExportWaiting(ns.name, ns.tracker.WaitingForSlot())
 		}
 		select {
 		case <-ctx.Done():
 		case <-p.ctx.Done():
 		case <-t.C:
+			continue
+		case <-p.drainWake:
+			// An export ended, freeing its cache for the next batch.
 			continue
 		}
 		// Woken by the end of ctx or of the export path: the drain ends
@@ -251,7 +257,8 @@ func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bo
 }
 
 // drainBusy reports whether a drain has work left it can do: an export in
-// flight, or a session or retry of a connected engine due by the deadline.
+// flight, or a changed entry, a session it waits for, or a retry due by the
+// deadline, of a connected engine.
 func drainBusy(left []DrainLeft) bool {
 	for _, l := range left {
 		if l.InFlight > 0 || (l.Connected && (l.Sessions > 0 || l.Pending > 0 || l.Retrying > 0)) {

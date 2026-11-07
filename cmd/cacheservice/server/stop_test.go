@@ -251,23 +251,28 @@ func TestDrainWelcomesOrRefusesEveryHello(t *testing.T) {
 // clock is the export path's, so the deadline and the drain's tick can't
 // race: the pass sees the time the test set.
 func TestDrainDoesNotStartRetryPastItsDeadline(t *testing.T) {
-	clock := gc.NewNow(time.Now())
-	const backoff = time.Hour
+	// The export path's clock runs an hour ahead of the real one, so the
+	// drain's context, whose deadline is on the export path's clock, never
+	// ends first: only the drain's own check of the deadline can end it.
+	clock := gc.NewNow(time.Now().Add(time.Hour))
+	const backoff = time.Second
 	h, _ := newDrainHarness(t, func(c *ExportConfig) {
 		c.Now = clock.Now
 		c.Tracker.BusyBackoff = backoff
 		c.Tracker.MaxBusyBackoff = backoff
 		// A session that ended with spans still to come keeps the drain
-		// busy until its deadline.
-		c.Tracker.EndGrace = 10 * backoff
+		// busy for Settle, at most 2s on the export path's clock, which
+		// moves only when the test moves it.
+		c.Tracker.Settle = time.Hour
+		c.Tracker.MaxDelay = time.Hour
 	})
 	digests := h.build()
 	h.cache.CorruptUploads(digests[1], 3)
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 	h.postSpans("session-2", carrierSpan(5))
-	// The deadline is a minute away on both clocks; the retry, an hour
-	// after the failure, comes due after it.
-	deadline := clock.Now().Add(time.Minute)
+	// The deadline is 500ms away on the export path's clock; the retry,
+	// a second after the failure, comes due after it.
+	deadline := clock.Now().Add(500 * time.Millisecond)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	done := make(chan DrainReport, 1)
@@ -282,8 +287,9 @@ func TestDrainDoesNotStartRetryPastItsDeadline(t *testing.T) {
 	})
 	exports := h.cache.Exports()
 	drainRunning(t, done, "before its deadline, with a session waiting for its spans")
-	// The retry is due now, and the deadline is past.
-	clock.Add(backoff + time.Second)
+	// The retry is due now, the deadline is past, and the session is still
+	// waited for (1.5s < 2s).
+	clock.Add(backoff + 500*time.Millisecond)
 	rep := waitDrain(t, done, 5*time.Second)
 	if rep.Outcome != metrics.DrainDeadline {
 		t.Fatalf("outcome %q, want %q: %+v", rep.Outcome, metrics.DrainDeadline, rep)
@@ -305,8 +311,9 @@ func TestDrainCanceledReportsCanceled(t *testing.T) {
 	h, _ := newDrainHarness(t, func(c *ExportConfig) {
 		c.Now = clock.Now
 		// A session that ended with spans still to come keeps the drain
-		// busy while its engine is connected.
-		c.Tracker.EndGrace = time.Hour
+		// busy while its engine is connected: the export path's clock
+		// stands still, so its wait for them doesn't pass.
+		c.Tracker.Settle = time.Hour
 	})
 	h.postSpans("session-1", carrierSpan(5))
 	h.svc.testHookDrainWoken = func() {

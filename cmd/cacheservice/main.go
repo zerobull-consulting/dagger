@@ -60,8 +60,8 @@
 //     scraper that shouldn't reach the debug API;
 //
 //   - on SIGTERM or an interrupt, a drain before it stops: it takes no new
-//     engine or session, exports what its tracked sessions retained, without
-//     waiting out their quiet period, and waits for those exports and their
+//     engine or session, exports every changed entry at once, without
+//     waiting for it to settle, and waits for those exports and their
 //     uploads, up to -drain-timeout (30s; 0: no drain). The engines stay
 //     connected meanwhile, since exports run over them: stop the service
 //     before its engines. The drain starts no export past its deadline.
@@ -139,6 +139,8 @@ func main() {
 		dumpDir       string
 		verbose       bool
 		scope         string
+		settle        time.Duration
+		maxDelay      time.Duration
 		quiet         time.Duration
 		endGrace      time.Duration
 		imports       bool
@@ -170,8 +172,10 @@ func main() {
 	flag.StringVar(&tokensFile, "tokens-file", "", "file of engine tokens and their namespaces, one '<token> <namespace>' per line; SIGHUP reloads it (empty: take any token, all in -scope)")
 	flag.StringVar(&tlsCert, "tls-cert", "", "serve the engine address over TLS with this certificate (PEM; with -tls-key)")
 	flag.StringVar(&tlsKey, "tls-key", "", "the key of -tls-cert (PEM)")
-	flag.DurationVar(&quiet, "export-quiet", exporter.DefaultQuietPeriod, "export a session's entries after this long without a cache span from it, if its end isn't seen")
-	flag.DurationVar(&endGrace, "export-end-grace", exporter.DefaultEndGrace, "after a session ends, wait this long for the cache spans it said were coming")
+	flag.DurationVar(&settle, "export-settle", exporter.DefaultSettle, "export a changed entry once this long passed with no cache span naming it; a session's end, with all its cache spans in, exports its entries at once")
+	flag.DurationVar(&maxDelay, "export-max-delay", exporter.DefaultMaxDelay, "export a changed entry at the latest this long after it first changed since its last export, even while cache spans still name it")
+	flag.DurationVar(&quiet, "export-quiet", 0, "DEPRECATED, removed in a later release: sets -export-settle when that isn't set")
+	flag.DurationVar(&endGrace, "export-end-grace", 0, "DEPRECATED, removed in a later release: ignored, since a session's end no longer holds its exports back")
 	flag.BoolVar(&exports, "export", true, "export engines' entries to the bucket, and run garbage collection (needs "+blobstore.EnvBucket+"); false: read-only, it only imports, and never writes to or deletes from the bucket, so it runs with a read-only key; can't be combined with -import=false, and needs "+blobstore.EnvBucket)
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
@@ -208,6 +212,15 @@ func main() {
 	if drainLinger < 0 {
 		logger.Error("-drain-linger must not be negative (0: no linger)")
 		os.Exit(2)
+	}
+
+	trackerCfg, warnings, timingErr := exportTiming(settle, maxDelay, quiet, endGrace, explicitFlags())
+	if timingErr != nil {
+		logger.Error(timingErr.Error())
+		os.Exit(2)
+	}
+	for _, w := range warnings {
+		logger.Warn(w)
 	}
 
 	if err := checkReadOnly(exports, imports, os.Getenv(blobstore.EnvBucket) != "", gcInterval, explicitFlags()); err != nil {
@@ -308,7 +321,7 @@ func main() {
 		if err == nil {
 			opts := server.S3Options{
 				Scope:      scope,
-				Tracker:    exporter.TrackerConfig{QuietPeriod: quiet, EndGrace: endGrace},
+				Tracker:    trackerCfg,
 				NoExport:   !exports,
 				NoImport:   !imports,
 				ImportPoll: importPoll,
@@ -615,6 +628,48 @@ func loopbackAddr(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// exportTiming is the tracker's timing from -export-settle and
+// -export-max-delay, and the deprecated -export-quiet and -export-end-grace
+// (zerobull-consulting/dagger#134), with a warning for each deprecated flag
+// set. -export-quiet set -export-settle's role for a session ("this long
+// with no cache span"), so it sets -export-settle when that isn't set, and
+// raises -export-max-delay to it when that isn't set either: a command line
+// that held exports back with it still does. -export-end-grace is ignored.
+// set holds the flags set on the command line.
+func exportTiming(settle, maxDelay, quiet, endGrace time.Duration, set map[string]bool) (exporter.TrackerConfig, []string, error) {
+	for name, d := range map[string]time.Duration{"export-settle": settle, "export-max-delay": maxDelay} {
+		if set[name] && d <= 0 {
+			return exporter.TrackerConfig{}, nil, fmt.Errorf("-%s must be positive", name)
+		}
+	}
+	var warnings []string
+	// As before, 0 or less for a deprecated flag means its default: the
+	// flag changes nothing then, but is still named in a warning.
+	if set["export-quiet"] {
+		w := "-export-quiet is deprecated and will be removed: use -export-settle"
+		switch {
+		case set["export-settle"]:
+			w += " (ignored: -export-settle is set)"
+		case quiet <= 0:
+			w += " (ignored: not positive)"
+		default:
+			settle = quiet
+			if !set["export-max-delay"] && maxDelay < settle {
+				maxDelay = settle
+			}
+			w += fmt.Sprintf(" (taken as -export-settle %s, -export-max-delay %s)", settle, maxDelay)
+		}
+		warnings = append(warnings, w)
+	}
+	if set["export-end-grace"] {
+		warnings = append(warnings, "-export-end-grace is deprecated, ignored, and will be removed: a session's end no longer holds its exports back (-export-settle)")
+	}
+	if settle > maxDelay {
+		warnings = append(warnings, fmt.Sprintf("-export-settle %s is longer than -export-max-delay %s: a changed entry is exported %s after its first change at the latest, even while spans still name it", settle, maxDelay, maxDelay))
+	}
+	return exporter.TrackerConfig{Settle: settle, MaxDelay: maxDelay}, warnings, nil
 }
 
 // explicitFlags returns the flags set on the command line, by name.

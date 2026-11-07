@@ -22,8 +22,9 @@ entries, and how it picks export roots. It is based on the engine at
 - `engine.share` reports only rows **imported** from the remote cache. The
   spike never merged anything, so it never saw one. That is expected.
 - The service should export every **retained** entry it sees in a session's
-  spans, in one `export` per session, as soon as the session ends. It should
-  drop entries named by `engine.prune` and by `gone` skips.
+  spans, as soon as its spans settle, while the session still runs; the
+  session's end only speeds that up (zerobull-consulting/dagger#134). It
+  should drop entries named by `engine.prune` and by `gone` skips.
 
 The one real gap is sessions whose clients send no telemetry to the service.
 Their entries are invisible. See [Gaps and options](#gaps-and-options).
@@ -138,12 +139,13 @@ don't put it in the key:
   starts a new value: reset the entry's parts and deps to that observation's.
   An equal count is merged as below.
 
-Group observations by **session** as well. Every session span's resource
-carries `dagger.io/engine.session`, beside `dagger.io/engine.cache`. Several
-sessions share one engine and can touch the same entry, so candidates and the
-session-end carrier span are tracked per session ID and generation. One
-session's carrier closes only that session's candidates. The persistent entry
-key stays cache ID and result number.
+Group observations by **session** as well, for the speed-up below only.
+Every session span's resource carries `dagger.io/engine.session`, beside
+`dagger.io/engine.cache`. Several sessions share one engine and can touch the
+same entry, so candidates and the session-end carrier span are tracked per
+session ID and generation. One session's carrier speeds up only that
+session's candidates. The persistent entry key stays cache ID and result
+number.
 
 Per entry, keep: type, deps, parts, retained, retention expiry, expiry,
 replacements, the session that last touched it, and the export state
@@ -182,10 +184,10 @@ drop times come from the same engine clock.
 
 ## Choosing export roots
 
-1. **Candidates.** An entry is a candidate for a session when any of that
-   session's spans (by `dagger.io/engine.session`) showed
-   `dagger.io/cache.retained = "true"`. Entries without a retention edge are
-   released with their session and come back `gone`.
+1. **Candidates.** An entry is a candidate when a span showed
+   `dagger.io/cache.retained = "true"`; it is a candidate of each session
+   (by `dagger.io/engine.session`) whose span did. Entries without a
+   retention edge are released with their session and come back `gone`.
 2. **Skip** candidates already exported with the same `replacements` count
    and a part set that covers every part now known. An entry whose known
    parts grew since its export is exported again. Also skip candidates
@@ -195,16 +197,26 @@ drop times come from the same engine clock.
    (`dagger.io/cache.retention.expires`). A missing or zero value means no
    expiry. A lapsed retention edge means the entry is no longer retained,
    even if an earlier span said it was and no `engine.prune` has arrived.
-3. **When.** Export when the session ends. The carrier span with
-   `dagger.io/cache.session.spans` marks the end and says how many cache spans
-   to expect. The live run didn't check that this span reaches the service,
-   since the spike logs only spans with a result ID. If it doesn't come, fall
-   back to a short quiet period.
-   Don't wait longer: the engine's GC can prune retained entries right after
-   the session (seen in #3 with GC on).
-4. **One request per session.** Send all of a session's candidates as `roots`
-   of one `export`. The bundle carries each root's whole dependency closure,
-   and shared dependencies are encoded once.
+3. **When.** Per entry, not per session (zerobull-consulting/dagger#134). An
+   entry is **dirty** from the first span that changes its value (a higher
+   replacement count, a new part, deps that grew, or retained turning true)
+   until an export takes it. A dirty candidate is due once nothing has named
+   it for a settle period (`-export-settle`, 1s), or once it has been dirty
+   for a max delay (`-export-max-delay`, 10s, counted from its first change
+   since its last export), so a long, busy session still streams. The carrier
+   span with `dagger.io/cache.session.spans` marks a session's end and says
+   how many cache spans to expect: once it and all of them are in, the
+   session's candidates are due at once. A carrier with spans missing changes
+   nothing, and nothing waits for a session whose carrier never comes. Don't
+   wait longer than that: the engine's GC can prune retained entries right
+   after the session (seen in #3 with GC on).
+4. **One request at a time per engine cache** (zerobull-consulting/dagger#135).
+   While an export of a cache is in flight, the candidates that come due
+   wait, and go as the `roots` of its next `export`, so batches grow with
+   load. The bundle carries each root's whole dependency closure, and
+   dependencies shared within one export are encoded once; one shared by
+   roots of separate exports is in each bundle. A value that changes while
+   its export is in flight is dirty again, and goes in a later one.
 5. **Outputs.** For each root, request the parts listed by its latest
    `dagger.io/cache.parts`, merged with parts reported by lazy-evaluation
    spans. Parts that own no bytes (absent or metadata parts) need no upload.

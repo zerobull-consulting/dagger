@@ -17,8 +17,8 @@ spike, and only logs what the engine does on the wire.
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
-| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. 503 while draining; 409 on a read-only instance (`-export=false`) |
-| `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache |
+| `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. It takes the engine cache's export slot: it waits for the export of that cache in flight to end, and the scheduler starts none beside it (see [Export path](#export-path)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache, with each entry's `dirty` and `dueAt` |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
 | `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
@@ -925,19 +925,58 @@ tracker and exporter, and its blobs, bundles and index under its own prefix.
 **Triggers and roots.** The tracker follows
 [ENTRY_DISCOVERY.md](ENTRY_DISCOVERY.md). It learns entries from session
 spans at `/v1/traces`, and prunes and cache wipes from engine events at
-`/v1/logs`. A session's roots are the entries its spans showed retained. Its
-outputs are every part those spans reported. A session is exported:
+`/v1/logs`. The roots are the entries spans showed retained, and each
+root's outputs are every part its spans reported. Exports stream: an entry
+is exported while its session still runs, once its spans settle
+([zerobull-consulting/dagger#134](https://github.com/zerobull-consulting/dagger/issues/134)).
+An entry is **dirty** from the first span that changes its value (a new
+replacement count, a new part, deps that grew, or retained turning true)
+until an export takes it. A dirty entry worth exporting is due:
 
-- when it ends: its carrier span (`dagger.io/cache.session.spans`) arrived,
-  and so did every cache span it counted, or `-export-end-grace` (2s) passed;
-- or, if its end isn't seen, after `-export-quiet` (10s) without a cache span
-  from it;
+- once `-export-settle` (1s) passed with no span naming it; each span naming
+  it starts the wait again;
+- or once it has been dirty for `-export-max-delay` (10s), counted from its
+  first change since its last export, so an entry a long, busy session keeps
+  naming is still exported;
+- or at once when its session ends: the carrier span
+  (`dagger.io/cache.session.spans`) arrived, and so did every cache span it
+  counted. A carrier with spans missing changes nothing, and nothing waits
+  for a session that sends none;
 - or when asked: `POST /debug/engines/{conn}/export`;
-- or when the service stops cleanly (SIGTERM): the drain exports a session
-  whose end isn't seen at once, without waiting out `-export-quiet`, and one
-  that ended once its spans are all in, or `-export-end-grace` passed, as
-  usual. Spans of the sessions it tracks are still taken meanwhile. See
+- or when the service stops cleanly (SIGTERM): the drain exports every dirty
+  entry at once, without waiting for it to settle. See
   [Stopping and draining](#stopping-and-draining).
+
+A value that changes while its export is in flight is dirty again, and is
+exported again once it settles, or `-export-max-delay` after the change, so a
+value that keeps changing isn't exported back to back; the next export
+covers its current parts. A non-retained entry is forgotten 10s after a span
+last named it, and so is a session.
+
+**One export per engine cache at a time**
+([zerobull-consulting/dagger#135](https://github.com/zerobull-consulting/dagger/issues/135)).
+Each engine cache of a namespace has one export slot. While an export of it
+is in flight, the entries that come due wait (`export_roots_waiting`), and
+go in its next batch, which starts when that export ends. So batches follow
+load: small and quick when the build is idle, larger when it's busy, with
+one export's compression and uploads on the engine's host at a time. A batch
+of more than 1,000 roots due is split, and the parts run one after another.
+The scheduler wakes at the next entry's due time, when an export ends, and
+at least every second. The explicit hook takes the slot too, waiting for the
+export in flight.
+
+| Flag | Default | |
+| --- | --- | --- |
+| `-export-settle` | `1s` | Export a changed entry once this long passed with no cache span naming it |
+| `-export-max-delay` | `10s` | Export a changed entry at the latest this long after its first change since its last export |
+| `-export-quiet` | | Deprecated, removed in a later release: sets `-export-settle` (and raises `-export-max-delay` to it) when `-export-settle` isn't set, with a warning |
+| `-export-end-grace` | | Deprecated, removed in a later release: ignored, with a warning |
+
+More, smaller exports than per-session ones mean more bundles and index
+records, and a dependency shared by roots of separate exports is in each
+bundle. Values exported before they are complete are exported again; the
+index keeps a record's parts when a later one lacks some
+([zerobull-consulting/dagger#142](https://github.com/zerobull-consulting/dagger/issues/142)).
 
 A trace request over its limit is refused whole (413), and the engine then
 stops publishing that session's telemetry: its entries aren't exported from
@@ -951,7 +990,7 @@ the stored values. So are entries whose expiry or retention has lapsed, and
 entries refused for the same value. An import that changed is exported, and
 `Record` keeps the stored entry's number for it (see
 [Imported entries](#imported-entries)). The export goes to the engine connected with the
-session's cache ID. If none is, the export waits and is tried again.
+entry's cache ID. If none is, the export waits and is tried again.
 
 **One export.**
 
@@ -1007,9 +1046,9 @@ A blob deleted from the bucket is uploaded again by the next export that
 needs it from an engine that has it: `UploadURLs` asks for every blob the
 store lacks.
 
-**Limits.** The engine works on 4 exports at once and queues the rest, so the
-service sends at most 4 at a time to each engine. The engine uploads 8 blobs at
-once across its exports; the service waits up to an hour for `uploaded`.
+**Limits.** The service sends one export at a time to each engine cache
+(above); the engine itself would work on 4 at once and queue the rest. The
+engine uploads 8 blobs at once across its exports; the service waits up to an hour for `uploaded`.
 Neither side sends a message over 64 MiB. When the engine answers an export
 with `too large`, or the service's own `export` or `upload` would be over the
 limit, the roots are split in two and each half is exported alone (an
@@ -2237,9 +2276,9 @@ returns at once, and logs `drain: nothing to export (read-only:
    (`TestDrainWelcomesOrRefusesEveryHello`). Spans and session ends of
    sessions the export path doesn't track are dropped (answered 200, counted
    in `drain_refused_total`). Spans and ends of the sessions it tracks are
-   still taken: a session that ended just before the signal still sends spans
-   within `-export-end-grace`, and dropping them would lose entries
-   (`TestDrainTakesLateSpansOfEndedSession`). The connected engines stay
+   still taken: a session that ended just before the signal, with some of the
+   cache spans its carrier counted still on their way, still sends them, and
+   dropping them would lose entries (`TestDrainTakesLateSpansOfEndedSession`). The connected engines stay
    connected, since exports run over them. The import sync loops and
    scheduled GC stop; a GC run under way is canceled (GC is idempotent, and
    the next run finishes it), whether scheduled or asked for. `POST
@@ -2247,14 +2286,15 @@ returns at once, and logs `drain: nothing to export (read-only:
    drain runs what is pending itself. Engine events
    (`engine.start`, `engine.prune`) are still taken: a prune makes an entry
    no longer worth exporting.
-2. **It flushes.** Every tracked session is due now. One whose end isn't seen
-   is exported at once, with the entries its spans showed so far; the
-   session is then no longer tracked, so its later spans are dropped. One that
-   ended is exported once its spans are all in, or `-export-end-grace` (2s)
-   passed, whichever comes first. Roots waiting for another try (busy,
-   failed, interrupted, or waiting for their engine) are due at once too. The
-   drain runs those exports and waits for them, their uploads, verification
-   and index writes included.
+2. **It flushes.** Every dirty entry is due now, without waiting for it to
+   settle (`pending` in its log and `GET /debug/drain`). A session whose end
+   isn't seen is no longer tracked, so its later spans are dropped. One that
+   ended with some of its counted spans missing is waited for (`sessions`)
+   until they are in, or `-export-settle` (at most 2s) passed with none of them. Roots
+   waiting for another try (busy, failed, interrupted, or waiting for their
+   engine) are due at once too. The drain runs those exports, one at a time
+   per engine cache as the scheduler does, and waits for them, their uploads,
+   verification and index writes included.
 3. **It starts nothing past its deadline.** Each pass checks the deadline,
    and whether the drain was canceled, before it schedules anything, so a
    drain whose deadline passed before it began starts nothing, and a retry
@@ -2494,6 +2534,7 @@ paths record into them through their metadata store. All are prefixed
 | `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
+| `export_roots_waiting` | `scope` | Roots due for export and waiting, as the scheduler last saw them: for their engine cache's export in flight to end, or for the next batch |
 | `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, or `debug` (the debug API; see [The debug API](#the-debug-api)) |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
@@ -2910,7 +2951,8 @@ ends the linger at once, and the engine's last event goes undelivered.
   (an unclean stop is always logged as the bound passing).
 - The drain logs what it stored (`drain: stored`) and its outcome
   (`drain: done outcome=complete`). Most exports are stored before it:
-  within about 2s of each session's end.
+  each entry within about `-export-settle` of its last span, or at its
+  session's end.
 
 **Pull-request jobs:** the same, with `-export=false` instead of
 `-gc-interval=0` (GC is off anyway, and an explicit nonzero `-gc-interval`

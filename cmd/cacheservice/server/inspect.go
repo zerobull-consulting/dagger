@@ -88,7 +88,7 @@ func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries := c.ns.tracker.Entries(c.CacheID())
+	entries := c.ns.tracker.EntriesAt(c.CacheID(), p.now())
 	if entries == nil {
 		entries = []exporter.EntryState{}
 	}
@@ -98,6 +98,11 @@ func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 // Export exports a connection's entries now: req's roots and outputs, or,
 // with no roots, every tracked entry worth exporting. It returns what was
 // stored.
+//
+// It takes the engine cache's slot, as the scheduler's exports do: it waits
+// for the export of that cache in flight to end, and the scheduler starts
+// none for it while Export waits or runs (zerobull-consulting/dagger#135).
+// The wait ends with ctx, whose error it then returns.
 func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request) (exporter.Result, error) {
 	p := s.export
 	if p == nil {
@@ -110,6 +115,14 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 	c, err := s.conn(conn)
 	if err != nil {
 		return exporter.Result{}, err
+	}
+	release, err := c.ns.tracker.AcquireSlot(ctx, c.CacheID())
+	if err != nil {
+		return exporter.Result{}, fmt.Errorf("waiting for the export of cache %s in flight: %w", c.CacheID(), err)
+	}
+	defer release()
+	if s.draining.Load() {
+		return exporter.Result{}, ErrDraining
 	}
 	if len(req.Roots) > 0 {
 		b, err := c.ns.tracker.Claim(c.CacheID(), req)

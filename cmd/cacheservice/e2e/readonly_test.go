@@ -55,9 +55,9 @@ func (s *state) readonly(t *testing.T) {
 	own := `{ container { from(address: "alpine:3.22") { withExec(args: ["sh", "-c", "echo readonly-` + Nonce() + ` > /ro"]) { file(path: "/ro") { contents } } } } }`
 	_, timeOwn := r.Query("run-r-own", own)
 	// Nothing being written can only be shown by waiting. A writer exports
-	// a session once its end and spans are in, within the end grace (2s),
-	// or after the quiet period (10s) without its end: 15s is past both.
-	time.Sleep(exporter.DefaultQuietPeriod + exporter.DefaultEndGrace + 3*time.Second)
+	// a changed entry once it settles (1s), or at the latest after the max
+	// delay (10s): 13s is past both.
+	time.Sleep(exporter.DefaultMaxDelay + 3*time.Second)
 
 	all := proxy.Since(0)
 	var writes []string

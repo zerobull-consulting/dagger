@@ -144,7 +144,7 @@ type readOnlyHarness struct {
 func readOnlyOptions() S3Options {
 	return S3Options{
 		Scope:    testScope,
-		Tracker:  exporter.TrackerConfig{QuietPeriod: 50 * time.Millisecond, EndGrace: 50 * time.Millisecond},
+		Tracker:  exporter.TrackerConfig{Settle: 50 * time.Millisecond, MaxDelay: 50 * time.Millisecond},
 		NoExport: true,
 	}
 }

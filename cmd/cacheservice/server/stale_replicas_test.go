@@ -23,7 +23,7 @@ func startReplica(t *testing.T, ctx context.Context, blobs *blobstore.MemStore, 
 	svc := New(slog.New(slog.DiscardHandler), "")
 	if err := svc.EnableExport(ctx, ExportConfig{
 		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
-		Tracker:  exporter.TrackerConfig{QuietPeriod: time.Minute, EndGrace: 50 * time.Millisecond},
+		Tracker:  exporter.TrackerConfig{Settle: time.Minute, MaxDelay: time.Minute},
 		Tick:     10 * time.Millisecond,
 	}); err != nil {
 		t.Fatal(err)

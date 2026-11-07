@@ -28,8 +28,8 @@ import (
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
 
-// testQuiet is the harnesses' quiet period: a drain that waited it out would
-// take a minute.
+// testQuiet is the harnesses' Settle and MaxDelay: a drain that waited for
+// entries to settle would take a minute.
 const testQuiet = time.Minute
 
 // drainFor drains svc with a deadline of d from now.
@@ -137,11 +137,12 @@ func TestDrainExportsQuietSession(t *testing.T) {
 
 // Intended, though it may surprise: while draining, the spans of a session
 // the service tracks are still taken. A session that ended just before the
-// signal still sends its spans within EndGrace, and the drain waits for them
-// (up to EndGrace) and exports them too. Dropping them would lose entries.
+// signal still sends the spans it counted, and the drain waits for them (until
+// Settle passes with none) and exports them too. Dropping them would lose
+// entries.
 func TestDrainTakesLateSpansOfEndedSession(t *testing.T) {
-	const endGrace = 30 * time.Second
-	h, _ := newDrainHarness(t, func(c *ExportConfig) { c.Tracker.EndGrace = endGrace })
+	const settle = 30 * time.Second
+	h, _ := newDrainHarness(t, func(c *ExportConfig) { c.Tracker.Settle = settle })
 	h.build()
 	// The end says 2 spans; one has arrived.
 	h.postSpans("session-1", cacheSpan(10), carrierSpan(2))
@@ -161,8 +162,8 @@ func TestDrainTakesLateSpansOfEndedSession(t *testing.T) {
 	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.Refused[metrics.DrainRefusedSpan] != 0 {
 		t.Fatalf("report %+v", rep)
 	}
-	if took := time.Since(start); took > endGrace/2 {
-		t.Fatalf("the drain took %s: it waited out EndGrace though every span was in", took)
+	if took := time.Since(start); took > settle/2 {
+		t.Fatalf("the drain took %s: it waited out Settle though every span was in", took)
 	}
 }
 

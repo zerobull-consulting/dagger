@@ -70,7 +70,7 @@ func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore
 	svc := New(logger, "")
 	cfg := ExportConfig{
 		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
-		Tracker:  exporter.TrackerConfig{QuietPeriod: time.Minute, EndGrace: 50 * time.Millisecond},
+		Tracker:  exporter.TrackerConfig{Settle: time.Minute, MaxDelay: time.Minute},
 		Tick:     10 * time.Millisecond,
 	}
 	if modify != nil {
@@ -547,15 +547,13 @@ func TestExportHookRequeuesBatchesNotRun(t *testing.T) {
 	if code, _ := h.debugExport(""); code != http.StatusBadGateway {
 		t.Fatalf("status %d", code)
 	}
-	entries := h.ns().tracker.Entries(h.cache.ID)
-	last := entries[len(entries)-1]
-	if last.Number != 1001 || last.RetryAt == "" || last.Failures != 0 {
-		t.Fatalf("batch not run wasn't requeued: %+v", last)
-	}
-	// Due again, so a scheduler tick runs it.
-	if b := h.ns().tracker.Due(time.Now()); len(b) == 0 {
-		t.Fatal("requeued batch not due")
-	}
+	// Requeued due now, which wakes the scheduler: it exports the batch the
+	// hook didn't run, though its tick is an hour.
+	waitUntil(t, 10*time.Second, "the requeued root to be stored", func() bool {
+		entries := h.ns().tracker.Entries(h.cache.ID)
+		last := entries[len(entries)-1]
+		return last.Number == 1001 && last.Stored && last.Failures == 0
+	})
 }
 
 // An export whose reply comes after the service gave up waiting is released,
