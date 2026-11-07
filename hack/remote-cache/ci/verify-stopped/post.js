@@ -6,14 +6,22 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const names = (process.env.INPUT_NAMES || '').split(/\s+/).filter(Boolean);
-const byPost = (process.env['INPUT_STOPPED-BY-POST'] || '').split(/\s+/).filter(Boolean);
-const temp = process.env.RUNNER_TEMP;
+const temp = process.env.RUNNER_TEMP || '';
 const problems = [];
 
+// The names docker lists, or null when docker itself failed: that says
+// nothing about the sidecar, and is reported as such.
 function docker(...args) {
   const r = spawnSync('docker', args, { encoding: 'utf8', timeout: 60000 });
-  return r.status === 0 ? r.stdout.trim() : `docker ${args.join(' ')} failed: ${r.stderr}`;
+  if (r.status !== 0) {
+    problems.push(`could not ask docker (docker ${args.join(' ')}): ${(r.stderr || r.error || '').toString().trim()}`);
+    return null;
+  }
+  return r.stdout.trim();
 }
+
+if (!temp) problems.push('RUNNER_TEMP is not set');
+if (!names.length) problems.push('no names given');
 
 for (const name of names) {
   for (const [what, args] of [
@@ -24,12 +32,12 @@ for (const name of names) {
     const left = docker(...args);
     if (left) problems.push(`${name}: ${what} left: ${left}`);
   }
+  if (!temp) continue;
   const dir = path.join(temp, 'remote-cache-sidecar', name);
   if (fs.existsSync(path.join(dir, 'state'))) problems.push(`${name}: its state file is still there: not stopped`);
-  if (byPost.includes(name)) {
-    const log = path.join(dir, 'logs', 'service.log');
-    if (!fs.existsSync(log)) problems.push(`${name}: no service log at ${log}: the post step did not stop it`);
-  }
+  // Every stop, explicit or the post step's, keeps the service's log.
+  const log = path.join(dir, 'logs', 'service.log');
+  if (!fs.existsSync(log)) problems.push(`${name}: no service log at ${log}: it was not stopped`);
 }
 
 if (problems.length) {

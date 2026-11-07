@@ -459,7 +459,7 @@ case "$1 $2" in
 	silent) echo 'time=x level=INFO msg="engine connected" conn=1' ;;
 	esac
 	;;
-"cp "*) echo "$*" >>"$FAKE_DIR/cps"; printf '#!/bin/sh\necho dagger fake\n' >"$3" ;;
+"cp "*) echo "$*" >>"${FAKE_DIR:-/dev/null}/cps"; printf '#!/bin/sh\necho dagger fake\n' >"$3" ;;
 *) exit 0 ;;
 esac
 EOF2
@@ -552,6 +552,24 @@ check "a CLI that isn't there is refused" not cli_check_msg "$first_version" "$f
 check "a CLI without a version to match (the deprecated engine-image) is refused" not cli_check_msg "$first_version" ""
 check "start refuses a mismatched CLI before it creates anything" start_refuses SIDECAR_CLI="$fake_cli" FAKE_CLI_VERSION=v0.0.1
 check "start refuses a CLI that isn't a file before it creates anything" start_refuses SIDECAR_CLI="$tmp/clis/nope"
+own_wrapper_refused() {
+	# The CLI given is the sidecar's own wrapper path, a script that records
+	# being run: the start must refuse it without running it.
+	local d="$tmp/own" out
+	rm -rf "$d"
+	mkdir -p "$d/remote-cache/bin"
+	printf '#!/bin/sh\ntouch "%s/ran"\necho "version:     %s"\n' "$d" "$first_version" >"$d/remote-cache/bin/dagger"
+	chmod +x "$d/remote-cache/bin/dagger"
+	out="$(
+		PATH="$tmp/nodocker:$PATH"
+		export SIDECAR_ROLE=writer SIDECAR_DIR="$d" SIDECAR_CLI="$d/remote-cache/bin/dagger"
+		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
+		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
+		start 2>&1
+	)"
+	[[ "$out" == *"own wrapper"* && ! -e "$d/ran" ]]
+}
+check "a CLI that is the sidecar's own wrapper is refused before it is run" own_wrapper_refused
 fake_start_cli() { hello_start welcome FAKE_CLI_VERSION="$first_version" SIDECAR_CLI="$fake_cli" "$@"; }
 check "a CLI of the engine's version: the start is ready" fake_start_cli
 check "... without copying the CLI out of the engine" [ ! -e "$tmp/okbin.fake/cps" ]

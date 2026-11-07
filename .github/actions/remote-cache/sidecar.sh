@@ -421,9 +421,10 @@ start() {
 	fi
 
 	local cli="${SIDECAR_CLI:-}"
+	# The wrapper runs the CLI: it must never be the wrapper itself, and it
+	# is refused before the CLI is run.
+	[[ -z "$cli" || "$cli" != "$(sidecar_dir)/$name/bin/dagger" ]] || die "SIDECAR_CLI is this sidecar's own wrapper ($cli): give the CLI the job installed"
 	[[ -z "$cli" ]] || check_cli "$cli" "$version"
-	# The wrapper runs the CLI: it must never be the wrapper itself.
-	[[ -z "$cli" || "$cli" != "$(sidecar_dir)/$name/bin/dagger" ]] || die "SIDECAR_CLI is this sidecar's own wrapper"
 
 	local dir
 	dir="$(sidecar_dir)/$name"

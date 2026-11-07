@@ -66,10 +66,12 @@ inputs:
   drain-timeout:
     description: >-
       How long the stop lets the service finish its exports (-drain-timeout).
-      The stop at the end of the job has no timeout of its own: the job's
-      timeout-minutes bounds it, so set one above the job's work plus this
-      plus 2 minutes (the drain's wait, this plus 5s, then the engine's stop,
-      cut off at 90s, then the cleanup).
+      The stop at the end of the job is not a step of yours, so it has no
+      timeout-minutes of its own: the job's timeout bounds it, so set one
+      above the job's work plus this plus 2 minutes (the drain's wait, this
+      plus 5s, then the engine's stop, cut off at 90s, then the cleanup). As a
+      last resort the shim also kills a stop that runs past this plus 5
+      minutes and 25s.
     required: false
     default: "10m"
   name:
@@ -169,15 +171,17 @@ runs:
         cat >"$dir/dagger" <<EOF2
         #!/usr/bin/env bash
         # Written by remote-cache/start (.github/actions/remote-cache/start/action.yml).
-        if [[ "\$*" == "--silent version" ]]; then
+        # Only while the installer runs (the file is removed after it).
+        if [[ -e "$dir/armed" && "\$*" == "--silent version" ]]; then
           echo "dagger none (the installer's probe: remote-cache/start installs the CLI)"
           exit 0
         fi
         real="$RUNNER_TEMP/bin/dagger"
-        [[ -x "\$real" ]] || { echo "dagger isn't installed" >&2; exit 127; }
+        [[ -x "\$real" ]] || { echo "dagger isn't installed at \$real (remote-cache/start installs it)" >&2; exit 127; }
         exec "\$real" "\$@"
         EOF2
         chmod +x "$dir/dagger"
+        : >"$dir/armed"
         echo "$dir" >>"$GITHUB_PATH"
     # Only installs: with no call, args, check or shell it runs no command
     # (and so never sets DAGGER_CLOUD_TOKEN from its empty cloud-token, or
@@ -191,6 +195,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # The probe shim answers the installer's probe only until now.
+        rm -f "${RUNNER_TEMP:?}/remote-cache-installer-probe/armed"
         cli="${RUNNER_TEMP:?}/bin/dagger"
         [[ -x "$cli" ]] || { echo "::error::remote-cache/start: the dagger CLI isn't installed at $cli"; exit 1; }
         echo "cli=$cli" >>"$GITHUB_OUTPUT"

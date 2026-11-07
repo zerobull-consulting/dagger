@@ -356,7 +356,6 @@ jobs:
         uses: ./hack/remote-cache/ci/verify-stopped
         with:
           names: demo-writer demo-reader
-          stopped-by-post: demo-reader
       - name: "Writer: note the time"
         run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
       - name: "Writer: start the sidecar"
