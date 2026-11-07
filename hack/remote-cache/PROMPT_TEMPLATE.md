@@ -199,11 +199,7 @@ keeps the rounds productive.
 
 - An org ruleset has Copilot review **every push** to a ready PR, and not
   drafts. So each push is a review round.
-- `feature/remote-cache`'s ruleset lists its required checks (today `unit
-  tests`, `S3 tests against MinIO`, `real engines (e2e)`, `sidecar demo` and
-  `fork paths`). Read them from the ruleset or a PR's checks list, not from
-  this file. Copilot is not a required check, so the merge waits on those
-  checks only.
+- `feature/remote-cache`'s ruleset is the source of truth for required checks. Read them from the ruleset or a PR's checks list, not from this file. Copilot is not a required check, so the merge waits on those checks only.
 
 **The limit:**
 
