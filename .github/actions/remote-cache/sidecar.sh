@@ -184,7 +184,7 @@ linger_seconds=15
 # settings, no engine needed, and bounded.
 cli_version() {
 	local out line
-	out="$(cli_run "$1" --silent version 2>/dev/null)" || return 1
+	out="$(cli_run "$1" version 2>/dev/null)" || return 1
 	while IFS= read -r line; do
 		if [[ "$line" =~ ^dagger\ (v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)(\ |$) ]]; then
 			echo "${BASH_REMATCH[1]}"
@@ -214,7 +214,7 @@ check_cli() {
 	[[ -n "$want" ]] ||
 		die "a CLI is given, but no version selects the engine: give version, which the CLI must match (engine-image, deprecated, can't be checked)"
 	got="$(cli_version "$cli")" ||
-		die "the CLI $cli didn't say its version (dagger --silent version printed: '$(cli_run "$cli" --silent version 2>&1 | head -c 300 | tr '\n' ' ' || true)'): a release of the CLI is needed, to match the engine $want"
+		die "the CLI $cli didn't say its version (dagger version printed: '$(cli_run "$cli" version 2>&1 | head -c 300 | tr '\n' ' ' || true)'): a release of the CLI is needed, to match the engine $want"
 	[[ "$got" == "$want" ]] ||
 		die "the CLI ($cli) is $got but the engine is $want: they must be the same version. Install CLI $want (the version input of the action does)"
 }

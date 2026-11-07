@@ -389,7 +389,7 @@ jobs:
       # installed, with TRACEPARENT (job env above) set.
       - name: "Writer: the installed CLI is the engine's version"
         run: |
-          [[ "$(dagger --silent version | cut -d' ' -f2)" == "$STOCK_ENGINE_TAG" ]]
+          [[ "$(dagger version | cut -d' ' -f2)" == "$STOCK_ENGINE_TAG" ]]
           [[ "${{ steps.writer.outputs.dagger }}" == "$(command -v dagger)" ]]
       - name: "Writer: run the demo"
         timeout-minutes: 10
@@ -432,7 +432,7 @@ jobs:
       - name: "Alias: the CLI runs"
         env:
           DAGGER: ${{ steps.alias.outputs.dagger }}
-        run: '"$DAGGER" --silent version'
+        run: '"$DAGGER" version'
       - name: "Alias: stop the sidecar"
         if: always()
         timeout-minutes: 12

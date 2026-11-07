@@ -3094,7 +3094,7 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
 
 Then the CLI, which must be the engine's version (the engine is pinned by
 digest, the CLI only by its release tag; the action installs it with
-`dagger/dagger-for-github` and fails the start when `dagger --silent
+`dagger/dagger-for-github` and fails the start when `dagger
 version` says another). Here it is the engine image's own, which matches,
 with the Cloud settings that make the engine publish the session's spans to
 the service, and no inherited trace:

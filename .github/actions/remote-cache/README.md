@@ -56,7 +56,7 @@ D4):
   v8.4.1, `27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77`), given only
   `version`, so it only installs. The engine is pinned by digest and the
   CLI only by its release tag, so the start **fails when the installed CLI
-  doesn't say it is the engine's version** (`dagger --silent version`),
+  doesn't say it is the engine's version** (`dagger version`),
   before it creates or pulls anything;
 - the engine: the stock `registry.dagger.io/engine` image of that version,
   pinned by the digest in the service's engine manifest,

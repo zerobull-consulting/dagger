@@ -520,6 +520,8 @@ fake_cli="$tmp/clis/dagger"
 cat >"$fake_cli" <<'EOF2'
 #!/bin/sh
 case "$*" in
+# As the real CLI: its version command takes no --silent.
+*--silent*) echo 'Error: flag --silent is not supported by command "dagger version"' >&2; exit 1 ;;
 *version*) [ -n "$FAKE_CLI_SILENT" ] || echo "dagger ${FAKE_CLI_VERSION} (image://registry.dagger.io/engine:x) linux/amd64" ;;
 *) echo "TRACEPARENT=${TRACEPARENT-unset} DAGGER_ENGINE=${DAGGER_ENGINE-unset} OTEL_X=${OTEL_X-unset} RUNNER=$_EXPERIMENTAL_DAGGER_RUNNER_HOST CLOUD=$DAGGER_CLOUD_URL $DAGGER_CLOUD_TOKEN" ;;
 esac
