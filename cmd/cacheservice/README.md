@@ -2400,10 +2400,14 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
   waiting for `-export-settle`, and stays so while the flush runs, so what
   becomes dirty meanwhile is exported too. Roots waiting out a retry's
   backoff (busy, failed, interrupted) are due now, once; a retry after that
-  waits its normal backoff. A session that ended with some of the cache
-  spans its carrier counted still missing is waited for until they are in,
-  or `-export-settle` (at most 2s) passed with none, as the drain does; its
-  late spans are taken and exported. The scheduler runs the exports, one
+  waits its normal backoff. A session whose spans may still come (one that
+  hasn't ended, or ended with some of the cache spans its carrier counted
+  missing) is waited for until it ended with every span in, or
+  `-export-settle` (at most 2s) passed since its last span: so a flush right
+  after the client returned waits for its last spans and its carrier, which
+  are on their way. Its late spans are taken and exported. A flush starts
+  each failing root's retry at once: a caller that loops flushes retries
+  them at its own rate. The scheduler runs the exports, one
   at a time per engine cache: the flush starts none of its own. Other
   caches are scheduled as usual.
 - **It isn't a drain.** New engines, sessions and spans are taken as usual.
@@ -2442,7 +2446,7 @@ only for auth, bad requests and refusals. The report:
 - `stored`: the roots stored by exports of the cache that ended during the
   flush.
 - `left`, as the drain counts them: `dirty` (worth exporting, not in flight
-  or waiting for a retry), `waitingSpans` (ended sessions still waited
+  or waiting for a retry), `waitingSpans` (sessions still waited
   for), `inFlight`, `retrying` (a retry due before the timeout), `later` (a
   retry due after it).
 

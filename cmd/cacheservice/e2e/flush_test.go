@@ -28,7 +28,8 @@ func (s *state) flush(t *testing.T) {
 	env := s.env
 	start := time.Now()
 	svc := env.StartService("flush", ServiceOptions{})
-	f := env.StartEngines(svc, "f")[0]
+	// Not "f": the superseded scenario's engine F has that name.
+	f := env.StartEngines(svc, "fl")[0]
 	cacheF := f.CacheID()
 
 	n := Nonce()

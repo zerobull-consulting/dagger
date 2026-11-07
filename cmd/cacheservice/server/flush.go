@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
@@ -42,9 +43,9 @@ type FlushLeft struct {
 	// Dirty are the roots worth exporting, changed since an export last
 	// claimed them, and not in flight or waiting out a retry.
 	Dirty int `json:"dirty"`
-	// WaitingSpans are the ended sessions with some of the cache spans
-	// their carrier counted still missing, waited for until Settle (at most
-	// 2s) passed with none of them.
+	// WaitingSpans are the sessions whose spans may still come: not ended,
+	// or ended with some of the cache spans their carrier counted missing,
+	// waited for until Settle (at most 2s) passed since their last span.
 	WaitingSpans int `json:"waitingSpans"`
 	// InFlight are the roots an export holds. A flush never cancels it: it
 	// runs on until it ends, or its engine stops.
@@ -82,8 +83,7 @@ type FlushReport struct {
 type flushRun struct {
 	ns      *namespace
 	cacheID string
-	mu      sync.Mutex
-	stored  int
+	stored  atomic.Int64
 }
 
 // flushRuns are the flushes under way.
@@ -120,9 +120,7 @@ func (s *Service) flushStored(ns *namespace, cacheID string, roots int) {
 	defer s.flushes.mu.Unlock()
 	for r := range s.flushes.runs {
 		if r.ns == ns && r.cacheID == cacheID {
-			r.mu.Lock()
-			r.stored += roots
-			r.mu.Unlock()
+			r.stored.Add(int64(roots))
 		}
 	}
 }
@@ -135,8 +133,11 @@ func (p *exportPath) changed() <-chan struct{} {
 	return p.changedCh
 }
 
-// broadcast wakes everything waiting on changed.
+// broadcast wakes everything waiting on changed, if a flush waits.
 func (p *exportPath) broadcast() {
+	if p.changedWaiters.Load() == 0 {
+		return
+	}
 	p.changedMu.Lock()
 	defer p.changedMu.Unlock()
 	close(p.changedCh)
@@ -165,9 +166,10 @@ func (s *Service) flushRefusal() error {
 //     it to settle, and every root of it waiting out a retry's backoff due
 //     now, once; a retry after that waits its normal backoff. Entries that
 //     become dirty during the flush are due at once too.
-//   - It waits for the cache's ended sessions whose carrier counted spans
-//     that haven't arrived, until Settle (at most 2s) passes with none of
-//     them, as a drain does; their late spans are taken and exported.
+//   - It waits for the cache's sessions whose spans may still come: not
+//     ended, or ended with some of the spans their carrier counted missing,
+//     until Settle (at most 2s) passed since their last span; their late
+//     spans are taken and exported.
 //   - The scheduler runs the exports, one at a time per cache: it starts
 //     none of its own.
 //   - It isn't a drain: new engines, sessions and spans are taken, and an
@@ -212,6 +214,8 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 	defer endFlush()
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	p.changedWaiters.Add(1)
+	defer p.changedWaiters.Add(-1)
 	poll := time.NewTicker(min(p.tick, maxDrainPoll))
 	defer poll.Stop()
 	for {
@@ -222,13 +226,15 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		switch {
 		case flushEmpty(st):
 			return end(metrics.FlushComplete), nil
+		case p.ctx.Err() != nil:
+			// The stop began: its engines are closed next, which isn't
+			// their engine going away.
+			return end(metrics.FlushCanceled), nil
 		case !connected():
 			return end(metrics.FlushNotConnected), nil
 		case st.InFlight == 0 && st.Pending == 0 && st.Retrying == 0 && st.Sessions == 0:
 			// Only retries due after the timeout: not waited for.
 			return end(metrics.FlushTimeout), nil
-		case p.ctx.Err() != nil:
-			return end(metrics.FlushCanceled), nil
 		case !now.Before(deadline):
 			return end(metrics.FlushTimeout), nil
 		}
@@ -256,9 +262,7 @@ func flushEmpty(st exporter.DrainState) bool {
 func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start time.Time, outcome string, deadline time.Time) FlushReport {
 	left := flushLeftOf(ns.tracker.FlushStatus(cacheID, s.export.now(), deadline))
 	took := time.Since(start)
-	run.mu.Lock()
-	stored := run.stored
-	run.mu.Unlock()
+	stored := int(run.stored.Load())
 	rep := FlushReport{
 		Outcome: outcome,
 		CacheID: cacheID,
@@ -280,11 +284,12 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 
 // notConnectedReport is the token form's report when none of the token's
 // connections is welcomed: nothing was flushed.
-func (s *Service) notConnectedReport(ns *namespace) FlushReport {
-	s.metrics.FlushEnded(metrics.FlushNotConnected, 0, 0)
+func (s *Service) notConnectedReport(ns *namespace, start time.Time) FlushReport {
+	took := time.Since(start)
+	s.metrics.FlushEnded(metrics.FlushNotConnected, took, 0)
 	s.logger.Info("flush: done", "namespace", ns.name, "outcome", metrics.FlushNotConnected,
 		"reason", "no engine connection with the request's token")
-	return FlushReport{Outcome: metrics.FlushNotConnected, Took: "0s"}
+	return FlushReport{Outcome: metrics.FlushNotConnected, Took: took.Round(time.Millisecond).String()}
 }
 
 // validCacheID reports whether a cache ID from a request's path is one the
@@ -360,6 +365,7 @@ func (s *Service) serveFlush(w http.ResponseWriter, r *http.Request) {
 // reports not_connected; with more than one cache, it answers 409, and the
 // caller flushes each by its ID.
 func (s *Service) serveFlushToken(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	ns, key, ok := s.flushAuth(w, r)
 	if !ok {
 		return
@@ -375,7 +381,7 @@ func (s *Service) serveFlushToken(w http.ResponseWriter, r *http.Request) {
 			writeFlushError(w, err)
 			return
 		}
-		writeJSON(w, s.notConnectedReport(ns))
+		writeJSON(w, s.notConnectedReport(ns, start))
 	case 1:
 		s.flushOne(w, r, ns, key, caches[0])
 	default:

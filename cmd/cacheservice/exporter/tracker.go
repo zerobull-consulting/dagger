@@ -1240,10 +1240,13 @@ func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
 
 // leftLocked is what cache c has left to export at now, for a drain (drain)
 // or a flush that ends at deadline. A drain waits for the sessions that
-// haven't ended too, until its first DrainDue stops tracking them; a flush
-// waits only for those that ended with some of their counted spans missing,
-// and only until Settle (at most maxDrainSessionWait) passed with none of
-// them, as a drain does.
+// haven't ended too, until its first DrainDue stops tracking them, and for
+// those that ended with some of their counted spans missing until Settle (at
+// most maxDrainSessionWait) passed with none of them. A flush waits for both
+// kinds by that last rule alone: a session still sending spans, or whose
+// carrier or last spans are on their way, as when the flush comes right
+// after its client returned, holds it until Settle (at most
+// maxDrainSessionWait) passed since its last span.
 func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain bool) DrainState {
 	st := DrainState{CacheID: c.id}
 	for n, e := range c.entries {
@@ -1266,8 +1269,9 @@ func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain boo
 		if s.generation < c.generation {
 			continue
 		}
-		waiting := s.ended() && s.seenSpans < s.expectSpans && now.Sub(s.lastSpanAt) < t.drainSessionWait()
-		if waiting || (drain && !s.ended()) {
+		recent := now.Sub(s.lastSpanAt) < t.drainSessionWait()
+		missing := s.ended() && s.seenSpans < s.expectSpans
+		if (drain && (!s.ended() || (missing && recent))) || (!drain && (!s.ended() || missing) && recent) {
 			st.Sessions++
 		}
 	}
@@ -1310,7 +1314,7 @@ func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
 
 // FlushStatus is what cacheID has left to export at now, for a flush that
 // ends at deadline: what a drain would count of it (see DrainState), except
-// that Sessions counts only the ended sessions still waited for (see
+// that Sessions counts the sessions waited for by a flush's rule (see
 // leftLocked). A cache the tracker doesn't know has nothing left.
 func (t *Tracker) FlushStatus(cacheID string, now, deadline time.Time) DrainState {
 	t.mu.Lock()

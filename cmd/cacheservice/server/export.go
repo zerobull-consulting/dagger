@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -43,8 +44,9 @@ type exportPath struct {
 	wake, drainWake chan struct{}
 	// changedCh is closed, and replaced, on every kick: flushes wait on it
 	// (changed).
-	changedMu sync.Mutex
-	changedCh chan struct{}
+	changedMu      sync.Mutex
+	changedCh      chan struct{}
+	changedWaiters atomic.Int32
 
 	wg workGroup
 }

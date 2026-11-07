@@ -221,6 +221,26 @@ func TestFlushTakesLateSpans(t *testing.T) {
 	}
 }
 
+// A session that hasn't ended holds the flush while its spans keep coming,
+// as when the flush comes right after the client returned and its last
+// spans and carrier are on their way: they are exported before it returns.
+func TestFlushWaitsForSessionStillSending(t *testing.T) {
+	h, _ := newDrainHarness(t, func(c *ExportConfig) { c.Tracker.Settle = 30 * time.Second })
+	h.build()
+	h.postSpans("session-1", cacheSpan(10))
+	done := startFlush(t, flushURL(h.srv.URL, h.cache.ID, "20s"), "engine-token")
+	waitUntil(t, 5*time.Second, "the flush to export what was in", func() bool { return indexHas(t, h, 10) })
+	flushRunning(t, done, "with the session still sending")
+	h.postSpans("session-1", cacheSpan(11, "10"), carrierSpan(2))
+	res := waitFlush(t, done, 15*time.Second)
+	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushComplete || res.rep.Stored != 2 {
+		t.Fatalf("flush: %d %+v %s", res.code, res.rep, res.body)
+	}
+	if !indexHas(t, h, 11) {
+		t.Fatal("the session's last entry wasn't stored when the flush returned")
+	}
+}
+
 // The wait for missing spans is reported, and bounded: with them never
 // arriving, the flush returns complete once Settle (at most 2s) passed.
 func TestFlushWaitsForMissingSpansBounded(t *testing.T) {
