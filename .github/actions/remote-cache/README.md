@@ -366,3 +366,9 @@ action's, which an outside caller's job would not have). The shim runs the
 so the pin fixes only the shim. After a change in `start/run`, commit it
 alone, then change the pin in `start/action.yml` to that commit in a
 following commit. Its tests: `node --test start/run/index.test.js`.
+
+The pin must stay fetchable. The commit it names is on the branch of the pull
+request that last changed the shim, so after a squash merge it is reachable
+only through that pull request's head ref, until a follow-up pins it to a
+commit on `feature/remote-cache`
+([zerobull-consulting/dagger#169](https://github.com/zerobull-consulting/dagger/issues/169)).

@@ -2994,7 +2994,7 @@ On GitHub Actions, use the composite action, which does everything below
     s3-prefix: cache
     s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
     s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
-- run: dagger call build                # any dagger command: start put a wrapper of the CLI first on PATH
+- run: dagger call build                # any dagger command: start puts a wrapper of the CLI first on PATH
 # No stop step: start stops the sidecar, draining its exports, at the end of the job.
 # The job's timeout-minutes bounds that stop: set it above the work plus the
 # drain timeout (10m) plus 2 minutes. remote-cache/stop stops earlier.
