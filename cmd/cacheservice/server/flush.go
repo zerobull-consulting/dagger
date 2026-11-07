@@ -230,8 +230,9 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		switch {
 		case flushEmpty(st):
 			return end(metrics.FlushComplete), nil
-		case p.ctx.Err() != nil:
-			// The stop began: its engines are closed next, which isn't
+		case p.ctx.Err() != nil, s.closing.Load():
+			// The stop began (the paths' context ended, or CloseEngines
+			// ran, in either order): its engines are closed, which isn't
 			// their engine going away.
 			return end(metrics.FlushCanceled), nil
 		case !connected():
@@ -291,7 +292,10 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 func (s *Service) notConnectedReport(ns *namespace, start time.Time) FlushReport {
 	took := time.Since(start)
 	s.metrics.FlushEnded(metrics.FlushNotConnected, took, 0)
-	s.logger.Info("flush: done", "namespace", ns.name, "outcome", metrics.FlushNotConnected,
+	// The same fields as every flush's (endFlush), with no cache.
+	s.logger.Info("flush: done", "namespace", ns.name, "cacheID", "", "outcome", metrics.FlushNotConnected,
+		"took", took.Round(time.Millisecond), "storedRoots", 0, "leftRoots", 0,
+		"dirty", 0, "waitingSpans", 0, "inFlight", 0, "retrying", 0, "later", 0,
 		"reason", "no engine connection with the request's token")
 	return FlushReport{Outcome: metrics.FlushNotConnected, Took: took.Round(time.Millisecond).String()}
 }
@@ -375,18 +379,19 @@ func (s *Service) serveFlushToken(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Before the caches: a bad timeout is a 400 whatever the token holds.
+	// Before the caches: a bad timeout is a 400, and a refusal (draining,
+	// stopping, export off) its own status, whatever the token holds.
 	if _, err := flushTimeout(r); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.flushRefusal(); err != nil {
+		writeFlushError(w, err)
 		return
 	}
 	caches := s.cachesOfToken(ns, key)
 	switch len(caches) {
 	case 0:
-		if err := s.flushRefusal(); err != nil {
-			writeFlushError(w, err)
-			return
-		}
 		writeJSON(w, s.notConnectedReport(ns, start))
 	case 1:
 		s.flushOne(w, r, ns, key, caches[0])

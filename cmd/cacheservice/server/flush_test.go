@@ -362,6 +362,24 @@ func TestFlushCanceledRequestLeavesExport(t *testing.T) {
 	h.waitIndex(10, 11)
 }
 
+// A flush whose engine the service's stop closes (CloseEngines, before or
+// without the paths' context ending) reports canceled, not not_connected:
+// the engine didn't go away, the service did.
+func TestFlushCanceledByStop(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	release := h.cache.Hold()
+	defer release()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+	done := startFlush(t, flushURL(h.srv.URL, h.cache.ID, "1m"), "engine-token")
+	waitUntil(t, 5*time.Second, "the export to be held", func() bool { return h.cache.InFlight() == 1 })
+	h.svc.CloseEngines()
+	res := waitFlush(t, done, 15*time.Second)
+	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushCanceled {
+		t.Fatalf("flush: %d %+v %s", res.code, res.rep, res.body)
+	}
+}
+
 // timeout=0 makes nothing due, exports nothing, and reports what is
 // pending.
 func TestFlushTimeoutZeroOnlyReports(t *testing.T) {
@@ -492,7 +510,7 @@ func TestFlushConcurrent(t *testing.T) {
 // with the request's token; with none it reports not_connected, and with
 // more than one cache it answers 409.
 func TestFlushTokenForm(t *testing.T) {
-	h, _ := newDrainHarness(t, nil)
+	h, rec := newDrainHarness(t, nil)
 	h.build()
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 	res := postFlush(t, h.srv.URL+"/v1/engines/flush?timeout=20s", "engine-token")
@@ -502,6 +520,18 @@ func TestFlushTokenForm(t *testing.T) {
 	res = postFlush(t, h.srv.URL+"/v1/engines/flush", "another-token")
 	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushNotConnected || res.rep.CacheID != "" {
 		t.Fatalf("another token: %d %+v %s", res.code, res.rep, res.body)
+	}
+	// Logged with the fields of every flush's line.
+	var line map[string]string
+	for _, l := range rec.find("flush: done") {
+		if l["outcome"] == metrics.FlushNotConnected {
+			line = l
+		}
+	}
+	for _, k := range []string{"took", "storedRoots", "leftRoots", "dirty", "waitingSpans", "inFlight", "retrying", "later"} {
+		if _, ok := line[k]; !ok {
+			t.Fatalf("not_connected's flush: done has no %s: %v", k, line)
+		}
 	}
 	h.connectEngine(fakeengine.New("cache-b", 4))
 	if res := postFlush(t, h.srv.URL+"/v1/engines/flush", "engine-token"); res.code != http.StatusConflict {
@@ -663,6 +693,9 @@ func TestFlushRefusals(t *testing.T) {
 	}
 
 	h, _ := newDrainHarness(t, nil)
+	// Two caches on the engine's token: the token form refuses before it
+	// counts them.
+	h.connectEngine(fakeengine.New("cache-b", 4))
 	drainFor(h.svc, time.Second)
 	for _, path := range []string{flushURL(h.srv.URL, h.cache.ID, ""), h.srv.URL + "/v1/engines/flush"} {
 		if res := postFlush(t, path, "engine-token"); res.code != http.StatusServiceUnavailable || !strings.Contains(res.body, ErrDraining.Error()) {
