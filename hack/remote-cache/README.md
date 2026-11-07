@@ -755,3 +755,68 @@ so a pull request can't weaken the check that measures it; a change to the
 checker takes effect once merged. The allowlist is the pull request's, since
 that's where an entry is added, and the job flags any change to it with a
 warning for the reviewer.
+
+## Automation tokens
+
+The release check and the nightly upstream sync
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117),
+D5) open pull requests that need CI. GitHub starts no workflows for pushes
+or pull requests made with a workflow's own `GITHUB_TOKEN`, so they use
+fine-grained personal access tokens instead. Each token is an environment
+secret:
+
+| Token | Permissions | Environment | Secret | Used by |
+|---|---|---|---|---|
+| `dagger-cache-bot-pr` | Contents, Pull requests: write | `cache-bot-pr` | `CACHE_BOT_PR_TOKEN` | the release check's `accept` and `reject` PRs |
+| `dagger-cache-bot-sync` | Contents, Pull requests, Workflows: write | `cache-bot-sync` | `CACHE_BOT_SYNC_TOKEN` | the nightly sync, and the release check's rebuild on a new upstream tag |
+
+- **Scope.** Both tokens are owned by `zerobull-consulting` and reach this
+  repository only.
+- **Why two.** Merges from upstream regularly change `.github/workflows/`,
+  and GitHub refuses that push without Workflows permission. The
+  accept-line PR changes only `cmd/cacheservice/compat/engines.txt`, so its
+  token can't touch CI.
+- **Expiry.** Both expire 2027-02-04. Rotate them together: regenerate each
+  one, then update its secret.
+- **Environments.** Neither has reviewers or a wait timer, and both deploy
+  only from `feature/remote-cache`, the default branch. Scheduled and
+  dispatched runs get the secrets; a pull request's branch doesn't. A job
+  reads a token with `environment: cache-bot-pr` (or `cache-bot-sync`).
+
+**Neither token merges anything.**
+- A workflow on `GITHUB_TOKEN` enables squash auto-merge on the accept-line
+  PR. GitHub then merges it only once the required checks pass, an
+  accept-line-only check among them.
+- That merge starts no workflows, so the release check runs
+  `cacheservice-publish.yml` on `feature/remote-cache` itself, with
+  `workflow_dispatch` and `actions: write`. That's what moves the floating
+  `:<engineVersion>` tag.
+- The tokens act as their owner, who can bypass the ruleset. A merge made
+  with one might not wait for the checks, so they are only used to push and
+  to open PRs.
+
+**The sync PR merges with a merge commit, never a squash.** It has to keep
+upstream `main` as a parent, or the next sync conflicts again and the
+`fork paths` base stays old (see "The fork's paths"). For this, the
+repository allows merge commits and the ruleset doesn't require linear
+history. Squash stays the method for every other pull request.
+
+Other settings these flows rely on:
+- **Allow auto-merge** is on.
+- **Allow GitHub Actions to create and approve pull requests** is off. The
+  tokens open every PR.
+- Issues the flows file (`compat-break`, upstream drift) use `GITHUB_TOKEN`
+  with `issues: write`.
+
+**Checking a token** on your own machine, without it reaching your shell
+history:
+
+```sh
+read -rs GH_TOKEN && export GH_TOKEN
+gh api repos/zerobull-consulting/dagger --jq .full_name       # zerobull-consulting/dagger
+gh api repos/zerobull-consulting/mcp-github-readonly --jq .full_name  # HTTP 404
+unset GH_TOKEN
+```
+
+Skip `--jq .permissions`: for a fine-grained token it shows the owner's
+role on the repository, not the token's permissions.
