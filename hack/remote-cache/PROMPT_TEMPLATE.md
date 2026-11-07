@@ -140,8 +140,8 @@ Invariants:
 **Sections 9, 10 and 12 may be given by reference.** A prompt can say
 "Rules, environment notes and review: sections 9, 10 and 12 of
 `hack/remote-cache/PROMPT_TEMPLATE.md`, as of the version named at the end",
-and add only what differs for the item (an extra rule, a different review
-tier, an environment quirk it will hit). The agent reads the file. Copying
+and add only what differs for the item (an extra rule, an environment quirk
+it will hit). The agent reads the file. Copying
 them into every prompt cost about 3k characters each, and the copies drifted.
 
 ### 10. Environment notes
@@ -166,8 +166,7 @@ agreement's full text below:
 - decide on splitting once, from the first diff's lines added plus deleted;
 - run `/code-review high` against `origin/feature/remote-cache` and fix the
   real findings, then mark the PR ready;
-- one push per round, at most **two** review rounds, or **four** for a
-  high-risk PR (the tiers below);
+- one push per round, at most **two** review rounds;
 - then known-gap tests and issues for confirmed findings, the rest appended to
   the tracking issue's rolling leads issue, one final push, then the squash
   merge with its explicit message, made by the session itself unless the
@@ -207,21 +206,12 @@ keeps the rounds productive.
 
 **The limit:**
 
-- **Two tiers of review rounds,** chosen by what the PR touches, not its
-  size:
-  - **Default: at most two** review rounds (reviews 1 and 2).
-  - **High risk: at most four** (reviews 1 to 4), when the PR touches
-    authentication or tokens, credentials or secrets, workflows that use
-    secrets or merge on their own, or any path that deletes stored data.
-  - The prompt names the tier; with none named, the agent picks by this rule
-    and says which in the PR.
-  - *Why:* over zerobull-consulting/dagger#107 to #168, size didn't predict
-    review churn. #141 (675 lines) took 5 reviews and #153 (2,353) took 2. The
-    PRs that went past two rounds were the high-risk ones (#107 debug-API
-    auth, #121 the drain and linger, #141 the fork-paths check, #156 the
-    release check's tokens and auto-merge), and those later rounds found real
-    problems. Most other PRs already finished in two under a cap of four, and
-    #168 met every target under a cap of two.
+- Every PR gets at most **two** review rounds (reviews 1 and 2), whatever its
+  size or what it touches.
+  - *Why:* under the earlier cap of four, most PRs from
+    zerobull-consulting/dagger#107 to #168 already finished in two, thanks to
+    the self-review before marking ready. zerobull-consulting/dagger#168 met
+    every target under a cap of two.
 - **Decide on splitting once, from the first diff:** when the draft first does
   what the prompt asks, before `/code-review` or any other review. Its size is
   the lines added plus the lines deleted, counting every file (tests, docs and
@@ -261,8 +251,7 @@ keeps the rounds productive.
      threads you've handled.
    - Push all of it in **one push**. Gather everything into that push: no
      README touch-ups, rebases or follow-up commits in between.
-4. **After the last round** (review 2, or review 4 for a high-risk PR), no
-   more fix rounds. Handle whatever
+4. **After the last round** (review 2), no more fix rounds. Handle whatever
    that review reports (new findings, a 🔵 "Needs a closer look" with or
    without text, findings only in its session) like this:
    - **Confirmed** (you traced a real path to the failure): pin it with a
