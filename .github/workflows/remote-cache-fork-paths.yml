@@ -25,7 +25,7 @@ jobs:
   fork-paths:
     name: fork paths
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       # Shallow: the check fetches upstream and deepens both histories, in
       # bounded steps, until it finds the merge base.
@@ -85,3 +85,38 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: hack/remote-cache/check-fork-paths_test.sh
+      # The shim's pin (start/action.yml) must be a commit on
+      # feature/remote-cache, so it stays fetchable (zerobull-consulting/dagger#169).
+      # In this job, which is required. Like the fork-paths checker, the script
+      # comes from the base branch on a pull request, so the pull request can't
+      # weaken the check it's measured by (until the base has one, the pull
+      # request's runs). The pin is read from this checkout. The branch is
+      # fixed, not the event's: a manual run from another branch must still
+      # measure against feature/remote-cache. 6 attempts of 60s at most.
+      - name: Check the shim's pin
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FORK_BRANCH: feature/remote-cache
+          FETCH_TIMEOUT: "60"
+        run: |
+          pincheck=hack/remote-cache/check-shim-pin.sh
+          if [ "$EVENT" = pull_request ] && git cat-file -e "$BASE_SHA:$pincheck" 2>/dev/null; then
+            git show "$BASE_SHA:$pincheck" >"$RUNNER_TEMP/check-shim-pin.sh"
+            chmod +x "$RUNNER_TEMP/check-shim-pin.sh"
+            pincheck=$RUNNER_TEMP/check-shim-pin.sh
+            echo "Running the base branch's pin check ($(git rev-parse --short "$BASE_SHA"))."
+            git diff --quiet "$BASE_SHA" HEAD -- hack/remote-cache/check-shim-pin.sh \
+              || echo "::notice::This pull request changes the pin check; its new version runs once merged."
+          else
+            echo "Running this checkout's pin check."
+          fi
+          "$pincheck"
+      # The test of the pin check runs from the checkout, after it, like the
+      # fork-paths test.
+      - name: Test the pin check
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: hack/remote-cache/check-shim-pin_test.sh

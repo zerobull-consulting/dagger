@@ -363,12 +363,19 @@ commit: a composite action can't reference a sibling at its own commit (a
 local `uses: ./...` resolves against the caller's workspace, not the
 action's, which an outside caller's job would not have). The shim runs the
 `sidecar.sh` of the same checkout as `start/action.yml` (`SIDECAR_SCRIPT`),
-so the pin fixes only the shim. After a change in `start/run`, commit it
-alone, then change the pin in `start/action.yml` to that commit in a
-following commit. Its tests: `node --test start/run/index.test.js`.
+so the pin fixes only the shim. Its tests: `node --test start/run/index.test.js`.
 
-The pin must stay fetchable. The commit it names is on the branch of the pull
-request that last changed the shim, so after a squash merge it is reachable
-only through that pull request's head ref, until a follow-up pins it to a
-commit on `feature/remote-cache`
-([zerobull-consulting/dagger#169](https://github.com/zerobull-consulting/dagger/issues/169)).
+The pin must be a commit that is already on `feature/remote-cache`, so it
+stays fetchable whatever happens to a pull request's branch or head ref. So a
+shim change takes two pull requests:
+
+1. Change `start/run` (and its tests), and merge. Leave the pin as it is.
+2. In a following pull request, change the pin in `start/action.yml` to the
+   commit that merge made on `feature/remote-cache` (the pin may be any full
+   commit id on the branch whose `start/run` is the one you want).
+
+`hack/remote-cache/check-shim-pin.sh` enforces it, in the `fork paths` job: the
+pin must be a full 40-character commit id and an ancestor of
+`origin/feature/remote-cache`. A pull request that changes `start/run` and the
+pin together fails it, because the new pin can't be on the branch yet; that is
+the point. Its test is `hack/remote-cache/check-shim-pin_test.sh`.

@@ -205,12 +205,13 @@ runs:
     # commit: a composite action can't reference a sibling at its own commit
     # (`uses: ./...` resolves against the caller's workspace). The shim runs
     # the sidecar.sh of this action's checkout (SIDECAR_SCRIPT), so the pin
-    # only fixes the shim. Bump it when start/run changes (README,
-    # "Changing the shim"). The settings reach the script as environment
+    # only fixes the shim. It is a commit already on feature/remote-cache
+    # (hack/remote-cache/check-shim-pin.sh checks it in CI); after a change in
+    # start/run, merge it, then re-pin (README, "Changing the shim"). The settings reach the script as environment
     # variables only, never expanded into a script.
     - name: Start the cache service and the engine
       id: start
-      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@15e8bf6562b4b9aaa4022980003285462f152d42
+      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@32ed76f8c5ee68ac142273af836b546b9da77fca
       env:
         SIDECAR_SCRIPT: ${{ github.action_path }}/../sidecar.sh
         SIDECAR_ROLE: ${{ inputs.role }}
