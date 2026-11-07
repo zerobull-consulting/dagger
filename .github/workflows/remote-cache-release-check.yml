@@ -1,0 +1,441 @@
+name: Remote cache release check
+# Verifies each new upstream Dagger release against the cache service, and
+# ends it as A (an accept-line PR), B (a rebuild PR on the new tag) or C (a
+# compat-break issue and a reject-line PR), once per release
+# (zerobull-consulting/dagger#117, D5). hack/remote-cache/release-check.sh
+# does the work; this file only decides when it runs and with which token.
+# See hack/remote-cache/README.md, "Release check".
+#
+# Tokens: the bot's tokens (CACHE_BOT_PR_TOKEN in the cache-bot-pr
+# environment, CACHE_BOT_SYNC_TOKEN in cache-bot-sync) push and open PRs, so
+# the PRs' CI runs. They are requested only by this workflow's schedule and
+# workflow_dispatch jobs on feature/remote-cache, never from
+# pull_request_target or workflow_run, and each is read in one step
+# ("The bot's token"), which a GitHub App token would replace
+# (zerobull-consulting/dagger#152). Everything else, dispatches, issues and
+# auto-merge included, uses GITHUB_TOKEN. Neither token merges anything.
+#
+# Upstream's code runs in one place only: the bundle job, which holds no
+# credential. Every job that holds a token only merges, diffs and pushes.
+"on":
+  schedule:
+    # Hourly, off the hour.
+    - cron: "17 * * * *"
+  # By hand. On any branch but feature/remote-cache it is always a dry run,
+  # since only that branch may deploy the bot's environments.
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Print what it would do, and push, open, enable or dispatch nothing (always, off feature/remote-cache)"
+        type: boolean
+        default: true
+      verify:
+        description: "In a dry run, still run the verification (dispatches remote-cache-tests.yml, and the bundle test), which commits nothing"
+        type: boolean
+        default: false
+      version:
+        description: "In a dry run, the release to check, such as v1.0.0-beta.24, listed or not (empty: the next new one)"
+        type: string
+        default: ""
+permissions:
+  contents: read
+# One run at a time, across branches: a dry run's verification would
+# otherwise share (and cancel) a real run's candidate run.
+concurrency:
+  group: remote-cache-release-check
+  cancel-in-progress: false
+# bash with pipefail: a "| tee" mustn't hide the script's failure.
+defaults:
+  run:
+    shell: bash
+env:
+  # Outside the checkout, and absolute without "..", which upload-artifact
+  # refuses.
+  RELEASE_CHECK_DIR: ${{ github.workspace }}-notes
+jobs:
+  # Poll, and publish what nothing published. No upstream code runs here.
+  check:
+    name: poll
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+      issues: read
+    outputs:
+      dry: ${{ steps.mode.outputs.dry }}
+      action: ${{ steps.plan.outputs.action }}
+      version: ${{ steps.plan.outputs.version }}
+      digest: ${{ steps.plan.outputs.digest }}
+      kind: ${{ steps.plan.outputs.kind }}
+      pr: ${{ steps.plan.outputs.pr }}
+      issue: ${{ steps.plan.outputs.issue }}
+      # Whether this run verifies: a new release, and in a dry run only
+      # with the verify input.
+      verify: ${{ steps.plan.outputs.action == 'verify' && (steps.mode.outputs.dry != 'true' || inputs.verify) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Dry run or not
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_INPUT: ${{ inputs.dry-run }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          dry=false
+          if [[ "$GITHUB_REF" != refs/heads/feature/remote-cache || ( "$EVENT" == workflow_dispatch && "$DRY_INPUT" != false ) ]]; then
+            dry=true
+          fi
+          if [[ -n "$VERSION" && "$dry" != true ]]; then
+            echo "::error::version is for dry runs only"
+            exit 1
+          fi
+          echo "dry=$dry" >>"$GITHUB_OUTPUT"
+          echo "RELEASE_CHECK_DRY_RUN=$dry" >>"$GITHUB_ENV"
+          echo "dry run: $dry" | tee -a "$GITHUB_STEP_SUMMARY"
+      # An accept PR auto-merged by GITHUB_TOKEN started no workflow: publish
+      # its merge, which moves the floating :<engine version> tags.
+      - name: Publish a head nothing published
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./hack/remote-cache/release-check.sh publish | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Poll upstream
+        id: plan
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: ./hack/remote-cache/release-check.sh plan ${VERSION:+"$VERSION"} | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # TestBundleVersionMatchesEngineCapture with the tag merged in. It compiles
+  # and runs upstream's code, so it runs in a job of its own: no environment,
+  # no token in any step's environment, a read-only GITHUB_TOKEN, and no
+  # persisted credentials. A token in the same job could be read from a
+  # process's environment, or by a process left behind for a later step.
+  bundle:
+    name: bundle test
+    needs: check
+    if: needs.check.outputs.verify == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      bundle: ${{ steps.bundle.outputs.bundle }}
+      merge: ${{ steps.bundle.outputs.merge }}
+    steps:
+      # Full history, without blobs, to merge the tag.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: The bundle test, with the tag merged
+        id: bundle
+        timeout-minutes: 30
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: ./hack/remote-cache/release-check.sh bundle "$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The e2e and the sidecar demo of the service as it is (a dry run: of its
+  # own branch), against the release: a dispatch of remote-cache-tests.yml,
+  # waited on. It runs alongside the bundle test.
+  verify:
+    name: verify
+    needs: check
+    if: needs.check.outputs.verify == 'true'
+    runs-on: ubuntu-24.04
+    # The verifying run's wait (150 minutes) and the fetches.
+    timeout-minutes: 170
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      result: ${{ steps.verify.outputs.result }}
+      run: ${{ steps.verify.outputs.run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Verify the release against the service as it is
+        id: verify
+        timeout-minutes: 165
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: ${{ needs.check.outputs.dry }}
+          RELEASE_CHECK_TEST_REF: ${{ needs.check.outputs.dry == 'true' && github.ref_name || '' }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+        run: ./hack/remote-cache/release-check.sh verify "$VERSION" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Keep the notes for the outcome jobs
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-check-notes
+          path: ${{ env.RELEASE_CHECK_DIR }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # A dry run shows the outcome its verification led to, or every outcome if
+  # it didn't verify, up to the push: the merge is real and local, and the
+  # pushes, PRs and the issue are printed. No upstream code runs here.
+  dry-run:
+    name: what the outcome would do (dry run)
+    needs: [check, bundle, verify]
+    if: >-
+      always() && needs.check.outputs.dry == 'true' &&
+      (needs.check.outputs.action == 'verify' || needs.check.outputs.action == 'resume-reject') &&
+      needs.bundle.result != 'failure' && needs.verify.result != 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: The notes
+        if: needs.verify.result == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          name: release-check-notes
+          path: ${{ env.RELEASE_CHECK_DIR }}
+      - name: What the outcome would do
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: "true"
+          RELEASE_CHECK_BUNDLE: ${{ needs.bundle.outputs.bundle }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+          E2E: ${{ needs.verify.outputs.result }}
+          RUN: ${{ needs.verify.outputs.run }}
+          ISSUE: ${{ needs.check.outputs.issue }}
+        run: |
+          rc=./hack/remote-cache/release-check.sh
+          run="${RUN:-$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID}"
+          if [[ -n "$ISSUE" ]]; then
+            "$rc" reject "$VERSION" "$ISSUE"
+            exit 0
+          fi
+          # Not verified: show every outcome, A's and B's as if each passed.
+          if [[ -z "$E2E" ]]; then
+            echo "--- A"; RELEASE_CHECK_BUNDLE=pass "$rc" accept "$VERSION" "$DIGEST" "$run"
+            echo "--- B"; RELEASE_CHECK_BUNDLE=pass "$rc" rebuild "$VERSION" "$DIGEST"
+            echo "--- C"; "$rc" reject "$VERSION"
+          elif [[ "$E2E" == pass && "$RELEASE_CHECK_BUNDLE" == pass ]]; then
+            echo "--- A"; "$rc" accept "$VERSION" "$DIGEST" "$run"
+          else
+            echo "--- B"; "$rc" rebuild "$VERSION" "$DIGEST"
+            echo "--- C"; "$rc" reject "$VERSION"
+          fi
+
+  # Outcome A, the e2e and the bundle test both green: the accept-line PR, as
+  # the bot (cache-bot-pr).
+  accept:
+    name: "A: accept-line PR"
+    needs: [check, bundle, verify]
+    if: >-
+      needs.check.outputs.dry == 'false' &&
+      needs.verify.outputs.result == 'pass' && needs.bundle.outputs.bundle == 'pass' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: cache-bot-pr
+    permissions:
+      contents: read
+    outputs:
+      pr: ${{ steps.accept.outputs.pr }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The notes
+        uses: actions/download-artifact@v7
+        with:
+          name: release-check-notes
+          path: ${{ env.RELEASE_CHECK_DIR }}
+      # The one step that gets the bot's token. A GitHub App
+      # (actions/create-github-app-token, zerobull-consulting/dagger#152)
+      # replaces this step and nothing else.
+      - name: The bot's token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CACHE_BOT_PR_TOKEN }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::CACHE_BOT_PR_TOKEN is empty or unreadable in the cache-bot-pr environment: nothing was pushed. Renew it (hack/remote-cache/README.md, \"Automation tokens\"); GITHUB_TOKEN is no substitute, since its PR's CI would never run."
+            exit 1
+          fi
+          echo "token=$TOKEN" >>"$GITHUB_OUTPUT"
+      - name: Open the accept-line PR
+        id: accept
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+          RELEASE_CHECK_AUTO_MERGE: ${{ vars.RELEASE_CHECK_AUTO_MERGE }}
+          RELEASE_CHECK_BUNDLE: ${{ needs.bundle.outputs.bundle }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+          RUN: ${{ needs.verify.outputs.run }}
+        run: ./hack/remote-cache/release-check.sh accept "$VERSION" "$DIGEST" "$RUN" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Squash auto-merge on an accept PR, with GITHUB_TOKEN, only once
+  # RELEASE_CHECK_AUTO_MERGE is true: set it only after "accept line only"
+  # is a required check. Also for an accept PR opened by an earlier run.
+  auto-merge:
+    name: "A: auto-merge"
+    needs: [check, accept]
+    if: >-
+      always() && needs.check.outputs.dry == 'false' &&
+      (needs.accept.outputs.pr != '' || (needs.check.outputs.action == 'pending' && needs.check.outputs.kind == 'accept'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Enable auto-merge if the gate is on
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_AUTO_MERGE: ${{ vars.RELEASE_CHECK_AUTO_MERGE }}
+          PR: ${{ needs.accept.outputs.pr || needs.check.outputs.pr }}
+        run: ./hack/remote-cache/release-check.sh auto-merge "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Outcome B, tried when A doesn't pass (and both its jobs ran): the tag
+  # merged and the base moved, on its own branch, verified there; a PR for a
+  # human to merge with a merge commit. As the sync bot (cache-bot-sync):
+  # the merge may change workflows. It never runs upstream's code itself:
+  # the bundle job's verdict stands for this same merge.
+  rebuild:
+    name: "B: rebuild on the tag"
+    needs: [check, bundle, verify]
+    if: >-
+      needs.check.outputs.dry == 'false' &&
+      needs.verify.result == 'success' && needs.bundle.result == 'success' &&
+      !(needs.verify.outputs.result == 'pass' && needs.bundle.outputs.bundle == 'pass') &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    environment: cache-bot-sync
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      result: ${{ steps.rebuild.outputs.result }}
+      pr: ${{ steps.rebuild.outputs.pr }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: The notes
+        uses: actions/download-artifact@v7
+        with:
+          name: release-check-notes
+          path: ${{ env.RELEASE_CHECK_DIR }}
+      # The one step that gets the bot's token (see accept).
+      - name: The bot's token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CACHE_BOT_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::CACHE_BOT_SYNC_TOKEN is empty or unreadable in the cache-bot-sync environment: nothing was pushed. Renew it (hack/remote-cache/README.md, \"Automation tokens\"); GITHUB_TOKEN is no substitute, since its PR's CI would never run."
+            exit 1
+          fi
+          echo "token=$TOKEN" >>"$GITHUB_OUTPUT"
+      - name: Rebuild on the tag, verify, open the PR
+        id: rebuild
+        timeout-minutes: 165
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+          RELEASE_CHECK_BUNDLE: ${{ needs.bundle.outputs.bundle }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+        run: ./hack/remote-cache/release-check.sh rebuild "$VERSION" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Keep the notes for C
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-check-notes-rebuild
+          path: ${{ env.RELEASE_CHECK_DIR }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Outcome C: the compat-break issue (GITHUB_TOKEN) and the reject-line PR
+  # (the bot, cache-bot-pr). Not for a rebuild that errored: only a red run
+  # or a rebuild that can't be tried leads here.
+  reject:
+    name: "C: compat-break issue and reject-line PR"
+    needs: [check, bundle, rebuild]
+    if: >-
+      always() && needs.check.outputs.dry == 'false' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/feature/remote-cache' &&
+      ((needs.rebuild.result == 'success' && (needs.rebuild.outputs.result == 'fail' || needs.rebuild.outputs.result == 'skipped')) ||
+       needs.check.outputs.action == 'resume-reject')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: cache-bot-pr
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The notes
+        if: needs.check.outputs.action != 'resume-reject'
+        uses: actions/download-artifact@v7
+        with:
+          name: release-check-notes-rebuild
+          path: ${{ env.RELEASE_CHECK_DIR }}
+      # The one step that gets the bot's token (see accept).
+      - name: The bot's token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CACHE_BOT_PR_TOKEN }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::CACHE_BOT_PR_TOKEN is empty or unreadable in the cache-bot-pr environment: nothing was pushed. Renew it (hack/remote-cache/README.md, \"Automation tokens\"); GITHUB_TOKEN is no substitute, since its PR's CI would never run."
+            exit 1
+          fi
+          echo "token=$TOKEN" >>"$GITHUB_OUTPUT"
+      - name: File the issue, open the reject-line PR
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+          RELEASE_CHECK_BUNDLE: ${{ needs.bundle.outputs.bundle }}
+          VERSION: ${{ needs.check.outputs.version }}
+          ISSUE: ${{ needs.check.outputs.issue }}
+        run: ./hack/remote-cache/release-check.sh reject "$VERSION" ${ISSUE:+"$ISSUE"} | tee -a "$GITHUB_STEP_SUMMARY"

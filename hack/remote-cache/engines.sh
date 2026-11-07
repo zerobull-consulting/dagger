@@ -24,9 +24,37 @@
 #       line, verified by this CI run (GITHUB_SERVER_URL, GITHUB_REPOSITORY,
 #       GITHUB_RUN_ID), so the run's service accepts it and its jobs run
 #       it. The edit is the run's own and is never committed by this
-#       script: a green run is what a commit of that line then cites.
+#       script: a green run is what a commit of that line then cites. An
+#       accepted version with the same digest is verified again: its line
+#       moves first.
 #
-# Both check the whole manifest as the service's parser does (compat.Parse;
+# The release check (release-check.sh, zerobull-consulting/dagger#117, D5)
+# reads and edits the manifest only through these:
+#
+#   engines.sh listed
+#       Prints every version the manifest names, on base, accept and reject
+#       lines, one per line, in file order.
+#
+#   engines.sh add-accept <version> <digest> <CI run URL>
+#       Adds 'accept <version> <digest> verified: <run>' as the first accept
+#       line, as candidate does, but for a commit: the run is the green run
+#       that verified it.
+#
+#   engines.sh add-reject <version> <owner/repo#issue>
+#       Appends 'reject <version> <issue>'.
+#
+#   engines.sh set-base <version>
+#       Moves the base line to that upstream release.
+#
+#   engines.sh reset-accept <version> <digest> <CI run URL>
+#       Replaces every accept line with that one: the list resets when the
+#       bundle or protocol version changes (D1). Reject lines stay.
+#
+# Each edit but set-base refuses a version already on an accept or reject
+# line. None writes anything unless the edited manifest passes the same
+# checks, and each keeps comments and blank lines.
+#
+# All of them check the whole manifest as the service's parser does (compat.Parse;
 # TestEnginesScriptMatchesParser keeps the two in step), and fail on
 # anything it would refuse, more than 100 accept lines included.
 set -euo pipefail
@@ -101,7 +129,71 @@ accepts() {
 	fi
 }
 
+# edit <line> [awk options] <awk program>: rewrites the manifest with the
+# program (the line in its variable "line"), and replaces the file only if the result
+# passes accepts' checks, so no edit can leave a manifest the service
+# refuses.
+edit() {
+	local tmp
+	tmp="$(mktemp)"
+	awk -v line="$1" "${@:2}" "$file" >"$tmp"
+	if ! (file="$tmp" accepts >/dev/null); then
+		rm -f "$tmp"
+		die "the edit ('$1') would leave $file invalid; nothing written"
+	fi
+	cat "$tmp" >"$file"
+	rm -f "$tmp"
+}
+
+# unnamed <version>: fails if any base, accept or reject line names it.
+unnamed() {
+	if awk -v v="$1" '($1 == "accept" || $1 == "reject") && $2 == v { found = 1 } END { exit !found }' "$file"; then
+		die "$1 is in $file already"
+	fi
+}
+
+check_run() {
+	[[ "$1" =~ $verified_re ]] || die "'$1' is not a GitHub Actions run URL"
+}
+
 case "${1:-}" in
+listed)
+	[[ $# -eq 1 ]] || die "usage: engines.sh listed"
+	accepts >/dev/null
+	awk '($1 == "base" || $1 == "accept" || $1 == "reject") && NF >= 2 { print $2 }' "$file"
+	;;
+add-accept | reset-accept)
+	[[ $# -eq 4 ]] || die "usage: engines.sh $1 <version> <digest> <CI run URL>"
+	v="$2" d="$3" run="$4"
+	[[ "$v" =~ $version_re ]] || die "version '$v' is not a release version such as v1.0.0-beta.25"
+	[[ "$d" =~ $digest_re ]] || die "digest '$d' is not a sha256 digest"
+	check_run "$run"
+	accepts >/dev/null
+	unnamed "$v"
+	if [[ "$1" == add-accept ]]; then
+		count="$(accepts | wc -l)"
+		((count < max_accept)) || die "$file has $max_accept accept lines already: drop one before adding $v"
+		edit "accept $v $d verified: $run" '!done && $1 == "accept" { print line; done = 1 } { print }'
+	else
+		edit "accept $v $d verified: $run" '$1 == "accept" { if (!done) print line; done = 1; next } { print }'
+	fi
+	;;
+add-reject)
+	[[ $# -eq 3 ]] || die "usage: engines.sh add-reject <version> <owner/repo#issue>"
+	v="$2" issue="$3"
+	[[ "$v" =~ $version_re ]] || die "version '$v' is not a release version such as v1.0.0-beta.25"
+	[[ "$issue" =~ $issue_re ]] || die "'$issue' is not an issue such as zerobull-consulting/dagger#117"
+	accepts >/dev/null
+	unnamed "$v"
+	edit "reject $v $issue" '{ print } END { print line }'
+	;;
+set-base)
+	[[ $# -eq 2 ]] || die "usage: engines.sh set-base <version>"
+	v="$2"
+	[[ "$v" =~ $version_re ]] || die "version '$v' is not a release version such as v1.0.0-beta.25"
+	accepts >/dev/null
+	edit "base $v" '$1 == "base" { print line; next } { print }'
+	;;
 pin)
 	[[ $# -le 2 ]] || die "usage: engines.sh pin [<version>]"
 	list="$(accepts)"
@@ -140,19 +232,21 @@ candidate)
 	done
 	# The whole manifest is checked first, and the candidate must fit: a
 	# full list is refused before anything is written.
-	count="$(accepts | wc -l)"
-	((count < max_accept)) || die "$file has $max_accept accept lines already: drop one before adding $v"
-	if awk -v v="$v" '($1 == "accept" || $1 == "reject") && $2 == v { found = 1 } END { exit !found }' "$file"; then
-		die "$v is in $file already"
-	fi
+	list="$(accepts)"
 	run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-	tmp="$(mktemp)"
-	awk -v line="accept $v $d verified: $run" '!done && $1 == "accept" { print line; done = 1 } { print }' "$file" >"$tmp"
-	cat "$tmp" >"$file"
-	rm -f "$tmp"
+	if grep -qxF "$v $d" <<<"$list"; then
+		# Verifying an accepted version again, with its own digest (the
+		# release check's dry run does): it moves to the first line, so the
+		# run runs it. Another digest, or a rejected version, is refused.
+		edit "accept $v $d verified: $run" -v v="$v" '!done && $1 == "accept" { print line; done = 1 } $1 == "accept" && $2 == v { next } { print }'
+	else
+		(($(wc -l <<<"$list") < max_accept)) || die "$file has $max_accept accept lines already: drop one before adding $v"
+		unnamed "$v"
+		edit "accept $v $d verified: $run" '!done && $1 == "accept" { print line; done = 1 } { print }'
+	fi
 	echo "::warning::verifying candidate engine $v ($d): this run's service accepts it as its first accept line; commit 'accept $v $d verified: $run' once the run is green"
 	;;
 *)
-	die "usage: engines.sh pin [<version>] | base | versions | candidate <version> <digest>"
+	die "usage: engines.sh pin [<version>] | base | versions | candidate <version> <digest> | listed | add-accept <version> <digest> <run> | add-reject <version> <issue> | set-base <version> | reset-accept <version> <digest> <run>"
 	;;
 esac

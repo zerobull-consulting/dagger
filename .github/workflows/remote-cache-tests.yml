@@ -100,6 +100,14 @@ jobs:
       - name: Release tags
         timeout-minutes: 5
         run: ./hack/remote-cache/release-tags_test.sh
+      # The hourly release check (remote-cache-release-check.yml) and the
+      # accept-line-only check (remote-cache-accept-line.yml), against fake
+      # gh, registry and go, and scratch repositories.
+      - name: Release check
+        timeout-minutes: 5
+        run: |
+          ./hack/remote-cache/release-check_test.sh
+          ./hack/remote-cache/accept-line-only_test.sh
       # The engine's side of the remote cache: its adapter, configuration and
       # fixtures, in packages shared with other engine code.
       - name: Engine integration
