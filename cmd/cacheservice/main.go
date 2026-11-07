@@ -621,27 +621,35 @@ func loopbackAddr(addr string) bool {
 // that held exports back with it still does. -export-end-grace is ignored.
 // set holds the flags set on the command line.
 func exportTiming(settle, maxDelay, quiet, endGrace time.Duration, set map[string]bool) (exporter.TrackerConfig, []string, error) {
-	for name, d := range map[string]time.Duration{"export-settle": settle, "export-max-delay": maxDelay, "export-quiet": quiet, "export-end-grace": endGrace} {
+	for name, d := range map[string]time.Duration{"export-settle": settle, "export-max-delay": maxDelay} {
 		if set[name] && d <= 0 {
 			return exporter.TrackerConfig{}, nil, fmt.Errorf("-%s must be positive", name)
 		}
 	}
 	var warnings []string
+	// As before, 0 or less for a deprecated flag means its default: the
+	// flag changes nothing then, but is still named in a warning.
 	if set["export-quiet"] {
 		w := "-export-quiet is deprecated and will be removed: use -export-settle"
-		if !set["export-settle"] {
+		switch {
+		case set["export-settle"]:
+			w += " (ignored: -export-settle is set)"
+		case quiet <= 0:
+			w += " (ignored: not positive)"
+		default:
 			settle = quiet
 			if !set["export-max-delay"] && maxDelay < settle {
 				maxDelay = settle
 			}
 			w += fmt.Sprintf(" (taken as -export-settle %s, -export-max-delay %s)", settle, maxDelay)
-		} else {
-			w += " (ignored: -export-settle is set)"
 		}
 		warnings = append(warnings, w)
 	}
 	if set["export-end-grace"] {
 		warnings = append(warnings, "-export-end-grace is deprecated, ignored, and will be removed: a session's end no longer holds its exports back (-export-settle)")
+	}
+	if settle > maxDelay {
+		warnings = append(warnings, fmt.Sprintf("-export-settle %s is longer than -export-max-delay %s: a changed entry is exported %s after its first change at the latest, even while spans still name it", settle, maxDelay, maxDelay))
 	}
 	return exporter.TrackerConfig{Settle: settle, MaxDelay: maxDelay}, warnings, nil
 }

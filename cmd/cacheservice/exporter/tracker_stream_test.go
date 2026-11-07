@@ -614,3 +614,150 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// A retry is a floor: a root waiting out a busy backoff, or given back for
+// its engine, isn't due before its retryAt, though its value changed
+// meanwhile. Otherwise a busy root, which its engine is still evaluating and
+// so keeps naming, would be exported every Settle, and a root of a
+// disconnected engine requeued every Settle.
+func TestTrackerRetryIsAFloor(t *testing.T) {
+	change := func(tr *Tracker, d time.Duration, part string) {
+		tr.Observe(Observation{CacheID: "c", Generation: 1, Session: "s1", Number: 1, Parts: []string{part}}, at(d))
+	}
+	t.Run("busy", func(t *testing.T) {
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		b := tr.Due(at(testSettle))
+		change(tr, 1100*time.Millisecond, metaPart) // in flight
+		// Busy: retryAt = done + BusyBackoff (1s).
+		tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, at(5*time.Second))
+		if got := roots(tr.Due(at(5*time.Second + 999*time.Millisecond))); len(got) != 0 {
+			t.Fatalf("due before its busy backoff: %v", got)
+		}
+		if got := roots(tr.Due(at(6 * time.Second))); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("after its backoff: %v", got)
+		}
+	})
+	t.Run("requeued", func(t *testing.T) {
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		b := tr.Due(at(testSettle))
+		tr.Requeue(b[0], at(11*time.Second))
+		change(tr, 2*time.Second, metaPart)
+		for d := 2 * time.Second; d < 11*time.Second; d += 100 * time.Millisecond {
+			if got := roots(tr.Due(at(d))); len(got) != 0 {
+				t.Fatalf("requeued root due at %s, before its wait: %v", d, got)
+			}
+		}
+		if got := roots(tr.Due(at(11 * time.Second))); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("after its wait: %v", got)
+		}
+	})
+	t.Run("drain", func(t *testing.T) {
+		// A retry during the drain waits its backoff too, changed or not.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		tr.StartDrain(t0)
+		b := tr.DrainDue(t0)
+		change(tr, 100*time.Millisecond, metaPart)
+		tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, at(200*time.Millisecond))
+		if got := roots(tr.DrainDue(at(500 * time.Millisecond))); len(got) != 0 {
+			t.Fatalf("drain due before its backoff: %v", got)
+		}
+		if st := tr.DrainStatus(at(500*time.Millisecond), time.Time{}); len(st) != 1 || st[0].Retrying != 1 || st[0].Pending != 0 {
+			t.Fatalf("drain status %+v, want it retrying", st)
+		}
+	})
+}
+
+// A drain waits for an ended session's missing spans for Settle, but at
+// most maxDrainSessionWait: a long Settle doesn't hold it idle.
+func TestTrackerDrainSessionWaitBounded(t *testing.T) {
+	tr := NewTracker(TrackerConfig{Settle: 10 * time.Minute, MaxDelay: 10 * time.Minute})
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 2, t0)
+	tr.StartDrain(t0)
+	tr.DrainDue(t0)
+	if st := tr.DrainStatus(at(maxDrainSessionWait-time.Millisecond), time.Time{}); len(st) != 1 || st[0].Sessions != 1 {
+		t.Fatalf("drain status %+v, want the session waited for", st)
+	}
+	if st := tr.DrainStatus(at(maxDrainSessionWait), time.Time{}); len(st) != 1 || st[0].Sessions != 0 {
+		t.Fatalf("drain status %+v, want no session waited for after %s", st, maxDrainSessionWait)
+	}
+}
+
+// With Settle longer than ForgetAfter, a session is kept until Settle, so a
+// carrier that comes after ForgetAfter still speeds its entries up.
+func TestTrackerSessionKeptWhileItCanSpeedUp(t *testing.T) {
+	tr := NewTracker(TrackerConfig{Settle: time.Minute, MaxDelay: time.Hour, ForgetAfter: 10 * time.Second})
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Due(at(30 * time.Second))
+	tr.SessionEnded("c", 1, "s1", 1, at(30*time.Second))
+	if got := roots(tr.Due(at(30 * time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("the carrier after ForgetAfter didn't speed it up: %v", got)
+	}
+}
+
+// Spans of a cache whose slot is taken don't wake the scheduler: it would
+// run Due for nothing. Freeing the slot does.
+func TestTrackerNoNotifyWhileHeld(t *testing.T) {
+	var kicks atomic.Int32
+	tr := NewTracker(TrackerConfig{Settle: testSettle, MaxDelay: testMaxDelay, Notify: func() { kicks.Add(1) }})
+	tr.Observe(noSession(1, 10, fsPart), t0)
+	b := tr.Due(at(testSettle))
+	before := kicks.Load()
+	for i := uint64(2); i < 100; i++ {
+		tr.Observe(noSession(i, 10, fsPart), at(testSettle))
+		tr.Due(at(testSettle)) // as the scheduler would, resetting NextDue
+	}
+	if k := kicks.Load() - before; k != 0 {
+		t.Fatalf("%d kicks for spans of a held cache", k)
+	}
+	tr.Done(b[0], Result{Stored: []uint64{1}}, at(testSettle))
+	if kicks.Load() == before {
+		t.Fatal("no kick when the slot was freed")
+	}
+}
+
+// Under a backlog of more than a batch, the longest due go first: a root
+// with a high number isn't starved by lower ones that keep coming due.
+func TestTrackerBacklogLongestDueFirst(t *testing.T) {
+	tr := newTestTracker()
+	// 1,000 low numbers due now, and one high number, due since earlier.
+	tr.Observe(noSession(99999, 10, fsPart), t0)
+	for n := uint64(1); n <= maxBatchRoots; n++ {
+		tr.Observe(noSession(n, 10, fsPart), at(time.Second))
+	}
+	b := tr.Due(at(2 * time.Second))
+	if len(b) != 1 || !slices.Contains(b[0].Request.Roots, 99999) {
+		t.Fatal("the root due longest wasn't in the first batch")
+	}
+	if w := tr.WaitingForSlot(); w != 1 {
+		t.Fatalf("waiting %d, want 1", w)
+	}
+}
+
+// An import an engine.prune drops, from an entry a later span retained,
+// isn't the stored value any more: it is dirty, the scheduler is woken, and
+// it is exported.
+func TestTrackerPrunedImportExported(t *testing.T) {
+	var kicks atomic.Int32
+	tr := NewTracker(TrackerConfig{Settle: testSettle, MaxDelay: testMaxDelay, Notify: func() { kicks.Add(1) }})
+	tr.Imported("c", 1, []ImportedValue{{Number: 1, Parts: []dagql.PersistedPartAddress{{Part: "fs"}}}})
+	tr.Observe(state(1, 100, fsPart), t0)
+	if got := dueRoots(tr, at(time.Minute)); len(got) != 0 {
+		t.Fatalf("unchanged import exported: %v", got)
+	}
+	// Dropped before the span that retained it: still retained.
+	before := kicks.Load()
+	tr.Pruned("c", 1, []Drop{{Number: 1, DroppedAtUnixNano: 50}})
+	if kicks.Load() == before {
+		t.Fatal("the scheduler wasn't woken")
+	}
+	if es := tr.EntriesAt("c", at(time.Minute)); !es[0].Dirty {
+		t.Fatalf("entry %+v, want dirty", es[0])
+	}
+	if got := dueRoots(tr, at(time.Minute)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after its import was dropped: %v", got)
+	}
+}

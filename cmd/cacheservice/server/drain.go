@@ -111,7 +111,7 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //     so are roots waiting for another try; one that fails again retries on
 //     its normal backoff. A session that hasn't ended is no longer tracked,
 //     and one that ended with spans missing is waited for until they are in,
-//     or Settle passed with none of them. Drain runs those exports, one at a
+//     or Settle (at most 2s) passed with none of them. Drain runs those exports, one at a
 //     time per engine cache as the scheduler does, and waits for them, their
 //     uploads included. Roots of an engine that is no longer connected are
 //     left: it can't reconnect to a draining service.

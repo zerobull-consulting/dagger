@@ -2283,7 +2283,7 @@ returns at once, and logs `drain: nothing to export (read-only:
    settle (`pending` in its log and `GET /debug/drain`). A session whose end
    isn't seen is no longer tracked, so its later spans are dropped. One that
    ended with some of its counted spans missing is waited for (`sessions`)
-   until they are in, or `-export-settle` passed with none of them. Roots
+   until they are in, or `-export-settle` (at most 2s) passed with none of them. Roots
    waiting for another try (busy, failed, interrupted, or waiting for their
    engine) are due at once too. The drain runs those exports, one at a time
    per engine cache as the scheduler does, and waits for them, their uploads,
