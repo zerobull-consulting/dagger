@@ -11,8 +11,7 @@
 #
 # The actions start/ and stop/ run it (start through a small JavaScript
 # shim, start/run, which also runs the stop at the end of the job), and so
-# does hack/remote-cache/demo/run.sh, locally. The deprecated aliases in
-# ../remote-cache-sidecar run it too. Its settings are environment
+# does hack/remote-cache/demo/run.sh, locally. Its settings are environment
 # variables:
 #
 #   SIDECAR_ROLE            writer | read-only (required)

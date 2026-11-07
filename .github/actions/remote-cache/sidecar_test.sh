@@ -4,7 +4,7 @@
 # command. CI's sidecar demo job runs it; run it
 # the same locally:
 #
-#   .github/actions/remote-cache-sidecar/sidecar_test.sh
+#   .github/actions/remote-cache/sidecar_test.sh
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

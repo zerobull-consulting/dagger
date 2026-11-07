@@ -61,7 +61,6 @@ func TestServiceNeverWritesLifecycleSource(t *testing.T) {
 	// (internal/s3test, internal/fakeengine) aren't in the service.
 	check(".", func(rel string) bool { return rel == "lifecycle" || rel == "internal" })
 	check(filepath.Join("..", "..", ".github", "actions", "remote-cache"), func(string) bool { return false })
-	check(filepath.Join("..", "..", ".github", "actions", "remote-cache-sidecar"), func(string) bool { return false })
 	if len(found) > 0 {
 		t.Fatalf("a lifecycle write outside the lifecycle command: %v", found)
 	}

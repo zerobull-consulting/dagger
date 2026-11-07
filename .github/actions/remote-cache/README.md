@@ -14,8 +14,8 @@ engine of one accepted version side by side on a GitHub Actions runner:
 
 What each step does, and how to run the same outside GitHub, is in
 [Running it as a sidecar](../../../cmd/cacheservice/README.md#running-it-as-a-sidecar).
-(These replace [`remote-cache-sidecar`](../remote-cache-sidecar/README.md),
-which stays for a transition.)
+(These replace `remote-cache-sidecar`, which is gone: switch the `uses:` path,
+and give `version` where you gave `engine-image`.)
 
 ```yaml
 jobs:
@@ -336,7 +336,6 @@ export is never stored):
   debug API refuses a request without the token and answers one with it,
   and that the installed CLI is the engine's version), the demo, and an
   explicit `stop`, after which `start`'s own post step has nothing to do;
-- the deprecated `remote-cache-sidecar` alias, which still works and warns;
 - a read-only phase on a fresh engine with a read-only key, with **no stop
   step** and a failing step before the job's end: `start`'s post step stops
   it, which a post step of the job

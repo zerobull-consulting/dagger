@@ -2999,8 +2999,7 @@ Pin the action to a commit of `feature/remote-cache`. Its `version` is an
 version), the stock engine of that version, pinned by the manifest's digest,
 and `dagger-remote-cache:<version>`, the newest verified service that
 accepts it (see [Image](#image)). The two images are pulled at the same
-time. The old `remote-cache-sidecar` action is a deprecated alias, removed
-after 2027-02-05. The start is ready once the service has welcomed
+time. The start is ready once the service has welcomed
 the engine, and fails on a refusal. `service-image` overrides the service
 image, to pin one build or test your own.
 The [demo](../../hack/remote-cache/demo/README.md) is a small project that

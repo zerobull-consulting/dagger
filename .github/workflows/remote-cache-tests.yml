@@ -257,9 +257,9 @@ jobs:
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
   # The sidecar demo (hack/remote-cache/demo) through the composite action
   # (.github/actions/remote-cache/start and stop), against MinIO: a writer
-  # phase (start, the demo, an explicit stop, which drains), a run through the
-  # deprecated alias, then a read-only phase on a fresh engine (-export=false
-  # and MinIO's read-only user) that is stopped by the start's own post step,
+  # phase (start, the demo, an explicit stop, which drains), then a read-only
+  # phase on a fresh engine (-export=false and MinIO's read-only user) that is
+  # stopped by the start's own post step,
   # after a step that failed. Each start's time is reported in the step
   # summary. check.sh counts
   # cache spans in the service's log: the cacheable step must be a hit with
@@ -347,7 +347,7 @@ jobs:
       - name: Verify the sidecars are stopped at the job's end
         uses: ./hack/remote-cache/ci/verify-stopped
         with:
-          names: demo-writer demo-alias demo-reader
+          names: demo-writer demo-reader
           stopped-by-post: demo-reader
       - name: "Writer: note the time"
         run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
@@ -412,33 +412,6 @@ jobs:
         env:
           LOGS: ${{ steps.writer-stop.outputs.logs }}
         run: ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/demo/writer"
-      # The deprecated alias still works for a pinned caller, and warns (see
-      # the run's annotations): the engine from its image's own CLI.
-      - name: "Alias: start the sidecar"
-        id: alias
-        uses: ./.github/actions/remote-cache-sidecar
-        with:
-          role: read-only
-          name: demo-alias
-          version: ${{ env.STOCK_ENGINE_TAG }}
-          service-image: cacheservice:ci
-          s3-endpoint: ${{ steps.store.outputs.endpoint }}
-          s3-region: ${{ steps.store.outputs.region }}
-          s3-bucket: ${{ steps.store.outputs.bucket }}
-          s3-prefix: demo/${{ github.run_id }}-${{ github.run_attempt }}
-          s3-access-key-id: ${{ steps.store.outputs.readonly-access-key-id }}
-          s3-secret-access-key: ${{ steps.store.outputs.readonly-secret-access-key }}
-          s3-path-style: "true"
-      - name: "Alias: the CLI runs"
-        env:
-          DAGGER: ${{ steps.alias.outputs.dagger }}
-        run: '"$DAGGER" version'
-      - name: "Alias: stop the sidecar"
-        if: always()
-        timeout-minutes: 12
-        uses: ./.github/actions/remote-cache-sidecar/stop
-        with:
-          name: demo-alias
       # A new engine, with a new, empty state volume: the writer's was
       # removed by its stop.
       - name: "Read-only: note the time"

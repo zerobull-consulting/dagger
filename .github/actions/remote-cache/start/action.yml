@@ -204,7 +204,7 @@ runs:
     # variables only, never expanded into a script.
     - name: Start the cache service and the engine
       id: start
-      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@cbcc5d6b0509515b8c26bb251c6e65be8443f197
+      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@15e8bf6562b4b9aaa4022980003285462f152d42
       env:
         SIDECAR_SCRIPT: ${{ github.action_path }}/../sidecar.sh
         SIDECAR_ROLE: ${{ inputs.role }}
