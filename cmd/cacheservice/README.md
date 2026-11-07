@@ -15,9 +15,12 @@ spike, and only logs what the engine does on the wire.
 | `-listen` (`:8090`) | `/v1/engine` | The engine WebSocket (`protocol.EnginePath`) |
 | `-listen` | `/v1/logs`, `/v1/traces`, `/v1/metrics` | OTLP/HTTP receivers for the engine's Cloud telemetry, each body bounded (see [OTLP limits](#otlp-limits)) |
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
+| `-listen` | `POST /v1/engines/{cacheID}/flush?timeout=<d>` | Exports what is pending for one engine cache now, through the scheduler, within `timeout` (default `10s`, at most `10m`), and answers with what is left. Authenticated as the engine's requests are. 409 on a read-only instance or with the export path off, 503 while draining or stopping (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `-listen` | `POST /v1/engines/flush?timeout=<d>` | The same, for the engine cache of the connections that authenticated with the request's token: the form for a sidecar, which doesn't know its engine's cache ID. 409 when that token's connections hold more than one cache |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
 | `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. It takes the engine cache's export slot: it waits for the export of that cache in flight to end, and the scheduler starts none beside it (see [Export path](#export-path)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `POST /debug/engines/{conn}/flush?timeout=<d>` | The flush of a connection's engine cache, as `POST /v1/engines/{cacheID}/flush` does it, keyed like the other debug routes |
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache, with each entry's `dirty` and `dueAt` |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
@@ -2374,6 +2377,17 @@ to expiring staged uploads itself, which is safe but costs requests.
 
 ## Stopping and draining
 
+There are two ways to get what is pending exported before something stops:
+
+- **The flush**, for an orchestrator stopping one engine while the service
+  stays up: `POST /v1/engines/{cacheID}/flush`, then stop the engine, then,
+  if the service goes too, stop it with no drain (`-drain-timeout 0`). It is
+  per engine cache, bounded by the caller, and takes new work all along (see
+  [Flushing one engine cache](#flushing-one-engine-cache)).
+- **The drain**, for a shared service restarting under its engines: on
+  SIGTERM, every cache, until `-drain-timeout`, taking no new work, and the
+  service stops after it. The rest of this section is the drain.
+
 The service runs as a sidecar on an ephemeral CI runner, and the end of the
 job is its only chance to store what the job built
 ([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
@@ -2461,6 +2475,100 @@ bounded shutdown. A CI job sets it long, such as `10m`.
 |------|---------|---|
 | `-drain-timeout` | `30s` | How long the drain may take (0: no drain, and no linger). A negative one is refused at startup |
 | `-drain-linger` | `15s` | After the drain, at most how long the service keeps answering the engines' OTLP requests, so each connected engine whose events come here can deliver `engine.stop` (0: none; see [The linger](#the-linger)). A negative one is refused at startup |
+
+### Flushing one engine cache
+
+`POST /v1/engines/{cacheID}/flush?timeout=<Go duration>`, on the engine
+address (`-listen`), exports what is pending for one engine cache now, and
+answers once nothing is left or the timeout passed
+([zerobull-consulting/dagger#136](https://github.com/zerobull-consulting/dagger/issues/136)).
+An orchestrator calls it before it stops a long-lived engine, while the
+service is fully up, so the engine still delivers its last events.
+
+```bash
+curl -fsS -X POST -u "$ENGINE_TOKEN:" "http://cache:8090/v1/engines/$CACHE_ID/flush?timeout=10s"
+# A sidecar, which doesn't know its engine's cache ID: the cache of the
+# connections that authenticated with this token.
+curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?timeout=10s"
+```
+
+- **Auth**, as the engine's own requests: the HTTP Basic username is the
+  token (401 without one, or with one the tokens file doesn't know), and the
+  token's namespace is the one flushed. With `-tokens-file`, only the token
+  of the cache's latest connection (its owner, as for its engine events)
+  may flush it: another token of the namespace gets 403. A token of
+  another namespace sees only its own, where the cache isn't: it gets
+  `not_connected`, the same answer as for a cache that doesn't exist. Without
+  a tokens file, any token is taken, as on the WebSocket. The cache ID is
+  1 to 128 letters, digits, `.`, `_` or `-` (400 otherwise).
+- **The token form**, `POST /v1/engines/flush`, flushes the cache of the
+  welcomed connections that authenticated with the request's token, in its
+  namespace: one in a sidecar. With none, it reports `not_connected`; with
+  more than one cache, it answers 409, and the caller flushes each by its
+  ID. The report names the cache (`cacheID`).
+- **The timeout** is optional: `10s` when the request names none, at most
+  `10m` (400 beyond that, or for a negative or unreadable one). The cap is
+  fixed, not `-drain-timeout`, since a service stopped with no drain runs
+  with `-drain-timeout 0`. `timeout=0` makes nothing due, and only reports
+  what is pending.
+- **What it does.** Every dirty entry of the cache is due at once, without
+  waiting for `-export-settle`, and stays so while the flush runs, so what
+  becomes dirty meanwhile is exported too. Roots waiting out a retry's
+  backoff (busy, failed, interrupted) are due now, once; a retry after that
+  waits its normal backoff. A session whose spans may still come (one that
+  hasn't ended, or ended with some of the cache spans its carrier counted
+  missing) is waited for until it ended with every span in, or
+  `-export-settle` (at most 2s) passed since its last span: so a flush right
+  after the client returned waits for its last spans and its carrier, which
+  are on their way. Its late spans are taken and exported. A flush starts
+  each failing root's retry at once: a caller that loops flushes retries
+  them at its own rate. The scheduler runs the exports, one
+  at a time per engine cache: the flush starts none of its own. Other
+  caches are scheduled as usual.
+- **It isn't a drain.** New engines, sessions and spans are taken as usual.
+  An engine still running builds can keep a flush busy until its timeout.
+- **When it returns:** once nothing of the cache is dirty, waiting for
+  spans, in flight or due for a retry before the timeout (`complete`); once
+  the timeout passes, or only retries due after it are left (`timeout`; such
+  a retry isn't waited for, and is counted `later`); at once, with what is
+  left, when the cache's engine isn't connected or disconnects
+  (`not_connected`); and when the request is canceled (`canceled`). **It
+  never cancels an export**: one in flight when it returns runs on until it
+  ends, or the engine stops and interrupts it. A canceled request ends the
+  wait, not the exports.
+- **Concurrent flushes** of one cache each wait on the cache's state, and
+  each reports on its own: what was stored while it ran, and what was left
+  when it returned.
+- **Refusals:** 409 on a read-only instance (`-export=false`) or with the
+  export path off, as the explicit export hook; 503 while draining
+  (`ErrDraining`), and once the stop has begun (`ErrStopping`).
+
+The answer is 200 for every outcome, and the body says which; errors are
+only for auth, bad requests and refusals. The report:
+
+```json
+{
+  "outcome": "complete",
+  "cacheID": "6e1f...",
+  "took": "1.234s",
+  "stored": 5,
+  "left": {"dirty": 0, "waitingSpans": 0, "inFlight": 0, "retrying": 0, "later": 0}
+}
+```
+
+- `outcome`: `complete` (nothing left), `timeout`, `not_connected` or
+  `canceled`.
+- `stored`: the roots stored by exports of the cache that ended during the
+  flush.
+- `left`, as the drain counts them: `dirty` (worth exporting, not in flight
+  or waiting for a retry), `waitingSpans` (sessions still waited
+  for), `inFlight`, `retrying` (a retry due before the timeout), `later` (a
+  retry due after it).
+
+Each flush logs one `flush: done` line, with the outcome and these counts,
+and is counted in `flush_total{outcome}`, `flush_duration_seconds` and
+`flush_unexported_roots_total` (see [Metrics](#metrics)). The debug API has
+a twin, `POST /debug/engines/{conn}/flush`, keyed by connection.
 
 ### The linger
 
@@ -2650,7 +2758,7 @@ paths record into them through their metadata store. All are prefixed
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
 | `export_roots_waiting` | `scope` | Roots due for export and waiting, as the scheduler last saw them: for their engine cache's export in flight to end, or for the next batch |
-| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, or `debug` (the debug API; see [The debug API](#the-debug-api)) |
+| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, `flush` (see [Flushing one engine cache](#flushing-one-engine-cache)), or `debug` (the debug API; see [The debug API](#the-debug-api)) |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
 | `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
@@ -2671,6 +2779,9 @@ paths record into them through their metadata store. All are prefixed
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
+| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `flush_duration_seconds` | | Time of each flush |
+| `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
 | `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full) or `timeout` (408). Nothing of them is recorded |
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
