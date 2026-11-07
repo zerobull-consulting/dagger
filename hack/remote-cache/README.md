@@ -70,13 +70,18 @@ local/dagger-cache/dev/`) to start over, or after a change of layout.
 
 The dev bucket has no lifecycle rule: staged uploads that were never
 promoted (an export cut short) stay until `dev.sh reset`, and are never read.
-To try the rule the service's README recommends
+To try the rules the service's README recommends
 ([lifecycle rule for staging](../../cmd/cacheservice/README.md#lifecycle-rule-for-staging)),
-once per namespace:
+with the service's prefix claimed (run it once), and the settings of
+`dev.sh env`:
 
 ```bash
-docker compose -f hack/remote-cache/compose.yaml exec minio sh -c 'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc ilm rule add --prefix <prefix>/ns/<namespace>/staging/ --expire-days 1 local/dagger-cache'
+go run ./cmd/cacheservice lifecycle plan -tokens-file <tokens> -abort-rule=false
+go run ./cmd/cacheservice lifecycle apply -tokens-file <tokens> -abort-rule=false -confirm=dagger-cache/<prefix>
 ```
+
+`-abort-rule=false`, since MinIO refuses the rule aborting incomplete
+multipart uploads ([below](#what-each-store-does)).
 
 Configure an AWS SDK client for MinIO with a base endpoint, a static
 credential, path-style addressing and checksums only when required. The SDK's
@@ -236,7 +241,7 @@ npx @dotenvx/dotenvx run -- bash -c '
 | `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
 | `CACHESERVICE_TEST_STORE` | `minio` (default) or `spaces`: what the tests expect where stores differ ([below](#what-each-store-does)). |
 | `E2E_S3_RESIGN` | `1` makes the e2e's proxy sign requests again for any store, to run that path against MinIO. |
-| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration. Leave it unset on a shared bucket. |
+| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration, and the `lifecycle` command's tests (`TestMinIOLifecycle*`) merge into it and put it back. Leave it unset on a shared bucket. |
 
 ### What keeps a shared bucket safe
 
@@ -259,8 +264,11 @@ enforces this in test setup:
   bucket-level change. The one exception is the lifecycle configuration with
   `CACHESERVICE_TEST_DISPOSABLE_BUCKET=1`, since
   `PutBucketLifecycleConfiguration` replaces the whole bucket's. Without it,
-  `TestMinIOGC` skips that part, and expects no rule. Reads are not limited:
-  they change nothing.
+  `TestMinIOGC` skips that part, and expects no rule, and the `lifecycle`
+  command's tests skip. Those tests and `TestMinIOGC` take a lock on this
+  machine (`s3test.LockLifecycle`), since `go test` runs their packages at
+  once. The `lifecycle` tests put back the configuration they found when
+  they end. Reads are not limited: they change nothing.
 - Each test deletes its objects, with their versions and delete markers on a
   versioned bucket, and aborts its uploads when it ends, failed or not, and
   fails if any are left. The key needs to be allowed to list versions.
@@ -315,7 +323,7 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
-| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)** | Both accepted with a full-access key; **403 with a more limited key** | Whether they take effect isn't checked: rules run on a scale of days. |
+| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. Whether a `Read/Write/Delete` limited key can *read* them: not run | Set only by `cacheservice lifecycle apply`, with a full-access key (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |
 | A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
 | Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
 | Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |
@@ -607,6 +615,7 @@ the main service's exports by polling the index.
 | `superseded` | [#32](https://github.com/zerobull-consulting/dagger/issues/32), [#27](https://github.com/zerobull-consulting/dagger/issues/27) | Writes a Dang module (`ttlmod` in the run's directory) whose function `stamp2` has a cache TTL of `E2E_TTL` seconds, runs it on A, waits for it to expire, and runs it again. Then starts engine F, empty, waits until both bundles are merged into it, and reads the value on it. | A replaced the value in place, the index kept its service number and moved it to a newer bundle, and F's call resolved to the imported entry (its `withExec` hit; a function with a TTL is evaluated on every call). It reports which record F got by the layer it read: the newer one passes; the older one is logged as `GAP` (#27), without failing; neither fails. F, the first engine started after `prune` moved C's imports, gets C's bundles holding them merged, with their roots and the imported entries (#47). |
 | `parts` | [zerobull-consulting/dagger#133](https://github.com/zerobull-consulting/dagger/issues/133) | Three sessions on A, with a nonce. One: exec V, which writes the nonce to its stdout (its `execMeta` part) and to `/v` (`fs`). Engine F1, empty, then imports V. Two: exec W over V. Three: exec Y over X, alpine with a variable set, which the engine doesn't retain. Engine F2, empty, then imports. F1 and F2 read V; F2 reads X's variable, then Y's stdout. | A stored V as a root with its parts, and W's bundle holds V's record with fewer (the engine exports only the roots' outputs), and the index kept V's first record and parts all the same; before #133's fix, V's entry moved to W's bundle with `fs` only. F1 and F2 read A's V (stdout and file) as a cache hit, with no exec run. The store holds X only in Y's bundle, with no parts, and F2 still reads X's variable as A set it: a partial import doesn't fail. F2 hits Y with A's stdout. |
 | `streaming` | [zerobull-consulting/dagger#134](https://github.com/zerobull-consulting/dagger/issues/134) | A runs one session with a nonce: an exec, then `sleep 40` over it. | The first exec's entry is stored while the session still runs (the sleep), within `-export-settle` plus one scheduler tick, plus the export itself, of the last span naming it; then A's retained entries are all stored once the session ends. |
+| `flush` | [zerobull-consulting/dagger#136](https://github.com/zerobull-consulting/dagger/issues/136) | Starts its own service and engine F on it. F runs a build with a nonce (two execs); as soon as its CLI returns, the scenario flushes F's cache with F's token by the form that needs no cache ID (`POST /v1/engines/flush`, as the sidecar calls it), then stops F's container (`docker stop --time 30`) with the service still up. | The flush answers `complete` for F's cache, with nothing left; the build's last retained exec is in the index when it returns, and every retained entry of F's is stored, with nothing waited for after it; F stops cleanly, and the entry is still in the index after. |
 | `readonly` | [#65](https://github.com/zerobull-consulting/dagger/issues/65) | Starts a second service with `-export=false` (`ServiceOptions.ReadOnly`), on an S3 proxy of its own and, on MinIO, with the read-only user `dev.sh` creates, and engine R, empty, on it. Waits until A's roots are merged into R, runs A's pipeline on R, then a pipeline of R's own, and waits past `-export-max-delay` (13s), by which a writer would have exported it. | R's `withExec` calls hit, with A's stamps; no request but GET and HEAD reached the service's proxy (the other services, writers still running, use the run's); the index has no mapping of R's cache and no entry from it; the service tracks nothing (`ErrReadOnly`) and runs no GC (`ErrGCReadOnly`); `CheckConsistent` passes. |
 
 The resilience scenarios ([#12](https://github.com/zerobull-consulting/dagger/issues/12))
@@ -637,7 +646,7 @@ progress, and oversized bundles).
 Each check is logged as `ok` or `FAIL`; a failed check fails its scenario
 without stopping it. Run some scenarios only with
 `E2E_SCENARIOS="renew prune" ./hack/remote-cache/dev.sh e2e` (the names:
-`reexport`, `renew`, `prune`, `superseded`, `parts`, `streaming`, `readonly`, `namespaces`, `verify`, `gc`, `disconnect`,
+`reexport`, `renew`, `prune`, `superseded`, `parts`, `streaming`, `flush`, `readonly`, `namespaces`, `verify`, `gc`, `disconnect`,
 `engine-restart`, `s3-faults`, `service-restart`, `drain`), or pass `go
 test` flags after `e2e`, such as `-run 'TestRealEngines/^renew$'`. The first
 part always runs.
@@ -886,19 +895,29 @@ only decides when it runs and with which token.
    new release is handled first, and only one at a time:
    - if a release-check PR for it is open, the run waits for it (and turns
      auto-merge on for an accept PR once the gate is on);
-   - if its image isn't on `registry.dagger.io` yet, it's skipped this hour,
-     and the next one is tried. Only a multi-platform index digest counts;
-     a registry error fails the run rather than skipping.
+   - if its image isn't on `registry.dagger.io` yet, the run waits for it
+     and tries nothing newer: a newer release accepted first would make it
+     old, and it would never be checked. Only a multi-platform index digest
+     counts; a registry error, or an upstream that can't be listed, fails
+     the run rather than reading as "nothing new".
 3. **Verify (A).** It dispatches `remote-cache-tests.yml` on
    `feature/remote-cache` with `candidate-version` and `candidate-digest`,
    and waits for it (at most 150 minutes): the e2e and the sidecar demo of
-   the service as it is, against that stock engine. With the tag merged into
-   a scratch copy of the branch, it runs `TestBundleVersionMatchesEngineCapture`.
+   the service as it is, against that stock engine. Meanwhile, a job of its
+   own (`bundle test`) merges the tag into a scratch copy of the branch and
+   runs `TestBundleVersionMatchesEngineCapture`; both must pass. If the tag
+   conflicts with the branch, the bundle test can't run, and that counts as
+   not passing. The bundle test compiles and runs upstream's code, so that
+   job holds no credential: no environment, no token in any step, a
+   read-only `GITHUB_TOKEN`, and `release-check.sh bundle` refuses to run
+   with a token in its environment. It is the only place upstream's code
+   runs in this workflow.
    It writes the advisory diff of the engine's side of the remote cache from
    the manifest's `base` to the release, and whether the bundle or protocol
    version changed. **The run is the gate**; the diff only informs.
-   A run that is cancelled, or that the check can't read, is an error: it
-   never leads to a reject line.
+   A run that is cancelled, that failed before testing (its checkout or its
+   pin step), or that the check can't read, is an error: it never leads to
+   a reject line.
 4. **The outcome:**
    - **A, both green:** a PR from `release-check/accept/<version>`, as
      `CACHE_BOT_PR_TOKEN`, adding only
@@ -907,12 +926,13 @@ only decides when it runs and with which token.
      auto-merges (squash).
    - **B, otherwise:** `release-check/rebuild/<version>`, as
      `CACHE_BOT_SYNC_TOKEN`: the tag merged with a merge commit, the `base`
-     line moved. That branch is verified the same way (a dispatch on it),
-     and if green, gets the accept line, citing that run, and a PR. If the
-     bundle or protocol version changed, the accept list resets to that one
-     version. **A human merges it, with a merge commit.** No rebuild is
-     tried if the merge conflicts, or if the branch already contains the
-     tag: that rebuild would be the code A ran.
+     line moved. That branch is verified the same way: a dispatch on it, and
+     the bundle test's verdict, which is for this same merge. If green, it
+     gets the accept line, citing that run, and a PR. If the bundle or
+     protocol version changed, the accept list resets to that one version.
+     **A human merges it, with a merge commit.** No rebuild is tried if the
+     merge conflicts, if the bundle test didn't pass, or if the branch
+     already contains the tag: that rebuild would be the code A ran.
    - **C, the rebuild red or not tried:** an issue titled
      `compat-break: engine <version> fails against the cache service`,
      labeled `compat-break` (with `GITHUB_TOKEN`), with both runs' failing
@@ -924,7 +944,8 @@ only decides when it runs and with which token.
 on; nothing newer is tried meanwhile. A release whose `compat-break` issue
 is open but whose reject branch doesn't exist (a run that stopped between
 them) gets its reject PR, without a second issue. Once a line for it is
-merged, it's no longer new. A `release-check/*/<version>` branch with no
+merged, it's no longer new. A release whose image never appears holds
+up everything newer: add a `reject` line for it by hand. A `release-check/*/<version>` branch with no
 open PR (a PR closed by hand, or a run that died) **fails the run** with
 the branch named: delete it to try that release again, or add its line by
 hand. To verify a rejected release again, remove its `reject` line.
@@ -948,23 +969,42 @@ variable) stays unset until `accept line only` is a required check. Then:
 2. add it to the ruleset's required checks;
 3. set `RELEASE_CHECK_AUTO_MERGE` to `true`.
 
-The check, `.github/workflows/remote-cache-accept-line.yml`, runs the base
-branch's copy of `accept-line-only.sh`, and fails an accept PR unless, from
+The check, `.github/workflows/remote-cache-accept-line.yml`, runs on
+`pull_request_target`, so its workflow and the scripts it runs
+(`accept-line-only.sh`, `engines.sh`) are always the default branch's
+(`feature/remote-cache`): a PR that edits any of them is still measured by
+the versions it would replace. It runs none of the PR's code, only diffs its
+commits and parses its manifest, and requests no environment. It has no
+`pull_request` trigger, so no skipped job of its name reports (a skipped
+required check counts as passed). **A gap:** a required status check is
+matched by name, so a PR from a branch of this repository (its author has
+write access) can add a `pull_request` workflow with its own job named
+`accept line only`. Requiring this workflow through the ruleset's "Require
+workflows to pass", rather than as a status check, closes that
+([zerobull-consulting/dagger#164](https://github.com/zerobull-consulting/dagger/issues/164)). It fails an
+accept PR unless, from
 its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
 one added line (no mode change, no rename), that line is
 `accept <the branch's version> <digest> verified: <run URL>`, it is the
 first accept line, and `engines.sh` takes the result. On failure it turns
 the PR's auto-merge off. The release check's `auto-merge` job checks the
 same before enabling it, and only on PRs from this repository's own
-branches.
+branches. If the PR's required checks have all passed before the gate is
+on, GitHub refuses to enable auto-merge on it ("clean status"), so the job
+squash-merges it instead, with `GITHUB_TOKEN`, at the head it checked;
+`GITHUB_TOKEN` can't bypass the ruleset, so that merge still needs every
+required check.
 
 **Running it by hand.** Actions, "Remote cache release check", Run
 workflow. Off `feature/remote-cache` it is always a dry run, which can't
 reach the bots' environments: it polls, prints the plan, and prints each
 push, PR and issue the outcome would make, after a real, local merge. On
 `feature/remote-cache`, `dry-run` (default on) does the same. In a dry run:
-- `verify` also runs the real verification (about an hour); it changes no
-  file in the repository;
+- `verify` also runs the real verification, on the dry run's own branch, so
+  a branch's dry run tests that branch's service in the e2e; it changes no
+  file in the repository. The bundle test still builds on
+  `feature/remote-cache` (a known gap,
+  [zerobull-consulting/dagger#162](https://github.com/zerobull-consulting/dagger/issues/162));
 - `version` checks a chosen release, listed or not. For an accepted one,
   `engines.sh candidate` moves its own line first, with its digest, so the
   run runs it.
@@ -976,6 +1016,8 @@ hack/remote-cache/release-check.sh --dry-run plan
 hack/remote-cache/release-check_test.sh      # offline, fake gh, docker and go
 hack/remote-cache/accept-line-only_test.sh   # offline
 ```
+
+Both run in `remote-cache-tests.yml`'s `unit tests` job.
 
 **What it never does.** It never merges, never pushes to
 `feature/remote-cache`, and never gives a bot token to anything but a push

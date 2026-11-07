@@ -6,6 +6,8 @@
 #
 #   hack/remote-cache/release-check_test.sh
 set -uo pipefail
+# The caller's own tokens never reach the script under test.
+unset GITHUB_TOKEN BOT_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 script="$here/release-check.sh"
@@ -55,6 +57,8 @@ EOF
 cat >"$tmp/bin/go" <<'EOF'
 #!/usr/bin/env bash
 echo "go $*" >>"$FAKE/go-calls"
+# The tree it runs in: the merge's first parent, the branch it built on.
+echo "built on $(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)" >>"$FAKE/go-calls"
 [[ -z "${FAKE_GO_FAIL:-}" ]]
 EOF
 # gh: the API calls the script makes, against JSON state in $FAKE. Every
@@ -85,7 +89,7 @@ case "$method $path" in
 "POST repos/o/r/pulls")
 	num=$(n pr)
 	jq --argjson n "$num" --argjson in "$input" '. + [{number: $n, state: "open", title: $in.title, body: $in.body,
-		head: {ref: $in.head, repo: {full_name: "o/r"}}, base: {ref: $in.base}, auto_merge: null, node_id: "PR_\($n)"}]' "$FAKE/pulls.json" >"$FAKE/p.tmp"
+		head: {ref: $in.head, sha: "0123456789012345678901234567890123456789", repo: {full_name: "o/r"}}, base: {ref: $in.base}, auto_merge: null, node_id: "PR_\($n)"}]' "$FAKE/pulls.json" >"$FAKE/p.tmp"
 	mv "$FAKE/p.tmp" "$FAKE/pulls.json"
 	echo "{\"number\": $num}" ;;
 "GET repos/o/r/pulls/"*/files*)
@@ -107,6 +111,8 @@ case "$method $path" in
 "POST repos/o/r/actions/workflows/"*/dispatches)
 	wf="${path#repos/o/r/actions/workflows/}"; wf="${wf%/dispatches}"
 	echo "$input" >"$FAKE/dispatch-$wf-$(n dispatch-$wf)"
+	# Whether the advisory diff was written before this dispatch.
+	[[ -f "$FAKE/notes/advisory.md" ]] && echo "$wf" >>"$FAKE/advisory-before-dispatch"
 	[[ -n "${FAKE_NO_RUN_ID:-}" ]] && exit 0
 	id=$((5000 + $(n run)))
 	c="$(head -n1 "$FAKE/conclusions" 2>/dev/null || echo success)"
@@ -114,7 +120,12 @@ case "$method $path" in
 	echo "$c" >"$FAKE/run-$id"
 	echo "{\"workflow_run_id\": $id, \"run_url\": \"x\", \"html_url\": \"x\"}" ;;
 "GET repos/o/r/actions/runs/"*/jobs*)
-	echo '{"jobs": [{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/1/job/2"},
+	[[ -n "${FAKE_JOBS_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
+	# FAKE_JOBS_FAIL_AFTER=1: the first read works, every later one fails.
+	if [[ -n "${FAKE_JOBS_FAIL_AFTER:-}" ]] && (($(n jobs-read) > FAKE_JOBS_FAIL_AFTER)); then echo "HTTP 502" >&2; exit 1; fi
+	failed_step="${FAKE_FAILED_STEP:-Real engines}"
+	echo '{"jobs": [{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/1/job/2",
+		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "failure"}]},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
 "GET repos/o/r/actions/runs/"*)
 	c="$(cat "$FAKE/run-${path##*/}")"
@@ -123,7 +134,10 @@ case "$method $path" in
 	sha="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
 	echo "{\"commit\": {\"sha\": \"$sha\", \"commit\": {\"committer\": {\"date\": \"${FAKE_HEAD_DATE:-2020-01-01T00:00:00Z}\"}}}}" ;;
 "GET repos/o/r/actions/workflows/cacheservice-publish.yml/runs?head_sha="*) echo "{\"total_count\": ${FAKE_PUBLISH_RUNS:-0}}" ;;
-"POST graphql") printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
+"POST graphql")
+	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
+	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
+"PUT repos/o/r/pulls/"*/merge) echo "$input" >"$FAKE/merged"; echo '{"merged": true}' ;;
 *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
 esac
 EOF
@@ -186,7 +200,8 @@ rc() {
 			PATH="$tmp/bin:$PATH" BOT_SECRET="$bot_secret" GH_SECRET="$gh_secret" GH_TOKEN="$gh_secret" \
 				ENGINES_FILE="$work/$manifest" RELEASE_CHECK_REPO=o/r RELEASE_CHECK_REMOTE="$FAKE/origin.git" \
 				RELEASE_CHECK_UPSTREAM="$up" RELEASE_CHECK_DIR="$FAKE/notes" RELEASE_CHECK_POLL_SECONDS=0 \
-				GITHUB_SERVER_URL=https://github.com GITHUB_OUTPUT="$FAKE/output" "$@" "$script" "${ARGS[@]}"
+				GITHUB_SERVER_URL=https://github.com GITHUB_OUTPUT="$FAKE/output" RELEASE_CHECK_BUNDLE="${BUNDLE-pass}" \
+				"$@" "$script" "${ARGS[@]}"
 	) >"$tmp/out" 2>&1
 	status=$?
 }
@@ -213,7 +228,12 @@ check "plan: and nothing is done" has "$tmp/out" "action=none"
 
 printf 'v1.0.0-beta.27 application/vnd.oci.image.index.v1+json %s\n' "$d2" >"$FAKE/images"
 run plan
-check "plan: a newer release with an image is verified past one without" has "$tmp/out" "version=v1.0.0-beta.27"
+check "plan: a newer release with an image waits for an older one without" has "$tmp/out" "action=none"
+check "plan: so the older one is never left behind" not has "$tmp/out" "version=v1.0.0-beta.27"
+
+ARGS=(plan); rc env RELEASE_CHECK_UPSTREAM="$tmp/no-such-repo"
+check "plan: an upstream that can't be listed fails the run" test "$status" -ne 0
+check "plan: rather than reading as nothing new" not has "$tmp/out" "action=none"
 
 printf 'v1.0.0-beta.26 application/vnd.oci.image.manifest.v1+json %s\n' "$d2" >"$FAKE/images"
 run plan
@@ -236,14 +256,13 @@ echo "--- verify"
 setup
 echo success >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
-check "verify: a green run and bundle test pass" has "$tmp/out" "result=pass"
+check "verify: a green run passes" has "$tmp/out" "result=pass"
 check "verify: cites the run" has "$tmp/out" "run=https://github.com/o/r/actions/runs/5001"
 check "verify: dispatches remote-cache-tests.yml on the branch with the candidate" \
 	jq -e --arg d "$d2" '.ref == "feature/remote-cache" and .inputs == {"candidate-version": "v1.0.0-beta.26", "candidate-digest": $d}' "$FAKE/dispatch-remote-cache-tests.yml-1"
 check "verify: dispatches with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/actions/workflows/remote-cache-tests.yml/dispatches"
-check "verify: runs the bundle test" has "$FAKE/go-calls" "TestBundleVersionMatchesEngineCapture"
+check "verify: never runs upstream's code (the bundle job does)" not test -f "$FAKE/go-calls"
 check "verify: writes the advisory diff" has "$FAKE/notes/advisory.md" "dagql/cache_live.go"
-check "verify: notes the tag merges" has "$FAKE/notes/notes.env" "merge=merged"
 
 setup
 echo failure >"$FAKE/conclusions"
@@ -252,9 +271,44 @@ check "verify: a red run fails" has "$tmp/out" "result=fail"
 check "verify: and lists its failing jobs" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
 
 setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
+check "verify: a red run whose jobs can't be read is an error, not a failure" test "$status" -ne 0
+check "verify: so no result is given" not has "$tmp/out" "result="
+
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_AFTER=1
+check "verify: a red run's jobs are read once, so a failing second read can't stand in for them" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
+check "verify: and no placeholder list is written" not has "$FAKE/notes/a-jobs.md" "couldn't list"
+
+echo "--- the bundle test"
+setup
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
+check "bundle: runs the bundle test with the tag merged" has "$FAKE/go-calls" "TestBundleVersionMatchesEngineCapture"
+check "bundle: passes" has "$tmp/out" "bundle=pass"
+check "bundle: notes the tag merges" has "$tmp/out" "merge=merged"
+check "bundle: writes nothing" test "$(writes)" = 0
+setup
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN FAKE_GO_FAIL=1
+check "bundle: a failing bundle test fails" has "$tmp/out" "bundle=fail"
+for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN; do
+	setup
+	ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN "$var=x"
+	check "bundle: refuses to run upstream's code with $var set" test "$status" -ne 0
+	check "bundle: before compiling anything ($var)" not test -f "$FAKE/go-calls"
+done
+
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_FAILED_STEP="The engine pin, from the manifest"
+check "verify: a run that failed at its pin step is an error, not a failure" test "$status" -ne 0
+check "verify: saying it failed before testing" has "$tmp/out" "failed before testing"
+
+setup
 echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_GO_FAIL=1
-check "verify: a failing bundle test fails it, whatever the e2e" has "$tmp/out" "result=fail"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF=remote-cache/some-branch
+check "verify: a dry run's verification runs on its own ref" jq -e '.ref == "remote-cache/some-branch"' "$FAKE/dispatch-remote-cache-tests.yml-1"
 
 setup
 echo cancelled >"$FAKE/conclusions"
@@ -302,6 +356,10 @@ check "auto-merge: on with it" has "$tmp/out" "auto_merge=on"
 check "auto-merge: squash, with GITHUB_TOKEN" has "$FAKE/calls" "gh POST graphql"
 check "auto-merge: titled with the full PR reference" has "$FAKE/graphql" "(zerobull-consulting/dagger#1)"
 rm -f "$FAKE/graphql"
+ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true FAKE_CLEAN=1
+check "auto-merge: a PR whose checks passed already is squash-merged" has "$tmp/out" "auto_merge=merged"
+check "auto-merge: with GITHUB_TOKEN, pinned to the checked head" jq -e '.merge_method == "squash" and .sha == "0123456789012345678901234567890123456789" and (.commit_title | endswith("(zerobull-consulting/dagger#1)"))' "$FAKE/merged"
+check "auto-merge: by GITHUB_TOKEN" has "$FAKE/calls" "gh PUT repos/o/r/pulls/1/merge"
 echo '[{"filename": "cmd/cacheservice/compat/engines.txt", "status": "modified", "additions": 2, "deletions": 0}]' >"$FAKE/files-1.json"
 ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true
 check "auto-merge: refused for a PR adding two lines" test "$status" -ne 0
@@ -387,6 +445,18 @@ check "B ancestor: skipped, it would be the code A ran" has "$tmp/out" "result=s
 check "B ancestor: nothing pushed or opened" test "$(writes)" = 0
 
 setup
+printf 'failure\nsuccess\n' >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+before="$(writes)"
+ARGS=(rebuild v1.0.0-beta.26 "$d2"); BUNDLE=fail rc env BOT_TOKEN="$bot_secret"
+check "B bundle: no rebuild when the bundle test of that merge failed" has "$tmp/out" "result=skipped"
+check "B bundle: nothing pushed, dispatched or opened" test "$(writes)" = "$before"
+check "B bundle: no rebuild branch" test -z "$(git -C "$FAKE/origin.git" for-each-ref refs/heads/release-check/)"
+check "B bundle: never runs upstream's code itself" not test -f "$FAKE/go-calls"
+run_bot reject v1.0.0-beta.26
+check "B bundle: C's issue says why it wasn't rebuilt" jq -e '.[0].body | contains("the bundle test with")' "$FAKE/issues.json"
+
+setup
 printf 'failure\nfailure\n' >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
 run_bot rebuild v1.0.0-beta.26 "$d2"
@@ -422,6 +492,62 @@ jq 'map(.state = "closed")' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE
 run plan
 check "stuck: a branch with no open PR fails the run" test "$status" -ne 0
 check "stuck: naming the branch" has "$tmp/out" "release-check/reject/v1.0.0-beta.26"
+
+echo "--- known gaps"
+# Known gap, zerobull-consulting/dagger#162: a dry run's bundle test builds
+# on the branch, not on RELEASE_CHECK_TEST_REF as its e2e does. The fix
+# flips this test.
+setup
+git -C "$work" checkout -q -b other
+echo "# other" >>"$work/$manifest"
+git -C "$work" commit -qam other && git -C "$work" push -q origin other
+other="$(git -C "$work" rev-parse HEAD)"
+git -C "$work" checkout -q feature/remote-cache
+main="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN RELEASE_CHECK_TEST_REF=other
+check "known gap (bundle on the dry run's ref, zerobull-consulting/dagger#162): it builds on the branch" has "$FAKE/go-calls" "built on $main"
+check "known gap (bundle on the dry run's ref, zerobull-consulting/dagger#162): not on the dry run's ref" not has "$FAKE/go-calls" "built on $other"
+
+# Known gap, zerobull-consulting/dagger#163: verify fetches the tags and
+# writes the advisory diff before it dispatches, which eats into the step's
+# timeout. The fix flips this test.
+setup
+echo success >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "known gap (advisory before the dispatch, zerobull-consulting/dagger#163)" has "$FAKE/advisory-before-dispatch" "remote-cache-tests.yml"
+
+echo "--- a tag that conflicts"
+setup
+git -C "$up" checkout -q -b conflicting v1.0.0-beta.25
+mkdir -p "$up/cmd/cacheservice/compat"
+echo "upstream's own" >"$up/cmd/cacheservice/compat/engines.txt"
+git -C "$up" add -A && git -C "$up" commit -qm conflicting && git -C "$up" tag -f -a -m conflicting v1.0.0-beta.26 >/dev/null
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
+check "conflict: the bundle test isn't run, which is no pass" has "$tmp/out" "bundle=conflict"
+check "conflict: nothing compiled" not test -f "$FAKE/go-calls"
+git -C "$up" checkout -q main
+git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
+
+echo "--- the bundle version"
+setup
+git -C "$up" checkout -q -b odd v1.0.0-beta.25
+echo 'const valueBundleVersion uint = 3 // typed now' >"$up/dagql/cache_transfer_types.go"
+git -C "$up" commit -qam odd && git -C "$up" tag -f -a -m odd v1.0.0-beta.26 >/dev/null
+echo success >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "advisory: a bundle version it can't read fails the run" test "$status" -ne 0
+check "advisory: saying so" has "$tmp/out" "couldn't read dagql's valueBundleVersion"
+git -C "$up" checkout -q main
+git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
+
+echo "--- dry run of a listed version"
+setup
+run --dry-run accept v1.0.0-beta.25 "$d1" https://github.com/o/r/actions/runs/7
+check "dry run listed: accept still shows its PR" has "$tmp/out" "dry run: would open a PR from release-check/accept/v1.0.0-beta.25"
+check "dry run listed: and says the edit would be refused" has "$tmp/out" "is listed already"
+run --dry-run reject v1.0.0-beta.25
+check "dry run listed: reject still shows its PR" has "$tmp/out" "dry run: would open a PR from release-check/reject/v1.0.0-beta.25"
+check "dry run listed: nothing written" test "$(writes)" = 0
 
 echo "--- dry run"
 setup

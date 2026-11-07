@@ -18,8 +18,9 @@
 #       Turns the PR's auto-merge off if it's on (GH_TOKEN, GITHUB_TOKEN).
 #       The workflow runs it when the check fails.
 #
-# The workflow runs the base branch's copy of this script, so a PR can't
-# change the check that measures it.
+# The workflow runs on pull_request_target, with the default branch's copy
+# of this script and of engines.sh, so a PR can't change the check that
+# measures it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

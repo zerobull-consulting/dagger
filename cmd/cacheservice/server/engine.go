@@ -82,6 +82,8 @@ type Service struct {
 	// no new engine, so none is welcomed after CloseEngines took its list.
 	closing atomic.Bool
 	drain   drainState
+	// flushes are the flushes under way (flush.go).
+	flushes flushRuns
 	// testHookExportRecorded, set by tests only, runs after an export's
 	// result reached the tracker.
 	testHookExportRecorded func()
@@ -146,11 +148,15 @@ func (s *Service) MetricsHandler() http.Handler {
 }
 
 // Handler serves engines: the WebSocket at protocol.EnginePath, the OTLP
-// receivers and the blob PUT stand-in.
+// receivers, the blob PUT stand-in, and the flush of one engine cache
+// (POST /v1/engines/{cacheID}/flush, and POST /v1/engines/flush for the
+// cache of the request's token; see flush.go).
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(protocol.EnginePath, s.serveEngine)
 	mux.HandleFunc("PUT /blobs/{digest}", s.serveBlobPut)
+	mux.HandleFunc("POST /v1/engines/{cacheID}/flush", s.serveFlush)
+	mux.HandleFunc("POST /v1/engines/flush", s.serveFlushToken)
 	s.otlpRoutes(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("unhandled request", "method", r.Method, "path", r.URL.Path)
@@ -691,6 +697,7 @@ func (s *Service) DebugHandler() http.Handler {
 	mux.HandleFunc("GET /debug/engines", s.listEngines)
 	mux.HandleFunc("POST /debug/engines/{conn}/request", s.sendRequest)
 	mux.HandleFunc("POST /debug/engines/{conn}/export", s.serveExport)
+	mux.HandleFunc("POST /debug/engines/{conn}/flush", s.serveDebugFlush)
 	mux.HandleFunc("GET /debug/engines/{conn}/entries", s.serveEntries)
 	mux.HandleFunc("POST /debug/engines/{conn}/import", s.serveImport)
 	mux.HandleFunc("GET /debug/engines/{conn}/imports", s.serveImports)

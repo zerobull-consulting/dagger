@@ -238,7 +238,7 @@ candidate)
 		# Verifying an accepted version again, with its own digest (the
 		# release check's dry run does): it moves to the first line, so the
 		# run runs it. Another digest, or a rejected version, is refused.
-		edit "accept $v $d verified: $run" -v v="$v" '$1 == "accept" && $2 == v { next } !done && $1 == "accept" { print line; done = 1 } { print }'
+		edit "accept $v $d verified: $run" -v v="$v" '!done && $1 == "accept" { print line; done = 1 } $1 == "accept" && $2 == v { next } { print }'
 	else
 		(($(wc -l <<<"$list") < max_accept)) || die "$file has $max_accept accept lines already: drop one before adding $v"
 		unnamed "$v"

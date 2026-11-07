@@ -6,9 +6,18 @@ name: Remote cache accept line
 # the PR's auto-merge off. Make it a required check before setting
 # RELEASE_CHECK_AUTO_MERGE (hack/remote-cache/README.md, "Release check").
 #
-# It also runs the release check's own tests, offline.
+# It runs on pull_request_target, so this file and the scripts it runs are
+# always the default branch's (feature/remote-cache): a PR that edits this
+# workflow, the check or engines.sh is measured by the versions it would
+# replace. It runs none of the PR's code: it only diffs the PR's commits and
+# parses its manifest. It requests no environment (only schedule and
+# workflow_dispatch jobs may: hack/remote-cache/README.md, "Automation
+# tokens"), and its token can only turn auto-merge off. It has no
+# pull_request trigger, so no skipped job of the same name ever reports (a
+# skipped required check counts as passed). The release check's own tests
+# run in remote-cache-tests.yml's unit job.
 "on":
-  pull_request:
+  pull_request_target:
     types:
       - opened
       - reopened
@@ -31,7 +40,7 @@ jobs:
       pull-requests: write
     steps:
       # The PR's head, with the history its merge base needs; no blobs until
-      # read, and no persisted credentials.
+      # read, and no persisted credentials. Data only: nothing in it runs.
       - name: Checkout
         uses: actions/checkout@v5
         with:
@@ -39,8 +48,9 @@ jobs:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
-      # The base branch's copy of the check and of engines.sh, so a PR can't
-      # weaken the check it's measured by. Until the base has one, the PR's.
+      # The default branch's copy of the check and of engines.sh, as this
+      # workflow is (GITHUB_SHA, on pull_request_target), so a PR can't
+      # weaken the check it's measured by. Never the PR's.
       - name: Check the PR adds only one accept line
         id: check
         timeout-minutes: 5
@@ -49,18 +59,13 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          dir=hack/remote-cache
-          if git cat-file -e "$BASE_SHA:$dir/accept-line-only.sh" 2>/dev/null; then
-            mkdir -p "$RUNNER_TEMP/base"
-            for f in accept-line-only.sh engines.sh; do
-              git show "$BASE_SHA:$dir/$f" >"$RUNNER_TEMP/base/$f"
-              chmod +x "$RUNNER_TEMP/base/$f"
-            done
-            dir="$RUNNER_TEMP/base"
-            echo "Running the base branch's check ($(git rev-parse --short "$BASE_SHA"))."
-          else
-            echo "The base branch has no check yet; running this PR's."
-          fi
+          dir="$RUNNER_TEMP/base"
+          mkdir -p "$dir"
+          for f in accept-line-only.sh engines.sh; do
+            git show "$GITHUB_SHA:hack/remote-cache/$f" >"$dir/$f"
+            chmod +x "$dir/$f"
+          done
+          echo "Running the default branch's check ($(git rev-parse --short "$GITHUB_SHA"))."
           echo "CHECK_DIR=$dir" >>"$GITHUB_ENV"
           "$dir/accept-line-only.sh" check "$BASE_SHA" "$HEAD_SHA" "$HEAD_REF"
       - name: Turn auto-merge off
@@ -70,19 +75,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: '"$CHECK_DIR/accept-line-only.sh" disable-auto-merge "$PR"'
-
-  tests:
-    name: release check scripts
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-      - name: The release check's tests
-        timeout-minutes: 5
-        run: ./hack/remote-cache/release-check_test.sh
-      - name: The accept-line-only check's tests
-        timeout-minutes: 5
-        run: ./hack/remote-cache/accept-line-only_test.sh
