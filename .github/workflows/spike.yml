@@ -11,5 +11,7 @@ jobs:
       - uses: actions/checkout@v5
       - id: o
         uses: ./.github/actions/spike/outer-local
-      - run: echo "output=${{ steps.o.outputs.hello }}"; echo "PATH has spike: $PATH" | tr ':' '\n' | grep spike || echo NO-SPIKE-PATH
+      - run: |
+          echo "output=${{ steps.o.outputs.hello }}"
+          echo "$PATH" | tr ':' '\n' | grep spike || echo NO-SPIKE-PATH
       - run: exit 1
