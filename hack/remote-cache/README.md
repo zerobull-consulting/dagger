@@ -905,7 +905,9 @@ only decides when it runs and with which token.
    and waits for it (at most 150 minutes): the e2e and the sidecar demo of
    the service as it is, against that stock engine. Meanwhile, with the tag
    merged into a scratch copy of the branch, it runs
-   `TestBundleVersionMatchesEngineCapture`; both must pass.
+   `TestBundleVersionMatchesEngineCapture`; both must pass. If the tag
+   conflicts with the branch, the bundle test can't run, and that counts as
+   not passing.
    It writes the advisory diff of the engine's side of the remote cache from
    the manifest's `base` to the release, and whether the bundle or protocol
    version changed. **The run is the gate**; the diff only informs.

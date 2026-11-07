@@ -566,7 +566,9 @@ cmd_verify() {
 	fi
 	say "TestBundleVersionMatchesEngineCapture with $v merged: $bundle"
 	a="$(finish_tests "$id" a)"
-	if [[ "$a" == pass && "$bundle" != fail ]]; then
+	# Both must pass: a bundle test that didn't run (the tag conflicts with
+	# the branch) verified nothing, so it is no accept line.
+	if [[ "$a" == pass && "$bundle" == pass ]]; then
 		out result pass
 	else
 		out result fail

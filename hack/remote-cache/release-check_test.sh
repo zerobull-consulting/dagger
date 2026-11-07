@@ -455,6 +455,19 @@ run plan
 check "stuck: a branch with no open PR fails the run" test "$status" -ne 0
 check "stuck: naming the branch" has "$tmp/out" "release-check/reject/v1.0.0-beta.26"
 
+echo "--- a tag that conflicts"
+setup
+git -C "$up" checkout -q -b conflicting v1.0.0-beta.25
+mkdir -p "$up/cmd/cacheservice/compat"
+echo "upstream's own" >"$up/cmd/cacheservice/compat/engines.txt"
+git -C "$up" add -A && git -C "$up" commit -qm conflicting && git -C "$up" tag -f -a -m conflicting v1.0.0-beta.26 >/dev/null
+echo success >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "conflict: a green run with the bundle test not run (the tag conflicts) is no pass" has "$tmp/out" "result=fail"
+check "conflict: noted as such" has "$FAKE/notes/notes.env" "bundle=conflict"
+git -C "$up" checkout -q main
+git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
+
 echo "--- the bundle version"
 setup
 git -C "$up" checkout -q -b odd v1.0.0-beta.25
