@@ -179,6 +179,10 @@ type trackedEntry struct {
 	// accel is set when a session that named the entry ended with all its
 	// spans in: due at once, without waiting for Settle.
 	accel bool
+	// changedAt is when a span last changed the value, and busyAt when the
+	// engine last answered busy for it: zero unless retryAt is a busy wait.
+	changedAt time.Time
+	busyAt    time.Time
 }
 
 // exportedValue is the state of a value an export covered.
@@ -378,8 +382,11 @@ func (t *Tracker) Observe(o Observation, now time.Time) bool {
 			e.retainedAtNano = o.EndUnixNano
 		}
 	}
-	if changed && (e.dirtySince.IsZero() || settled) {
-		e.dirtySince = now
+	if changed {
+		e.changedAt = now
+		if e.dirtySince.IsZero() || settled {
+			e.dirtySince = now
+		}
 	}
 	if sess != nil && e.retained {
 		sess.candidates[o.Number] = true
@@ -452,8 +459,10 @@ func (t *Tracker) notifyLocked() {
 // became dirty, or now when a carrier sped it up or a newer generation
 // cleared its refusal; for a drain, every such entry is due now. A retry
 // (busy, failed, or given back for its engine) is a floor: a root waiting
-// one isn't due before its retryAt, whatever changed meanwhile, so its
-// backoff holds. It reports false when nothing makes it due.
+// one isn't due before its retryAt, so its backoff holds; except a busy
+// wait, which ends once the engine is done with the value (its session's
+// carrier with every span in, or a change after the busy answer). It
+// reports false when nothing makes it due.
 func (t *Tracker) dueAtLocked(e *trackedEntry, now time.Time, drain bool) (time.Time, bool) {
 	var at time.Time
 	ok := false
@@ -469,7 +478,14 @@ func (t *Tracker) dueAtLocked(e *trackedEntry, now time.Time, drain bool) (time.
 	if e.accel || e.recheck || drain {
 		consider(now)
 	}
-	if !e.retryAt.IsZero() && (!ok || at.Before(e.retryAt)) {
+	switch {
+	case e.retryAt.IsZero():
+	case !e.busyAt.IsZero() && (e.accel || e.changedAt.After(e.busyAt)):
+		// A busy wait ends early once the engine is done with the value:
+		// its session ended with every span in, or a span changed it since
+		// the busy answer (and it settled, as above).
+		consider(e.retryAt)
+	case !ok || at.Before(e.retryAt):
 		at, ok = e.retryAt, true
 	}
 	return at, ok
@@ -811,7 +827,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 func (t *Tracker) claimLocked(e *trackedEntry) {
 	e.inFlight = true
 	e.retryAt, e.recheck = time.Time{}, false
-	e.dirtySince, e.accel = time.Time{}, false
+	e.dirtySince, e.accel, e.busyAt = time.Time{}, false, time.Time{}
 }
 
 // AcquireSlot waits for cacheID's slot, for an export the caller runs itself
@@ -955,6 +971,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		if e := entry(s.Number); e != nil {
 			e.retryAt = now.Add(t.backoff(e.busy))
 			e.busy++
+			e.busyAt = now
 		}
 		settled[s.Number] = true
 	}

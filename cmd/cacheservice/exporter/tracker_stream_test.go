@@ -638,6 +638,49 @@ func TestTrackerRetryIsAFloor(t *testing.T) {
 			t.Fatalf("after its backoff: %v", got)
 		}
 	})
+	t.Run("busy, then its session ends", func(t *testing.T) {
+		// Its carrier, with every span in: the engine is done with it.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		b := tr.Due(at(testSettle))
+		tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, at(2*time.Second))
+		tr.Done(tr.Due(at(3 * time.Second))[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, at(3*time.Second))
+		// Waiting 2s now, to 5s.
+		tr.SessionEnded("c", 1, "s1", 1, at(4*time.Second))
+		if got := roots(tr.Due(at(4 * time.Second))); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("busy wait not ended by its session's end: %v", got)
+		}
+	})
+	t.Run("busy, then changed", func(t *testing.T) {
+		// A change after the busy answer ends the wait, once it settles.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		b := tr.Due(at(testSettle))
+		tr.Done(b[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, at(2*time.Second))
+		tr.Done(tr.Due(at(3 * time.Second))[0], Result{Busy: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipBusy}}}, at(3*time.Second))
+		change(tr, 3100*time.Millisecond, metaPart) // waiting to 5s
+		if got := roots(tr.Due(at(4 * time.Second))); len(got) != 0 {
+			t.Fatalf("due before the change settled: %v", got)
+		}
+		if got := roots(tr.Due(at(4100 * time.Millisecond))); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("busy wait not ended by a settled change: %v", got)
+		}
+	})
+	t.Run("failed, then changed", func(t *testing.T) {
+		// A failure's backoff holds.
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		b := tr.Due(at(testSettle))
+		tr.Done(b[0], Result{Failed: []FailedRoot{{Number: 1}}}, at(2*time.Second))                           // to 3s
+		tr.Done(tr.Due(at(3 * time.Second))[0], Result{Failed: []FailedRoot{{Number: 1}}}, at(3*time.Second)) // to 5s
+		change(tr, 3100*time.Millisecond, metaPart)
+		if got := roots(tr.Due(at(4900 * time.Millisecond))); len(got) != 0 {
+			t.Fatalf("a failure's backoff cut short: %v", got)
+		}
+		if got := roots(tr.Due(at(5 * time.Second))); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("after its backoff: %v", got)
+		}
+	})
 	t.Run("requeued", func(t *testing.T) {
 		tr := newTestTracker()
 		tr.Observe(state(1, 10, fsPart), t0)
