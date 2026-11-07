@@ -75,7 +75,7 @@ func TestBinaryDebugListenStartupErrors(t *testing.T) {
 			// killed after 10s.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, bin, append([]string{"-listen", freeAddr(t)}, tc.args...)...)
+			cmd := exec.CommandContext(ctx, bin, append([]string{"-listen", anyPort}, tc.args...)...)
 			cmd.Env = storelessEnv()
 			out, err := cmd.CombinedOutput()
 			var exit *exec.ExitError
@@ -100,11 +100,13 @@ func TestBinaryDebugListenStartupErrors(t *testing.T) {
 }
 
 // storelessBinary runs the command without a store, waits until it listens
-// on its listeners addresses, and stops it at the end of the test.
-func storelessBinary(t *testing.T, listeners int, args ...string) (*exec.Cmd, *syncBuffer) {
+// on its listeners addresses, and stops it at the end of the test. It
+// returns the bound addresses by listener name (engine, debug, metrics); the
+// engine address is anyPort unless args set -listen.
+func storelessBinary(t *testing.T, listeners int, args ...string) (*exec.Cmd, *syncBuffer, map[string]string) {
 	t.Helper()
 	bin := buildBinary(t)
-	cmd := exec.Command(bin, append([]string{"-listen", freeAddr(t)}, args...)...)
+	cmd := exec.Command(bin, append([]string{"-listen", anyPort}, args...)...)
 	cmd.Env = storelessEnv()
 	logs := &syncBuffer{}
 	cmd.Stdout, cmd.Stderr = logs, logs
@@ -123,20 +125,8 @@ func storelessBinary(t *testing.T, listeners int, args ...string) (*exec.Cmd, *s
 			t.Logf("the service's log:\n%s", logs.String())
 		}
 	})
-	want := listeners
-	deadline := time.Now().Add(30 * time.Second)
-	for strings.Count(logs.String(), "msg=listening") < want {
-		select {
-		case <-exited:
-			t.Fatalf("the service exited:\n%s", logs.String())
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the service didn't listen on %d addresses within 30s", want)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return cmd, logs
+	addrs := waitListening(t, logs, exited, listeners, 30*time.Second)
+	return cmd, logs, addrs
 }
 
 func get(t *testing.T, url, auth string) (int, string) {
@@ -160,9 +150,9 @@ func get(t *testing.T, url, auth string) (int, string) {
 // A loopback -debug-listen without -tokens-file starts open, with a
 // warning that says so.
 func TestBinaryDebugLoopbackOpen(t *testing.T) {
-	debug := freeAddr(t)
-	_, logs := storelessBinary(t, 2, "-debug-listen", debug)
-	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on "+debug) {
+	_, logs, addrs := storelessBinary(t, 2, "-debug-listen", anyPort)
+	debug := addrs["debug"]
+	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on "+anyPort) {
 		t.Errorf("no warning that the debug API is open:\n%s", logs.String())
 	}
 	if code, body := get(t, "http://"+debug+"/debug/engines", ""); code != http.StatusOK {
@@ -177,11 +167,9 @@ func TestBinaryDebugLoopbackOpen(t *testing.T) {
 func TestBinaryDebugToken(t *testing.T) {
 	debugFile := writeFile(t, "debug-token", binDebugToken+"\n")
 	tokens := writeFile(t, "tokens", "engine-token-0123456789 team-a\n")
-	port := strings.TrimPrefix(freeAddr(t), "127.0.0.1")
-	metrics := freeAddr(t)
-	cmd, logs := storelessBinary(t, 3, "-debug-listen", "0.0.0.0"+port, "-debug-token-file", debugFile,
-		"-tokens-file", tokens, "-metrics-listen", metrics)
-	debug := "http://127.0.0.1" + port
+	cmd, logs, addrs := storelessBinary(t, 3, "-debug-listen", "0.0.0.0:0", "-debug-token-file", debugFile,
+		"-tokens-file", tokens, "-metrics-listen", anyPort)
+	debug, metrics := "http://"+loopback(t, addrs["debug"]), addrs["metrics"]
 	for _, path := range []string{"/debug/engines", "/debug/drain", "/metrics"} {
 		for _, auth := range []string{"", "Bearer " + binDebugToken2, "Bearer engine-token-0123456789", "Basic ZW5naW5lLXRva2VuLTAxMjM0NTY3ODk6"} {
 			if code, _ := get(t, debug+path, auth); code != http.StatusUnauthorized {
@@ -231,7 +219,7 @@ func TestBinaryDebugToken(t *testing.T) {
 // used the debug API keeps starting after an upgrade.
 func TestBinaryDebugOffByDefaultWithTokens(t *testing.T) {
 	tokens := writeFile(t, "tokens", "engine-token-0123456789 team-a\n")
-	_, logs := storelessBinary(t, 1, "-tokens-file", tokens)
+	_, logs, _ := storelessBinary(t, 1, "-tokens-file", tokens)
 	out := logs.String()
 	if !strings.Contains(out, "debug API off") {
 		t.Errorf("no warning that the debug API is off:\n%s", out)
@@ -247,10 +235,9 @@ func TestBinaryDebugIPv6LoopbackOpen(t *testing.T) {
 	if err != nil {
 		t.Skip("no IPv6 loopback here")
 	}
-	addr := ln.Addr().String()
 	ln.Close()
-	_, logs := storelessBinary(t, 2, "-debug-listen", addr)
-	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on "+addr) {
+	_, logs, _ := storelessBinary(t, 2, "-debug-listen", "[::1]:0")
+	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on [::1]:0") {
 		t.Errorf("no open-API warning:\n%s", logs.String())
 	}
 }

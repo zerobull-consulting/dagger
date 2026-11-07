@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,8 @@ type binaryTest struct {
 	scope *s3test.Scope
 	cmd   *exec.Cmd
 	logs  *syncBuffer
+	// url and debug are the engine and debug addresses' URLs, once
+	// waitListening read them from the log.
 	url   string
 	debug string
 	meta  *metastore.Store
@@ -87,14 +90,55 @@ func buildBinary(t *testing.T) string {
 	return binPath
 }
 
-func freeAddr(t *testing.T) string {
+// anyPort is the address a test passes to the binary for each listener:
+// the kernel picks the port when the binary binds it, and the test reads it
+// back from the log with waitListening. A port a test picked itself and
+// released before the binary bound it could be taken in between, by another
+// test or the same one (zerobull-consulting/dagger#145).
+const anyPort = "127.0.0.1:0"
+
+// listeningLine is the binary's log line for a listener it bound.
+var listeningLine = regexp.MustCompile(`msg=listening addr=\S* bound=(\S+) tls=\S+ listener=(\w+)`)
+
+// waitListening waits, up to timeout, until the binary logged that it
+// bound n listeners, and returns their bound addresses, by listener name
+// (engine, debug, metrics). It fails the test if the binary exits first.
+func waitListening(t *testing.T, logs *syncBuffer, exited <-chan struct{}, n int, timeout time.Duration) map[string]string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(timeout)
+	for {
+		matches := listeningLine.FindAllStringSubmatch(logs.String(), -1)
+		if len(matches) >= n {
+			addrs := make(map[string]string, len(matches))
+			for _, m := range matches {
+				addrs[m[2]] = m[1]
+			}
+			return addrs
+		}
+		select {
+		case <-exited:
+			t.Fatalf("the service exited before it listened on %d addresses:\n%s", n, logs.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the service didn't listen on %d addresses within %s:\n%s", n, timeout, logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+}
+
+// loopback is a bound address as a client on this host reaches it: a
+// wildcard host ("0.0.0.0", "::") becomes 127.0.0.1.
+func loopback(t *testing.T, bound string) string {
+	t.Helper()
+	host, port, err := net.SplitHostPort(bound)
+	if err != nil {
+		t.Fatalf("bound address %q: %v", bound, err)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func envOr(name, def string) string {
@@ -160,8 +204,7 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 	accessKey := cmp.Or(opts.accessKey, envOr("CACHESERVICE_S3_ACCESS_KEY_ID", "dagger-dev"))
 	secretKey := cmp.Or(opts.secretKey, envOr("CACHESERVICE_S3_SECRET_ACCESS_KEY", "dagger-dev-secret"))
 
-	listen, debug := freeAddr(t), freeAddr(t)
-	base := []string{"-listen", listen, "-debug-listen", debug}
+	base := []string{"-listen", anyPort, "-debug-listen", anyPort}
 	if !opts.gcDefault {
 		base = append(base, "-gc-interval", "0")
 	}
@@ -175,7 +218,7 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 		"CACHESERVICE_S3_SECRET_ACCESS_KEY="+secretKey,
 	)
 	cmd.Env = append(cmd.Env, opts.env...)
-	b := &binaryTest{t: t, scope: scope, cmd: cmd, logs: &syncBuffer{}, url: "http://" + listen, debug: "http://" + debug, exited: make(chan struct{})}
+	b := &binaryTest{t: t, scope: scope, cmd: cmd, logs: &syncBuffer{}, exited: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = b.logs, b.logs
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -214,7 +257,7 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 	if opts.noEngine {
 		return b
 	}
-	b.waitLog(30*time.Second, `msg=listening addr=`+listen)
+	b.waitListening(30 * time.Second)
 	b.cache = opts.cache
 	if b.cache == nil {
 		b.cache = fakeengine.New("cache-a", 1)
@@ -233,6 +276,14 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 		return b.getJSON("/debug/engines", &engines) && len(engines) == 1
 	})
 	return b
+}
+
+// waitListening waits until the service bound its engine and debug
+// addresses, and sets b.url and b.debug to them.
+func (b *binaryTest) waitListening(timeout time.Duration) {
+	b.t.Helper()
+	addrs := waitListening(b.t, b.logs, b.exited, 2, timeout)
+	b.url, b.debug = "http://"+addrs["engine"], "http://"+addrs["debug"]
 }
 
 func (b *binaryTest) waitFor(timeout time.Duration, what string, cond func() bool) {

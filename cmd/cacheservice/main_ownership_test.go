@@ -116,7 +116,7 @@ func TestMinIOBinaryWritersRaceOnEmptyPrefix(t *testing.T) {
 		bins[i] = startBinaryWith(t, binaryOpts{scope: scope, noEngine: true})
 	}
 	for _, b := range bins {
-		b.waitLog(30*time.Second, "msg=listening")
+		b.waitListening(30 * time.Second)
 	}
 	claimed := 0
 	for _, b := range bins {

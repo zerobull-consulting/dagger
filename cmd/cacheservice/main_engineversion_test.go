@@ -67,8 +67,8 @@ func debugJSON(t *testing.T, url string, v any) {
 // refuses, before the welcome, one of any other: the refusal is logged,
 // counted in /metrics, and reaches the engine's own log.
 func TestBinaryEngineVersionRefused(t *testing.T) {
-	listen, debug := freeAddr(t), freeAddr(t)
-	_, logs := storelessBinary(t, 2, "-listen", listen, "-debug-listen", debug)
+	_, logs, addrs := storelessBinary(t, 2, "-debug-listen", anyPort)
+	listen, debug := addrs["engine"], addrs["debug"]
 	m := compat.Embedded()
 	// slog quotes the list once it has a space.
 	list := `"?\[` + regexp.QuoteMeta(strings.Join(m.Versions(), " ")) + `\]"?`
@@ -116,8 +116,8 @@ func TestBinaryEngineVersionRefused(t *testing.T) {
 // -allow-engine-version-mismatch says loudly that the check is off, and
 // welcomes an engine of any version, logging it.
 func TestBinaryEngineVersionMismatchAllowed(t *testing.T) {
-	listen, debug := freeAddr(t), freeAddr(t)
-	_, logs := storelessBinary(t, 2, "-listen", listen, "-debug-listen", debug, "-allow-engine-version-mismatch")
+	_, logs, addrs := storelessBinary(t, 2, "-debug-listen", anyPort, "-allow-engine-version-mismatch")
+	listen, debug := addrs["engine"], addrs["debug"]
 	if !strings.Contains(logs.String(), `level=WARN msg="ENGINE VERSION CHECK OFF`) {
 		t.Fatalf("no warning that the check is off:\n%s", logs.String())
 	}
@@ -148,7 +148,7 @@ func TestBinaryReleaseStamp(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, build("v0.0.1"), "-listen", freeAddr(t))
+	cmd := exec.CommandContext(ctx, build("v0.0.1"), "-listen", anyPort)
 	cmd.Env = storelessEnv()
 	out, err := cmd.CombinedOutput()
 	if code := cmd.ProcessState.ExitCode(); code != 2 {
@@ -158,7 +158,7 @@ func TestBinaryReleaseStamp(t *testing.T) {
 		t.Fatalf("want %q in:\n%s", want, out)
 	}
 
-	cmd = exec.CommandContext(ctx, build(m.Base), "-listen", freeAddr(t), "-debug-listen", "")
+	cmd = exec.CommandContext(ctx, build(m.Base), "-listen", anyPort, "-debug-listen", "")
 	cmd.Env = storelessEnv()
 	logs := &syncBuffer{}
 	cmd.Stdout, cmd.Stderr = logs, logs
