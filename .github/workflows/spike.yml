@@ -1,0 +1,28 @@
+name: spike
+"on":
+  push:
+    branches: [remote-cache/action-start]
+permissions:
+  contents: read
+jobs:
+  local-in-repo:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - id: o
+        uses: ./.github/actions/spike/outer-local
+      - run: echo "output=${{ steps.o.outputs.hello }}"; echo "PATH has spike: $PATH" | tr ':' '\n' | grep spike || echo NO-SPIKE-PATH
+      - run: exit 1
+  local-external:
+    runs-on: ubuntu-24.04
+    steps:
+      # No checkout: the caller's workspace is empty, as an outside repo's is.
+      - id: o
+        uses: zerobull-consulting/dagger/.github/actions/spike/outer-local@remote-cache/action-start
+      - run: echo "output=${{ steps.o.outputs.hello }}"
+  remote-ref:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: o
+        uses: zerobull-consulting/dagger/.github/actions/spike/outer-remote@remote-cache/action-start
+      - run: echo "output=${{ steps.o.outputs.hello }}"

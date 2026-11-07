@@ -1,0 +1,13 @@
+name: spike outer local
+outputs:
+  hello:
+    value: ${{ steps.in.outputs.hello }}
+runs:
+  using: composite
+  steps:
+    - run: echo outer step before
+      shell: bash
+    - id: in
+      uses: ./.github/actions/spike/inner
+      env:
+        SPIKE_X: from-step-env
