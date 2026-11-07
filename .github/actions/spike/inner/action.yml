@@ -1,6 +1,0 @@
-name: spike inner
-runs:
-  using: node24
-  main: index.js
-  post: index.js
-  post-if: always()

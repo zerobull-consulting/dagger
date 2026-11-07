@@ -30,6 +30,7 @@ var pinnedEngineRE = regexp.MustCompile(`registry\.dagger\.io/engine:([^\s"'` + 
 var pinDirs = []string{
 	"cmd/cacheservice",
 	"hack/remote-cache",
+	".github/actions/remote-cache",
 	".github/actions/remote-cache-sidecar",
 	".github/workflows",
 }

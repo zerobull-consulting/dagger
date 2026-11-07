@@ -325,7 +325,7 @@ func TestEngineVersionRejectedLongBounded(t *testing.T) {
 // writes them, msg="...": a renamed message here would leave it waiting
 // until its timeout.
 func TestSidecarWaitsForTheseLines(t *testing.T) {
-	data, err := os.ReadFile("../../../.github/actions/remote-cache-sidecar/sidecar.sh")
+	data, err := os.ReadFile("../../../.github/actions/remote-cache/sidecar.sh")
 	require.NoError(t, err)
 	var b strings.Builder
 	slog.New(slog.NewTextHandler(&b, nil)).Info(LogEngineWelcomed)

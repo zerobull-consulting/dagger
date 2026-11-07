@@ -9,8 +9,10 @@
 #                      exit; keep their logs; remove the containers, the
 #                      engine's state and the network
 #
-# The composite actions in this directory and in stop/ run it, and so does
-# hack/remote-cache/demo/run.sh, locally. Its settings are environment
+# The actions start/ and stop/ run it (start through a small JavaScript
+# shim, start/run, which also runs the stop at the end of the job), and so
+# does hack/remote-cache/demo/run.sh, locally. The deprecated aliases in
+# ../remote-cache-sidecar run it too. Its settings are environment
 # variables:
 #
 #   SIDECAR_ROLE            writer | read-only (required)
@@ -19,10 +21,15 @@
 #                           (cmd/cacheservice/compat/engines.txt, at this
 #                           script's own commit; default: its first). It
 #                           selects both images: the stock engine of that
-#                           version, pinned by the manifest's digest, whose
-#                           own dagger CLI is the one used, and the service
+#                           version, pinned by the manifest's digest, and the service
 #                           image that accepts it,
 #                           ghcr.io/zerobull-consulting/dagger-remote-cache:<version>
+#   SIDECAR_CLI             the dagger CLI to use: an absolute path to the one
+#                           the job installed (such as dagger/dagger-for-github
+#                           does). Its version must be the engine's, or the
+#                           start fails before it creates or pulls anything.
+#                           Without it (a local run), the CLI is copied out of
+#                           the engine image, which always matches
 #   SIDECAR_SERVICE_IMAGE   overrides the service image (such as a build of
 #                           your own, or one pinned by digest); the version
 #                           still selects the engine, and the start fails if
@@ -170,6 +177,40 @@ duration_seconds() {
 # sooner, once that event arrived. 15s is the service's default too.
 linger_seconds=15
 
+# The version a dagger CLI says it is, such as v1.0.0-beta.25, from the first
+# line of `dagger version` ("dagger v1.0.0-beta.25 (image://...) linux/amd64");
+# nothing, and a failure, for anything else (a dev build included). The CLI
+# runs as the wrapper runs it: none of the caller's trace or DAGGER_*
+# settings, no engine needed, and bounded.
+cli_version() {
+	local out v
+	out="$(
+		for v in $(compgen -e); do
+			case "$v" in TRACEPARENT | TRACESTATE | OTEL_* | DAGGER_* | _EXPERIMENTAL_DAGGER_*) unset "$v" ;; esac
+		done
+		export DAGGER_NO_NAG=1
+		timeout 30 "$1" --silent version </dev/null 2>/dev/null
+	)" || return 1
+	out="${out%%$'\n'*}"
+	[[ "$out" =~ ^dagger\ (v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)(\ |$) ]] || return 1
+	echo "${BASH_REMATCH[1]}"
+}
+
+# check_cli CLI VERSION: fails unless CLI is an executable that says it is
+# VERSION, the engine's. The engine is pinned by digest and the CLI only by
+# its release tag, so this is what keeps the two matched.
+check_cli() {
+	local cli="$1" want="$2" got
+	[[ "$cli" == /* ]] || die "SIDECAR_CLI '$cli' isn't an absolute path"
+	[[ -f "$cli" && -x "$cli" ]] || die "SIDECAR_CLI $cli isn't an executable file"
+	[[ -n "$want" ]] ||
+		die "a CLI is given, but no version selects the engine: give version, which the CLI must match (engine-image, deprecated, can't be checked)"
+	got="$(cli_version "$cli")" ||
+		die "the CLI $cli didn't say its version (dagger --silent version): a release of the CLI is needed, to match the engine $want"
+	[[ "$got" == "$want" ]] ||
+		die "the CLI ($cli) is $got but the engine is $want: they must be the same version. Install CLI $want (the version input of the action does)"
+}
+
 # --- state, kept between start and stop ---
 
 sidecar_dir() {
@@ -301,6 +342,31 @@ show_log() {
 
 # --- start ---
 
+# pull_one IMAGE FORCE: pulls an image unless it is here already; FORCE=true
+# pulls it anyway. Bounded: a daemon that doesn't answer reads as "not here",
+# and the pull's own bound then fails it.
+pull_one() {
+	local image="$1" force="$2"
+	if [[ "$force" == true ]] || ! timeout "${SIDECAR_INSPECT_TIMEOUT:-30}" docker image inspect "$image" >/dev/null 2>&1; then
+		echo "remote-cache-sidecar: pulling $image"
+		timeout 900 docker pull -q "$image" >/dev/null
+	fi
+}
+
+# pull_images SERVICE_IMAGE SERVICE_FORCE ENGINE_IMAGE: both at once, then
+# waits for both and fails naming each that failed.
+pull_images() {
+	local service_image="$1" service_force="$2" engine_image="$3" failed=""
+	local service_pid engine_pid
+	pull_one "$service_image" "$service_force" &
+	service_pid=$!
+	pull_one "$engine_image" false &
+	engine_pid=$!
+	wait "$service_pid" || failed+=" pulling $service_image failed or took over 15m;"
+	wait "$engine_pid" || failed+=" pulling $engine_image failed or took over 15m;"
+	[[ -z "$failed" ]] || die "${failed# }"
+}
+
 start() {
 	local role="${SIDECAR_ROLE:-}"
 	local name="${SIDECAR_NAME:-remote-cache}"
@@ -345,6 +411,11 @@ start() {
 		echo "::add-mask::$CACHESERVICE_S3_SECRET_ACCESS_KEY"
 	fi
 
+	local cli="${SIDECAR_CLI:-}"
+	[[ -z "$cli" ]] || check_cli "$cli" "$version"
+	# The wrapper runs the CLI: it must never be the wrapper itself.
+	[[ -z "$cli" || "$cli" != "$(sidecar_dir)/$name/bin/dagger" ]] || die "SIDECAR_CLI is this sidecar's own wrapper"
+
 	local dir
 	dir="$(sidecar_dir)/$name"
 	local state="$dir/state" logs="$dir/logs" bin="$dir/bin"
@@ -374,17 +445,12 @@ start() {
 	# Pulled only when not here already: a job may have built them, and the
 	# engine is pinned by digest. The version's floating service tag is
 	# always pulled: it moves to newer builds, and a copy left from an
-	# earlier job (a self-hosted runner, a dev machine) would be stale.
-	local image
-	for image in "$service_image" "$engine_image"; do
-		# Bounded too: a daemon that doesn't answer reads as "not here", and
-		# the pull's own bound then fails the step.
-		if [[ "$image" == "$service_image" && "$service_floating" == true ]] ||
-			! timeout "${SIDECAR_INSPECT_TIMEOUT:-30}" docker image inspect "$image" >/dev/null 2>&1; then
-			echo "remote-cache-sidecar: pulling $image"
-			timeout 900 docker pull -q "$image" >/dev/null || die "pulling $image failed or took over 15m"
-		fi
-	done
+	# earlier job (a self-hosted runner, a dev machine) would be stale. The
+	# two are pulled at the same time, each bounded; the start fails if
+	# either fails.
+	local pulled_at=$SECONDS
+	pull_images "$service_image" "$service_floating" "$engine_image"
+	echo "remote-cache-sidecar: images ready in $((SECONDS - pulled_at))s"
 
 	timeout 60 docker network create --label remote-cache-sidecar="$name" "$network" >/dev/null ||
 		die "creating the network $network failed"
@@ -545,10 +611,16 @@ start() {
 	fi
 	[[ "$welcomed" == true ]] && echo "remote-cache-sidecar: the service welcomed the engine (${version:-$engine_image})"
 
-	# The engine image's own CLI, which matches the engine.
-	timeout 120 docker cp "$engine:/usr/local/bin/dagger" "$dir/dagger" >/dev/null ||
-		die "copying the CLI out of the engine image failed"
-	chmod +x "$dir/dagger"
+	# The CLI the job installed (its version checked against the engine's
+	# above), or, in a local run, the engine image's own, which matches.
+	if [[ -n "$cli" ]]; then
+		echo "remote-cache-sidecar: using the CLI $cli ($version)"
+	else
+		cli="$dir/dagger"
+		timeout 120 docker cp "$engine:/usr/local/bin/dagger" "$cli" >/dev/null ||
+			die "copying the CLI out of the engine image failed"
+		chmod +x "$cli"
+	fi
 	# A wrapper, so whatever a later step's environment holds, the CLI uses
 	# this engine and sends its telemetry to this service, and never
 	# continues an inherited trace: a CLI that continues an unsampled
@@ -556,10 +628,10 @@ start() {
 	# exports nothing (cmd/cacheservice/README.md, "Real-engine run"). The
 	# CLI also stops early, with the service's log, if the service is gone.
 	local q_service q_dagger
-	q_service="$(printf %q "$service")" q_dagger="$(printf %q "$dir/dagger")"
+	q_service="$(printf %q "$service")" q_dagger="$(printf %q "$cli")"
 	cat >"$bin/dagger" <<EOF
 #!/usr/bin/env bash
-# Written by remote-cache-sidecar (.github/actions/remote-cache-sidecar).
+# Written by the remote cache sidecar (.github/actions/remote-cache).
 if [[ "\$(timeout 30 docker inspect -f '{{.State.Running}}' $q_service 2>/dev/null)" != true ]]; then
 	echo "remote-cache-sidecar: the cache service $q_service isn't running" >&2
 	timeout 30 docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2

@@ -2973,31 +2973,34 @@ There's no endpoint to host. Concurrent jobs are replicas of each other,
 which the service is safe for.
 
 On GitHub Actions, use the composite action, which does everything below
-([`.github/actions/remote-cache-sidecar`](../../.github/actions/remote-cache-sidecar/README.md)):
+([`.github/actions/remote-cache`](../../.github/actions/remote-cache/README.md)):
 
 ```yaml
-- uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar@<commit SHA>
+- uses: zerobull-consulting/dagger/.github/actions/remote-cache/start@<commit SHA>
   with:
     role: writer                    # read-only in pull-request jobs
-    version: v1.0.0-beta.25         # the engine; selects the service image too
+    version: v1.0.0-beta.25         # the engine and the CLI; selects the service image too
     s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
     s3-region: ${{ vars.CACHE_S3_REGION }}
     s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
     s3-prefix: cache
     s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
     s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
-- run: dagger call build                # any dagger command: the action set up the CLI
-- if: always()
-  timeout-minutes: 12                   # the drain timeout (10m) plus 2 minutes
-  uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
+- run: dagger call build                # any dagger command: start put a wrapper of the CLI first on PATH
+# No stop step: start stops the sidecar, draining its exports, at the end of the job.
+# The job's timeout-minutes bounds that stop: set it above the work plus the
+# drain timeout (10m) plus 2 minutes. remote-cache/stop stops earlier.
 ```
 
 Pin the action to a commit of `feature/remote-cache`. Its `version` is an
 `accept` line of that commit's [`compat/engines.txt`](compat/engines.txt)
-(default: the first, CI's pin), and selects both images: the stock engine
-of that version, pinned by the manifest's digest, and
-`dagger-remote-cache:<version>`, the newest verified service that accepts
-it (see [Image](#image)). The start is ready once the service has welcomed
+(default: the first, CI's pin), and selects the CLI (installed with
+`dagger/dagger-for-github`; the start fails unless it is the engine's
+version), the stock engine of that version, pinned by the manifest's digest,
+and `dagger-remote-cache:<version>`, the newest verified service that
+accepts it (see [Image](#image)). The two images are pulled at the same
+time. The old `remote-cache-sidecar` action is a deprecated alias, removed
+after 2027-02-05. The start is ready once the service has welcomed
 the engine, and fails on a refusal. `service-image` overrides the service
 image, to pin one build or test your own.
 The [demo](../../hack/remote-cache/demo/README.md) is a small project that
@@ -3007,7 +3010,7 @@ action and the demo stay in agreement. Locally, `hack/remote-cache/dev.sh
 demo` runs it against MinIO.
 
 Elsewhere, these are the steps the action runs
-([`sidecar.sh`](../../.github/actions/remote-cache-sidecar/sidecar.sh) is the
+([`sidecar.sh`](../../.github/actions/remote-cache/sidecar.sh) is the
 action's script, and runs outside GitHub too).
 
 **1. The network.** One Docker network for the service and the engine.
@@ -3089,9 +3092,12 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   engine disagree: the engine would build without the cache. `msg="engine
   connected"` comes before either, and says nothing about the version.
 
-Then the CLI: the engine image's own, which matches the engine, with the
-Cloud settings that make the engine publish the session's spans to the
-service, and no inherited trace:
+Then the CLI, which must be the engine's version (the engine is pinned by
+digest, the CLI only by its release tag; the action installs it with
+`dagger/dagger-for-github` and fails the start when `dagger --silent
+version` says another). Here it is the engine image's own, which matches,
+with the Cloud settings that make the engine publish the session's spans to
+the service, and no inherited trace:
 
 ```bash
 docker cp remote-cache-engine:/usr/local/bin/dagger ./dagger

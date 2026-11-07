@@ -1,9 +1,13 @@
-name: "Remote cache sidecar"
+name: "Remote cache sidecar (deprecated)"
 description: >-
-  Runs the remote cache service and a stock engine of one accepted version
+  Deprecated: use remote-cache/start, which installs the CLI with
+  dagger/dagger-for-github, pulls both images at once, and stops by itself at
+  the end of the job. This alias is kept for callers pinned to it, and is
+  removed after 2027-02-05. It runs the same script, and still copies
+  the CLI out of the engine image. Runs the remote cache service and a stock engine of one accepted version
   on this runner, and sets up the dagger CLI for later steps; ready once the
   service has welcomed the engine. Stop it at the end of the job with
-  remote-cache-sidecar/stop, with if: always().
+  remote-cache-sidecar/stop (or remote-cache/stop), with if: always().
 
 inputs:
   role:
@@ -139,6 +143,10 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Warn that the action is deprecated
+      shell: bash
+      run: |
+        echo "::warning title=remote-cache-sidecar is deprecated::Use zerobull-consulting/dagger/.github/actions/remote-cache/start (and, if you stop explicitly, remote-cache/stop): its start is faster, and it stops the sidecar by itself at the end of the job. remote-cache-sidecar is removed after 2027-02-05, 90 days after remote-cache/start landed (zerobull-consulting/dagger#161)."
     - name: Start the cache service and the engine
       id: start
       shell: bash
@@ -162,4 +170,4 @@ runs:
         CACHESERVICE_S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id }}
         CACHESERVICE_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key }}
         CACHESERVICE_S3_PATH_STYLE: ${{ inputs.s3-path-style }}
-      run: '"$GITHUB_ACTION_PATH/sidecar.sh" start'
+      run: '"$GITHUB_ACTION_PATH/../remote-cache/sidecar.sh" start'

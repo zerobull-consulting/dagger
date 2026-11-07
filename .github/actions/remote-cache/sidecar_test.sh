@@ -459,7 +459,7 @@ case "$1 $2" in
 	silent) echo 'time=x level=INFO msg="engine connected" conn=1' ;;
 	esac
 	;;
-"cp "*) printf '#!/bin/sh\necho dagger fake\n' >"$3" ;;
+"cp "*) echo "$*" >>"$FAKE_DIR/cps"; printf '#!/bin/sh\necho dagger fake\n' >"$3" ;;
 *) exit 0 ;;
 esac
 EOF2
@@ -511,6 +511,89 @@ check "... but not before the grace: a refusal comes first" not hello_start refu
 check "... and a grace longer than the start's timeout still fails at the timeout" not hello_start silent SIDECAR_WELCOME_GRACE=60
 check "an engine that never connects: the start fails" not hello_start none
 check "... says so" grep -q "the engine didn't connect to the service within 5s" "$tmp/hello.out"
+
+# --- SIDECAR_CLI: the job's installed CLI, which must be the engine's version ---
+# A fake CLI: `version` says FAKE_CLI_VERSION; anything else prints the
+# settings the wrapper left it.
+mkdir -p "$tmp/clis"
+fake_cli="$tmp/clis/dagger"
+cat >"$fake_cli" <<'EOF2'
+#!/bin/sh
+case "$*" in
+*version*) [ -n "$FAKE_CLI_SILENT" ] || echo "dagger ${FAKE_CLI_VERSION} (image://registry.dagger.io/engine:x) linux/amd64" ;;
+*) echo "TRACEPARENT=${TRACEPARENT-unset} DAGGER_ENGINE=${DAGGER_ENGINE-unset} OTEL_X=${OTEL_X-unset} RUNNER=$_EXPERIMENTAL_DAGGER_RUNNER_HOST CLOUD=$DAGGER_CLOUD_URL $DAGGER_CLOUD_TOKEN" ;;
+esac
+EOF2
+chmod +x "$fake_cli"
+cli_says() { (FAKE_CLI_VERSION="$1" cli_version "$fake_cli"); }
+check "the CLI's version is read from the first line of dagger version" [ "$(cli_says v1.0.0-beta.25)" = v1.0.0-beta.25 ]
+check "... a release's too" [ "$(cli_says v0.20.8)" = v0.20.8 ]
+check "... a dev build isn't one" not cli_says devel
+check "... nor is a version that is not semver" not cli_says v1.0
+check "... a CLI that says nothing is refused" not bash -c "FAKE_CLI_SILENT=1 FAKE_CLI_VERSION=x; export FAKE_CLI_SILENT FAKE_CLI_VERSION; source '$here/sidecar.sh'; cli_version '$fake_cli'"
+check "check_cli accepts the engine's version" bash -c "export FAKE_CLI_VERSION=$first_version; source '$here/sidecar.sh'; check_cli '$fake_cli' $first_version"
+cli_check_msg() { (FAKE_CLI_VERSION="$1" check_cli "${3:-$fake_cli}" "$2") 2>&1; }
+check "a CLI of another version is refused" not cli_check_msg v1.0.0-beta.24 "$first_version"
+check "... saying both versions" grep -qF "is v1.0.0-beta.24 but the engine is $first_version" <<<"$(cli_check_msg v1.0.0-beta.24 "$first_version")"
+check "a relative CLI path is refused" not cli_check_msg "$first_version" "$first_version" ./dagger
+check "a CLI that isn't there is refused" not cli_check_msg "$first_version" "$first_version" "$tmp/clis/nope"
+check "a CLI without a version to match (the deprecated engine-image) is refused" not cli_check_msg "$first_version" ""
+check "start refuses a mismatched CLI before it creates anything" start_refuses SIDECAR_CLI="$fake_cli" FAKE_CLI_VERSION=v0.0.1
+check "start refuses a CLI that isn't a file before it creates anything" start_refuses SIDECAR_CLI="$tmp/clis/nope"
+fake_start_cli() { hello_start welcome FAKE_CLI_VERSION="$first_version" SIDECAR_CLI="$fake_cli" "$@"; }
+check "a CLI of the engine's version: the start is ready" fake_start_cli
+check "... without copying the CLI out of the engine" [ ! -e "$tmp/okbin.fake/cps" ]
+check "... and says which CLI it uses" grep -q "using the CLI $fake_cli ($first_version)" "$tmp/hello.out"
+sidecar_wrapper="$tmp/okbin.sc/remote-cache/bin/dagger"
+check "... the wrapper runs that CLI" grep -qF "$fake_cli" "$sidecar_wrapper"
+# The guards survive: a job with a trace and settings of its own.
+wrapped() { TRACEPARENT=00-aa-bb-00 DAGGER_ENGINE=other OTEL_X=1 PATH="$tmp/okbin:$PATH" "$sidecar_wrapper" call; }
+check "... which drops an inherited TRACEPARENT, DAGGER_* and OTEL_*" grep -q "^TRACEPARENT=unset DAGGER_ENGINE=unset OTEL_X=unset" <<<"$(wrapped)"
+check "... and sets this engine and this service" grep -q "RUNNER=docker-container://remote-cache-engine CLOUD=http://10.9.0.1:30000 sidecar-cli" <<<"$(wrapped)"
+mismatch_start() {
+	hello_start welcome FAKE_CLI_VERSION=v1.0.0-beta.1 SIDECAR_CLI="$fake_cli" SIDECAR_SERVICE_IMAGE=
+	local rc=$?
+	[[ $rc -ne 0 ]] && [[ ! -e "$tmp/okbin.fake/pulls" && ! -e "$tmp/okbin.fake/runs" ]] && grep -q "is v1.0.0-beta.1 but the engine is" "$tmp/hello.out"
+}
+check "... a mismatch pulls nothing and runs nothing" mismatch_start
+hello_start welcome >/dev/null
+check "... docker cp copies the CLI out of the engine" grep -q "^cp remote-cache-engine:/usr/local/bin/dagger " "$tmp/okbin.fake/cps"
+
+# --- the pulls run at the same time, and each failure fails the start ---
+# Both images are missing. Each pull records that it started, then waits (at
+# most 5s) for the other to have started: sequential pulls never see it.
+mkdir -p "$tmp/pullbin"
+cat >"$tmp/pullbin/docker" <<'EOF2'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == "network inspect -f" ]] && { echo 10.9.0.1; exit 0; }
+case "$1 $2" in
+"container inspect" | "volume inspect" | "network inspect" | "image inspect") exit 1 ;;
+"pull -q")
+	img="${3//[^A-Za-z0-9]/_}"
+	: >"$FAKE_DIR/started.$img"
+	for _ in $(seq 50); do
+		[[ "$(ls "$FAKE_DIR" | grep -c '^started\.')" -ge 2 ]] && { echo "$3" >>"$FAKE_DIR/overlapped"; break; }
+		sleep 0.1
+	done
+	[[ -n "$FAKE_PULL_FAIL" && "$3" == *"$FAKE_PULL_FAIL"* ]] && exit 1
+	exit 0
+	;;
+*) exit 1 ;;
+esac
+EOF2
+chmod +x "$tmp/pullbin/docker"
+pull_start() { rm -rf "$tmp/pullbin.fake" "$tmp/pullbin.sc"; fake_start pullbin SIDECAR_START_TIMEOUT=2 "$@" >"$tmp/pull.out" 2>&1; }
+pull_start SIDECAR_SERVICE_IMAGE=svc:1
+check "the start's pulls overlap: each saw the other begin" [ "$(wc -l <"$tmp/pullbin.fake/overlapped")" = 2 ]
+pull_start FAKE_PULL_FAIL=svc SIDECAR_SERVICE_IMAGE=svc:1
+check "a failed service pull fails the start" grep -q "pulling svc:1 failed or took over 15m" "$tmp/pull.out"
+check "... naming only that image" not grep -q "pulling registry.dagger.io[^ ]* failed" "$tmp/pull.out"
+check "... before it creates a network" not grep -q "starting the .* service" "$tmp/pull.out"
+pull_start FAKE_PULL_FAIL=registry.dagger.io SIDECAR_SERVICE_IMAGE=svc:1
+check "a failed engine pull fails the start" grep -q "pulling registry.dagger.io/engine:.* failed or took over 15m" "$tmp/pull.out"
+check "... naming only that image" not grep -q "pulling svc:1 failed" "$tmp/pull.out"
+pull_start FAKE_PULL_FAIL=: SIDECAR_SERVICE_IMAGE=svc:1
+check "both failing: both are named" bash -c "grep -q 'pulling svc:1 failed' '$tmp/pull.out' && grep -q 'pulling registry.dagger.io/engine' '$tmp/pull.out'"
 
 # --- debug-port: a generated token, in a file mounted read-only ---
 # A docker that records the service's docker run, then has it exit.
