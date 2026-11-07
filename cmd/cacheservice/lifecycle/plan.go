@@ -150,8 +150,10 @@ type Report struct {
 	// Live are, by namespace, the prefixes of enabled rules that expire
 	// its live data (blobs, bundles, resolutions, the index or the GC
 	// epoch): GC's liveRules warning. Unlike GC, it counts a rule that
-	// expires on a date, or filters by a tag or size too: either deletes
-	// live data all the same.
+	// expires on a date, or filters by a tag or size too, and a rule that
+	// transitions current objects to another storage class (which can
+	// leave them unreadable, as Glacier does): each puts live data out of
+	// reach all the same.
 	Live map[string][]string
 	// Unsafe describe the command's own rules that it wouldn't write
 	// (CheckSafe), such as a hand-made one too broad.
@@ -179,7 +181,7 @@ func Check(prefix string, rules []types.LifecycleRule, namespaces []string) (*Re
 			continue
 		}
 		p, _ := filterPrefix(r)
-		if e := r.Expiration; e != nil && (aws.ToInt32(e.Days) > 0 || e.Date != nil) {
+		if e := r.Expiration; (e != nil && (aws.ToInt32(e.Days) > 0 || e.Date != nil)) || len(r.Transitions) > 0 {
 			expiring = append(expiring, p)
 		}
 		if a := r.AbortIncompleteMultipartUpload; a != nil && aws.ToInt32(a.DaysAfterInitiation) > 0 && len(p) <= len(root) && root[:len(p)] == p {

@@ -6,10 +6,6 @@ import "github.com/aws/aws-sdk-go-v2/service/s3/types"
 // lifecycle), so that its check and GC agree on what covers a namespace's
 // staging prefix and what expires its live data.
 
-// RulePrefix is the prefix a lifecycle rule applies to, and false when it
-// filters by anything else too (a tag or a size).
-func RulePrefix(r types.LifecycleRule) (string, bool) { return rulePrefix(r) }
-
 // ExpiringPrefixes are the prefixes under which enabled rules expire every
 // current object by its age, as ExpirationPrefixes reads them.
 func ExpiringPrefixes(rules []types.LifecycleRule) []string { return expiringPrefixes(rules) }

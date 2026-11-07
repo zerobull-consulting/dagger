@@ -18,20 +18,11 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
-	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
 
 const prefix = "cache"
-
-func ids(rules []types.LifecycleRule) []string {
-	var out []string
-	for _, r := range rules {
-		out = append(out, aws.ToString(r.ID))
-	}
-	return out
-}
 
 func expireRule(id, p string) types.LifecycleRule {
 	return types.LifecycleRule{
@@ -69,7 +60,7 @@ func TestRules(t *testing.T) {
 		}
 		for i, p := range tc.prefixes {
 			r := rules[i]
-			if pf, _ := gc.RulePrefix(r); pf != p || aws.ToInt32(r.Expiration.Days) != 1 || r.AbortIncompleteMultipartUpload != nil {
+			if pf, _ := filterPrefix(r); pf != p || aws.ToInt32(r.Expiration.Days) != 1 || r.AbortIncompleteMultipartUpload != nil {
 				t.Fatalf("rule %d: %s", i, describe(r))
 			}
 			ns := strings.Split(p, "/")[2]
@@ -78,7 +69,7 @@ func TestRules(t *testing.T) {
 			}
 		}
 		last := rules[len(rules)-1]
-		if pf, _ := gc.RulePrefix(last); pf != "cache/" || last.Expiration != nil || aws.ToInt32(last.AbortIncompleteMultipartUpload.DaysAfterInitiation) != 1 {
+		if pf, _ := filterPrefix(last); pf != "cache/" || last.Expiration != nil || aws.ToInt32(last.AbortIncompleteMultipartUpload.DaysAfterInitiation) != 1 {
 			t.Fatalf("abort rule: %s", describe(last))
 		}
 		for _, r := range rules {
@@ -215,6 +206,38 @@ func TestPlanMergesAroundForeignRules(t *testing.T) {
 	}
 }
 
+// A rule is the command's only with its prefix's hash and a filter under
+// the prefix, or a README-era ID on exactly its target: never another
+// service's, whatever the two prefixes.
+func TestOwned(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		rule   types.LifecycleRule
+		prefix string
+		want   bool
+	}{
+		{"its staging rule", expireRule(StagingID("cache", "a"), "cache/ns/a/staging/"), "cache", true},
+		{"its abort rule", abortRule(AbortID("cache"), "cache/"), "cache", true},
+		{"its hash, a broad hand-made rule", expireRule(OwnedIDPrefix+prefixTag("cache")+"-oops", "cache/ns/"), "cache", true},
+		{"its hash, outside the prefix", expireRule(StagingID("cache", "a"), "other/ns/a/staging/"), "cache", false},
+		{"another prefix's, from the empty prefix", expireRule(StagingID("team2", "x"), "team2/ns/x/staging/"), "", false},
+		{"a nested prefix's", expireRule(StagingID("cache/sub", "x"), "cache/sub/ns/x/staging/"), "cache", false},
+		{"the parent prefix's, from a nested one", abortRule(AbortID("cache"), "cache/"), "cache/sub", false},
+		{"legacy staging", expireRule("cacheservice-staging-a", "cache/ns/a/staging/"), "cache", true},
+		{"legacy staging, another prefix", expireRule("cacheservice-staging-a", "cache2/ns/a/staging/"), "cache", false},
+		{"legacy staging, nested prefix", expireRule("cacheservice-staging-a", "cache/sub/ns/a/staging/"), "cache", false},
+		{"legacy staging, another namespace's prefix", expireRule("cacheservice-staging-a", "cache/ns/b/staging/"), "cache", false},
+		{"legacy abort", abortRule("cacheservice-incomplete-copies", "cache/"), "cache", true},
+		{"legacy abort, another prefix", abortRule("cacheservice-incomplete-copies", "other/"), "cache", false},
+		{"another cacheservice- rule", expireRule("cacheservice-oops", "cache/"), "cache", false},
+		{"another tool's", expireRule("logs", "cache/ns/a/staging/"), "cache", false},
+	} {
+		if got := Owned(tc.rule, tc.prefix); got != tc.want {
+			t.Errorf("%s: owned %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // The diff: keep, add, update, replace (the README's former IDs) and remove
 // (a namespace no longer configured).
 func TestPlanDiff(t *testing.T) {
@@ -299,8 +322,10 @@ func TestCheck(t *testing.T) {
 		{"bucket-wide", []types.LifecycleRule{expireRule("all", "")}, []string{"a", "b"}, []string{"a", "b"}, 0, false},
 		{"dated", append(slices.Clone(good), dated), nil, []string{"b"}, 0, true},
 		{"disabled", append(slices.Clone(good), disabled), nil, nil, 0, true},
-		{"broad own", []types.LifecycleRule{expireRule(OwnedIDPrefix+"x", "cache/ns/a/")}, []string{"a", "b"}, []string{"a"}, 1, false},
+		{"broad own", []types.LifecycleRule{expireRule(OwnedIDPrefix+prefixTag(prefix)+"-x", "cache/ns/a/")}, []string{"a", "b"}, []string{"a"}, 1, false},
 		{"abort above the prefix", []types.LifecycleRule{abortRule("x", "")}, []string{"a", "b"}, nil, 0, true},
+		{"a transition", append(slices.Clone(good), types.LifecycleRule{ID: aws.String("cold"), Status: types.ExpirationStatusEnabled,
+			Filter: &types.LifecycleRuleFilter{Prefix: aws.String("cache/ns/a/blobs/")}, Transitions: []types.Transition{{Days: aws.Int32(7), StorageClass: types.TransitionStorageClassGlacier}}}), nil, []string{"a"}, 0, true},
 	} {
 		rep, err := Check(prefix, tc.rules, []string{"a", "b"})
 		if err != nil {
@@ -431,14 +456,21 @@ func TestApplyRemovals(t *testing.T) {
 	if code, _ := run(t, opts("apply", "a", "b"), st); code != ExitOK {
 		t.Fatal(code)
 	}
-	code, out := run(t, opts("plan", "a"), st)
-	if code != ExitOK || !strings.Contains(out, "- remove   "+StagingID(prefix, "b")) || !strings.Contains(out, "-allow-removals") {
+	o := opts("plan", "a")
+	o.TokensFile, o.AbortRule = "/etc/cache service/tokens", false
+	code, out := run(t, o, st)
+	if code != ExitOK || !strings.Contains(out, "- remove   "+StagingID(prefix, "b")) {
 		t.Fatalf("plan of a removal:\n%s", out)
+	}
+	// The apply command it prints repeats the namespaces' flag and the
+	// options, so pasting it applies this plan, not -scope's.
+	if want := "cacheservice lifecycle apply -tokens-file '/etc/cache service/tokens' -abort-rule=false -allow-removals -confirm=bkt/cache"; !strings.Contains(out, want) {
+		t.Fatalf("plan's apply command, want %q:\n%s", want, out)
 	}
 	if code, out := run(t, opts("apply", "a"), st); code != ExitUsage || st.puts != 1 {
 		t.Fatalf("a removal without -allow-removals: %d\n%s", code, out)
 	}
-	o := opts("apply", "a")
+	o = opts("apply", "a")
 	o.AllowRemovals = true
 	if code, out := run(t, o, st); code != ExitOK || st.puts != 2 || slices.Contains(ids(st.cfg.Rules), StagingID(prefix, "b")) {
 		t.Fatalf("with -allow-removals: %d, %v\n%s", code, ids(st.cfg.Rules), out)
@@ -480,27 +512,32 @@ func TestApplyStoreErrors(t *testing.T) {
 	if code, out := run(t, opts("apply", "a"), st); code != ExitError || st.puts != 0 || !strings.Contains(out, "s3:GetLifecycleConfiguration") {
 		t.Fatalf("403 on get: %d\n%s", code, out)
 	}
-	// A configuration changed between the plan and the write isn't
-	// overwritten.
-	st = &fakeStore{}
-	st.onGet = func(n int) {
-		if n == 2 {
-			st.cfg.Rules = append(st.cfg.Rules, expireRule("new", "x/"))
-		}
-	}
-	if code, out := run(t, opts("apply", "a"), st); code != ExitError || st.puts != 0 || !strings.Contains(out, "changed while planning") {
-		t.Fatalf("changed while planning: %d\n%s", code, out)
-	}
-	// What is read back after the write is verified.
+	// What is read back after the write is verified: a foreign rule
+	// dropped, or changed in a detail the diff doesn't show (its tag), is
+	// reported.
 	st = &fakeStore{cfg: Config{Rules: []types.LifecycleRule{expireRule("logs", "logs/")}}}
 	st.onGet = func(n int) {
-		if n == 3 { // reading it back: a store that dropped the foreign rule
+		if n == 2 { // reading it back: a store that dropped the foreign rule
 
 			st.cfg.Rules = st.cfg.Rules[1:]
 		}
 	}
-	if code, out := run(t, opts("apply", "a"), st); code != ExitError || !strings.Contains(out, "other rules changed") {
+	if code, out := run(t, opts("apply", "a"), st); code != ExitError || !strings.Contains(out, "other rules aren't as they were written") {
 		t.Fatalf("a foreign rule lost: %d\n%s", code, out)
+	}
+	tagged := func(v string) types.LifecycleRule {
+		r := expireRule("logs", "")
+		r.Filter = &types.LifecycleRuleFilter{And: &types.LifecycleRuleAndOperator{Prefix: aws.String("logs/"), Tags: []types.Tag{{Key: aws.String("k"), Value: aws.String(v)}}}}
+		return r
+	}
+	st = &fakeStore{cfg: Config{Rules: []types.LifecycleRule{tagged("v")}}}
+	st.onGet = func(n int) {
+		if n == 2 {
+			st.cfg.Rules[0] = tagged("other")
+		}
+	}
+	if code, out := run(t, opts("apply", "a"), st); code != ExitError || !strings.Contains(out, "other rules aren't as they were written") {
+		t.Fatalf("a foreign rule's tag changed: %d\n%s", code, out)
 	}
 }
 

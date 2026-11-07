@@ -119,9 +119,11 @@ func explainWrite(err error, abortRule bool) error {
 			"Setting it takes the admin key (on DigitalOcean Spaces, a full-access key): a Read or Read/Write/Delete key gets 403. "+
 			"Run apply with it, interactively; never put it in the service's or a job's secrets", err)
 	case abortRule && httpStatus(err) == http.StatusBadRequest:
+		// MinIO answers 400 InvalidArgument; other causes give 400 too,
+		// so the message names the likely one, not a certain one.
 		return fmt.Errorf("the store refused the configuration (%w). "+
-			"Some stores refuse a rule that aborts incomplete multipart uploads (MinIO does, and drops stale uploads itself after 24h): "+
-			"run again with -abort-rule=false on such a store", err)
+			"If this store refuses rules that abort incomplete multipart uploads (MinIO does, with InvalidArgument, and drops stale uploads itself after 24h), "+
+			"run again with -abort-rule=false; otherwise, see the store's error", err)
 	}
 	return fmt.Errorf("can't set the bucket's lifecycle configuration: %w", err)
 }

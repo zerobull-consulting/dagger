@@ -18,9 +18,10 @@
 // PutBucketLifecycleConfiguration replaces a bucket's whole configuration, so
 // apply always reads it, replaces only the rules it owns, and writes back
 // every other rule as it read it. A rule is the command's when its ID starts
-// with OwnedIDPrefix ("cacheservice-") and its filter's prefix is under the
-// service's prefix: so two services on two prefixes of one bucket each own
-// their own rules, and rules of other tools are never touched.
+// with OwnedIDPrefix ("cacheservice-") and the prefix's hash (below), and its
+// filter's prefix is under the service's prefix (see Owned): so two services
+// on two prefixes of one bucket each own their own rules, and rules of other
+// tools are never touched.
 //
 // # Rule IDs
 //
@@ -127,7 +128,11 @@ func Rules(prefix string, namespaces []string, abort bool) ([]types.LifecycleRul
 }
 
 // filterPrefix is the prefix of a rule's filter, whatever else it filters by,
-// and whether it filters by anything else too.
+// and whether it filters by anything else too. Unlike gc.rulePrefix, which
+// counts only a rule filtered by prefix alone (one that expires every object
+// under it), it returns the prefix of a tag- or size-filtered rule too: such a
+// rule still expires some live objects, which check reports, and a rule the
+// command writes must not have one.
 func filterPrefix(r types.LifecycleRule) (prefix string, only bool) {
 	f := r.Filter
 	if f == nil {
@@ -139,14 +144,36 @@ func filterPrefix(r types.LifecycleRule) (prefix string, only bool) {
 	return aws.ToString(f.Prefix), f.Tag == nil && f.ObjectSizeGreaterThan == nil && f.ObjectSizeLessThan == nil
 }
 
+// Legacy IDs, which the README's hand-made rules used before the command:
+// unique per bucket only with one prefix, so they are the command's only on
+// their exact target under its prefix.
+const (
+	legacyStagingID = OwnedIDPrefix + "staging-"
+	legacyAbortID   = OwnedIDPrefix + "incomplete-copies"
+)
+
 // Owned reports whether a rule is the command's for prefix: its ID starts
-// with OwnedIDPrefix, and its filter's prefix is under the prefix.
+// with OwnedIDPrefix and the prefix's tag (see StagingID), and its filter's
+// prefix is under the prefix; or it has one of the README's former IDs on
+// exactly what that ID was for, under the prefix: legacy
+// cacheservice-staging-<ns> on <prefix>/ns/<ns>/staging/, and
+// cacheservice-incomplete-copies on <prefix>/. So another service's rules,
+// on another prefix of the bucket, nested or not, are never the command's.
 func Owned(r types.LifecycleRule, prefix string) bool {
-	if !strings.HasPrefix(aws.ToString(r.ID), OwnedIDPrefix) {
-		return false
-	}
+	id := aws.ToString(r.ID)
 	p, _ := filterPrefix(r)
-	return strings.HasPrefix(p, layout.Root(prefix))
+	root := layout.Root(prefix)
+	if strings.HasPrefix(id, OwnedIDPrefix+prefixTag(prefix)+"-") {
+		return strings.HasPrefix(p, root)
+	}
+	if id == legacyAbortID {
+		return p == root
+	}
+	if ns, ok := strings.CutPrefix(id, legacyStagingID); ok && layout.ValidateNamespace(ns) == nil {
+		sp, _ := StagingPrefix(prefix, ns)
+		return p == sp
+	}
+	return false
 }
 
 // CheckSafe returns an error unless a rule is one the command may write for

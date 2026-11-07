@@ -99,13 +99,7 @@ func ParseTokens(data []byte) (*TokenFile, error) {
 func (tf *TokenFile) Len() int { return len(tf.entries) }
 
 // Namespaces returns how many distinct namespaces the file maps to.
-func (tf *TokenFile) Namespaces() int {
-	set := map[string]bool{}
-	for _, e := range tf.entries {
-		set[e.namespace] = true
-	}
-	return len(set)
-}
+func (tf *TokenFile) Namespaces() int { return len(tf.NamespaceNames()) }
 
 // Lookup returns the namespace of token. It hashes the token and compares
 // the hash with every entry's in constant time, so how long it takes says

@@ -580,17 +580,23 @@ What it does:
   ID of the command's for the same prefix and action, such as the former
   hand-made IDs below), `-` removed. Then how many other rules there are, the
   total against the store's limit, and the command's rules as JSON. It warns
-  of any rule that expires a namespace's live data.
+  of any rule that expires a namespace's live data, and ends with the `apply`
+  command for this plan: the same `-tokens-file` or `-scope`, the same
+  options, and `-allow-removals` when it removes rules.
 - **`apply` merges.** `PutBucketLifecycleConfiguration` replaces the whole
   configuration, so `apply` reads it, replaces only the rules it owns, and
-  writes every other rule back as it read it. It owns a rule whose ID starts
-  with `cacheservice-` and whose filter's prefix is under the service's
-  prefix: two services on two prefixes of one bucket each own their own,
-  and other tools' rules are never touched. Before writing, it reads the
-  configuration again and stops if it changed since the plan (S3 has no
-  conditional write for it); after writing, it reads it back and checks
-  that its rules are as wanted and the others as they were. When nothing
-  changes, it writes nothing.
+  writes every other rule back as it read it. It owns a rule whose ID
+  starts with `cacheservice-<hash>-`, the hash of its prefix (see Rule IDs
+  below), and whose filter's prefix is under the service's prefix, or one
+  with a former hand-made ID on exactly that ID's target (below): two
+  services on two prefixes of one bucket, nested or not, each own their
+  own, and other tools' rules are never touched. After writing, it reads
+  the configuration back and checks that its rules are as wanted and the
+  others exactly as they were. S3 has no conditional write for the
+  configuration, so a change another tool makes between `apply`'s read and
+  its write is lost, and that check reports it: don't run `apply` while
+  something else changes the rules. When nothing changes, it writes
+  nothing.
 - **`apply` refuses**, exit 2 and nothing written: without `-confirm`
   repeating the bucket and the prefix (`<bucket>/<prefix>`, `<bucket>/` for
   an empty prefix); and when it would remove a rule nothing replaces, such
@@ -609,8 +615,9 @@ What it does:
 - **`check`** reads the configuration and exits 3 when a namespace lacks its
   staging rule (what `gc_staging_rule_missing` reports, by the same rule
   parsing), when a rule expires a namespace's live data (GC's `liveRules`
-  warning, and also a rule that expires on a date, or filters by a tag or
-  size too), or when a rule of the command's is too broad. It exits 1 when
+  warning, and also a rule that expires on a date, filters by a tag or
+  size too, or transitions objects to another storage class, which can
+  leave them unreadable), or when a rule of the command's is too broad. It exits 1 when
   the configuration can't be read (`TestMinIOLifecycleCheckUnreadable`). The
   abort rule's absence is a note, not a failure. It doesn't run GC, and it
   checks the tokens file's namespaces, not those with data in the bucket:
@@ -629,10 +636,10 @@ requires. Namespaces are validated as the service validates them (at most
 128 letters, digits, `.`, `_` or `-`), so an ID is at most 158 characters,
 under S3's 255; `CheckSafe` checks every ID again before writing.
 
-**Stores.** MinIO refuses a rule with `AbortIncompleteMultipartUpload` (400,
-see `hack/remote-cache/README.md`, "What each store does"). `apply` fails
-with that explained, and nothing written: run it with `-abort-rule=false`
-there. MinIO drops stale uploads itself after 24 hours (its `api
+**Stores.** MinIO refuses a rule with `AbortIncompleteMultipartUpload` (400
+`InvalidArgument`, see `hack/remote-cache/README.md`, "What each store
+does"). `apply` fails, writes nothing, and names that as the likely cause
+of a 400: run it with `-abort-rule=false` there. MinIO drops stale uploads itself after 24 hours (its `api
 stale_uploads_expiry`), and GC aborts stale ones at blob keys. A Spaces key
 that isn't full-access gets 403, which `apply` explains as needing the admin
 key. Tested against MinIO (`TestMinIOLifecycle`: plan, apply, a foreign rule
@@ -662,8 +669,9 @@ Before the command, this section built them by hand from the tokens file
 (an `awk` and `jq` pipeline) and applied them with `aws s3api
 put-bucket-lifecycle-configuration` or `mc ilm rule add`, with IDs
 `cacheservice-staging-<namespace>` and `cacheservice-incomplete-copies`.
-`apply` takes rules with those IDs over as its own (under the prefix, they
-start with `cacheservice-`), and replaces them with the IDs above. Use the
+`apply` takes a rule with one of those IDs over as its own only on exactly
+its target under the prefix (`<prefix>/ns/<namespace>/staging/`, or
+`<prefix>/`), and replaces it with the IDs above. Use the
 command rather than writing the configuration by hand: that call replaces
 the bucket's whole configuration, and a hand-made merge can drop another
 tool's rules.

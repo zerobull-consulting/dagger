@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -48,6 +49,9 @@ type Options struct {
 	// where they came from.
 	Namespaces []string
 	Source     string
+	// TokensFile or Scope is the flag the namespaces came from, repeated in
+	// the apply command plan prints.
+	TokensFile, Scope string
 	// Confirm is apply's -confirm: <bucket>/<prefix>.
 	Confirm string
 	// AllowRemovals lets apply remove rules of the command's that no
@@ -135,12 +139,12 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 		if err != nil {
 			return fail(ExitError, "%v", err)
 		}
-		o.Namespaces, o.Source = tf.NamespaceNames(), "the tokens file "+tokensFile
+		o.Namespaces, o.Source, o.TokensFile = tf.NamespaceNames(), "the tokens file "+tokensFile, tokensFile
 	} else {
 		if err := layout.ValidateNamespace(scope); err != nil {
 			return fail(ExitUsage, "-scope: %v", err)
 		}
-		o.Namespaces, o.Source = []string{scope}, "-scope, without a tokens file"
+		o.Namespaces, o.Source, o.Scope = []string{scope}, "-scope, without a tokens file", scope
 	}
 	cfg, err := blobstore.S3ConfigFromEnv()
 	if err != nil {
@@ -228,11 +232,7 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	removals := p.Count(Remove)
 	if o.Action == "plan" {
 		if p.Changed() {
-			hint := ""
-			if removals > 0 {
-				hint = " -allow-removals"
-			}
-			fmt.Fprintf(out, "plan only: nothing written. To write it, with the admin key: cacheservice lifecycle apply -confirm=%s%s\n", ConfirmValue(o.Bucket, o.Prefix), hint)
+			fmt.Fprintf(out, "plan only: nothing written. To write it, with the admin key and the same CACHESERVICE_S3_* settings:\n  %s\n", applyCommand(o, removals > 0))
 		} else {
 			fmt.Fprintln(out, "plan only: the bucket's rules are as wanted, nothing to apply")
 		}
@@ -247,15 +247,10 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	if removals > 0 && !o.AllowRemovals {
 		return fail(ExitUsage, "it would remove %d of this command's rules (the lines marked -): pass -allow-removals to remove them; nothing written", removals)
 	}
-	// The configuration can't be written conditionally: read it again
-	// right before, so that a change since the plan isn't overwritten.
-	again, err := st.GetLifecycle(ctx)
-	if err != nil {
-		return fail(ExitError, "%v", explainRead(err))
-	}
-	if fingerprint(again) != fingerprint(current) {
-		return fail(ExitError, "the bucket's lifecycle configuration changed while planning; run it again. Nothing written")
-	}
+	// S3 can't write the configuration conditionally: a change by someone
+	// else between the read above and this write is lost, which the read
+	// back below reports. Don't run apply while another tool changes the
+	// rules.
 	if err := st.PutLifecycle(ctx, Config{Rules: p.Result, TransitionDefaultMinimumObjectSize: current.TransitionDefaultMinimumObjectSize}); err != nil {
 		return fail(ExitError, "%v; nothing written", explainWrite(err, o.AbortRule))
 	}
@@ -373,14 +368,45 @@ func jsonRules(rules []types.LifecycleRule) map[string][]jsonRule {
 	return map[string][]jsonRule{"Rules": out}
 }
 
-// fingerprint is a configuration as compared before writing it.
-func fingerprint(c Config) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n", c.TransitionDefaultMinimumObjectSize)
-	for _, r := range c.Rules {
-		fmt.Fprintf(&b, "%s %s\n", aws.ToString(r.ID), describe(r))
+// applyCommand is the apply command for what plan just showed: the same
+// namespaces' flag and the same options, so that pasting it applies that
+// plan, not another one.
+func applyCommand(o Options, removals bool) string {
+	args := []string{"cacheservice", "lifecycle", "apply"}
+	if o.TokensFile != "" {
+		args = append(args, "-tokens-file", shellQuote(o.TokensFile))
+	} else if o.Scope != "" {
+		args = append(args, "-scope", shellQuote(o.Scope))
 	}
-	return b.String()
+	if !o.AbortRule {
+		args = append(args, "-abort-rule=false")
+	}
+	if o.MaxRules != MaxRules {
+		args = append(args, fmt.Sprintf("-max-rules=%d", o.MaxRules))
+	}
+	if removals {
+		args = append(args, "-allow-removals")
+	}
+	return strings.Join(append(args, shellQuote("-confirm="+ConfirmValue(o.Bucket, o.Prefix))), " ")
+}
+
+// safeShell are the characters a word needs no quotes for.
+var safeShell = regexp.MustCompile(`^[A-Za-z0-9._/=:@,+-]+$`)
+
+func shellQuote(s string) string {
+	if safeShell.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// ruleKey is a rule in full, as the read back compares it.
+func ruleKey(r types.LifecycleRule) string {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return aws.ToString(r.ID) + " " + describe(r)
+	}
+	return string(b)
 }
 
 // verify checks what the bucket holds after a write: the command's rules as
@@ -400,13 +426,21 @@ func verify(prefix string, p *Plan, after []types.LifecycleRule, maxRules int) e
 	key := func(rules []types.LifecycleRule) []string {
 		var out []string
 		for _, r := range rules {
-			out = append(out, aws.ToString(r.ID)+" "+describe(r))
+			out = append(out, ruleKey(r))
 		}
 		slices.Sort(out)
 		return out
 	}
 	if !slices.Equal(key(p.Foreign), key(again.Foreign)) {
-		return fmt.Errorf("the other rules changed: %q, now %q", key(p.Foreign), key(again.Foreign))
+		return fmt.Errorf("the other rules aren't as they were written (changed by someone else at the same time, or by the store): %d written, %d now: %v", len(p.Foreign), len(again.Foreign), ids(again.Foreign))
 	}
 	return nil
+}
+
+func ids(rules []types.LifecycleRule) []string {
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, aws.ToString(r.ID))
+	}
+	return out
 }
