@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the demo locally, as CI's sidecar job does, against the compose MinIO:
 #
-#   1. writer phase: a writer sidecar (.github/actions/remote-cache-sidecar/
+#   1. writer phase: a writer sidecar (.github/actions/remote-cache/
 #      sidecar.sh), the demo, then the stop, which drains;
 #   2. read-only phase: a fresh engine and a read-only sidecar (-export=false,
 #      with MinIO's read-only user), the demo again.
@@ -25,7 +25,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
-sidecar="$repo/.github/actions/remote-cache-sidecar/sidecar.sh"
+sidecar="$repo/.github/actions/remote-cache/sidecar.sh"
 
 # One version picks both images (zerobull-consulting/dagger#147, item 2).
 [[ -z "${ENGINE_IMAGE:-}" ]] ||

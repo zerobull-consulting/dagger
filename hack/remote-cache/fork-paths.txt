@@ -26,7 +26,7 @@
 # The service and its tooling.
 any       cmd/cacheservice/                              the cache service, its tests and its docs
 any       hack/remote-cache/                             the service's dev scripts, demo, docs and this check
-any       .github/actions/remote-cache-sidecar/          the sidecar action that runs the service next to an engine in CI
+any       .github/actions/remote-cache/                  the remote-cache actions (start, stop, the script they share) that run the service next to an engine in CI
 
 # The fork's own workflows, by name. Upstream's workflows aren't the fork's.
 any       .github/workflows/cacheservice-image.yml       builds and smoke-tests the service image on pull requests

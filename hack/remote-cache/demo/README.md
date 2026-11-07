@@ -3,7 +3,7 @@
 A small project that shows what a
 [remote cache sidecar](../../../cmd/cacheservice/README.md#running-it-as-a-sidecar)
 carries from one engine to a fresh one, and what it doesn't. CI runs it
-through the [action](../../../.github/actions/remote-cache-sidecar/README.md)
+through the [action](../../../.github/actions/remote-cache/README.md)
 on every pull request (the `sidecar demo` job), so the docs, the action and
 the demo stay in agreement.
 

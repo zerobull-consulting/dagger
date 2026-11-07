@@ -31,7 +31,7 @@ const CloseEngineVersionRefused = 4002
 
 // The log messages of a welcome and of a refusal for the engine's version.
 // The sidecar action's start waits for one or the other
-// (.github/actions/remote-cache-sidecar/sidecar.sh;
+// (.github/actions/remote-cache/sidecar.sh;
 // zerobull-consulting/dagger#146), and TestSidecarWaitsForTheseLines keeps
 // the two in step: change them together.
 const (

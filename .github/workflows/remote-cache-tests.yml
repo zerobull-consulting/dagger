@@ -264,9 +264,12 @@ jobs:
             ~/.cache/go-build
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
   # The sidecar demo (hack/remote-cache/demo) through the composite action
-  # (.github/actions/remote-cache-sidecar), against MinIO: a writer phase
-  # (the action, the demo, the stop, which drains), then a read-only phase on
-  # a fresh engine (-export=false and MinIO's read-only user). check.sh counts
+  # (.github/actions/remote-cache/start and stop), against MinIO: a writer
+  # phase (start, the demo, an explicit stop, which drains), then a read-only
+  # phase on a fresh engine (-export=false and MinIO's read-only user) that is
+  # stopped by the start's own post step,
+  # after a step that failed. Each start's time is reported in the step
+  # summary. check.sh counts
   # cache spans in the service's log: the cacheable step must be a hit with
   # 0 executed, and the cache-volume step must rerun. The service's image is
   # built from this checkout, so a pull request tests its own service; the
@@ -276,6 +279,11 @@ jobs:
     name: sidecar demo
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # What some runners export: an unsampled trace. The CLI the start sets
+      # up must not continue it, or the service learns no entries and the
+      # demo's export is never stored.
+      TRACEPARENT: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -299,7 +307,11 @@ jobs:
       # in the release matrix: it doesn't depend on the engine.
       - name: Test the action's script
         if: inputs.engine-version == ''
-        run: ./.github/actions/remote-cache-sidecar/sidecar_test.sh
+        run: ./.github/actions/remote-cache/sidecar_test.sh
+      # The JavaScript shim that runs the script, and stops it at the job's end.
+      - name: Test the action's shim
+        if: inputs.engine-version == ''
+        run: node --test .github/actions/remote-cache/start/run/index.test.js
       # Warns when this branch's engine side of the remote cache differs from
       # STOCK_ENGINE's; fails only on a pin that contradicts itself. See the
       # script.
@@ -309,9 +321,7 @@ jobs:
       # The demo's default engine and the docs' examples are checked against
       # the manifest by TestPinsMatchManifest, in unit tests.
       # The service as cacheservice-image.yml builds it, or, in the release
-      # matrix, the release image its caller built and smoke-tested; the
-      # engine pulled alongside, bounded as the action's own pull is (15
-      # minutes).
+      # matrix, the release image its caller built and smoke-tested.
       - name: Download the release image
         if: inputs.service-image-artifact != ''
         timeout-minutes: 10
@@ -319,12 +329,13 @@ jobs:
         with:
           name: ${{ inputs.service-image-artifact }}
           path: ${{ runner.temp }}/release-image
-      - name: Build the service's image, pull the engine's
+      # Not the engine's: the start pulls it, which is part of the time it
+      # reports.
+      - name: Build the service's image
         env:
           REVISION: ${{ github.sha }}
           RELEASE_IMAGE: ${{ inputs.service-image-artifact && format('{0}/release-image/image.tar.gz', runner.temp) || '' }}
         run: |
-          timeout 900 docker pull -q "$STOCK_ENGINE" &
           if [[ -n "$RELEASE_IMAGE" ]]; then
             timeout 300 docker load -i "$RELEASE_IMAGE"
             docker tag cacheservice:release cacheservice:ci
@@ -332,16 +343,24 @@ jobs:
             docker build -f cmd/cacheservice/Dockerfile \
               --build-arg REVISION="$REVISION" -t cacheservice:ci .
           fi
-          wait $!
       # MinIO on the Docker bridge gateway, where the sidecar's containers
       # reach it, with a read-only user for the demo's prefix (demo/). The
       # credentials are MinIO's committed dev ones.
       - name: Start MinIO
         id: store
         run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
+      # Declared before the starts: its post step runs after theirs, and
+      # fails the job unless they stopped everything (the reader's, by the
+      # start's own post step).
+      - name: Verify the sidecars are stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: demo-writer demo-reader
+      - name: "Writer: note the time"
+        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
       - name: "Writer: start the sidecar"
         id: writer
-        uses: ./.github/actions/remote-cache-sidecar
+        uses: ./.github/actions/remote-cache/start
         with:
           role: writer
           name: demo-writer
@@ -357,6 +376,11 @@ jobs:
           s3-path-style: "true"
           verbose: "true"
           debug-port: "8091"
+      # What a consumer waits for: the CLI's install, both images' pulls (here
+      # the engine's: the service's image was built above) and the wait for
+      # the welcome.
+      - name: "Writer: report the start's time"
+        run: ./hack/remote-cache/ci/report-start-time.sh "writer" "$T0"
       # The debug API through debug-port: 401 without the generated token,
       # and the connected engine with it.
       - name: "Writer: check the debug API takes only its token"
@@ -368,18 +392,27 @@ jobs:
           # The header from a file descriptor: the token on no command line.
           curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")") http://127.0.0.1:8091/debug/engines | grep -q '"conn"' ||
             { echo "::error::with the token: no engine listed"; exit 1; }
+      # The CLI the demo runs is the wrapper over the one the official action
+      # installed, with TRACEPARENT (job env above) set.
+      - name: "Writer: the installed CLI is the engine's version"
+        run: |
+          [[ "$(dagger version | sed -n 's/^version: *//p')" == "$STOCK_ENGINE_TAG" ]]
+          [[ "${{ steps.writer.outputs.dagger }}" == "$(command -v dagger)" ]]
       - name: "Writer: run the demo"
         timeout-minutes: 10
         env:
           SERVICE: ${{ steps.writer.outputs.service-container }}
           DAGGER: ${{ steps.writer.outputs.dagger }}
         run: ./hack/remote-cache/demo/check.sh writer "$SERVICE" "$RUNNER_TEMP/demo/writer"
+      # Explicit: the drain must be done before the export is checked, and
+      # before the next phase. The start's post step then finds nothing to
+      # stop.
       - name: "Writer: stop the sidecar"
         id: writer-stop
         if: always()
         # Above the drain timeout (10m) plus 5s.
         timeout-minutes: 12
-        uses: ./.github/actions/remote-cache-sidecar/stop
+        uses: ./.github/actions/remote-cache/stop
         with:
           name: demo-writer
       - name: "Writer: check the export was stored"
@@ -388,9 +421,11 @@ jobs:
         run: ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/demo/writer"
       # A new engine, with a new, empty state volume: the writer's was
       # removed by its stop.
+      - name: "Read-only: note the time"
+        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
       - name: "Read-only: start the sidecar"
         id: reader
-        uses: ./.github/actions/remote-cache-sidecar
+        uses: ./.github/actions/remote-cache/start
         with:
           role: read-only
           name: demo-reader
@@ -405,18 +440,20 @@ jobs:
           s3-secret-access-key: ${{ steps.store.outputs.readonly-secret-access-key }}
           s3-path-style: "true"
           verbose: "true"
+      - name: "Read-only: report the start's time"
+        run: ./hack/remote-cache/ci/report-start-time.sh "read-only" "$T0"
       - name: "Read-only: run the demo"
         timeout-minutes: 10
         env:
           SERVICE: ${{ steps.reader.outputs.service-container }}
           DAGGER: ${{ steps.reader.outputs.dagger }}
         run: ./hack/remote-cache/demo/check.sh read-only "$SERVICE" "$RUNNER_TEMP/demo/read-only" "$RUNNER_TEMP/demo/writer"
-      - name: "Read-only: stop the sidecar"
-        if: always()
-        timeout-minutes: 12
-        uses: ./.github/actions/remote-cache-sidecar/stop
-        with:
-          name: demo-reader
+      # No stop step: the start's post step stops the reader at the job's end,
+      # whatever happens before, and the step above checks it did. A failing
+      # step, allowed to fail, is in the way.
+      - name: "Read-only: a step that fails before the job's end"
+        continue-on-error: true
+        run: exit 1
       # The service's and the engine's logs of both phases (presigned URLs'
       # credentials redacted), and the demo's CLI output.
       - name: Upload the logs
