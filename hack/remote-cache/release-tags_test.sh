@@ -33,10 +33,20 @@ case "$1 $2 $3" in
 	[[ -n "${FAKE_ERROR:-}" ]] && { echo "$FAKE_ERROR" >&2; exit 1; }
 	tag="${4##*:}"
 	[[ " $FAKE_PUSHED " == *" $tag "* ]] && { echo "Name: $4"; exit 0; }
+	[[ -n "${FAKE_MISSING:-}" ]] && { echo "$FAKE_MISSING" >&2; exit 1; }
 	echo "ERROR: $4: not found" >&2
 	exit 1
 	;;
-"buildx imagetools create") echo "${@: -2:1} <- ${@: -1}" >>"$FAKE_DIR/created" ;;
+"buildx imagetools create")
+	# FAKE_FAIL_TAG fails that tag's copy, FAKE_FAIL_TIMES times (default:
+	# always).
+	if [[ "${@: -2:1}" == "${FAKE_FAIL_TAG:-}" ]]; then
+		n=$(($(cat "$FAKE_DIR/fails" 2>/dev/null || echo 0) + 1))
+		echo "$n" >"$FAKE_DIR/fails"
+		((n <= ${FAKE_FAIL_TIMES:-99})) && { echo "ERROR: unexpected status 503" >&2; exit 1; }
+	fi
+	echo "${@: -2:1} <- ${@: -1}" >>"$FAKE_DIR/created"
+	;;
 *) exit 1 ;;
 esac
 EOF
@@ -83,7 +93,7 @@ tags() {
 	rm -rf "$tmp/fake" && mkdir -p "$tmp/fake"
 	(
 		cd "$repo" || exit 1
-		export PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp/fake" FAKE_PUSHED="" IMAGE=r/new OLD_IMAGE=r/old
+		export PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp/fake" FAKE_PUSHED="" IMAGE=r/new OLD_IMAGE=r/old RELEASE_TAGS_RETRY_DELAY=0
 		(($#)) && export "$@"
 		"$here/release-tags.sh"
 	) >"$tmp/out" 2>&1
@@ -115,6 +125,18 @@ check "... nothing created" [ -z "$(created)" ]
 check "a registry error other than not found fails it" not tags FAKE_ERROR="unauthorized: authentication required"
 check "... before it moves anything" [ -z "$(created)" ]
 check "... and says why" grep -q "moving nothing" "$tmp/out"
+
+check "a missing tag reported as MANIFEST_UNKNOWN is a missing tag too" tags FAKE_PUSHED="$c2" FAKE_MISSING="ERROR: unexpected status from HEAD request: 404 Not Found: MANIFEST_UNKNOWN: manifest unknown"
+check "... the walk goes on to the verified build" grep -q "r/new:v1.0.0-beta.25 -> $c2" "$tmp/out"
+
+check "a copy that fails twice, then works: retried, and it succeeds" tags FAKE_PUSHED="$c2" FAKE_FAIL_TAG=r/new:v1.0.0-beta.25 FAKE_FAIL_TIMES=2
+check "... every tag moved" \
+	[ "$(created)" = "r/new:v1.0.0-beta.25 <- r/new:$c2;r/new:v1.0.0-beta.24 <- r/new:$c2;r/old:feature-remote-cache <- r/new:$c2;" ]
+check "a copy that keeps failing fails the run" not tags FAKE_PUSHED="$c2" FAKE_FAIL_TAG=r/new:v1.0.0-beta.25
+check "... after 3 tries" [ "$(cat "$tmp/fake/fails")" = 3 ]
+check "... the other tags still move" \
+	[ "$(created)" = "r/new:v1.0.0-beta.24 <- r/new:$c2;r/old:feature-remote-cache <- r/new:$c2;" ]
+check "... and it names the stale one, and the way out" grep -q "left where they were: r/new:v1.0.0-beta.25. Re-run this job" "$tmp/out"
 
 check "a bad depth fails it" not tags RELEASE_TAGS_DEPTH=x
 

@@ -2614,7 +2614,10 @@ pull paths.
    ([`hack/remote-cache/release-tags.sh`](../../hack/remote-cache/release-tags.sh)).
    The job runs one at a time across pushes and always looks from the
    head, so the tags never move backwards, nor onto an unverified build,
-   and a red head leaves them on the newest green commit before it.
+   and a red head leaves them on the newest green commit before it. A
+   copy that fails is retried; one that still fails leaves only its own tag
+   where it was (each tag is correct on its own), fails the job, and is
+   moved by re-running it.
 
 A `workflow_dispatch` of the workflow on another branch is a dry run: it
 builds, smoke-tests and runs the matrix, and pushes nothing.
