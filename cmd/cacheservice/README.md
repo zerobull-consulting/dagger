@@ -89,8 +89,16 @@ than 100 `accept` lines fails the unit tests, and the service at startup.
 Every digest-pinned engine in this README, `hack/remote-cache` and the
 sidecar action is checked against the `accept` lines
 (`TestPinsMatchManifest`), and CI reads its pin from the manifest
-(`hack/remote-cache/engines.sh pin`). To verify a new version, see
-[Engine](../../hack/remote-cache/README.md#engine).
+(`hack/remote-cache/engines.sh pin`).
+
+**New versions are verified by the release check**
+([Release check](../../hack/remote-cache/README.md#release-check)): every
+hour it looks for an upstream `v1` release newer than every line here,
+waits for its image, and runs the e2e and the sidecar demo of this service
+against it. A green run becomes an `accept` line through a PR; a red one is
+tried again on a rebuild of the service on that release, and failing that
+becomes a `reject` line and a `compat-break` issue. To verify a version by
+hand, see [Engine](../../hack/remote-cache/README.md#engine).
 
 **The match** is an exact string match of the hello's `engineVersion`
 against the `accept` lines: no ranges, prefixes or normalization. An empty
