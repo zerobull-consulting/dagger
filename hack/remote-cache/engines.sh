@@ -3,11 +3,21 @@
 # engines.txt; ENGINES_FILE overrides it) for CI and the scripts, so that no
 # engine pin is copied by hand (zerobull-consulting/dagger#117, D1):
 #
-#   engines.sh pin
+#   engines.sh pin [<version>]
 #       Prints STOCK_ENGINE (the first accept line's stock engine image,
 #       pinned by digest) and STOCK_ENGINE_TAG (its version) as NAME=value
 #       lines, for "$GITHUB_ENV" or eval. The first accept line is the
-#       engine CI's pull requests, the e2e harness and the demo run.
+#       engine CI's pull requests, the e2e harness and the demo run. With a
+#       version, that version's accept line instead; a version that isn't
+#       accepted (unlisted, rejected or malformed) fails.
+#
+#   engines.sh base
+#       Prints the base line's upstream release: what a release image is
+#       stamped as (the Dockerfile's RELEASE).
+#
+#   engines.sh versions
+#       Prints the accepted versions, in order, as one JSON array of
+#       strings: the release matrix (cacheservice-publish.yml).
 #
 #   engines.sh candidate <version> <digest>
 #       Verifying a version not yet accepted: adds it as the first accept
@@ -37,8 +47,10 @@ die() {
 # accepts checks the whole manifest as compat.Parse does (each line's
 # keyword, fields and their shapes, one base line, no version twice, at
 # least one and at most max_accept accept lines), and prints the accept
-# lines' "<version> <digest>", in order.
+# lines' "<version> <digest>", in order, then, with an argument "base",
+# a last line "base <tag>".
 accepts() {
+	local want_base="${1:-}" base=""
 	local n=0 lineno=0 bases=0 line
 	local -a f
 	local -A seen=()
@@ -56,6 +68,7 @@ accepts() {
 			((bases == 0)) || die "$where: a second base line"
 			[[ "${f[1]}" =~ $version_re ]] || die "$where: base '${f[1]}' is not a release version"
 			bases=1
+			base="${f[1]}"
 			;;
 		accept)
 			((${#f[@]} == 5)) && [[ "${f[3]}" == verified: ]] || die "$where: want 'accept <version> <digest> verified: <CI run URL>'"
@@ -83,15 +96,39 @@ accepts() {
 	done <"$file"
 	((bases == 1)) || die "$file: no base line"
 	((n > 0)) || die "$file: no accept line"
+	if [[ "$want_base" == base ]]; then
+		echo "base $base"
+	fi
 }
 
 case "${1:-}" in
 pin)
-	[[ $# -eq 1 ]] || die "usage: engines.sh pin"
+	[[ $# -le 2 ]] || die "usage: engines.sh pin [<version>]"
 	list="$(accepts)"
-	read -r v d <<<"$list"
+	if [[ $# -eq 1 ]]; then
+		read -r v d <<<"$list"
+	else
+		want="$2" v="" d=""
+		# Not repeated: it may be anything a caller passed.
+		[[ "$want" =~ $version_re ]] || die "the version given is not a release version such as v1.0.0-beta.25"
+		while read -r lv ld; do
+			[[ "$lv" == "$want" ]] && { v="$lv" d="$ld"; break; }
+		done <<<"$list"
+		[[ -n "$v" ]] || die "$want is not accepted by $file: it accepts only $(cut -d' ' -f1 <<<"$list" | paste -sd' ')"
+	fi
 	echo "STOCK_ENGINE=registry.dagger.io/engine:$v@$d"
 	echo "STOCK_ENGINE_TAG=$v"
+	;;
+base)
+	[[ $# -eq 1 ]] || die "usage: engines.sh base"
+	list="$(accepts base)"
+	tail -n1 <<<"$list" | cut -d' ' -f2
+	;;
+versions)
+	[[ $# -eq 1 ]] || die "usage: engines.sh versions"
+	list="$(accepts)"
+	# Each version matched version_re, so it needs no JSON escaping.
+	cut -d' ' -f1 <<<"$list" | awk 'BEGIN { printf "[" } { printf "%s\"%s\"", (NR > 1 ? "," : ""), $1 } END { print "]" }'
 	;;
 candidate)
 	[[ $# -eq 3 ]] || die "usage: engines.sh candidate <version> <digest>"
@@ -116,6 +153,6 @@ candidate)
 	echo "::warning::verifying candidate engine $v ($d): this run's service accepts it as its first accept line; commit 'accept $v $d verified: $run' once the run is green"
 	;;
 *)
-	die "usage: engines.sh pin | engines.sh candidate <version> <digest>"
+	die "usage: engines.sh pin [<version>] | base | versions | candidate <version> <digest>"
 	;;
 esac

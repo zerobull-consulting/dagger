@@ -1,8 +1,9 @@
 name: "Remote cache sidecar"
 description: >-
-  Runs the remote cache service and an engine with its client on this runner,
-  and sets up the dagger CLI for later steps. Stop it at the end of the job
-  with remote-cache-sidecar/stop, with if: always().
+  Runs the remote cache service and a stock engine of one accepted version
+  on this runner, and sets up the dagger CLI for later steps; ready once the
+  service has welcomed the engine. Stop it at the end of the job with
+  remote-cache-sidecar/stop, with if: always().
 
 inputs:
   role:
@@ -10,18 +11,34 @@ inputs:
       writer (exports to the bucket; for jobs on the default branch) or
       read-only (-export=false and a read-only key; for pull-request jobs)
     required: true
+  version:
+    description: >-
+      The engine version, such as v1.0.0-beta.25: an accept line of the
+      service's engine manifest, cmd/cacheservice/compat/engines.txt, at this
+      action's commit (default: its first accept line). It selects both
+      images: the stock registry.dagger.io/engine of that version, pinned by
+      the manifest's digest, whose own CLI is the one set up, and the
+      service image that accepts it,
+      ghcr.io/zerobull-consulting/dagger-remote-cache:<version>. A version
+      the manifest doesn't accept fails the step before anything starts
+    required: false
+    default: ""
   service-image:
-    description: "The cache service image, such as ghcr.io/zerobull-consulting/cacheservice:<commit SHA>"
-    required: true
+    description: >-
+      Overrides the service image, such as a build of your own, or
+      ghcr.io/zerobull-consulting/dagger-remote-cache:<commit SHA> (or
+      @sha256:...) to pin one build; version still selects the engine. The
+      step fails if this service refuses that engine (default: the
+      version's dagger-remote-cache:<version>)
+    required: false
+    default: ""
   engine-image:
     description: >-
-      A stock Dagger engine release, v1.0.0-beta.24 or later, pinned by
-      digest, such as
-      registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834;
-      its own CLI is the one set up. Under the lockstep policy
-      (zerobull-consulting/dagger#117) it will be the release the service was
-      built from
-    required: true
+      Deprecated, and to be removed: give version instead. The engine image,
+      pinned by digest; only with service-image and without version, and
+      it warns
+    required: false
+    default: ""
   s3-endpoint:
     description: "The store's endpoint URL, such as https://nyc3.digitaloceanspaces.com"
     required: true
@@ -89,6 +106,15 @@ outputs:
   dagger:
     description: "The dagger CLI set up for the sidecar (also first on PATH for later steps)"
     value: ${{ steps.start.outputs.dagger }}
+  version:
+    description: "The engine version the sidecar runs (empty with the deprecated engine-image)"
+    value: ${{ steps.start.outputs.version }}
+  service-image:
+    description: "The service image it runs"
+    value: ${{ steps.start.outputs.service-image }}
+  engine-image:
+    description: "The engine image it runs, pinned by digest"
+    value: ${{ steps.start.outputs.engine-image }}
   runner-host:
     description: "The engine, as _EXPERIMENTAL_DAGGER_RUNNER_HOST"
     value: ${{ steps.start.outputs.runner-host }}
@@ -120,6 +146,7 @@ runs:
       # expanded into the script itself.
       env:
         SIDECAR_ROLE: ${{ inputs.role }}
+        SIDECAR_VERSION: ${{ inputs.version }}
         SIDECAR_SERVICE_IMAGE: ${{ inputs.service-image }}
         SIDECAR_ENGINE_IMAGE: ${{ inputs.engine-image }}
         SIDECAR_NAMESPACE: ${{ inputs.namespace }}

@@ -8,7 +8,10 @@
 #   2. started with -metrics-listen, it serves /metrics;
 #   3. `docker stop` delivers SIGTERM to the binary as PID 1, and it exits 0
 #      within STOP_LIMIT seconds (default 5): that is the stop's own timeout,
-#      after which docker sends SIGKILL and the exit code is 137.
+#      after which docker sends SIGKILL and the exit code is 137;
+#   4. with EXPECT_BASE, its startup log's identity reports that base (a
+#      release image's, stamped with the Dockerfile's RELEASE; "dev" for an
+#      unstamped one), and with EXPECT_REVISION, that revision.
 #
 # Needs only docker, curl, grep and bash (no GNU date or bc).
 # Used by .github/workflows/cacheservice-image.yml and cacheservice-publish.yml;
@@ -62,5 +65,20 @@ logs="$(docker logs "$name" 2>&1)"
 [[ "$code" == 0 ]] || fail "exit code $code, not 0 (137: still running after ${STOP_LIMIT}s, so docker sent SIGKILL)"
 grep -q 'msg=stopping signal=terminated' <<<"$logs" || fail "the binary didn't log that it got SIGTERM"
 echo "ok: exit 0 on SIGTERM"
+
+if [[ -n "${EXPECT_BASE:-}${EXPECT_REVISION:-}" ]]; then
+	echo "== 4. the identity it reports"
+	identity="$(grep -m1 'msg=identity ' <<<"$logs" || true)"
+	[[ -n "$identity" ]] || fail "no identity line in its startup log"
+	echo "$identity"
+	if [[ -n "${EXPECT_BASE:-}" ]]; then
+		grep -qF " base=$EXPECT_BASE " <<<"$identity" || fail "it reports another base than $EXPECT_BASE"
+	fi
+	if [[ -n "${EXPECT_REVISION:-}" ]]; then
+		[[ "$EXPECT_REVISION" =~ ^[0-9a-f]{7,64}$ ]] || fail "EXPECT_REVISION '$EXPECT_REVISION' is not a commit SHA"
+		grep -qE " revision=$EXPECT_REVISION( |\$)" <<<"$identity" || fail "it reports another revision than $EXPECT_REVISION"
+	fi
+	echo "ok"
+fi
 
 echo "PASS: $image"

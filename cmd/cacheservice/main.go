@@ -360,26 +360,44 @@ func main() {
 	// cut off the engine WebSocket; the OTLP routes bound their bodies
 	// themselves.
 	servers := []*http.Server{server.NewHTTPServer(listen, svc.Handler())}
+	names := []string{"engine"}
 	if debugListen != "" {
 		servers = append(servers, server.NewHTTPServer(debugListen, svc.DebugHandler()))
+		names = append(names, "debug")
 	}
 	if metricsListen != "" {
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", svc.MetricsHandler())
 		servers = append(servers, server.NewHTTPServer(metricsListen, mux))
+		names = append(names, "metrics")
 	}
 	errs := make(chan error, len(servers))
 	for i, srv := range servers {
 		// Only the engine address is served over TLS: the debug and
 		// metrics addresses are for local use.
 		tls := i == 0 && tlsCert != ""
-		logger.Info("listening", "addr", srv.Addr, "tls", tls)
+		// Bound before it is logged, so "listening" means its port is
+		// bound, and bound is the port a :0 address got.
+		// An empty address is ListenAndServe's default.
+		addr := srv.Addr
+		if addr == "" {
+			addr = ":http"
+			if tls {
+				addr = ":https"
+			}
+		}
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			errs <- err
+			continue
+		}
+		logger.Info("listening", "addr", srv.Addr, "bound", ln.Addr().String(), "tls", tls, "listener", names[i])
 		go func() {
 			var err error
 			if tls {
-				err = srv.ListenAndServeTLS(tlsCert, tlsKey)
+				err = srv.ServeTLS(ln, tlsCert, tlsKey)
 			} else {
-				err = srv.ListenAndServe()
+				err = srv.Serve(ln)
 			}
 			if !errors.Is(err, http.ErrServerClosed) {
 				errs <- err

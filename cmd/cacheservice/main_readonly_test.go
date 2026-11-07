@@ -120,7 +120,7 @@ func TestBinaryReadOnlyStartupErrors(t *testing.T) {
 			endpoint, conns := countingStore(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, bin, append([]string{"-listen", freeAddr(t), "-debug-listen", ""}, tc.args...)...)
+			cmd := exec.CommandContext(ctx, bin, append([]string{"-listen", anyPort, "-debug-listen", ""}, tc.args...)...)
 			var environ []string
 			for _, kv := range os.Environ() {
 				if !strings.HasPrefix(kv, "CACHESERVICE_S3_") {
