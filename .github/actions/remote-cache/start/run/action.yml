@@ -1,0 +1,12 @@
+name: "Remote cache sidecar: run the script"
+description: >-
+  Internal to remote-cache/start: runs sidecar.sh start, and, at the end of
+  the job whatever happened, sidecar.sh stop. It takes its settings from the
+  step's environment (SIDECAR_* and CACHESERVICE_S3_*), as start/action.yml
+  sets them. Use remote-cache/start, not this.
+
+runs:
+  using: node24
+  main: index.js
+  post: index.js
+  post-if: always()
