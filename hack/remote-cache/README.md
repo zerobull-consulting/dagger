@@ -956,10 +956,10 @@ variable) stays unset until `accept line only` is a required check. Then:
 
 The check, `.github/workflows/remote-cache-accept-line.yml`, runs on
 `pull_request_target`, so its workflow and the scripts it runs
-(`accept-line-only.sh`, `engines.sh`) are always the base branch's: a PR
-that edits any of them is still measured by the base's. It runs none of the
-PR's code, only diffs its commits and parses its manifest, and requests no
-environment. It reports on PRs into branches that have it. It fails an
+(`accept-line-only.sh`, `engines.sh`) are always the default branch's
+(`feature/remote-cache`): a PR that edits any of them is still measured by
+the versions it would replace. It runs none of the PR's code, only diffs its
+commits and parses its manifest, and requests no environment. It fails an
 accept PR unless, from
 its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
 one added line (no mode change, no rename), that line is
