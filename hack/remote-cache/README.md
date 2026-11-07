@@ -760,10 +760,12 @@ warning for the reviewer.
 
 The release check and the nightly upstream sync
 ([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117),
-D5) open pull requests that need CI. GitHub starts no workflows for pushes
-or pull requests made with a workflow's own `GITHUB_TOKEN`, so they use
-fine-grained personal access tokens instead. Each token is an environment
-secret:
+D5, steps 3 and 4) open pull requests that need CI. GitHub starts no
+workflows for pushes or pull requests made with a workflow's own
+`GITHUB_TOKEN`, so they use fine-grained personal access tokens instead.
+The tokens and settings below are in place; the workflows that use them are
+still to be built, and the parts that depend on them are marked *planned*.
+Each token is an environment secret:
 
 | Token | Permissions | Environment | Secret | Used by |
 |---|---|---|---|---|
@@ -776,30 +778,45 @@ secret:
   and GitHub refuses that push without Workflows permission. The
   accept-line PR changes only `cmd/cacheservice/compat/engines.txt`, so its
   token can't touch CI.
-- **Expiry.** Both expire 2027-02-04. Rotate them together: regenerate each
-  one, then update its secret.
+- **Expiry.** Each token expires 90 days after it's created; the token's
+  settings page shows the date. Rotate both together before the earlier
+  expiry: regenerate each one with the same permissions, then update its
+  secret.
 - **Environments.** Neither has reviewers or a wait timer, and both deploy
   only from `feature/remote-cache`, the default branch. Scheduled and
-  dispatched runs get the secrets; a pull request's branch doesn't. A job
-  reads a token with `environment: cache-bot-pr` (or `cache-bot-sync`).
+  dispatched runs get the secrets; a `pull_request` run, whose ref is the
+  pull request's, doesn't. A job reads a token with
+  `environment: cache-bot-pr` (or `cache-bot-sync`).
+- **Never from `pull_request_target` or `workflow_run`.** Those run on the
+  default branch's ref, so the branch rule would let them in, while they can
+  run a pull request's code. Request these environments only from
+  `schedule` and `workflow_dispatch` jobs.
 
-**Neither token merges anything.**
+**Neither token merges anything** (*planned*,
+zerobull-consulting/dagger#117 step 3):
 - A workflow on `GITHUB_TOKEN` enables squash auto-merge on the accept-line
-  PR. GitHub then merges it only once the required checks pass, an
-  accept-line-only check among them.
+  PR. GitHub then merges it once the required checks pass.
+- The accept-line-only check doesn't exist yet. Step 3 adds it, lets it
+  report once on a PR, and adds it to the ruleset's required checks. Until
+  then, don't enable auto-merge on a bot PR: the five checks required today
+  don't stop it changing more than the manifest.
 - That merge starts no workflows, so the release check runs
   `cacheservice-publish.yml` on `feature/remote-cache` itself, with
-  `workflow_dispatch` and `actions: write`. That's what moves the floating
-  `:<engineVersion>` tag.
+  `workflow_dispatch` and `actions: write`. Today that moves
+  `:feature-remote-cache`; once zerobull-consulting/dagger#117 step 2
+  lands, it also moves the floating `:<engineVersion>` tag.
 - The tokens act as their owner, who can bypass the ruleset. A merge made
   with one might not wait for the checks, so they are only used to push and
-  to open PRs.
+  to open PRs. Removing that risk is
+  [zerobull-consulting/dagger#152](https://github.com/zerobull-consulting/dagger/issues/152).
 
-**The sync PR merges with a merge commit, never a squash.** It has to keep
-upstream `main` as a parent, or the next sync conflicts again and the
-`fork paths` base stays old (see "The fork's paths"). For this, the
-repository allows merge commits and the ruleset doesn't require linear
-history. Squash stays the method for every other pull request.
+**Merges from upstream use a merge commit, never a squash.** That's the
+nightly sync PR, and the rebuild on a new upstream tag if it merges the tag.
+Either has to keep the upstream commit as a parent, or the next sync
+conflicts again and the `fork paths` base stays old (see "The fork's
+paths"). For this, the repository allows merge commits and the ruleset
+doesn't require linear history. Squash stays the method for every other
+pull request.
 
 Other settings these flows rely on:
 - **Allow auto-merge** is on.
@@ -809,14 +826,18 @@ Other settings these flows rely on:
   with `issues: write`.
 
 **Checking a token** on your own machine, without it reaching your shell
-history:
+history (bash; in zsh, `read -rs "GH_TOKEN?token: "`):
 
 ```sh
-read -rs GH_TOKEN && export GH_TOKEN
+read -rsp 'token: ' GH_TOKEN && echo && export GH_TOKEN
 gh api repos/zerobull-consulting/dagger --jq .full_name       # zerobull-consulting/dagger
 gh api repos/zerobull-consulting/mcp-github-readonly --jq .full_name  # HTTP 404
 unset GH_TOKEN
 ```
+
+The 404 shows the token reaches no other repository, but only because
+`mcp-github-readonly` is private: a fine-grained token can read any public
+repository. Probe a private repository of the org.
 
 Skip `--jq .permissions`: for a fine-grained token it shows the owner's
 role on the repository, not the token's permissions.
