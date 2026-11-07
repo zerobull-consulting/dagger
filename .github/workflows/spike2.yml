@@ -1,0 +1,13 @@
+name: spike2
+"on":
+  push:
+    branches: [remote-cache/action-start]
+permissions:
+  contents: read
+jobs:
+  remote-ref:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: o
+        uses: zerobull-consulting/dagger/.github/actions/spike/outer-remote@remote-cache/action-start
+      - run: echo "output=${{ steps.o.outputs.hello }}"
