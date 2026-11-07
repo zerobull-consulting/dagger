@@ -10,24 +10,32 @@
 # demo`, which starts MinIO where containers reach it. See README.md in this
 # directory.
 #
-# SERVICE_IMAGE and ENGINE_IMAGE are the images (default: the service's
-# published :feature-remote-cache tag, and the stock engine release CI's
-# sidecar job runs, its STOCK_ENGINE: the first accept line of the service's
-# engine manifest, cmd/cacheservice/compat/engines.txt, read with
-# ../engines.sh pin). The service refuses an engine of any version its
-# manifest doesn't accept. DEMO_PREFIX is the bucket prefix (default: a
-# new one under demo/), and DEMO_DIR where the logs go. CA_FILE, for a host
-# behind a TLS-intercepting proxy, is given to the engine.
+# VERSION is the engine version (default: the first accept line of the
+# service's engine manifest, cmd/cacheservice/compat/engines.txt, the one
+# CI's sidecar job runs). It selects both images, as the action's version
+# input does: the stock engine of that version, pinned by the manifest's
+# digest, and the service image that accepts it,
+# ghcr.io/zerobull-consulting/dagger-remote-cache:<version>; so the two
+# can't disagree. SERVICE_IMAGE overrides the service image (such as one
+# built from this checkout), and the start fails if it refuses the engine.
+# DEMO_PREFIX is the bucket prefix (default: a new one under demo/), and
+# DEMO_DIR where the logs go. CA_FILE, for a host behind a TLS-intercepting
+# proxy, is given to the engine.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 sidecar="$repo/.github/actions/remote-cache-sidecar/sidecar.sh"
 
-: "${SERVICE_IMAGE:=ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache}"
-if [[ -z "${ENGINE_IMAGE:-}" ]]; then
-	pin="$("$here/../engines.sh" pin)"
-	ENGINE_IMAGE="$(sed -n 's/^STOCK_ENGINE=//p' <<<"$pin")"
+# One version picks both images (zerobull-consulting/dagger#147, item 2).
+[[ -z "${ENGINE_IMAGE:-}" ]] ||
+	{ echo "run.sh: ENGINE_IMAGE is gone: set VERSION, which selects the engine and the service that accepts it" >&2; exit 2; }
+# VERSION is a common name: say which one this is when it isn't accepted.
+# The sidecar reads this checkout's manifest, never ENGINES_FILE: so does
+# this check.
+if [[ -n "${VERSION:-}" ]] && ! env -u ENGINES_FILE "$here/../engines.sh" pin "$VERSION" >/dev/null; then
+	echo "run.sh: VERSION is the demo's engine version, an accept line of cmd/cacheservice/compat/engines.txt; unset it for the first one" >&2
+	exit 2
 fi
 run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 : "${DEMO_PREFIX:=demo/$run_id}"
@@ -40,7 +48,8 @@ for var in CACHESERVICE_S3_ENDPOINT CACHESERVICE_S3_BUCKET CACHESERVICE_S3_ACCES
 done
 mkdir -p "$DEMO_DIR"
 
-export SIDECAR_SERVICE_IMAGE="$SERVICE_IMAGE" SIDECAR_ENGINE_IMAGE="$ENGINE_IMAGE"
+export SIDECAR_VERSION="${VERSION:-}" SIDECAR_SERVICE_IMAGE="${SERVICE_IMAGE:-}"
+unset SIDECAR_ENGINE_IMAGE
 export SIDECAR_DIR="$DEMO_DIR/sidecar" SIDECAR_VERBOSE=true
 export SIDECAR_ENGINE_CA_FILE="${CA_FILE:-}"
 export CACHESERVICE_S3_PREFIX="$DEMO_PREFIX"

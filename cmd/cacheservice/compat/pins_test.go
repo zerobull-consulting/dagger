@@ -7,6 +7,7 @@ package compat
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -232,6 +233,48 @@ func TestEnginesScriptMatchesParser(t *testing.T) {
 			_, perr := Parse(mustRead(t, path))
 			require.Error(t, perr, "the parser takes what the script refuses")
 		})
+	}
+}
+
+// TestEnginesScriptSelects: pin <version> gives that accept line, as the
+// sidecar action's version input and the release matrix read it; base
+// gives the base line, which a release image is stamped as; versions gives
+// the accept list, in order, as the matrix's JSON. A version that isn't
+// accepted, or isn't a version, is refused.
+func TestEnginesScriptSelects(t *testing.T) {
+	m := Embedded()
+	for _, a := range m.Accept {
+		out, err := runScript(t, "engines.txt", "pin", a.Version)
+		require.NoError(t, err, out)
+		require.Equal(t, "STOCK_ENGINE="+a.Image()+"\nSTOCK_ENGINE_TAG="+a.Version+"\n", out)
+	}
+	out, err := runScript(t, "engines.txt", "base")
+	require.NoError(t, err, out)
+	require.Equal(t, m.Base+"\n", out)
+	out, err = runScript(t, "engines.txt", "versions")
+	require.NoError(t, err, out)
+	var vs []string
+	require.NoError(t, json.Unmarshal([]byte(out), &vs), out)
+	require.Equal(t, m.Versions(), vs)
+
+	// A rejected version, an unlisted one, a prefix of an accepted one and
+	// something that isn't a version are all refused, with nothing printed
+	// on stdout.
+	path := filepath.Join(t.TempDir(), "engines.txt")
+	require.NoError(t, os.WriteFile(path, []byte("base v1.0.0-beta.25\n"+acceptLine("v1.0.0-beta.25", digestA)+"\nreject v1.0.0-beta.23 o/r#1\n"), 0o644))
+	for _, v := range []string{"v1.0.0-beta.23", "v1.0.0-beta.26", "v1.0.0-beta.2", "v1.0.0-beta.25 ", "--x", "v1;true", ""} {
+		cmd := exec.Command(filepath.Join(repoRoot, "hack/remote-cache/engines.sh"), "pin", v)
+		cmd.Env = append(os.Environ(), "ENGINES_FILE="+path)
+		stdout, err := cmd.Output()
+		require.Error(t, err, "pin %q", v)
+		require.Empty(t, stdout, "pin %q", v)
+	}
+	// A malformed manifest fails every subcommand, as the parser does.
+	bad := filepath.Join(t.TempDir(), "engines.txt")
+	require.NoError(t, os.WriteFile(bad, []byte("base v1.0.0-beta.25\naccept v1.0.0-beta.25 sha256:xyz verified: "+runA+"\n"), 0o644))
+	for _, args := range [][]string{{"pin", "v1.0.0-beta.25"}, {"base"}, {"versions"}} {
+		out, err := runScript(t, bad, args...)
+		require.Error(t, err, "%v: %s", args, out)
 	}
 }
 

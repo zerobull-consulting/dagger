@@ -104,8 +104,7 @@ is never tracked, merged into or exported from.
   it accepts, and then: for a version on a `reject` line, its issue; for
   another version of a release's shape (at most 64 bytes), the hint to run
   `dagger-remote-cache:<engineVersion>` once that version is verified (the
-  image name zerobull-consulting/dagger#117's D4 publishes; until then,
-  `ghcr.io/zerobull-consulting/cacheservice`);
+  floating tag of the service's [image](#image) that accepts that engine);
 - then a close with status **4002** (`server.CloseEngineVersionRefused`;
   4001 is a revoked token) and a short reason, within a close frame's 123
   bytes;
@@ -113,6 +112,13 @@ is never tracked, merged into or exported from.
   accepted`, with `engineVersion`, `accept`, `base` and `closeStatus=4002`,
   and `engine_version_mismatch_total{outcome="refused"}` (no version label:
   the version is the engine's to choose).
+
+An accepted engine gets the welcome, and the service logs `engine welcomed`,
+with `engineVersion` (cut at 64 bytes) and `versionAccepted`. `engine
+connected` comes earlier, at the WebSocket upgrade, before the hello says
+whether the engine is accepted: wait for `engine welcomed` or the refusal,
+as the sidecar action's start does
+([zerobull-consulting/dagger#146](https://github.com/zerobull-consulting/dagger/issues/146)).
 
 The stock engine logs the refusal at warning level, `remote cache
 connection ended; reconnecting`, with the error reply as its error:
@@ -144,8 +150,9 @@ fields, of which there are none; the stock engine doesn't decode the
 welcome's body, so nothing in `engine/` changed for it), at
 `GET /debug/identity`, in refusals and in the startup log line `identity`.
 `base` is the manifest's `base` only in a build stamped as that release
-(the image's `--build-arg RELEASE=<tag>`, which sets `compat.Release`); any
-other build, such as one tracking upstream main, reports `dev`. A build
+(the image's `--build-arg RELEASE=<tag>`, which sets `compat.Release`), as
+every published [image](#image) is; any other build, such as a local one,
+reports `dev`. A build
 stamped as another release than the manifest's `base` refuses to start.
 The revision is the image's `REVISION`, else the build's VCS revision, else
 `dev`.
@@ -2571,20 +2578,65 @@ What to watch:
 
 ## Image
 
-CI publishes the service as `ghcr.io/zerobull-consulting/cacheservice`
-([`cacheservice-publish.yml`](../../.github/workflows/cacheservice-publish.yml)),
-`linux/amd64` only:
+CI publishes the service as
+**`ghcr.io/zerobull-consulting/dagger-remote-cache`**
+([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117),
+D4 and D6), `linux/amd64` only, from
+[`cacheservice-publish.yml`](../../.github/workflows/cacheservice-publish.yml).
+The name doesn't depend on this repository, so a later extraction keeps the
+pull paths.
 
-- `:<commit SHA>` (the full SHA) for each push to `feature/remote-cache`;
-- `:feature-remote-cache`, which moves to the newest of those.
+- **`:<engine version>`**, such as `:v1.0.0-beta.25`: a **floating** tag,
+  one per `accept` line, on the newest verified build that accepts that
+  engine. Pull this tag for the engine you run. A version that a newer
+  build no longer accepts keeps its tag on the last build that did.
+- **`:<commit SHA>`** (the full SHA), or the image's digest: the immutable
+  pin, one per verified push to `feature/remote-cache`.
+- **No `:latest`**: an image is only right for the engines it accepts.
 
-Pull requests that touch the service build the image and smoke-test it
+**What a release is.** Every push to `feature/remote-cache` is a candidate:
+
+1. its image is built **stamped as the manifest's `base`**
+   (`--build-arg RELEASE`, from [`compat/engines.txt`](compat/engines.txt)'s
+   `base` line, read with `hack/remote-cache/engines.sh base`) and its
+   commit (`REVISION`), and smoke-tested, its identity included: it must
+   report that base, not `dev`, and that revision;
+2. the e2e and the sidecar demo run against **every `accept` line**, a
+   matrix of [`remote-cache-tests.yml`](../../.github/workflows/remote-cache-tests.yml)'s
+   jobs, the demo with this very image (pull requests run only the first
+   line);
+3. only once the whole matrix is green, the image is pushed as
+   `:<commit SHA>`;
+4. then each `:<engine version>` tag moves to the **newest verified
+   build**: the newest commit of the branch (first parents, from its head)
+   whose `:<commit SHA>` is pushed, one tag per `accept` line of that
+   commit's own manifest
+   ([`hack/remote-cache/release-tags.sh`](../../hack/remote-cache/release-tags.sh)).
+   The job runs one at a time across pushes and always looks from the
+   head, so the tags never move backwards, nor onto an unverified build,
+   and a red head leaves them on the newest green commit before it. A
+   copy that fails is retried; one that still fails leaves only its own tag
+   where it was (each tag is correct on its own), fails the job, and is
+   moved by re-running it.
+
+A `workflow_dispatch` of the workflow on another branch is a dry run: it
+builds, smoke-tests and runs the matrix, and pushes nothing.
+
+**The old name**, `ghcr.io/zerobull-consulting/cacheservice`, is still
+published for a transition: `:<commit SHA>` and the moving
+`:feature-remote-cache` get the same digests as the new name's commit tag
+and head. Its tags are never deleted, so pinned consumers keep working;
+move to `dagger-remote-cache` (or to the sidecar action's `version` input).
+
+Pull requests that touch the service build the image as a release is built,
+stamped, and smoke-test it, its identity included
 ([`cacheservice-image.yml`](../../.github/workflows/cacheservice-image.yml),
 [`hack/remote-cache/image-smoke.sh`](../../hack/remote-cache/image-smoke.sh)),
 and push nothing. To build it from a fresh clone, at the repository root:
 
 ```bash
-docker build -f cmd/cacheservice/Dockerfile -t cacheservice .
+docker build -f cmd/cacheservice/Dockerfile \
+  --build-arg RELEASE="$(hack/remote-cache/engines.sh base)" -t dagger-remote-cache .
 ```
 
 The context is the repository root, since the module is the whole monorepo;
@@ -2597,9 +2649,13 @@ sets to the commit SHA) in the binary, as the `serviceVersion` of the
 ownership marker an instance of it creates (see
 [Bucket ownership](#bucket-ownership)) and the `revision` of its identity.
 `--build-arg RELEASE=<tag>` stamps it as a build of that upstream release,
-which must be `compat/engines.txt`'s `base`; without it, as for the images
-CI publishes from `feature/remote-cache`, which tracks upstream main, the
-service reports its base as `dev` (see [Engine versions](#engine-versions)). An image of another layout refuses
+which must be `compat/engines.txt`'s `base`, or it refuses to start; CI
+stamps every image it builds that way. Without it, as in a plain local
+build, the service reports its base as `dev` (see
+[Engine versions](#engine-versions)). The stamp is the manifest's claim:
+`feature/remote-cache` merges upstream main, and the base becomes exact
+once the service is its own module, built against that release
+(zerobull-consulting/dagger#117, D7). An image of another layout refuses
 a prefix this one created, and the other way round: moving between them is
 [Changing layouts](#changing-layouts).
 
@@ -2627,13 +2683,14 @@ There is no `HEALTHCHECK`: the image has no shell, and the engine reconnects
 with backoff. To try it, unauthenticated and with no store (export path off):
 
 ```bash
-docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/cacheservice:feature-remote-cache
+docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25
 ```
 
 The engine that connects to it is a stock Dagger release whose version is
 an `accept` line of the image's manifest (see
-[Engine versions](#engine-versions)); the service refuses any other. The
-fork no longer publishes an engine image of its own.
+[Engine versions](#engine-versions)); the service refuses any other. With
+the `:<engine version>` tag, that is the engine of that version. The fork
+no longer publishes an engine image of its own.
 
 With a bucket, a pull-request job's instance adds `-export=false` and a
 read-only key (see [Read-only instances](#read-only-instances)). Running it
@@ -2655,8 +2712,7 @@ On GitHub Actions, use the composite action, which does everything below
 - uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar@<commit SHA>
   with:
     role: writer                    # read-only in pull-request jobs
-    service-image: ghcr.io/zerobull-consulting/cacheservice:<commit SHA>
-    engine-image: registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+    version: v1.0.0-beta.25         # the engine; selects the service image too
     s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
     s3-region: ${{ vars.CACHE_S3_REGION }}
     s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -2669,12 +2725,14 @@ On GitHub Actions, use the composite action, which does everything below
   uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@<commit SHA>
 ```
 
-Pin the action and the service's image to the same commit of
-`feature/remote-cache`, and the engine to a stock release by digest that is
-an `accept` line of that commit's
-[`compat/engines.txt`](compat/engines.txt) (the example is its first, CI's
-pin): the service refuses any other engine (see
-[Engine versions](#engine-versions)).
+Pin the action to a commit of `feature/remote-cache`. Its `version` is an
+`accept` line of that commit's [`compat/engines.txt`](compat/engines.txt)
+(default: the first, CI's pin), and selects both images: the stock engine
+of that version, pinned by the manifest's digest, and
+`dagger-remote-cache:<version>`, the newest verified service that accepts
+it (see [Image](#image)). The start is ready once the service has welcomed
+the engine, and fails on a refusal. `service-image` overrides the service
+image, to pin one build or test your own.
 The [demo](../../hack/remote-cache/demo/README.md) is a small project that
 shows what the sidecar carries and what it doesn't; CI runs it through the
 action on every pull request (the `sidecar demo` job), so this section, the
@@ -2697,7 +2755,8 @@ docker network create remote-cache-net
 gw="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' remote-cache-net)"
 ```
 
-**2. The service**, by tag, with the bucket's `CACHESERVICE_S3_*` variables
+**2. The service**, by the tag of the engine version it is to run with
+(or by commit SHA, to pin one build), with the bucket's `CACHESERVICE_S3_*` variables
 passed by name (`-e NAME`, so their values aren't on a command line):
 
 ```bash
@@ -2708,7 +2767,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_ENDPOINT -e CACHESERVICE_S3_REGION -e CACHESERVICE_S3_BUCKET \
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
-  ghcr.io/zerobull-consulting/cacheservice:<commit SHA> \
+  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25 \
   -scope default -drain-timeout 10m -drain-linger 15s -gc-interval=0
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
@@ -2735,9 +2794,9 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
   doesn't own) or 2 (a flag error) instead. Fail the job if it exits, with
   its log.
 
-**3. The engine and the CLI.** A stock Dagger engine release, pinned by
-digest (an `accept` line of the service's manifest; see
-[Engine versions](#engine-versions)), with
+**3. The engine and the CLI.** The stock Dagger engine release of that
+version, pinned by the digest on its `accept` line of the service's
+manifest (see [Engine versions](#engine-versions)), with
 the settings `cmd/cacheservice/e2e` starts its engines with:
 
 ```bash
@@ -2758,7 +2817,10 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   them. That happened in this work's walk-through, on a host whose disk
   looked full: the cacheable step's entry was pruned, and the read-only
   phase missed it. The job's disk bounds the engine instead.
-- The service logs `msg="engine connected"` when the engine is connected.
+- The engine is ready once the service logs `msg="engine welcomed"`. On
+  `msg="engine refused: its version is not accepted"`, the service and the
+  engine disagree: the engine would build without the cache. `msg="engine
+  connected"` comes before either, and says nothing about the version.
 
 Then the CLI: the engine image's own, which matches the engine, with the
 Cloud settings that make the engine publish the session's spans to the

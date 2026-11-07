@@ -29,6 +29,16 @@ import (
 // connection doesn't reset, so it retries every 30s at most.
 const CloseEngineVersionRefused = 4002
 
+// The log messages of a welcome and of a refusal for the engine's version.
+// The sidecar action's start waits for one or the other
+// (.github/actions/remote-cache-sidecar/sidecar.sh;
+// zerobull-consulting/dagger#146), and TestSidecarWaitsForTheseLines keeps
+// the two in step: change them together.
+const (
+	LogEngineWelcomed = "engine welcomed"
+	LogEngineRefused  = "engine refused: its version is not accepted"
+)
+
 // refusalWriteTimeout bounds the refusal's error reply.
 const refusalWriteTimeout = 5 * time.Second
 
@@ -111,7 +121,7 @@ func (c *engineConn) checkEngineVersion(ctx context.Context, hello protocol.Enve
 	}
 	c.svc.metrics.EngineVersionMismatch(true)
 	msg := refusalMessage(v, p.identity, p.manifest)
-	c.logger.Warn("engine refused: its version is not accepted",
+	c.logger.Warn(LogEngineRefused,
 		"engineVersion", boundVersion(v), "accept", p.identity.Accept,
 		"base", p.identity.Base, "closeStatus", CloseEngineVersionRefused)
 	// The whole refusal as the hello's error reply, which the engine logs

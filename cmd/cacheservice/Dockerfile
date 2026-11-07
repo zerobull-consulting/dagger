@@ -34,7 +34,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 ARG REVISION=""
 LABEL org.opencontainers.image.source="https://github.com/zerobull-consulting/dagger" \
       org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.title="cacheservice"
+      org.opencontainers.image.title="dagger-remote-cache"
 COPY --from=build /out/cacheservice /cacheservice
 USER 65532:65532
 # The engine WebSocket and the OTLP receivers (-listen). The debug API

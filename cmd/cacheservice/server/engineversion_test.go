@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func mismatches(t *testing.T, svc *Service, outcome string) float64 {
 func TestEngineVersionAccepted(t *testing.T) {
 	for _, v := range []string{"v1.0.0-beta.25", "v1.0.0-beta.24"} {
 		t.Run(v, func(t *testing.T) {
-			svc, _, srv := newTestService(t, "")
+			svc, rec, srv := newTestService(t, "")
 			svc.useManifest(testManifest(t))
 			e := dialRaw(t, srv, "tok")
 			e.send(helloEnvelope(t, v))
@@ -90,6 +91,15 @@ func TestEngineVersionAccepted(t *testing.T) {
 			require.True(t, c.versionAccepted)
 			require.True(t, svc.Engines()[0].VersionAccepted)
 			require.Zero(t, mismatches(t, svc, "refused"))
+			// The line the sidecar action's start waits for
+			// (zerobull-consulting/dagger#146), logged after the welcome.
+			waitUntil(t, 5*time.Second, "the welcome logged", func() bool {
+				return len(rec.find("engine welcomed")) == 1
+			})
+			require.Equal(t, []slog.Level{slog.LevelInfo}, levels(rec, "engine welcomed"))
+			got := rec.find("engine welcomed")[0]
+			require.Equal(t, v, got["engineVersion"])
+			require.Equal(t, "true", got["versionAccepted"])
 		})
 	}
 }
@@ -159,6 +169,9 @@ func TestEngineVersionRefused(t *testing.T) {
 			require.Equal(t, float64(1), mismatches(t, svc, "refused"))
 			require.Zero(t, mismatches(t, svc, "allowed"))
 			require.Empty(t, svc.Engines())
+			// Never logged as welcomed: the sidecar's start tells the two
+			// apart (zerobull-consulting/dagger#146).
+			require.Empty(t, rec.find("engine welcomed"))
 		})
 	}
 }
@@ -192,6 +205,10 @@ func TestEngineVersionMismatchAllowed(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, []slog.Level{slog.LevelWarn}, levels(rec, "ENGINE VERSION NOT ACCEPTED, welcomed anyway: -allow-engine-version-mismatch is set (development only)"))
 	require.Equal(t, "v1.0.0-beta.26-dev-0123456789ab", got[0]["engineVersion"])
+	waitUntil(t, 5*time.Second, "the welcome logged", func() bool {
+		return len(rec.find("engine welcomed")) == 1
+	})
+	require.Equal(t, "false", rec.find("engine welcomed")[0]["versionAccepted"])
 	require.Equal(t, float64(1), mismatches(t, svc, "allowed"))
 	require.Zero(t, mismatches(t, svc, "refused"))
 	require.False(t, svc.Engines()[0].VersionAccepted)
@@ -300,4 +317,22 @@ func TestEngineVersionRejectedLongBounded(t *testing.T) {
 	require.Contains(t, msg, "was tried and rejected: see zerobull-consulting/dagger#117")
 	require.NotContains(t, msg, long[:maxQuotedVersion+1])
 	require.Less(t, len(msg), 512)
+}
+
+// TestSidecarWaitsForTheseLines: the sidecar action's start decides from
+// these two log lines whether the service welcomed or refused its engine
+// (zerobull-consulting/dagger#146). It matches them as the text handler
+// writes them, msg="...": a renamed message here would leave it waiting
+// until its timeout.
+func TestSidecarWaitsForTheseLines(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/actions/remote-cache-sidecar/sidecar.sh")
+	require.NoError(t, err)
+	var b strings.Builder
+	slog.New(slog.NewTextHandler(&b, nil)).Info(LogEngineWelcomed)
+	slog.New(slog.NewTextHandler(&b, nil)).Warn(LogEngineRefused)
+	for _, msg := range []string{LogEngineWelcomed, LogEngineRefused} {
+		quoted := `msg="` + msg + `"`
+		require.Contains(t, b.String(), quoted, "the text handler doesn't write %q so", msg)
+		require.True(t, strings.Contains(string(data), `'`+quoted+`'`), "sidecar.sh doesn't wait for %s", quoted)
+	}
 }
