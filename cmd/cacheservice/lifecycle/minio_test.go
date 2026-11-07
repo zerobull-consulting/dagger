@@ -292,3 +292,94 @@ func TestMinIOLifecycleCheckUnreadable(t *testing.T) {
 		t.Fatalf("check with the read-only key: %d", code)
 	}
 }
+
+// claim on an empty prefix creates the marker with nothing else, apply and
+// check work right after, and a second claim writes nothing (the marker
+// object is the same, by its ETag and body).
+func TestMinIOLifecycleClaim(t *testing.T) {
+	e := newMinIOEnv(t)
+	ctx := context.Background()
+	confirm := "-confirm=" + ConfirmValue(e.cfg.Bucket, e.cfg.Prefix)
+	abort := []string{}
+	if !s3test.StoreBehavior(t).LifecycleAbortRule {
+		abort = []string{"-abort-rule=false"}
+	}
+	objs, err := metastore.NewS3Objects(ctx, e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := e.main(append([]string{"apply", confirm}, abort...)...); code != ExitError {
+		t.Fatalf("apply before claim: %d", code)
+	}
+
+	if code, out := e.main("claim", confirm); code != ExitOK || !strings.Contains(out, "created") {
+		t.Fatalf("claim: %d", code)
+	}
+	keys, err := objs.ListKeys(ctx, e.cfg.Prefix+"/", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{e.cfg.Prefix + "/cacheservice.json"}; !slices.Equal(keys, want) {
+		t.Fatalf("keys after claim: %v, want only the marker %v", keys, want)
+	}
+	body, etag, err := objs.Get(ctx, e.cfg.Prefix+"/cacheservice.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, err := ownership.ReadMarker(ctx, objs, e.cfg.Prefix); err != nil {
+		t.Fatalf("the marker claim wrote: %v", err)
+	} else if m.ServiceVersion == "" {
+		t.Fatalf("marker %+v", m)
+	}
+
+	if code, _ := e.main(append([]string{"apply", confirm}, abort...)...); code != ExitOK {
+		t.Fatalf("apply after claim: %d", code)
+	}
+	if code, _ := e.main(append([]string{"check"}, abort...)...); code != ExitOK {
+		t.Fatalf("check after apply: %d", code)
+	}
+
+	time.Sleep(1100 * time.Millisecond) // a rewritten marker would carry another creation time
+	if code, out := e.main("claim", confirm); code != ExitOK || !strings.Contains(out, "already claimed") {
+		t.Fatalf("second claim: %d", code)
+	}
+	body2, etag2, err := objs.Get(ctx, e.cfg.Prefix+"/cacheservice.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if etag2 != etag || !bytes.Equal(body, body2) {
+		t.Fatalf("a second claim rewrote the marker: %s then %s", body, body2)
+	}
+}
+
+// claim refuses a prefix that holds a key and no marker, and writes nothing;
+// without -confirm it exits 2 before any request.
+func TestMinIOLifecycleClaimRefusesKeys(t *testing.T) {
+	e := newMinIOEnv(t)
+	ctx := context.Background()
+	confirm := "-confirm=" + ConfirmValue(e.cfg.Bucket, e.cfg.Prefix)
+	objs, err := metastore.NewS3Objects(ctx, e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stray := e.cfg.Prefix + "/stray"
+	if _, err := objs.Put(ctx, stray, []byte("not the service's"), metastore.Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := e.main("claim"); code != ExitUsage {
+		t.Fatalf("claim without -confirm: %d", code)
+	}
+	if code, _ := e.main("claim", "-confirm="+e.cfg.Bucket+"/other"); code != ExitUsage {
+		t.Fatalf("claim with a wrong -confirm: %d", code)
+	}
+	if code, out := e.main("claim", confirm); code != ExitError || !strings.Contains(out, stray) {
+		t.Fatalf("claim on a prefix with a key: %d", code)
+	}
+	keys, err := objs.ListKeys(ctx, e.cfg.Prefix+"/", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(keys, []string{stray}) {
+		t.Fatalf("keys after a refused claim: %v, want only %s", keys, stray)
+	}
+}

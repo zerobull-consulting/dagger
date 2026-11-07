@@ -41,7 +41,7 @@ const DefaultTimeout = 2 * time.Minute
 
 // Options are a run's settings, from the flags and CACHESERVICE_S3_*.
 type Options struct {
-	// Action is plan, apply or check.
+	// Action is plan, claim, apply or check.
 	Action string
 	Bucket string
 	Prefix string
@@ -52,7 +52,7 @@ type Options struct {
 	// TokensFile or Scope is the flag the namespaces came from, repeated in
 	// the apply command plan prints.
 	TokensFile, Scope string
-	// Confirm is apply's -confirm: <bucket>/<prefix>.
+	// Confirm is apply's and claim's -confirm: <bucket>/<prefix>.
 	Confirm string
 	// AllowRemovals lets apply remove rules of the command's that no
 	// wanted rule replaces.
@@ -82,8 +82,11 @@ func OpenS3(ctx context.Context, cfg blobstore.S3Config) (Store, error) {
 	return &S3Store{Client: client, Bucket: cfg.Bucket}, nil
 }
 
-const usage = `usage: cacheservice lifecycle [plan|apply|check] [flags]
+const usage = `usage: cacheservice lifecycle [plan|claim|apply|check] [flags]
 
+  claim  create the ownership marker on an empty prefix, which apply needs; needs -confirm=<bucket>/<prefix>
+         and a key that can write there (the admin key on a fresh bucket); writes only the marker, and nothing
+         when the prefix is already claimed. Run it once, before the first apply
   plan   print the rules the prefix wants and the diff against the bucket's (the default; changes nothing)
   apply  merge them into the bucket's lifecycle configuration; needs -confirm=<bucket>/<prefix>
          and the admin key (on DigitalOcean Spaces, a full-access key)
@@ -112,7 +115,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	var timeout time.Duration
 	fs.StringVar(&tokensFile, "tokens-file", "", "the service's tokens file: one staging rule per namespace it names (empty: -scope)")
 	fs.StringVar(&scope, "scope", server.DefaultNamespace, "the one namespace when there is no -tokens-file, as for the service")
-	fs.StringVar(&o.Confirm, "confirm", "", "apply: the bucket and prefix it changes, as <bucket>/<prefix>")
+	fs.StringVar(&o.Confirm, "confirm", "", "apply, claim: the bucket and prefix it changes, as <bucket>/<prefix>")
 	fs.BoolVar(&o.AllowRemovals, "allow-removals", false, "apply: remove this command's rules that nothing wanted replaces, such as a namespace's no longer in the tokens file")
 	fs.BoolVar(&o.AbortRule, "abort-rule", true, "include the rule aborting incomplete multipart uploads under the prefix (false on stores that refuse it, such as MinIO)")
 	fs.IntVar(&o.MaxRules, "max-rules", MaxRules, "the store's limit on rules in a bucket's configuration")
@@ -127,9 +130,9 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	if fs.NArg() > 0 {
 		return fail(ExitUsage, "unexpected arguments %q: flags go after the action", fs.Args())
 	}
-	if !slices.Contains([]string{"plan", "apply", "check"}, o.Action) {
+	if !slices.Contains([]string{"plan", "claim", "apply", "check"}, o.Action) {
 		fs.Usage()
-		return fail(ExitUsage, "unknown action %q: want plan, apply or check", o.Action)
+		return fail(ExitUsage, "unknown action %q: want plan, claim, apply or check", o.Action)
 	}
 	if timeout <= 0 || o.MaxRules <= 0 {
 		return fail(ExitUsage, "-timeout and -max-rules must be positive")
@@ -145,10 +148,21 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	if slices.ContainsFunc(strings.Split(strings.Trim(o.Prefix, "/"), "/"), func(s string) bool { return s == ".." || s == "." }) {
 		return fail(ExitUsage, "%s is %q: it can't contain . or .. segments", blobstore.EnvPrefix, o.Prefix)
 	}
-	// A wrong -confirm stops apply before anything is read, the tokens
-	// file included (Run checks it again, for its other callers).
-	if o.Action == "apply" && o.Confirm != ConfirmValue(o.Bucket, o.Prefix) {
-		return fail(ExitUsage, "apply needs -confirm=%s, repeating the bucket and prefix it changes (got %q); nothing read or written", ConfirmValue(o.Bucket, o.Prefix), o.Confirm)
+	// A wrong -confirm stops apply and claim before anything is read, the
+	// tokens file included (Run checks it again, for its other callers).
+	if (o.Action == "apply" || o.Action == "claim") && o.Confirm != ConfirmValue(o.Bucket, o.Prefix) {
+		return fail(ExitUsage, "%s needs -confirm=%s, repeating the bucket and prefix it changes (got %q); nothing read or written", o.Action, ConfirmValue(o.Bucket, o.Prefix), o.Confirm)
+	}
+	if o.Action == "claim" {
+		// The marker is the prefix's, not a namespace's: no tokens file or
+		// -scope is read.
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		st, err := open(ctx, cfg)
+		if err != nil {
+			return fail(ExitError, "%v", err)
+		}
+		return Run(ctx, o, st, stdout, stderr)
 	}
 	if tokensFile != "" {
 		tf, err := server.LoadTokenFile(tokensFile)
@@ -180,6 +194,9 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 	root := layout.Root(o.Prefix)
 	fmt.Fprintf(out, "bucket %s, prefix %q\n", o.Bucket, root)
+	if o.Action == "claim" {
+		return runClaim(ctx, o, st, out, fail)
+	}
 	fmt.Fprintf(out, "namespaces, from %s (%d): %s\n", o.Source, len(o.Namespaces), strings.Join(o.Namespaces, ", "))
 	if len(o.Namespaces) == 0 {
 		fmt.Fprintln(out, "warning: no namespaces: no staging rules are wanted")
@@ -209,8 +226,12 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		fmt.Fprintf(out, "ownership marker: can't read it: %v\n", merr)
 	}
 	if o.Action == "apply" && merr != nil {
-		return fail(ExitError, "refusing a prefix the service doesn't own, as GC does: %v. "+
-			"Start the service on the prefix first (a writer claims an empty one), or check %s", merr, blobstore.EnvPrefix)
+		hint := "check " + blobstore.EnvPrefix
+		if errors.Is(merr, ownership.ErrNoMarker) {
+			hint = "if the prefix is empty, claim it with `cacheservice lifecycle claim -confirm=" + ConfirmValue(o.Bucket, o.Prefix) + "` " +
+				"(or start a writer on it); otherwise check " + blobstore.EnvPrefix
+		}
+		return fail(ExitError, "refusing a prefix the service doesn't own, as GC does: %v. %s", merr, hint)
 	}
 
 	current, err := st.GetLifecycle(ctx)
@@ -271,6 +292,35 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 	fmt.Fprintf(out, "apply: written and read back: %d added, %d updated, %d replaced, %d removed; %d other rules unchanged\n",
 		p.Count(Add), p.Count(Update), p.Count(Replace), removals, len(p.Foreign))
+	return ExitOK
+}
+
+// runClaim creates the prefix's ownership marker, the claim a writer makes
+// at startup (ownership.Check), and nothing else: no server, no probe. With
+// the marker there already, it writes nothing.
+func runClaim(ctx context.Context, o Options, st Store, out io.Writer, fail func(int, string, ...any) int) int {
+	if o.Confirm == "" {
+		return fail(ExitUsage, "needs -confirm=%s, repeating the bucket and prefix it claims", ConfirmValue(o.Bucket, o.Prefix))
+	}
+	if want := ConfirmValue(o.Bucket, o.Prefix); o.Confirm != want {
+		return fail(ExitUsage, "-confirm=%s doesn't match the bucket and prefix it would claim, %s; nothing written", o.Confirm, want)
+	}
+	state, m, err := st.Claim(ctx, o.Prefix)
+	if err != nil {
+		if denied(err) {
+			err = fmt.Errorf("%w (the key isn't allowed to read, list or write there: claim needs the admin key on a fresh bucket)", err)
+		}
+		return fail(ExitError, "%v; nothing claimed", err)
+	}
+	marker := layout.MarkerKey(o.Prefix)
+	switch state {
+	case ownership.Owned:
+		fmt.Fprintf(out, "claim: already claimed: %s records layout %d (created %s); nothing written\n", marker, m.Layout, m.Created.Format(time.RFC3339))
+	case ownership.ClaimedByOther:
+		fmt.Fprintf(out, "claim: already claimed, by a writer that created %s first (layout %d); nothing written\n", marker, m.Layout)
+	default:
+		fmt.Fprintf(out, "claim: created %s (layout %d); next: cacheservice lifecycle apply -confirm=%s\n", marker, m.Layout, ConfirmValue(o.Bucket, o.Prefix))
+	}
 	return ExitOK
 }
 

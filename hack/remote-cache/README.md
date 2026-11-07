@@ -72,10 +72,11 @@ The dev bucket has no lifecycle rule: staged uploads that were never
 promoted (an export cut short) stay until `dev.sh reset`, and are never read.
 To try the rules the service's README recommends
 ([lifecycle rule for staging](../../cmd/cacheservice/README.md#lifecycle-rule-for-staging)),
-with the service's prefix claimed (run it once), and the settings of
-`dev.sh env`:
+with the settings of `dev.sh env`, claim the prefix first (once; `apply`
+refuses a prefix without the service's marker):
 
 ```bash
+go run ./cmd/cacheservice lifecycle claim -confirm=dagger-cache/<prefix>
 go run ./cmd/cacheservice lifecycle plan -tokens-file <tokens> -abort-rule=false
 go run ./cmd/cacheservice lifecycle apply -tokens-file <tokens> -abort-rule=false -confirm=dagger-cache/<prefix>
 ```
@@ -323,7 +324,7 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
-| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. Whether a `Read/Write/Delete` limited key can *read* them: not run | Set only by `cacheservice lifecycle apply`, with a full-access key (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |
+| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. A `Read/Write/Delete` limited key can't *read* them either (`GetBucketLifecycleConfiguration` 403 `AccessDenied`, observed 2026-11-07) | Set only by `cacheservice lifecycle apply`, with a full-access key, after `lifecycle claim` (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |
 | A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
 | Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
 | Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |
