@@ -87,6 +87,9 @@ func TestRealEngines(t *testing.T) {
 	env.Run("prune", st.prune)
 	env.Run("superseded", st.superseded)
 	env.Run("parts", st.parts)
+	// Streaming exports (zerobull-consulting/dagger#134): an entry stored
+	// while its session still runs.
+	env.Run("streaming", st.streaming)
 	// A read-only service (-export=false, #65): its own service and engine,
 	// and nothing written.
 	env.Run("readonly", st.readonly)

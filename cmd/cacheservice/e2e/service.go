@@ -115,7 +115,7 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 	}
 	s3opts := server.S3Options{
 		Scope:        e.Scope,
-		Tracker:      exporter.TrackerConfig{QuietPeriod: exporter.DefaultQuietPeriod, EndGrace: exporter.DefaultEndGrace},
+		Tracker:      exporter.TrackerConfig{},
 		NoExport:     opts.ReadOnly,
 		ImportPoll:   poll,
 		NoEngineWait: noEngineWait,

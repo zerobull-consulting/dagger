@@ -1,6 +1,7 @@
 package exporter
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -15,12 +16,17 @@ import (
 
 // Defaults for TrackerConfig.
 const (
-	// DefaultQuietPeriod is how long a session must go without a cache span
-	// before its candidates are exported, when its end isn't seen.
-	DefaultQuietPeriod = 10 * time.Second
-	// DefaultEndGrace is how long to wait, after a session's end, for cache
-	// spans it said were coming.
-	DefaultEndGrace = 2 * time.Second
+	// DefaultSettle is how long an entry must go without a span naming it
+	// before it is exported.
+	DefaultSettle = time.Second
+	// DefaultMaxDelay bounds how long a changed entry waits for its spans to
+	// settle: an entry dirty this long is exported even while spans still
+	// name it, so long, busy sessions stream.
+	DefaultMaxDelay = 10 * time.Second
+	// DefaultForgetAfter is how long an entry that isn't worth exporting
+	// (not retained, pruned or expired), or a session, is kept after a span
+	// last named it.
+	DefaultForgetAfter = 10 * time.Second
 	// DefaultBusyBackoff is the wait before a busy root is exported again;
 	// it doubles each time, up to DefaultMaxBusyBackoff.
 	DefaultBusyBackoff    = 2 * time.Second
@@ -29,17 +35,23 @@ const (
 	// root gets before the tracker stops trying it.
 	DefaultMaxFailures = 5
 	// maxBatchRoots bounds the roots of one export, so its request stays
-	// small. A larger batch is split.
+	// small. More roots due wait for the next batch.
 	maxBatchRoots = 1000
 )
 
 // TrackerConfig configures a Tracker.
 type TrackerConfig struct {
-	QuietPeriod    time.Duration
-	EndGrace       time.Duration
+	Settle         time.Duration
+	MaxDelay       time.Duration
+	ForgetAfter    time.Duration
 	BusyBackoff    time.Duration
 	MaxBusyBackoff time.Duration
 	MaxFailures    int
+	// Notify, if set, is called when something may have become due sooner
+	// than NextDue said, or an export slot was freed: the scheduler should
+	// call Due again. It is called with the tracker's lock held, so it
+	// must not block or call the tracker.
+	Notify func()
 }
 
 // Tracker learns which entries each engine cache has from session spans and
@@ -48,18 +60,29 @@ type TrackerConfig struct {
 //
 //   - Entries are keyed by cache ID and engine number. Observations from a
 //     generation older than the newest seen for the cache are ignored.
-//   - An entry is a candidate when a span showed it retained. Its parts are
-//     the union of what its spans reported, for the value at the highest
-//     replacement count seen.
-//   - A session's candidates are exported when the session ends (its
-//     carrier span, once all its cache spans arrived, or EndGrace after it),
-//     or after QuietPeriod without a cache span from it.
+//   - An entry is worth exporting when a span showed it retained. Its parts
+//     are the union of what its spans reported, for the value at the
+//     highest replacement count seen.
+//   - An entry is dirty from the first span that changes its value (a new
+//     replacement count, a new part, deps that grew, or retained turning
+//     true) until an export claims it. A dirty entry worth exporting is due
+//     once Settle passed with no span naming it, or once it has been dirty
+//     for MaxDelay, whichever comes first.
+//   - A session's carrier span only speeds this up: once it arrived and
+//     every cache span it counted is in, the session's retained entries are
+//     due at once. A session whose carrier never comes, or whose spans are
+//     missing, holds nothing back.
 //   - An entry already stored with the same replacement count and parts is
 //     not exported again. Nor is one imported from the store with them
 //     (Imported), one refused for the same value, or one whose expiry or
 //     retention has lapsed.
 //   - Busy roots, and roots whose export failed, are exported again later,
-//     with backoff.
+//     with backoff. A root whose value changed while its export was in
+//     flight is dirty again, and due by the same rule.
+//   - At most one export of each cache is in flight (its slot): Due hands
+//     out no batch for a cache whose slot is taken, and what becomes due
+//     meanwhile goes in the next batch, so batches grow with load. Done,
+//     Interrupted and Requeue free the slot.
 //
 // Its methods are safe for concurrent use.
 type Tracker struct {
@@ -70,6 +93,19 @@ type Tracker struct {
 	// draining is set by StartDrain: the tracker takes spans only for the
 	// sessions it tracks, and DrainDue makes everything pending due.
 	draining bool
+
+	// slots are the caches with an export in flight, by cache ID, and
+	// slotWaiters the explicit exports waiting for a cache's slot
+	// (AcquireSlot). Due hands out nothing for a cache in either. freed is
+	// closed, and replaced, whenever a slot is freed.
+	slots       map[string]bool
+	slotWaiters map[string]int
+	freed       chan struct{}
+	// next is the earliest time something may become due (NextDue); zero
+	// when nothing is pending. waiting is how many roots the last Due or
+	// DrainDue found due and held back for a slot.
+	next    time.Time
+	waiting int
 }
 
 type trackedCache struct {
@@ -82,15 +118,18 @@ type trackedCache struct {
 	imports map[uint64]*exportedValue
 }
 
+// trackedSession is what the carrier's speed-up needs of a session.
 type trackedSession struct {
 	generation uint64
 	candidates map[uint64]bool
 	seenSpans  int
 	// expectSpans is the carrier's count, or -1 before the carrier.
 	expectSpans int
-	endedAt     time.Time
-	lastSpanAt  time.Time
+	// lastSpanAt is when a span or the carrier of the session last came.
+	lastSpanAt time.Time
 }
+
+func (s *trackedSession) ended() bool { return s.expectSpans >= 0 }
 
 type trackedEntry struct {
 	typ          string
@@ -127,6 +166,12 @@ type trackedEntry struct {
 	recheck bool
 	// lastSeen is when a span last named the entry.
 	lastSeen time.Time
+	// dirtySince is when the value first changed since an export last
+	// claimed the entry; zero when it hasn't.
+	dirtySince time.Time
+	// accel is set when a session that named the entry ended with all its
+	// spans in: due at once, without waiting for Settle.
+	accel bool
 }
 
 // exportedValue is the state of a value an export covered.
@@ -159,11 +204,14 @@ func (e *trackedEntry) value() *exportedValue {
 
 // NewTracker returns an empty Tracker.
 func NewTracker(cfg TrackerConfig) *Tracker {
-	if cfg.QuietPeriod <= 0 {
-		cfg.QuietPeriod = DefaultQuietPeriod
+	if cfg.Settle <= 0 {
+		cfg.Settle = DefaultSettle
 	}
-	if cfg.EndGrace <= 0 {
-		cfg.EndGrace = DefaultEndGrace
+	if cfg.MaxDelay <= 0 {
+		cfg.MaxDelay = DefaultMaxDelay
+	}
+	if cfg.ForgetAfter <= 0 {
+		cfg.ForgetAfter = DefaultForgetAfter
 	}
 	if cfg.BusyBackoff <= 0 {
 		cfg.BusyBackoff = DefaultBusyBackoff
@@ -174,7 +222,13 @@ func NewTracker(cfg TrackerConfig) *Tracker {
 	if cfg.MaxFailures <= 0 {
 		cfg.MaxFailures = DefaultMaxFailures
 	}
-	return &Tracker{cfg: cfg, caches: map[string]*trackedCache{}}
+	return &Tracker{
+		cfg:         cfg,
+		caches:      map[string]*trackedCache{},
+		slots:       map[string]bool{},
+		slotWaiters: map[string]int{},
+		freed:       make(chan struct{}),
+	}
 }
 
 // Observation is what one cache span says about an entry.
@@ -263,21 +317,32 @@ func (t *Tracker) Observe(o Observation, now time.Time) bool {
 		e = &trackedEntry{parts: map[string]dagql.PersistedPartAddress{}}
 		c.entries[o.Number] = e
 	}
+	// Whether the value was settled (an export or an import covers it, or
+	// it isn't retained) before this span: a change then starts a new
+	// dirty period, and MaxDelay counts from it.
+	settled := t.settledLocked(c, o.Number, e)
+	changed := false
 	e.lastSeen = now
 	switch {
 	case o.Replacements < e.replacements:
-		// An older value.
+		// An older value. It still names the entry: its settle restarts.
+		t.scheduleLocked(c, o.Number, e, now)
+		t.accelerateIfInLocked(c, o.Session, sess, now)
 		return true
 	case o.Replacements > e.replacements:
 		// A new value: reset what belonged to the old one.
 		e.replacements = o.Replacements
 		e.deps = nil
 		e.parts = map[string]dagql.PersistedPartAddress{}
+		changed = true
 	}
 	if o.Type != "" {
 		e.typ = o.Type
 	}
 	if o.HasDeps && len(o.Deps) >= len(e.deps) {
+		if !slices.Equal(o.Deps, e.deps) {
+			changed = true
+		}
 		e.deps = slices.Clone(o.Deps)
 	}
 	for _, p := range o.Parts {
@@ -286,21 +351,108 @@ func (t *Tracker) Observe(o Observation, now time.Time) bool {
 			continue
 		}
 		// Keyed as the store keys parts, so imports compare.
-		e.parts[metastore.PartKey(addr)] = addr
+		k := metastore.PartKey(addr)
+		if _, ok := e.parts[k]; !ok {
+			changed = true
+		}
+		e.parts[k] = addr
 	}
 	if o.State && o.EndUnixNano >= e.stateEndNano {
 		e.stateEndNano = o.EndUnixNano
 		e.retentionExpires = o.RetentionExp
 		e.expires = o.Expires
 		if o.EndUnixNano > e.pruneNano {
+			if o.Retained && !e.retained {
+				changed = true
+			}
 			e.retained = o.Retained
 			e.retainedAtNano = o.EndUnixNano
 		}
 	}
+	if changed && (e.dirtySince.IsZero() || settled) {
+		e.dirtySince = now
+	}
 	if sess != nil && e.retained {
 		sess.candidates[o.Number] = true
 	}
+	t.scheduleLocked(c, o.Number, e, now)
+	t.accelerateIfInLocked(c, o.Session, sess, now)
 	return true
+}
+
+// settledLocked reports whether entry n's current value needs no export: it
+// isn't retained, or an export or import covers it.
+func (t *Tracker) settledLocked(c *trackedCache, n uint64, e *trackedEntry) bool {
+	return !e.retained || e.stored.covers(e) || e.refused.covers(e) || c.imports[n].covers(e)
+}
+
+// accelerateIfInLocked makes a session's candidates due at once, and stops
+// tracking the session, once its carrier came and every cache span it
+// counted is in.
+func (t *Tracker) accelerateIfInLocked(c *trackedCache, id string, s *trackedSession, now time.Time) {
+	if s == nil || !s.ended() || s.seenSpans < s.expectSpans {
+		return
+	}
+	for n := range s.candidates {
+		if e := c.entries[n]; e != nil {
+			e.accel = true
+			t.scheduleLocked(c, n, e, now)
+		}
+	}
+	delete(c.sessions, id)
+}
+
+// scheduleLocked brings NextDue forward to when entry n is due, if that is
+// sooner, and then tells the scheduler (TrackerConfig.Notify).
+func (t *Tracker) scheduleLocked(c *trackedCache, n uint64, e *trackedEntry, now time.Time) {
+	if e.inFlight || !t.wantedLocked(c, n, e, now) {
+		return
+	}
+	if at, ok := t.dueAtLocked(e, now, t.draining); ok {
+		t.soonLocked(at)
+	}
+}
+
+// soonLocked brings NextDue forward to at, if that is sooner, and then tells
+// the scheduler.
+func (t *Tracker) soonLocked(at time.Time) {
+	if !t.next.IsZero() && !at.Before(t.next) {
+		return
+	}
+	t.next = at
+	t.notifyLocked()
+}
+
+func (t *Tracker) notifyLocked() {
+	if t.cfg.Notify != nil {
+		t.cfg.Notify()
+	}
+}
+
+// dueAtLocked returns when an entry worth exporting, and not in flight, is
+// due: its retry, once Settle passed since a span last named it or MaxDelay
+// since it became dirty, or now when a carrier sped it up. For a drain,
+// every such entry that isn't waiting out a retry's backoff, or that changed
+// since, is due now. It reports false when nothing makes it due.
+func (t *Tracker) dueAtLocked(e *trackedEntry, now time.Time, drain bool) (time.Time, bool) {
+	var at time.Time
+	ok := false
+	consider := func(x time.Time) {
+		if !ok || x.Before(at) {
+			at, ok = x, true
+		}
+	}
+	if !e.retryAt.IsZero() {
+		consider(e.retryAt)
+	}
+	if !e.dirtySince.IsZero() {
+		consider(e.lastSeen.Add(t.cfg.Settle))
+		consider(e.dirtySince.Add(t.cfg.MaxDelay))
+	}
+	if e.accel || e.recheck || (drain && (e.retryAt.IsZero() || !e.dirtySince.IsZero())) {
+		consider(now)
+	}
+	return at, ok
 }
 
 // tracksSessionLocked reports whether a session of a cache's current
@@ -315,7 +467,8 @@ func (t *Tracker) tracksSessionLocked(cacheID string, generation uint64, session
 }
 
 // SessionEnded records a session's carrier span: the session ended, and had
-// cacheSpans spans naming an entry. It reports whether it was taken: while
+// cacheSpans spans naming an entry. Once they are all in, the session's
+// retained entries are due at once. It reports whether it was taken: while
 // draining, the end of a session the tracker doesn't track is dropped.
 func (t *Tracker) SessionEnded(cacheID string, generation uint64, session string, cacheSpans int, now time.Time) bool {
 	t.mu.Lock()
@@ -328,8 +481,9 @@ func (t *Tracker) SessionEnded(cacheID string, generation uint64, session string
 		return false
 	}
 	s := c.session(session, generation)
-	s.expectSpans = cacheSpans
-	s.endedAt = now
+	s.expectSpans = max(cacheSpans, 0)
+	s.lastSpanAt = now
+	t.accelerateIfInLocked(c, session, s, now)
 	return true
 }
 
@@ -430,6 +584,9 @@ type Batch struct {
 	values map[uint64]*exportedValue
 	// generation is the cache's generation when the batch was claimed.
 	generation uint64
+	// slot is set when the batch holds its cache's slot (Due, DrainDue):
+	// Done, Interrupted or Requeue frees it.
+	slot bool
 }
 
 // Generation is the cache's generation when the batch was claimed. An
@@ -438,74 +595,129 @@ type Batch struct {
 // be settled against this generation.
 func (b Batch) Generation() uint64 { return b.generation }
 
-// Due returns the exports due at now: the candidates of sessions that ended
-// or went quiet, and roots due for another try. Each root is in at most one
-// batch until Done is called for it.
+// Due returns the exports due at now: at most one batch per cache, for the
+// caches with no export in flight (see Tracker). A batch holds its cache's
+// slot until Done, Interrupted or Requeue is called for it, and each root is
+// in at most one batch until then. Roots due beyond a batch's bound wait for
+// the next one.
 func (t *Tracker) Due(now time.Time) []Batch {
 	return t.due(now, false)
 }
 
 // DrainDue is Due for a service that is stopping (see StartDrain): it doesn't
-// wait out the quiet period. Every session that hasn't ended is due now. A
-// session that ended is due once its spans are all in, or EndGrace after
-// its end, as in Due: the spans it said were coming are still on their way,
-// and are taken. Roots waiting for another try are due at their retryAt, as
-// in Due; StartDrain made those waiting then due at once.
+// wait for entries to settle. Every entry worth exporting is due now, except
+// one waiting out a retry's backoff with its value unchanged since, which is
+// due at its retryAt, as in Due; StartDrain made those waiting then due at
+// once. Sessions that haven't ended are no longer tracked, so their later
+// spans are refused; an ended session whose counted spans are still missing
+// is tracked until they are in, or until Settle passed with none of them.
 func (t *Tracker) DrainDue(now time.Time) []Batch {
 	return t.due(now, true)
+}
+
+// NextDue is the earliest time something not yet due may become due,
+// as the last Due or DrainDue, and the spans since, saw it; zero when
+// nothing is pending. A cache whose slot is taken doesn't count: freeing a
+// slot calls TrackerConfig.Notify.
+func (t *Tracker) NextDue() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.next
+}
+
+// WaitingForSlot is how many roots the last Due or DrainDue found due and
+// held back because their cache's slot was taken, or beyond a batch's bound.
+func (t *Tracker) WaitingForSlot() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.waiting
 }
 
 func (t *Tracker) due(now time.Time, drain bool) []Batch {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var batches []Batch
+	t.next, t.waiting = time.Time{}, 0
 	for _, cacheID := range slices.Sorted(maps.Keys(t.caches)) {
 		c := t.caches[cacheID]
-		roots := map[uint64]bool{}
 		for id, s := range c.sessions {
-			if s.generation < c.generation {
+			switch {
+			case s.generation < c.generation,
+				now.Sub(s.lastSpanAt) >= t.cfg.ForgetAfter,
+				// A drain exports what such a session named at once,
+				// and takes no more of it; an ended one is waited for
+				// until its spans are in, or have settled.
+				drain && (!s.ended() || now.Sub(s.lastSpanAt) >= t.cfg.Settle):
 				delete(c.sessions, id)
-				continue
 			}
-			ended := !s.endedAt.IsZero()
-			ready := (ended && (s.seenSpans >= s.expectSpans || now.Sub(s.endedAt) >= t.cfg.EndGrace)) ||
-				(!ended && (drain || (!s.lastSpanAt.IsZero() && now.Sub(s.lastSpanAt) >= t.cfg.QuietPeriod)))
-			if !ready {
-				continue
-			}
-			for n := range s.candidates {
-				roots[n] = true
-			}
-			// Exported, whether it ended or went quiet. A later span of a
-			// quiet session starts it again.
-			delete(c.sessions, id)
 		}
+		held := t.slots[cacheID] || t.slotWaiters[cacheID] > 0
+		var roots []uint64
 		for n, e := range c.entries {
-			if e.recheck {
-				// A cleared stale-generation refusal (see cache): scheduled
-				// now, as done schedules one it drops. One in flight is
-				// scheduled by its done, if still worth exporting.
-				e.recheck = false
-				if e.retryAt.IsZero() && t.wantedLocked(c, n, e, now) {
-					e.retryAt = now
+			if e.inFlight {
+				continue
+			}
+			if !t.wantedLocked(c, n, e, now) {
+				// No longer worth exporting, as once stored, pruned or
+				// expired: stop waiting, so the entry can be forgotten.
+				e.retryAt, e.recheck, e.accel, e.dirtySince = time.Time{}, false, false, time.Time{}
+				// An entry the engine no longer keeps (not retained,
+				// pruned or expired) is forgotten once its spans have
+				// stopped coming. A stored one is kept, so its stored
+				// value is remembered.
+				if t.lapsedLocked(e, now) && now.Sub(e.lastSeen) >= t.cfg.ForgetAfter {
+					delete(c.entries, n)
 				}
+				continue
 			}
-			if !e.retryAt.IsZero() && !now.Before(e.retryAt) {
-				roots[n] = true
+			at, ok := t.dueAtLocked(e, now, drain)
+			if !ok {
+				// Worth exporting with nothing scheduled: treated as
+				// changed now, so it settles and is exported. Nothing is
+				// known to leave an entry so; this keeps one from waiting
+				// forever.
+				e.dirtySince = now
+				at, _ = t.dueAtLocked(e, now, drain)
 			}
-			// An entry without retention isn't exported; once its spans
-			// have stopped coming, forget it.
-			if !e.retained && !e.inFlight && e.retryAt.IsZero() && !roots[n] && now.Sub(e.lastSeen) >= t.cfg.QuietPeriod {
-				delete(c.entries, n)
+			if now.Before(at) {
+				if !held && (t.next.IsZero() || at.Before(t.next)) {
+					// Not soonLocked: the scheduler, which called this,
+					// reads NextDue next.
+					t.next = at
+				}
+				continue
 			}
+			roots = append(roots, n)
 		}
-		batches = append(batches, t.batchesLocked(cacheID, c, slices.Sorted(maps.Keys(roots)), now)...)
+		if held {
+			t.waiting += len(roots)
+			continue
+		}
+		slices.Sort(roots)
+		if len(roots) > maxBatchRoots {
+			t.waiting += len(roots) - maxBatchRoots
+			roots = roots[:maxBatchRoots]
+		}
+		if bs := t.batchesLocked(cacheID, c, roots, now); len(bs) > 0 {
+			b := bs[0]
+			b.slot = true
+			t.slots[cacheID] = true
+			batches = append(batches, b)
+		}
 	}
 	return batches
 }
 
+// lapsedLocked reports whether the engine no longer keeps an entry: it isn't
+// retained, or its expiry or retention passed.
+func (t *Tracker) lapsedLocked(e *trackedEntry, now time.Time) bool {
+	unix := now.Unix()
+	return !e.retained || (e.expires != 0 && e.expires <= unix) || (e.retentionExpires != 0 && e.retentionExpires <= unix)
+}
+
 // All returns batches of every root of cacheID worth exporting at now, due
-// or not: the explicit hook.
+// or not: the explicit hook, which holds the cache's slot (AcquireSlot)
+// while it runs them.
 func (t *Tracker) All(cacheID string, now time.Time) []Batch {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -536,8 +748,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}, generation: c.generation})
 			cur = &batches[len(batches)-1]
 		}
-		e.inFlight = true
-		e.retryAt, e.recheck = time.Time{}, false
+		t.claimLocked(e)
 		cur.Request.Roots = append(cur.Request.Roots, n)
 		for _, k := range slices.Sorted(maps.Keys(e.parts)) {
 			cur.Request.Outputs = append(cur.Request.Outputs, protocol.ExportOutput{Number: n, Address: e.parts[k]})
@@ -545,6 +756,74 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 		cur.values[n] = e.value()
 	}
 	return batches
+}
+
+// claimLocked marks an entry in flight: the batch exports its value as it is
+// now, so it is no longer dirty. A change from now on makes it dirty again.
+func (t *Tracker) claimLocked(e *trackedEntry) {
+	e.inFlight = true
+	e.retryAt, e.recheck = time.Time{}, false
+	e.dirtySince, e.accel = time.Time{}, false
+}
+
+// AcquireSlot waits for cacheID's slot, for an export the caller runs itself
+// (the explicit hook), and takes it. While it waits, Due hands out no batch
+// for the cache, so the hook runs once the export in flight ends. It returns
+// the function that frees the slot, or ctx's error if ctx ends first.
+func (t *Tracker) AcquireSlot(ctx context.Context, cacheID string) (func(), error) {
+	t.mu.Lock()
+	t.slotWaiters[cacheID]++
+	for t.slots[cacheID] {
+		freed := t.freed
+		t.mu.Unlock()
+		select {
+		case <-freed:
+		case <-ctx.Done():
+			t.mu.Lock()
+			t.leaveSlotQueueLocked(cacheID)
+			t.mu.Unlock()
+			return nil, ctx.Err()
+		}
+		t.mu.Lock()
+	}
+	t.leaveSlotQueueLocked(cacheID)
+	t.slots[cacheID] = true
+	t.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.freeSlotLocked(cacheID)
+		})
+	}, nil
+}
+
+// SlotWaiters is how many explicit exports wait for cacheID's slot.
+func (t *Tracker) SlotWaiters(cacheID string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.slotWaiters[cacheID]
+}
+
+func (t *Tracker) leaveSlotQueueLocked(cacheID string) {
+	if t.slotWaiters[cacheID]--; t.slotWaiters[cacheID] <= 0 {
+		delete(t.slotWaiters, cacheID)
+		// What waited behind the hook may be due now.
+		t.notifyLocked()
+	}
+}
+
+// freeSlotLocked frees cacheID's slot, wakes what waits for it, and tells
+// the scheduler: the cache may have batches due.
+func (t *Tracker) freeSlotLocked(cacheID string) {
+	if !t.slots[cacheID] {
+		return
+	}
+	delete(t.slots, cacheID)
+	close(t.freed)
+	t.freed = make(chan struct{})
+	t.notifyLocked()
 }
 
 // wantedLocked reports whether entry n should be exported now.
@@ -585,6 +864,9 @@ func (t *Tracker) Interrupted(b Batch, res Result, now, retryAt time.Time) {
 func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if b.slot {
+		defer t.freeSlotLocked(b.CacheID)
+	}
 	c := t.caches[b.CacheID]
 	if c == nil {
 		return
@@ -665,13 +947,17 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 			continue
 		}
 		e.inFlight = false
-		// Spans that named the entry during the export were dropped with
-		// their session, since it was in flight; and its value may have
-		// changed since the snapshot exported, been stored or refused. If
-		// it is still worth exporting and nothing is scheduled, export it
-		// again now.
-		if e.retryAt.IsZero() && t.wantedLocked(c, n, e, now) {
-			e.retryAt = now
+		// The value may have changed since the snapshot exported, or been
+		// stored or refused for it. A value that changed in flight is
+		// dirty again, and is due once it settles, or MaxDelay after the
+		// change, so a value that keeps changing isn't exported back to
+		// back. One still worth exporting with nothing scheduled and no
+		// change, as when a stale refusal was dropped, is due now.
+		if t.wantedLocked(c, n, e, now) {
+			if e.retryAt.IsZero() && e.dirtySince.IsZero() {
+				e.retryAt = now
+			}
+			t.scheduleLocked(c, n, e, now)
 		}
 	}
 }
@@ -696,8 +982,7 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 	}
 	for _, n := range req.Roots {
 		if e := c.entries[n]; e != nil {
-			e.inFlight = true
-			e.retryAt, e.recheck = time.Time{}, false
+			t.claimLocked(e)
 			b.values[n] = e.value()
 		}
 	}
@@ -727,10 +1012,24 @@ type EntryState struct {
 	Refused      string   `json:"refused,omitempty"`
 	Failures     int      `json:"failures,omitempty"`
 	RetryAt      string   `json:"retryAt,omitempty"`
+	// Dirty is whether the value changed since an export last claimed the
+	// entry, and is worth exporting.
+	Dirty bool `json:"dirty"`
+	// InFlight is whether an export holds the entry.
+	InFlight bool `json:"inFlight,omitempty"`
+	// DueAt is when the entry is due (RFC 3339, with milliseconds), if it
+	// is worth exporting and not in flight: it may be in the past while its
+	// cache's slot is taken.
+	DueAt string `json:"dueAt,omitempty"`
 }
 
-// Entries returns the tracked entries of a cache, by number.
+// Entries returns the tracked entries of a cache, by number, as of now.
 func (t *Tracker) Entries(cacheID string) []EntryState {
+	return t.EntriesAt(cacheID, time.Now())
+}
+
+// EntriesAt returns the tracked entries of a cache, by number, as of now.
+func (t *Tracker) EntriesAt(cacheID string, now time.Time) []EntryState {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	c := t.caches[cacheID]
@@ -749,6 +1048,7 @@ func (t *Tracker) Entries(cacheID string) []EntryState {
 			Retained:     e.retained,
 			Stored:       e.stored.covers(e) || c.imports[n].covers(e),
 			Failures:     e.failures,
+			InFlight:     e.inFlight,
 		}
 		if e.refused.covers(e) {
 			s.Refused = e.refusedMessage
@@ -759,16 +1059,26 @@ func (t *Tracker) Entries(cacheID string) []EntryState {
 		if !e.retryAt.IsZero() {
 			s.RetryAt = e.retryAt.UTC().Format(time.RFC3339)
 		}
+		if !e.inFlight && t.wantedLocked(c, n, e, now) {
+			s.Dirty = !e.dirtySince.IsZero()
+			if at, ok := t.dueAtLocked(e, now, t.draining); ok {
+				s.DueAt = at.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+			}
+		}
 		out = append(out, s)
 	}
 	return out
 }
 
 // Requeue puts a batch back, untried, to be due again at at: its engine
-// wasn't connected.
+// wasn't connected, or was at an older generation. It frees the batch's
+// slot.
 func (t *Tracker) Requeue(b Batch, at time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if b.slot {
+		defer t.freeSlotLocked(b.CacheID)
+	}
 	c := t.caches[b.CacheID]
 	if c == nil {
 		return
@@ -777,14 +1087,15 @@ func (t *Tracker) Requeue(b Batch, at time.Time) {
 		if e := c.entries[n]; e != nil {
 			e.inFlight = false
 			e.retryAt = at
+			t.soonLocked(at)
 		}
 	}
 }
 
 // StartDrain makes the tracker drain, for a service that is stopping: from
 // now on it takes spans and session ends only for the sessions it tracks
-// (Observe, SessionEnded), and every root waiting for another try is due at
-// once. Retries after this one wait their normal backoff. It can't be undone:
+// (Observe, SessionEnded), DrainDue doesn't wait for entries to settle, and
+// every root waiting for another try is due at once. Retries after this one wait their normal backoff. It can't be undone:
 // a drained service stops. Calls after the first do nothing.
 func (t *Tracker) StartDrain(now time.Time) {
 	t.mu.Lock()
@@ -800,17 +1111,22 @@ func (t *Tracker) StartDrain(now time.Time) {
 			}
 		}
 	}
+	t.notifyLocked()
 }
 
 // DrainState is what a cache has left to export, as a drain sees it. Each
-// root is counted once: in flight first, then waiting for a retry, then
-// pending in a session.
+// root is counted once: in flight first, then dirty, then waiting for a
+// retry.
 type DrainState struct {
 	CacheID string `json:"cacheID"`
-	// Sessions are the sessions not exported yet: ended ones waiting for
-	// their spans, within EndGrace, and, before DrainDue runs, the others.
+	// Sessions are the sessions the drain still waits for: before the
+	// first DrainDue, those that haven't ended; after, those that ended
+	// with some of their counted spans missing, until Settle passes with
+	// none of them.
 	Sessions int `json:"sessions"`
-	// Pending are the roots of those sessions worth exporting.
+	// Pending are the dirty roots: worth exporting, not in flight, and not
+	// waiting out a retry with an unchanged value. DrainDue makes them due
+	// at once.
 	Pending int `json:"pending"`
 	// InFlight are the roots an export holds now.
 	InFlight int `json:"inFlight"`
@@ -832,33 +1148,28 @@ func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
 	for _, cacheID := range slices.Sorted(maps.Keys(t.caches)) {
 		c := t.caches[cacheID]
 		st := DrainState{CacheID: cacheID}
-		counted := map[uint64]bool{}
 		for n, e := range c.entries {
 			switch {
 			case e.inFlight:
 				st.InFlight++
-			case e.recheck && e.retryAt.IsZero() && t.wantedLocked(c, n, e, now):
+			case !t.wantedLocked(c, n, e, now):
+			case e.recheck && e.retryAt.IsZero():
 				// Due at the next DrainDue (see cache).
 				st.Retrying++
-			case e.retryAt.IsZero() || !t.wantedLocked(c, n, e, now):
-				continue
+			case e.retryAt.IsZero() || !e.dirtySince.IsZero():
+				st.Pending++
 			case !deadline.IsZero() && e.retryAt.After(deadline):
 				st.Later++
 			default:
 				st.Retrying++
 			}
-			counted[n] = true
 		}
 		for _, s := range c.sessions {
 			if s.generation < c.generation {
 				continue
 			}
-			st.Sessions++
-			for n := range s.candidates {
-				if e := c.entries[n]; e != nil && !counted[n] && t.wantedLocked(c, n, e, now) {
-					st.Pending++
-					counted[n] = true
-				}
+			if !s.ended() || (s.seenSpans < s.expectSpans && now.Sub(s.lastSpanAt) < t.cfg.Settle) {
+				st.Sessions++
 			}
 		}
 		if st.Sessions > 0 || st.Roots() > 0 {

@@ -16,10 +16,18 @@ const (
 	metaPart = `{"part":"execMeta"}`
 )
 
+// The test tracker's timing.
+const (
+	testSettle   = time.Second
+	testMaxDelay = 10 * time.Second
+	testForget   = 10 * time.Second
+)
+
 func newTestTracker() *Tracker {
 	return NewTracker(TrackerConfig{
-		QuietPeriod:    10 * time.Second,
-		EndGrace:       2 * time.Second,
+		Settle:         testSettle,
+		MaxDelay:       testMaxDelay,
+		ForgetAfter:    testForget,
 		BusyBackoff:    time.Second,
 		MaxBusyBackoff: 8 * time.Second,
 		MaxFailures:    3,
@@ -42,61 +50,6 @@ func roots(batches []Batch) []uint64 {
 	}
 	slices.Sort(out)
 	return out
-}
-
-func TestTrackerExportsRetainedAtSessionEnd(t *testing.T) {
-	tr := newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	notRetained := state(2, 11)
-	notRetained.Retained = false
-	tr.Observe(notRetained, t0)
-	// A lazy-evaluation span adds a part.
-	tr.Observe(Observation{CacheID: "c", Generation: 1, Session: "s1", Number: 1, Parts: []string{metaPart}}, t0)
-
-	if b := tr.Due(t0); len(b) != 0 {
-		t.Fatalf("due before the session ended: %v", roots(b))
-	}
-	tr.SessionEnded("c", 1, "s1", 3, t0)
-	batches := tr.Due(t0)
-	if len(batches) != 1 || !slices.Equal(batches[0].Request.Roots, []uint64{1}) {
-		t.Fatalf("batches %+v", batches)
-	}
-	b := batches[0]
-	if b.CacheID != "c" || len(b.Request.Outputs) != 2 {
-		t.Fatalf("batch %+v", b)
-	}
-	for _, o := range b.Request.Outputs {
-		if o.Number != 1 || (o.Address.Part != "fs" && o.Address.Part != "execMeta") {
-			t.Fatalf("output %+v", o)
-		}
-	}
-	// In flight: not handed out again.
-	if b := tr.All("c", t0); len(b) != 0 {
-		t.Fatalf("in-flight root handed out again: %v", roots(b))
-	}
-}
-
-func TestTrackerWaitsForAnnouncedSpans(t *testing.T) {
-	tr := newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	tr.SessionEnded("c", 1, "s1", 2, t0)
-	if b := tr.Due(t0.Add(time.Second)); len(b) != 0 {
-		t.Fatal("due while a span is still coming")
-	}
-	if got := roots(tr.Due(t0.Add(2 * time.Second))); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("after the grace: %v", got)
-	}
-}
-
-func TestTrackerQuietPeriod(t *testing.T) {
-	tr := newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	if b := tr.Due(t0.Add(9 * time.Second)); len(b) != 0 {
-		t.Fatal("due before the quiet period")
-	}
-	if got := roots(tr.Due(t0.Add(10 * time.Second))); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("after the quiet period: %v", got)
-	}
 }
 
 func TestTrackerStoredNotExportedAgain(t *testing.T) {
@@ -124,8 +77,18 @@ func TestTrackerPartsGrewDuringExport(t *testing.T) {
 	b := tr.All("c", t0)
 	tr.Observe(Observation{CacheID: "c", Generation: 1, Number: 1, Parts: []string{metaPart}}, t0)
 	tr.Done(b[0], Result{Stored: []uint64{1}}, t0)
-	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{1}) {
+	// Dirty again since the change in flight: due once it settles, not
+	// back to back with the export that just ended (#135 point 4).
+	if got := roots(tr.Due(t0.Add(testSettle - time.Millisecond))); len(got) != 0 {
+		t.Fatalf("re-exported before it settled: %v", got)
+	}
+	again := tr.Due(t0.Add(testSettle))
+	if got := roots(again); !slices.Equal(got, []uint64{1}) {
 		t.Fatalf("not re-exported after its parts grew: %v", got)
+	}
+	// The next export's value covers the new part.
+	if len(again[0].Request.Outputs) != 2 {
+		t.Fatalf("outputs %+v, want both parts", again[0].Request.Outputs)
 	}
 }
 
@@ -350,8 +313,10 @@ func TestTrackerStaleRefusalInFlightDropped(t *testing.T) {
 	if e := tr.Entries("c"); len(e) != 1 || e[0].Refused != "" || e[0].Failures != 0 {
 		t.Fatalf("entries %+v, want not refused, not failed", e)
 	}
-	if got := roots(tr.All("c", t0)); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("after the in-flight refusal: %v, want it exported again", got)
+	// Through Due, as the service runs (#129): nothing in flight changed
+	// the value, so done schedules it at once.
+	if got := exportedWithin(tr, t0, time.Hour); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("after the in-flight refusal: %v, want it exported again, once", got)
 	}
 }
 
@@ -513,22 +478,6 @@ func TestTrackerIgnoresBadParts(t *testing.T) {
 	}
 }
 
-func TestTrackerQuietSessionRemoved(t *testing.T) {
-	tr := newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	if got := roots(tr.Due(t0.Add(10 * time.Second))); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("quiet session: %v", got)
-	}
-	if n := len(tr.caches["c"].sessions); n != 0 {
-		t.Fatalf("%d sessions kept after export", n)
-	}
-	// A later span starts it again.
-	tr.Observe(state(2, 20, fsPart), t0.Add(11*time.Second))
-	if n := len(tr.caches["c"].sessions); n != 1 {
-		t.Fatalf("%d sessions after a new span", n)
-	}
-}
-
 func TestTrackerPrunedWhileWaitingIsForgotten(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)
@@ -561,7 +510,10 @@ func TestTrackerRetriesValueChangedInFlight(t *testing.T) {
 	newer.Replacements = 1
 	tr.Observe(newer, t0)
 	tr.Done(b[0], Result{Refused: []protocol.SkippedRoot{{Number: 1, Reason: protocol.SkipRefused}}}, t0)
-	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{1}) {
+	if got := roots(tr.Due(t0)); len(got) != 0 {
+		t.Fatalf("new value retried before it settled: %v", got)
+	}
+	if got := roots(tr.Due(t0.Add(testSettle))); !slices.Equal(got, []uint64{1}) {
 		t.Fatalf("new value not retried: %v", got)
 	}
 }
@@ -573,10 +525,14 @@ func TestTrackerNoRetryWhenStoredCovers(t *testing.T) {
 	tr.Observe(state(1, 10, fsPart), t0)
 	b := tr.All("c", t0)
 	tr.Observe(state(1, 20, fsPart), t0)
+	// The session ends with its spans in: its root is sped up, but in
+	// flight.
 	tr.SessionEnded("c", 1, "s1", 2, t0)
-	tr.Due(t0) // drops the session: its root is in flight
-	tr.Done(b[0], Result{Stored: []uint64{1}}, t0)
 	if got := roots(tr.Due(t0)); len(got) != 0 {
+		t.Fatalf("in-flight root in a second batch: %v", got)
+	}
+	tr.Done(b[0], Result{Stored: []uint64{1}}, t0)
+	if got := exportedWithin(tr, t0, time.Hour); len(got) != 0 {
 		t.Fatalf("stored root exported again: %v", got)
 	}
 }
@@ -667,54 +623,6 @@ func TestTrackerImportedIgnoresExpiry(t *testing.T) {
 	tr.SessionEnded("c", 1, "s1", 1, t0)
 	if got := roots(tr.Due(t0)); len(got) != 0 {
 		t.Fatalf("exported %v", got)
-	}
-}
-
-// A drain doesn't wait out the quiet period: a session that hasn't ended is
-// due at once. Due itself is unchanged.
-func TestTrackerDrainDueQuietSession(t *testing.T) {
-	tr := newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
-		t.Fatalf("due within the quiet period: %v", got)
-	}
-	tr.StartDrain(t0.Add(time.Second))
-	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
-		t.Fatalf("Due changed while draining: %v", got)
-	}
-	if got := roots(tr.DrainDue(t0.Add(time.Second))); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("drain due: %v", got)
-	}
-}
-
-// An ended session is due for a drain as for Due: once its spans are all in,
-// or EndGrace after its end. Its spans keep arriving meanwhile, and are
-// taken, so the drain exports them all.
-func TestTrackerDrainWaitsForEndedSessionsSpans(t *testing.T) {
-	tr := newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	tr.SessionEnded("c", 1, "s1", 2, t0)
-	tr.StartDrain(t0)
-	if got := roots(tr.DrainDue(t0.Add(time.Second))); len(got) != 0 {
-		t.Fatalf("due before its spans are in, within EndGrace: %v", got)
-	}
-	if st := tr.DrainStatus(t0, time.Time{}); len(st) != 1 || st[0].Sessions != 1 || st[0].Pending != 1 {
-		t.Fatalf("drain status %+v", st)
-	}
-	if !tr.Observe(state(2, 11, fsPart), t0.Add(time.Second)) {
-		t.Fatal("a span of a tracked session was dropped while draining")
-	}
-	if got := roots(tr.DrainDue(t0.Add(time.Second))); !slices.Equal(got, []uint64{1, 2}) {
-		t.Fatalf("drain due once its spans were in: %v", got)
-	}
-
-	// EndGrace bounds the wait, as in Due.
-	tr = newTestTracker()
-	tr.Observe(state(1, 10, fsPart), t0)
-	tr.SessionEnded("c", 1, "s1", 5, t0)
-	tr.StartDrain(t0)
-	if got := roots(tr.DrainDue(t0.Add(2 * time.Second))); !slices.Equal(got, []uint64{1}) {
-		t.Fatalf("drain due after EndGrace: %v", got)
 	}
 }
 

@@ -258,8 +258,8 @@ func TestDrainDoesNotStartRetryPastItsDeadline(t *testing.T) {
 		c.Tracker.BusyBackoff = backoff
 		c.Tracker.MaxBusyBackoff = backoff
 		// A session that ended with spans still to come keeps the drain
-		// busy until its deadline.
-		c.Tracker.EndGrace = 10 * backoff
+		// busy until its deadline (until Settle passes with none).
+		c.Tracker.Settle = 10 * backoff
 	})
 	digests := h.build()
 	h.cache.CorruptUploads(digests[1], 3)
@@ -305,8 +305,9 @@ func TestDrainCanceledReportsCanceled(t *testing.T) {
 	h, _ := newDrainHarness(t, func(c *ExportConfig) {
 		c.Now = clock.Now
 		// A session that ended with spans still to come keeps the drain
-		// busy while its engine is connected.
-		c.Tracker.EndGrace = time.Hour
+		// busy while its engine is connected (until Settle passes with
+		// none).
+		c.Tracker.Settle = time.Hour
 	})
 	h.postSpans("session-1", carrierSpan(5))
 	h.svc.testHookDrainWoken = func() {

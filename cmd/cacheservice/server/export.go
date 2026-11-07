@@ -28,21 +28,31 @@ type exportPath struct {
 	// cfg.Scope is replaced by the namespace.
 	cfg        exporter.Config
 	trackerCfg exporter.TrackerConfig
-	// tick is how often the scheduler looks for due exports, and
-	// noEngineWait how long a batch whose engine isn't connected waits.
+	// tick is the longest the scheduler waits before it looks for due
+	// exports again; it looks sooner when a tracker's NextDue says so, or
+	// a tracker calls kick. noEngineWait is how long a batch whose engine
+	// isn't connected waits.
 	tick         time.Duration
 	noEngineWait time.Duration
 	now          func() time.Time
 	// ctx runs the scheduler and every export.
 	ctx context.Context
+	// wake and drainWake wake the scheduler and the drain: a tracker's
+	// entries came due sooner, or a cache's slot was freed (kick).
+	wake, drainWake chan struct{}
 
 	wg workGroup
 }
 
 // ExportConfig configures the export path.
 type ExportConfig struct {
-	Exporter     exporter.Config
-	Tracker      exporter.TrackerConfig
+	Exporter exporter.Config
+	// Tracker configures each namespace's tracker; its Notify is the
+	// export path's.
+	Tracker exporter.TrackerConfig
+	// Tick is the longest the scheduler waits between looks for due
+	// exports (default 1s). It looks sooner when a tracker's next due time
+	// comes, or an export ends.
 	Tick         time.Duration
 	NoEngineWait time.Duration
 	// Now is the export path's clock, which the trackers and the drain
@@ -95,7 +105,10 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 		noEngineWait: cfg.NoEngineWait,
 		now:          cfg.Now,
 		ctx:          ctx,
+		wake:         make(chan struct{}, 1),
+		drainWake:    make(chan struct{}, 1),
 	}
+	p.trackerCfg.Notify = p.kick
 	s.export = p
 	s.metrics.ExportEnabled(true)
 	p.wg.Add()
@@ -106,30 +119,64 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 	return nil
 }
 
+// kick wakes the scheduler and the drain, without blocking: a tracker
+// calls it with its lock held (exporter.TrackerConfig.Notify).
+func (p *exportPath) kick() {
+	for _, ch := range []chan struct{}{p.wake, p.drainWake} {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// minSchedulerWait bounds how often the scheduler looks for due exports
+// when a next due time is already past, as when its clock stands still.
+const minSchedulerWait = 5 * time.Millisecond
+
 // scheduleExports runs the exports that come due until ctx ends, then waits
-// for those in flight.
+// for those in flight. It looks for them when the earliest next due time of
+// a namespace's tracker comes, when an export ends (its slot is freed) or a
+// tracker says entries came due sooner, and at least every tick.
 func (s *Service) scheduleExports(ctx context.Context) {
 	p := s.export
-	t := time.NewTicker(p.tick)
-	defer t.Stop()
+	timer := time.NewTimer(p.tick)
+	defer timer.Stop()
 	for {
+		// Drain schedules the exports while the service drains.
+		var next time.Time
+		if !s.draining.Load() {
+			for _, ns := range s.namespacesNow() {
+				s.startBatches(ctx, ns, ns.tracker.Due(p.now()))
+				s.metrics.ExportWaiting(ns.name, ns.tracker.WaitingForSlot())
+				if n := ns.tracker.NextDue(); !n.IsZero() && (next.IsZero() || n.Before(next)) {
+					next = n
+				}
+			}
+		}
+		wait := p.tick
+		if !next.IsZero() {
+			wait = min(wait, max(next.Sub(p.now()), minSchedulerWait))
+		}
+		timer.Reset(wait)
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-		}
-		// Drain schedules the exports while the service drains.
-		if s.draining.Load() {
-			continue
-		}
-		for _, ns := range s.namespacesNow() {
-			s.startBatches(ctx, ns, ns.tracker.Due(p.now()))
+		case <-timer.C:
+		case <-p.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 	}
 }
 
 // startBatches runs batches of a namespace, each in its own goroutine, which
-// Wait waits for.
+// Wait waits for. A tracker hands out at most one batch per engine cache at
+// a time, so batches of one cache run one after another.
 func (s *Service) startBatches(ctx context.Context, ns *namespace, batches []exporter.Batch) {
 	p := s.export
 	for _, b := range batches {

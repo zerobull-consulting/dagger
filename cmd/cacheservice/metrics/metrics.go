@@ -116,6 +116,7 @@ type Metrics struct {
 	exportCollected     *prometheus.CounterVec
 	draining            prometheus.Gauge
 	exportEnabled       prometheus.Gauge
+	exportWaiting       *prometheus.GaugeVec
 	drains              *prometheus.HistogramVec
 	drainStoredRoots    prometheus.Counter
 	drainLeftRoots      prometheus.Counter
@@ -340,6 +341,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "export_enabled",
 			Help: "1 when the export path is on, 0 when it is off: read-only (-export=false), or no bucket. A read-only instance never writes to or deletes from the bucket.",
 		}),
+		exportWaiting: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "export_roots_waiting",
+			Help: "Roots of a scope due for export and waiting, as the scheduler last saw them, for their engine cache's export in flight to end (one export per engine cache at a time) or for the next batch.",
+		}, []string{"scope"}),
 		drains: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "drain_duration_seconds",
 			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal).",
@@ -382,7 +387,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule, m.gcUnexpectedKeys, m.gcRefused,
 		m.exportCollected,
-		m.draining, m.exportEnabled, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
+		m.draining, m.exportEnabled, m.exportWaiting, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
 		m.otlpRefused, m.otlpRequestBytes,
 	}
 	if reg != nil {
@@ -813,6 +818,15 @@ func (m *Metrics) ExportEnabled(on bool) {
 		v = 1
 	}
 	m.exportEnabled.Set(v)
+}
+
+// ExportWaiting records how many roots of a scope are due and waiting for
+// their engine cache's slot, or the next batch.
+func (m *Metrics) ExportWaiting(scope string, roots int) {
+	if m == nil {
+		return
+	}
+	m.exportWaiting.WithLabelValues(scope).Set(float64(roots))
 }
 
 // DrainStarted records that the service started draining.

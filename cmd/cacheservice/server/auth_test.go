@@ -87,7 +87,7 @@ func newAuthHarnessOn(t *testing.T, blobs blobstore.Store, meta *metastore.Store
 	svc := New(slog.New(rec), "")
 	if err := svc.EnableExport(ctx, ExportConfig{
 		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
-		Tracker:  exporter.TrackerConfig{QuietPeriod: time.Minute, EndGrace: 50 * time.Millisecond},
+		Tracker:  exporter.TrackerConfig{Settle: time.Minute, MaxDelay: time.Minute},
 		Tick:     10 * time.Millisecond,
 	}); err != nil {
 		t.Fatal(err)
