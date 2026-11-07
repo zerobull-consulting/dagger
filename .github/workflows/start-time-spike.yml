@@ -4,6 +4,7 @@ name: start-time-spike
     branches: [remote-cache/action-start]
 permissions:
   contents: read
+  packages: read
 # Temporary (zerobull-consulting/dagger#161): the start's time before and after,
 # on cold runners, the same way. Removed before the PR is marked ready.
 jobs:
@@ -17,7 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: ./hack/remote-cache/engines.sh pin | tee -a "$GITHUB_ENV"
-      - run: docker build -f cmd/cacheservice/Dockerfile --build-arg REVISION=x -t cacheservice:ci .
+      - run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ github.token }}
       - id: store
         run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
       - run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
@@ -26,7 +29,6 @@ jobs:
         with:
           role: read-only
           version: ${{ env.STOCK_ENGINE_TAG }}
-          service-image: cacheservice:ci
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
@@ -47,7 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: ./hack/remote-cache/engines.sh pin | tee -a "$GITHUB_ENV"
-      - run: docker build -f cmd/cacheservice/Dockerfile --build-arg REVISION=x -t cacheservice:ci .
+      - run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ github.token }}
       - id: store
         run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
       - run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
@@ -56,7 +60,6 @@ jobs:
         with:
           role: read-only
           version: ${{ env.STOCK_ENGINE_TAG }}
-          service-image: cacheservice:ci
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
