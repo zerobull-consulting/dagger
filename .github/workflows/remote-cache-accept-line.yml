@@ -1,0 +1,88 @@
+name: Remote cache accept line
+# The "accept line only" check (zerobull-consulting/dagger#117, D5): the
+# release check's accept PRs (release-check/accept/<version>) auto-merge,
+# so each must add one accept line to cmd/cacheservice/compat/engines.txt
+# and change nothing else. Any other PR passes it. When it fails, it turns
+# the PR's auto-merge off. Make it a required check before setting
+# RELEASE_CHECK_AUTO_MERGE (hack/remote-cache/README.md, "Release check").
+#
+# It also runs the release check's own tests, offline.
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      # A changed base branch changes the diff.
+      - edited
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  accept-line-only:
+    name: accept line only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # The PR's head, with the history its merge base needs; no blobs until
+      # read, and no persisted credentials.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      # The base branch's copy of the check and of engines.sh, so a PR can't
+      # weaken the check it's measured by. Until the base has one, the PR's.
+      - name: Check the PR adds only one accept line
+        id: check
+        timeout-minutes: 5
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          dir=hack/remote-cache
+          if git cat-file -e "$BASE_SHA:$dir/accept-line-only.sh" 2>/dev/null; then
+            mkdir -p "$RUNNER_TEMP/base"
+            for f in accept-line-only.sh engines.sh; do
+              git show "$BASE_SHA:$dir/$f" >"$RUNNER_TEMP/base/$f"
+              chmod +x "$RUNNER_TEMP/base/$f"
+            done
+            dir="$RUNNER_TEMP/base"
+            echo "Running the base branch's check ($(git rev-parse --short "$BASE_SHA"))."
+          else
+            echo "The base branch has no check yet; running this PR's."
+          fi
+          echo "CHECK_DIR=$dir" >>"$GITHUB_ENV"
+          "$dir/accept-line-only.sh" check "$BASE_SHA" "$HEAD_SHA" "$HEAD_REF"
+      - name: Turn auto-merge off
+        if: failure() && steps.check.outcome == 'failure'
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: '"$CHECK_DIR/accept-line-only.sh" disable-auto-merge "$PR"'
+
+  tests:
+    name: release check scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The release check's tests
+        timeout-minutes: 5
+        run: ./hack/remote-cache/release-check_test.sh
+      - name: The accept-line-only check's tests
+        timeout-minutes: 5
+        run: ./hack/remote-cache/accept-line-only_test.sh

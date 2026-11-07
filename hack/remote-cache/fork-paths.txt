@@ -34,6 +34,8 @@ any       .github/workflows/cacheservice-publish.yml     builds the service's re
 any       .github/workflows/remote-cache-tests.yml       the service's unit, MinIO, e2e and sidecar jobs, and the release matrix's e2e and sidecar runs
 any       .github/workflows/remote-cache-spaces.yml      the service's DigitalOcean Spaces jobs
 any       .github/workflows/remote-cache-fork-paths.yml  runs this check
+any       .github/workflows/remote-cache-release-check.yml  the hourly release check: verifies each new upstream release and opens its accept, rebuild or reject PR (zerobull-consulting/dagger#117, D5)
+any       .github/workflows/remote-cache-accept-line.yml  the "accept line only" check on the release check's auto-merged PRs, and the release check's tests
 
 # Changes to upstream files the fork must make.
 deleted   .github/workflows/changelog.yml                gated on a needs/changelog label this repository doesn't have, so it only ever showed as a skipped check (zerobull-consulting/dagger#122)
