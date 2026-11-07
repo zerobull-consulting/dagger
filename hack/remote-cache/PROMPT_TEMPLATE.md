@@ -1,6 +1,6 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#171](https://github.com/zerobull-consulting/dagger/pull/171)
+**Version:** [zerobull-consulting/dagger#175](https://github.com/zerobull-consulting/dagger/pull/175)
 
 Every work item's prompt for the remote cache work is generated from this file. It holds the template, the conventions for the
 whole prompt, and the working agreement for review and merge (section 12).
@@ -169,8 +169,10 @@ agreement's full text below:
 - at most **two** Copilot reviews in all, counting every push's: review 1,
   one fix push, review 2, and **no push after review 2**;
 - review 2's confirmed findings become issues, the rest go to the tracking
-  issue's rolling leads issue, then the squash merge of review 2's head with
-  its explicit message, made by the session itself unless the prompt says the
+  issue's rolling leads issue, then the squash merge of review 2's head, or
+  the head of a push step 4's exception or step 6's CI fix allowed after it,
+  once the ruleset's required checks have passed on that head, with its
+  explicit message, made by the session itself unless the prompt says the
   user merges;
 - the exception for deleting data, publishing unverified blobs or bundles, or
   exposing a token.
@@ -277,8 +279,9 @@ keeps the rounds productive.
      review that push starts is handled like review 2: nothing more is pushed
      for it. If the fix needs a design decision, don't merge: stop and report.
 5. **Merge** (the session merges, unless the prompt says the user does):
-   squash-merge review 2's head (or the exception's push), once the ruleset's
-   required checks have passed on it, with the title and message set as in
+   squash-merge review 2's head, or the head of a push step 4's exception or
+   step 6's CI fix allowed after it, once the ruleset's required checks have
+   passed on that head, with the title and message set as in
    section 4, pinned to that head commit. Where the auto-merge tool can set
    the title and message and pin the head, enabling auto-merge (squash) is
    fine.
