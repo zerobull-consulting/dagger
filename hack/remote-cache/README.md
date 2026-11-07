@@ -70,13 +70,18 @@ local/dagger-cache/dev/`) to start over, or after a change of layout.
 
 The dev bucket has no lifecycle rule: staged uploads that were never
 promoted (an export cut short) stay until `dev.sh reset`, and are never read.
-To try the rule the service's README recommends
+To try the rules the service's README recommends
 ([lifecycle rule for staging](../../cmd/cacheservice/README.md#lifecycle-rule-for-staging)),
-once per namespace:
+with the service's prefix claimed (run it once), and the settings of
+`dev.sh env`:
 
 ```bash
-docker compose -f hack/remote-cache/compose.yaml exec minio sh -c 'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc ilm rule add --prefix <prefix>/ns/<namespace>/staging/ --expire-days 1 local/dagger-cache'
+go run ./cmd/cacheservice lifecycle plan -tokens-file <tokens> -abort-rule=false
+go run ./cmd/cacheservice lifecycle apply -tokens-file <tokens> -abort-rule=false -confirm=dagger-cache/<prefix>
 ```
+
+`-abort-rule=false`, since MinIO refuses the rule aborting incomplete
+multipart uploads ([below](#what-each-store-does)).
 
 Configure an AWS SDK client for MinIO with a base endpoint, a static
 credential, path-style addressing and checksums only when required. The SDK's
@@ -236,7 +241,7 @@ npx @dotenvx/dotenvx run -- bash -c '
 | `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
 | `CACHESERVICE_TEST_STORE` | `minio` (default) or `spaces`: what the tests expect where stores differ ([below](#what-each-store-does)). |
 | `E2E_S3_RESIGN` | `1` makes the e2e's proxy sign requests again for any store, to run that path against MinIO. |
-| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration. Leave it unset on a shared bucket. |
+| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration, and the `lifecycle` command's tests (`TestMinIOLifecycle*`) merge into it and put it back. Leave it unset on a shared bucket. |
 
 ### What keeps a shared bucket safe
 
@@ -259,8 +264,11 @@ enforces this in test setup:
   bucket-level change. The one exception is the lifecycle configuration with
   `CACHESERVICE_TEST_DISPOSABLE_BUCKET=1`, since
   `PutBucketLifecycleConfiguration` replaces the whole bucket's. Without it,
-  `TestMinIOGC` skips that part, and expects no rule. Reads are not limited:
-  they change nothing.
+  `TestMinIOGC` skips that part, and expects no rule, and the `lifecycle`
+  command's tests skip. Those tests and `TestMinIOGC` take a lock on this
+  machine (`s3test.LockLifecycle`), since `go test` runs their packages at
+  once. The `lifecycle` tests put back the configuration they found when
+  they end. Reads are not limited: they change nothing.
 - Each test deletes its objects, with their versions and delete markers on a
   versioned bucket, and aborts its uploads when it ends, failed or not, and
   fails if any are left. The key needs to be allowed to list versions.
@@ -315,7 +323,7 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
-| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)** | Both accepted with a full-access key; **403 with a more limited key** | Whether they take effect isn't checked: rules run on a scale of days. |
+| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. Whether a `Read/Write/Delete` limited key can *read* them: not run | Set only by `cacheservice lifecycle apply`, with a full-access key (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |
 | A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
 | Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
 | Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |

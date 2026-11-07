@@ -187,7 +187,10 @@ ones the unit tests use. The stores and the export and import logic are in
 [`exporter`](exporter/) and [`importer`](importer/), and garbage collection
 in [`gc`](gc/). What the service measures is in [`metrics`](metrics/). Every
 key the service writes is in [`layout`](layout/), and the ownership marker
-and its startup check in [`ownership`](ownership/).
+and its startup check in [`ownership`](ownership/). The one-shot
+`cacheservice lifecycle` subcommand, which sets the bucket's lifecycle rules,
+is [`lifecycle`](lifecycle/) (see
+[The lifecycle command](#the-lifecycle-command)).
 
 ## Bucket ownership
 
@@ -539,50 +542,139 @@ can't match `<prefix>/ns/*/staging/`. The options, and the choice:
 Plus one rule for the whole prefix that aborts incomplete multipart uploads
 (a promotion aborts its own, but a service killed mid-copy leaves its parts).
 
+#### The `lifecycle` command
+
+`cacheservice lifecycle` generates these rules from the tokens file, merges
+them into the bucket's configuration, and checks a bucket against them
+([zerobull-consulting/dagger#140](https://github.com/zerobull-consulting/dagger/issues/140)).
+It is a subcommand of the service's binary, so it ships in the image, and it
+reads the same `CACHESERVICE_S3_*` settings:
+
+```bash
+cacheservice lifecycle plan  -tokens-file tokens   # the default: print the rules and the diff; changes nothing
+cacheservice lifecycle apply -tokens-file tokens -confirm=dagger-cache/cache
+cacheservice lifecycle check -tokens-file tokens   # read-only: exit 3 if a rule is missing or too broad
+```
+
+or, from the image (`docker run --rm --env-file s3.env -v "$PWD/tokens:/tokens:ro"
+ghcr.io/zerobull-consulting/dagger-remote-cache:<tag> lifecycle plan -tokens-file /tokens`).
+Without `-tokens-file`, the one namespace is `-scope` (`default`), as for
+the service.
+
+**Run `apply` with the admin key, interactively.** Setting lifecycle rules
+takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
+key), since a rule can expire anything in the bucket. Run it once when a
+bucket is set up, and again when the tokens file's namespaces change, from
+your own shell, with the key in your environment for that one command. Never
+put the admin key in the service's secrets or a CI job's: no job needs it.
+`plan` and `check` only read, so they run with the writer's key, which needs
+`s3:GetLifecycleConfiguration` for them (see [the keys](#the-keys)). See
+[Retention and garbage collection](#retention-and-garbage-collection) for
+the three keys.
+
+What it does:
+
+- **`plan`** prints the bucket and prefix, the namespaces and where they came
+  from, the ownership marker, then one line per rule of the command's: `=`
+  kept, `+` added, `~` updated (same ID, other content) or replaced (another
+  ID of the command's for the same prefix and action, such as the former
+  hand-made IDs below), `-` removed. Then how many other rules there are, the
+  total against the store's limit, and the command's rules as JSON. It warns
+  of any rule that expires a namespace's live data, and ends with the `apply`
+  command for this plan: the same `-tokens-file` or `-scope`, the same
+  options, and `-allow-removals` when it removes rules.
+- **`apply` merges.** `PutBucketLifecycleConfiguration` replaces the whole
+  configuration, so `apply` reads it, replaces only the rules it owns, and
+  writes every other rule back as it read it. It owns a rule whose ID
+  starts with `cacheservice-<hash>-`, the hash of its prefix (see Rule IDs
+  below), and whose filter's prefix is under the service's prefix, or one
+  with a former hand-made ID on exactly that ID's target (below): two
+  services on two prefixes of one bucket, nested or not, each own their
+  own, and other tools' rules are never touched. After writing, it reads
+  the configuration back and checks that its rules are as wanted and the
+  others exactly as they were. S3 has no conditional write for the
+  configuration, so a change another tool makes between `apply`'s read and
+  its write is lost, and that check reports it: don't run `apply` while
+  something else changes the rules. When nothing changes, it writes
+  nothing.
+- **`apply` refuses**, exit 2 and nothing written: without `-confirm`
+  repeating the bucket and the prefix (`<bucket>/<prefix>`, `<bucket>/` for
+  an empty prefix); and when it would remove a rule nothing replaces, such
+  as the staging rule of a namespace no longer in the tokens file, unless
+  `-allow-removals` is passed. A removal costs nothing (GC expires that
+  namespace's staged uploads itself), but a wrong tokens file, or a missing
+  `-tokens-file`, would otherwise remove every namespace's rule at once.
+- **`apply` refuses**, exit 1: a prefix without the service's ownership marker
+  of this layout, as GC does (start the service on it first: a writer claims
+  an empty prefix); a configuration it can't read (it never writes one it
+  couldn't merge); a result over the store's limit (`-max-rules`, 1,000 as
+  on AWS); a wanted ID that a rule it doesn't own already has; and any rule
+  broader than a namespace's staging prefix, except the rule that only aborts
+  uploads, on the prefix itself. That last check (`lifecycle.CheckSafe`) runs
+  on every rule it would write, so no rule it writes can expire live data.
+- **`check`** reads the configuration and exits 3 when a namespace lacks its
+  staging rule (what `gc_staging_rule_missing` reports, by the same rule
+  parsing), when a rule expires a namespace's live data (GC's `liveRules`
+  warning, and also a rule that expires on a date, filters by a tag or
+  size too, or transitions objects to another storage class, which can
+  leave them unreadable), or when a rule of the command's is too broad. It exits 1 when
+  the configuration can't be read (`TestMinIOLifecycleCheckUnreadable`). The
+  abort rule's absence is a note, not a failure. It doesn't run GC, and it
+  checks the tokens file's namespaces, not those with data in the bucket:
+  GC's metric covers those.
+
+Exit codes: 0 ok, 1 an error or a refusal, 2 a flag or confirmation error,
+3 `check` found something. Every request is bounded (30s), and the whole
+run by `-timeout` (2m). It prints no key or token: the tokens file is read
+for its namespaces only.
+
+**Rule IDs** are `cacheservice-<hash>-staging-<namespace>` and
+`cacheservice-<hash>-incomplete-uploads`, where `<hash>` is 8 hex digits of
+the SHA-256 of the prefix with its trailing slash (`cache/` gives
+`daa886c7`). The hash keeps IDs unique between prefixes of one bucket, as S3
+requires. Namespaces are validated as the service validates them (at most
+128 letters, digits, `.`, `_` or `-`), so an ID is at most 158 characters,
+under S3's 255; `CheckSafe` checks every ID again before writing.
+
+**Stores.** MinIO refuses a rule with `AbortIncompleteMultipartUpload` (400
+`InvalidArgument`, see `hack/remote-cache/README.md`, "What each store
+does"). `apply` fails, writes nothing, and names that as the likely cause
+of a 400: run it with `-abort-rule=false` there. MinIO drops stale uploads itself after 24 hours (its `api
+stale_uploads_expiry`), and GC aborts stale ones at blob keys. A Spaces key
+that isn't full-access gets 403, which `apply` explains as needing the admin
+key. Tested against MinIO (`TestMinIOLifecycle`: plan, apply, a foreign rule
+kept, a second apply writing nothing, a removed namespace losing its rule
+with `-allow-removals`, check before and after, the abort rule refused) and
+in unit tests; not yet run on Spaces.
+
+#### The rules, for reference
+
 On AWS, with the service's prefix `cache` and namespaces `team-a` and
-`team-b`:
+`team-b`, `plan` prints these:
 
 ```json
 {
   "Rules": [
-    {"ID": "cacheservice-staging-team-a", "Status": "Enabled",
+    {"ID": "cacheservice-daa886c7-staging-team-a", "Status": "Enabled",
      "Filter": {"Prefix": "cache/ns/team-a/staging/"}, "Expiration": {"Days": 1}},
-    {"ID": "cacheservice-staging-team-b", "Status": "Enabled",
+    {"ID": "cacheservice-daa886c7-staging-team-b", "Status": "Enabled",
      "Filter": {"Prefix": "cache/ns/team-b/staging/"}, "Expiration": {"Days": 1}},
-    {"ID": "cacheservice-incomplete-copies", "Status": "Enabled",
+    {"ID": "cacheservice-daa886c7-incomplete-uploads", "Status": "Enabled",
      "Filter": {"Prefix": "cache/"}, "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}
   ]
 }
 ```
 
-```bash
-aws s3api put-bucket-lifecycle-configuration --bucket dagger-cache --lifecycle-configuration file://lifecycle.json
-```
-
-That call replaces the bucket's whole lifecycle configuration: merge these
-rules into any the bucket has. The rules can be generated from the tokens
-file (a namespace's rule is the same whichever of its tokens names it):
-
-```bash
-awk '!/^#/ && NF >= 2 {print $2}' tokens | sort -u |
-  jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
-    Filter: {Prefix: ($p + "/ns/" + . + "/staging/")}, Expiration: {Days: 1}}' |
-  jq -s --arg p cache '{Rules: (. + [{ID: "cacheservice-incomplete-copies", Status: "Enabled",
-    Filter: {Prefix: ($p + "/")}, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}}])}' > lifecycle.json
-```
-
-Without a tokens file, the one namespace is `-scope` (`default`):
-`cache/ns/default/staging/`.
-
-On MinIO, with `mc` (the alias `local` and bucket `dagger-cache` of
-`hack/remote-cache`):
-
-```bash
-mc ilm rule add --prefix cache/ns/team-a/staging/ --expire-days 1 local/dagger-cache
-```
-
-once per namespace. MinIO drops incomplete multipart uploads on its own
-(after 24 hours, its `api stale_uploads_expiry`).
+Before the command, this section built them by hand from the tokens file
+(an `awk` and `jq` pipeline) and applied them with `aws s3api
+put-bucket-lifecycle-configuration` or `mc ilm rule add`, with IDs
+`cacheservice-staging-<namespace>` and `cacheservice-incomplete-copies`.
+`apply` takes a rule with one of those IDs over as its own only on exactly
+its target under the prefix (`<prefix>/ns/<namespace>/staging/`, or
+`<prefix>/`), and replaces it with the IDs above. Use the
+command rather than writing the configuration by hand: that call replaces
+the bucket's whole configuration, and a hand-made merge can drop another
+tool's rules.
 
 ### Repairing blobs stored before verification
 
@@ -1359,6 +1451,12 @@ bucket, other namespaces' included, so give the cache a bucket of its own.
 Spaces also refuses a limited access key on a bucket with a bucket policy
 (`PutBucketPolicy`).
 
+Spaces keys come at three levels, which match the
+[three keys](#the-keys): a limited key with `Read` here, a limited key with
+`Read/Write/Delete` for the writer, and a full-access key only for setting
+lifecycle rules (`cacheservice lifecycle apply`), which a limited key can't
+(403). Keep the full-access key out of the jobs' secrets.
+
 ## OTLP limits
 
 The OTLP receivers bound what a request can make the service read and hold
@@ -1646,16 +1744,11 @@ the defaults: neither file decides that a namespace's data goes.
 - A namespace can have limits and no tokens: `-scope` without a tokens file,
   or a namespace whose tokens were all revoked, whose data still needs
   collecting.
-- It is the one list of namespaces an operator maintains: the staging
-  lifecycle rules can be generated from it (below and
-  [Lifecycle rule for staging](#lifecycle-rule-for-staging)), as they can
-  from the tokens file:
-
-```bash
-awk '!/^#/ && NF >= 1 && $1 != "*" {print $1}' namespaces | sort -u |
-  jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
-    Filter: {Prefix: ($p + "/ns/" + . + "/staging/")}, Expiration: {Days: 1}}' | jq -s .
-```
+- It is the one list of namespaces an operator maintains. The staging
+  lifecycle rules come from the tokens file, though
+  ([The lifecycle command](#the-lifecycle-command)): only a namespace with
+  tokens has engines that stage uploads, and one whose tokens were all
+  revoked keeps its rule until `lifecycle apply -allow-removals` runs.
 
 ### Blobs are kept per namespace
 
@@ -2192,7 +2285,8 @@ under the prefix, once per run (`FilterAllUploads`). It doesn't on AWS
 S3, which lists by prefix. MinIO also drops stale uploads itself after 24h.
 
 **Lifecycle rules.** Keep the staging rules and the multipart rule of
-[Lifecycle rule for staging](#lifecycle-rule-for-staging): they cost the
+[Lifecycle rule for staging](#lifecycle-rule-for-staging), set with
+[`cacheservice lifecycle apply`](#the-lifecycle-command): they cost the
 service nothing. Don't add rules for bundles, resolutions, blobs or the
 index: whether one is in use depends on the index, not its age, and a rule
 by age would delete live entries' data, leaving the index naming missing
@@ -2256,6 +2350,27 @@ The service's credentials also need `s3:ListBucket`,
 `uploads_unlisted`), `s3:DeleteObject` on every key under the prefix, and,
 to report namespaces without a staging rule,
 `s3:GetLifecycleConfiguration` on the bucket.
+
+#### The keys
+
+Keep three credentials, each with only what it needs
+([zerobull-consulting/dagger#140](https://github.com/zerobull-consulting/dagger/issues/140)):
+
+| Key | Who holds it | What it needs |
+| --- | --- | --- |
+| **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
+| **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs. On Spaces, a full-access key: a limited key gets 403. |
+
+The admin key is the most powerful: a lifecycle rule can expire anything in
+the bucket. Use it only for `lifecycle apply`, interactively, and keep it out
+of every CI secret and the service's environment. Neither the service nor
+the sidecar action ever writes lifecycle rules: they only read them, once
+per GC run (`TestServiceNeverWritesLifecycleSource` checks the sources,
+`TestMinIOBinaryNeverWritesLifecycle` a running writer's requests through a
+proxy that refuses any lifecycle write). Whether a Spaces `Read/Write/Delete`
+key can read the configuration hasn't been run; if it can't, GC falls back
+to expiring staged uploads itself, which is safe but costs requests.
 
 ## Stopping and draining
 
