@@ -1,7 +1,9 @@
 # remote-cache: start and stop
 
-Two actions run the remote cache service (`cmd/cacheservice`) and a stock
-engine of one accepted version side by side on a GitHub Actions runner:
+Two actions manage the remote cache service (`cmd/cacheservice`) and a stock
+engine of one accepted version, side by side on a GitHub Actions runner:
+`start` starts them (and stops them at the end of the job), and `stop` stops
+them earlier.
 
 - **`start`** installs the `dagger` CLI with
   [`dagger/dagger-for-github`](https://github.com/dagger/dagger-for-github),
@@ -151,7 +153,7 @@ fills, pass an `engine-config` with GC on.
 | Output | What it is |
 | --- | --- |
 | `dagger` | The CLI set up for the sidecar. It is also first on `PATH` for later steps. |
-| `version`, `service-image`, `engine-image` | What the sidecar runs . |
+| `version`, `service-image`, `engine-image` | What the sidecar runs. |
 | `runner-host` | The engine, as `_EXPERIMENTAL_DAGGER_RUNNER_HOST` (`docker-container://<name>-engine`). |
 | `service-url` | The service, as the engine and the CLI reach it: on the sidecar network's gateway, which only this runner reaches. |
 | `service-container`, `engine-container` | The containers. |
