@@ -769,8 +769,8 @@ Each token is an environment secret:
 
 | Token | Permissions | Environment | Secret | Used by |
 |---|---|---|---|---|
-| `dagger-cache-bot-pr` | Contents, Pull requests: write | `cache-bot-pr` | `CACHE_BOT_PR_TOKEN` | the release check's `accept` and `reject` PRs |
-| `dagger-cache-bot-sync` | Contents, Pull requests, Workflows: write | `cache-bot-sync` | `CACHE_BOT_SYNC_TOKEN` | the nightly sync, and the release check's rebuild on a new upstream tag |
+| `dagger-cache-bot-pr` | Contents: write, Pull requests: write | `cache-bot-pr` | `CACHE_BOT_PR_TOKEN` | the release check's `accept` and `reject` PRs |
+| `dagger-cache-bot-sync` | Contents: write, Pull requests: write, Workflows: write | `cache-bot-sync` | `CACHE_BOT_SYNC_TOKEN` | the nightly sync, and the release check's rebuild on a new upstream tag |
 
 - **Scope.** Both tokens are owned by `zerobull-consulting` and reach this
   repository only.
@@ -783,9 +783,10 @@ Each token is an environment secret:
   expiry: regenerate each one with the same permissions, then update its
   secret.
 - **Environments.** Neither has reviewers or a wait timer, and both deploy
-  only from `feature/remote-cache`, the default branch. Scheduled and
-  dispatched runs get the secrets; a `pull_request` run, whose ref is the
-  pull request's, doesn't. A job reads a token with
+  only from `feature/remote-cache`, the default branch. Scheduled runs,
+  and dispatches on `feature/remote-cache`, get the secrets. A dispatch on
+  any other ref doesn't, and neither does a `pull_request` run, whose ref is
+  the pull request's. A job reads a token with
   `environment: cache-bot-pr` (or `cache-bot-sync`).
 - **Never from `pull_request_target` or `workflow_run`.** Those run on the
   default branch's ref, so the branch rule would let them in, while they can
