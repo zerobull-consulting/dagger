@@ -260,6 +260,10 @@ checks the prefix:
 | none | nothing | creates the marker (`If-None-Match: *`), starts; unless a multipart upload is in progress there (exit 1) | starts, with nothing to import; writes nothing |
 | none | keys | exits 1 | exits 1 |
 
+- **Claiming without starting a writer:** `cacheservice lifecycle claim`
+  makes the same claim (this table's "none, nothing" row, as a writer) and
+  stops, for an operator who has only the admin key (see
+  [The `lifecycle` command](#the-lifecycle-command)).
 - **Two writers on an empty prefix** both start: both create the marker
   with `If-None-Match: *`, one wins, and the other reads the winner's marker
   (`TestWritersRaceOnEmptyPrefix`, `TestMinIOBinaryWritersRaceOnEmptyPrefix`).
@@ -563,6 +567,7 @@ reads the same `CACHESERVICE_S3_*` settings:
 
 ```bash
 cacheservice lifecycle plan  -tokens-file tokens   # the default: print the rules and the diff; changes nothing
+cacheservice lifecycle claim -confirm=dagger-cache/cache   # once per prefix: creates the ownership marker on an empty prefix
 cacheservice lifecycle apply -tokens-file tokens -confirm=dagger-cache/cache
 cacheservice lifecycle check -tokens-file tokens   # read-only: exit 3 if a rule is missing or too broad
 ```
@@ -572,7 +577,22 @@ ghcr.io/zerobull-consulting/dagger-remote-cache:<tag> lifecycle plan -tokens-fil
 Without `-tokens-file`, the one namespace is `-scope` (`default`), as for
 the service.
 
-**Run `apply` with the admin key, interactively.** Setting lifecycle rules
+**Setting up a fresh bucket or prefix**, with the admin key, from your own
+shell, in this order:
+
+1. `lifecycle claim -confirm=<bucket>/<prefix>`: `apply` refuses a prefix
+   without the service's ownership marker, and on a fresh bucket the admin
+   key is the only key there is, which must never go in the service's
+   environment, so no writer can claim the prefix first. `claim` makes the
+   claim a writer makes at startup, with the admin key.
+2. `lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>` (on
+   MinIO, with `-abort-rule=false`).
+3. `lifecycle check -tokens-file tokens`: exit 0.
+
+Then start the service with its own key (the Read/Write/Delete one). A prefix
+a writer already started on needs no `claim`; running it anyway is harmless.
+
+**Run `apply` and `claim` with the admin key, interactively.** Setting lifecycle rules
 takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
 key), since a rule can expire anything in the bucket. Run it once when a
 bucket is set up, and again when the tokens file's namespaces change, from
@@ -585,6 +605,19 @@ the three keys.
 
 What it does:
 
+- **`claim`** creates the prefix's ownership marker, `<prefix>/cacheservice.json`,
+  by the same check a writer makes at startup (`ownership.Check` in writer
+  mode, with `If-None-Match: *`), and does nothing else: it starts no
+  server and runs no conditional-write probe, and the marker is the only
+  object it writes. It needs `-confirm=<bucket>/<prefix>` (`<bucket>/` for an
+  empty prefix), like `apply`, and reads no tokens file. It is idempotent: with
+  a marker of this layout there already, it prints `already claimed`, writes
+  nothing and exits 0. It exits 1, writing nothing, on a prefix that holds keys
+  and no marker, one with a marker of another layout, a prefix inside another
+  service's, an upload in progress under it, or a store error (a 403 is
+  explained as needing a key that can write there). There is no
+  `apply -claim`: keeping the steps apart keeps `apply`'s refusal of an
+  unowned prefix a real check.
 - **`plan`** prints the bucket and prefix, the namespaces and where they came
   from, the ownership marker, then one line per rule of the command's: `=`
   kept, `+` added, `~` updated (same ID, other content) or replaced (another
@@ -616,8 +649,8 @@ What it does:
   namespace's staged uploads itself), but a wrong tokens file, or a missing
   `-tokens-file`, would otherwise remove every namespace's rule at once.
 - **`apply` refuses**, exit 1: a prefix without the service's ownership marker
-  of this layout, as GC does (start the service on it first: a writer claims
-  an empty prefix); a configuration it can't read (it never writes one it
+  of this layout, as GC does (on an empty prefix, run `lifecycle claim` first,
+  or start a writer on it); a configuration it can't read (it never writes one it
   couldn't merge); a result over the store's limit (`-max-rules`, 1,000 as
   on AWS); a wanted ID that a rule it doesn't own already has; and any rule
   broader than a namespace's staging prefix, except the rule that only aborts
@@ -634,8 +667,8 @@ What it does:
   checks the tokens file's namespaces, not those with data in the bucket:
   GC's metric covers those.
 
-Exit codes: 0 ok, 1 an error or a refusal, 2 a flag or confirmation error,
-3 `check` found something. Every request is bounded (30s), and the whole
+Exit codes: 0 ok, 1 an error or a refusal, 2 a flag or confirmation error
+(`apply` or `claim` without a matching `-confirm`), 3 `check` found something. Every request is bounded (30s), and the whole
 run by `-timeout` (2m). It prints no key or token: the tokens file is read
 for its namespaces only.
 
@@ -655,8 +688,16 @@ stale_uploads_expiry`), and GC aborts stale ones at blob keys. A Spaces key
 that isn't full-access gets 403, which `apply` explains as needing the admin
 key. Tested against MinIO (`TestMinIOLifecycle`: plan, apply, a foreign rule
 kept, a second apply writing nothing, a removed namespace losing its rule
-with `-allow-removals`, check before and after, the abort rule refused) and
-in unit tests; not yet run on Spaces.
+with `-allow-removals`, check before and after, the abort rule refused;
+`TestMinIOLifecycleClaim`: claim, then apply and check, a second claim
+writing nothing; `TestMinIOLifecycleClaimRefusesKeys`) and in unit tests.
+
+On DigitalOcean Spaces, as observed on 2026-11-07 on a bucket in sfo3, prefix
+`cache`, namespace `default` (the first run on Spaces): with a prefix claimed
+by a writer, a full-access key ran `lifecycle apply` (2 rules added, read
+back) and `lifecycle check` (ok, exit 0). A limited Read/Write/Delete key
+could not read the lifecycle configuration (`GetBucketLifecycleConfiguration`
+returned 403 `AccessDenied`), so `lifecycle check` needs the admin key.
 
 #### The rules, for reference
 
@@ -1420,8 +1461,9 @@ check (`TestMinIOBinaryReadOnlyKeyRefusedAsWriter`): that
 is what stops a
 pull-request job that forgot `-export=false` from running as a writer whose
 every export fails. MinIO answers 404 for a missing key even without
-`s3:ListBucket` (checked with a `GetObject`-only user); AWS S3 documents the
-403, which hasn't been run here.
+`s3:ListBucket` (checked with a `GetObject`-only user); so does Spaces with a
+limited `Read` key (below); AWS S3 documents the 403, which hasn't been run
+here.
 
 **MinIO** (what `hack/remote-cache/compose.yaml`'s `create-readonly-user`
 does), with `dagger-cache` and `cache` for your bucket and prefix:
@@ -1453,11 +1495,13 @@ check the bucket policy grants nothing wider.
 **DigitalOcean Spaces:** Spaces has no IAM policies; it has per-bucket
 [limited access keys](https://docs.digitalocean.com/products/spaces/how-to/manage-access/),
 each bucket with `Read` or `Read/Write/Delete`. Create one with `Read` on the
-cache's bucket only. What is confirmed: Spaces documents those two levels,
-per bucket. What isn't: this repository's CI runs on Spaces with a
-read/write key, and a `Read` key hasn't been run against the service, so
-which S3 calls it allows (and whether a missing key answers 404) is
-unchecked. It is per bucket, not per prefix: it reads every prefix of the
+cache's bucket only. Observed on 2026-11-07 (sfo3, prefix `cache`): a limited
+`Read` key could GET, HEAD and list objects and list multipart uploads; PUT,
+DELETE and CreateMultipart returned 403; a missing key returned 404
+`NoSuchKey`, not 403; and `GetBucketLifecycleConfiguration` returned 403. A
+read-only instance (`-export=false`) with that key started cleanly, and the
+same key without `-export=false` exited 1 with 403 on the conditional-write
+check. It is per bucket, not per prefix: it reads every prefix of the
 bucket, other namespaces' included, so give the cache a bucket of its own.
 Spaces also refuses a limited access key on a bucket with a bucket policy
 (`PutBucketPolicy`).
@@ -2379,9 +2423,16 @@ of every CI secret and the service's environment. Neither the service nor
 the sidecar action ever writes lifecycle rules: they only read them, once
 per GC run (`TestServiceNeverWritesLifecycleSource` checks the sources,
 `TestMinIOBinaryNeverWritesLifecycle` a running writer's requests through a
-proxy that refuses any lifecycle write). Whether a Spaces `Read/Write/Delete`
-key can read the configuration hasn't been run; if it can't, GC falls back
-to expiring staged uploads itself, which is safe but costs requests.
+proxy that refuses any lifecycle write). On Spaces, as observed
+on 2026-11-07 (sfo3, prefix `cache`), a limited `Read/Write/Delete` key could put,
+get and list objects, list multipart uploads, create and abort a multipart
+upload, and delete, but could not read the lifecycle configuration
+(`GetBucketLifecycleConfiguration` returned 403 `AccessDenied`). GC then logs
+"can't read the bucket's lifecycle rules, so it expires every namespace's
+staged uploads itself" on each run, the fallback above, which is safe but
+costs requests; and `lifecycle check` needs the admin key there. A writer
+with such a key also claimed an empty prefix at startup, creating the marker
+with `If-None-Match: *`.
 
 ## Stopping and draining
 
@@ -3205,10 +3256,10 @@ first merge is done, so a build that starts at once can miss what it hasn't
 merged yet
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 
-- **DigitalOcean Spaces' `Read` key** hasn't been run against the service
-  yet: this work's walk-through had no Spaces key, and CI's Spaces jobs use a
-  read/write one. What MinIO confirms of the read-only key, and what
-  Spaces documents, is in [A read-only key](#a-read-only-key).
+- **DigitalOcean Spaces' `Read` key** was run against the service on
+  2026-11-07, after this walk-through (which had no Spaces key); CI's Spaces
+  jobs still use a read/write one. What it showed is in
+  [A read-only key](#a-read-only-key).
 
 **The prefix is the service's** (see [Bucket ownership](#bucket-ownership)):
 nothing else may write under `CACHESERVICE_S3_PREFIX`, including another

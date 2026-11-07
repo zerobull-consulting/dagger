@@ -389,6 +389,11 @@ type fakeStore struct {
 	puts   int
 	gets   int
 	onGet  func(n int)
+	// keys is set when the prefix holds keys and no marker; claimErr is
+	// what Claim fails with; claims counts the markers written.
+	keys     bool
+	claimErr error
+	claims   int
 }
 
 func (f *fakeStore) GetLifecycle(context.Context) (Config, error) {
@@ -416,6 +421,25 @@ func (f *fakeStore) ReadMarker(context.Context, string) (ownership.Marker, error
 		return ownership.Marker{}, f.marker
 	}
 	return ownership.Marker{Layout: layout.Version}, nil
+}
+
+// Claim is ownership.Check for a writer: an empty prefix gets its marker,
+// one that holds keys is refused, and a marker already there is left alone.
+func (f *fakeStore) Claim(context.Context, string) (ownership.State, ownership.Marker, error) {
+	if f.claimErr != nil {
+		return 0, ownership.Marker{}, f.claimErr
+	}
+	switch {
+	case f.marker == nil:
+		return ownership.Owned, ownership.Marker{Layout: layout.Version, Created: time.Now()}, nil
+	case errors.Is(f.marker, ownership.ErrNoMarker) && f.keys:
+		return 0, ownership.Marker{}, &ownership.ErrNotOwned{Prefix: "cache", Keys: []string{"cache/x"}}
+	case errors.Is(f.marker, ownership.ErrNoMarker):
+		f.marker = nil
+		f.claims++
+		return ownership.Claimed, ownership.Marker{Layout: layout.Version, Created: time.Now()}, nil
+	}
+	return 0, ownership.Marker{}, f.marker
 }
 
 func apiError(status int, code string) error {
@@ -523,8 +547,13 @@ func TestApplyRemovals(t *testing.T) {
 func TestApplyRefusesUnownedPrefix(t *testing.T) {
 	for _, err := range []error{ownership.ErrNoMarker, &ownership.ErrOtherLayout{Key: "k", Found: 1}, errors.New("unreadable")} {
 		st := &fakeStore{marker: err}
-		if code, out := run(t, opts("apply", "a"), st); code != ExitError || st.puts != 0 {
+		code, out := run(t, opts("apply", "a"), st)
+		if code != ExitError || st.puts != 0 {
 			t.Fatalf("%v: %d\n%s", err, code, out)
+		}
+		// Only a prefix with no marker is one claim can help with.
+		if got := strings.Contains(out, "lifecycle claim -confirm=bkt/cache"); got != errors.Is(err, ownership.ErrNoMarker) {
+			t.Fatalf("%v: the refusal names `lifecycle claim`: %v\n%s", err, got, out)
 		}
 		// plan and check only report it.
 		if code, _ := run(t, opts("plan", "a"), st); code != ExitOK {
@@ -672,5 +701,93 @@ func TestMain(t *testing.T) {
 	t.Setenv(blobstore.EnvBucket, "")
 	if code, _ := main(); code != ExitUsage {
 		t.Errorf("no bucket: %d", code)
+	}
+}
+
+// claim creates the marker on an empty prefix, and apply works right after
+// on the same store; a second claim writes nothing.
+func TestClaim(t *testing.T) {
+	st := &fakeStore{marker: ownership.ErrNoMarker}
+	if code, out := run(t, opts("apply", "a"), st); code != ExitError {
+		t.Fatalf("apply before claim: %d\n%s", code, out)
+	}
+	code, out := run(t, opts("claim"), st)
+	if code != ExitOK || st.claims != 1 || st.puts != 0 || !strings.Contains(out, "created cache/cacheservice.json") {
+		t.Fatalf("claim: %d, %d claims, %d puts\n%s", code, st.claims, st.puts, out)
+	}
+	if st.gets != 0 {
+		t.Fatalf("claim read the lifecycle configuration: %d gets", st.gets)
+	}
+	if code, out := run(t, opts("apply", "a"), st); code != ExitOK || st.puts != 1 {
+		t.Fatalf("apply after claim: %d, %d puts\n%s", code, st.puts, out)
+	}
+	if code, out := run(t, opts("check", "a"), st); code != ExitOK {
+		t.Fatalf("check after claim and apply: %d\n%s", code, out)
+	}
+	code, out = run(t, opts("claim"), st)
+	if code != ExitOK || st.claims != 1 || !strings.Contains(out, "already claimed") {
+		t.Fatalf("second claim: %d, %d claims\n%s", code, st.claims, out)
+	}
+}
+
+// claim refuses what a writer's startup refuses, exit 1, and writes nothing.
+func TestClaimRefuses(t *testing.T) {
+	for name, st := range map[string]*fakeStore{
+		"keys and no marker": {marker: ownership.ErrNoMarker, keys: true},
+		"another layout":     {marker: &ownership.ErrOtherLayout{Key: "k", Found: 1}},
+		"nested prefix":      {marker: ownership.ErrNoMarker, claimErr: &ownership.ErrNestedPrefix{Prefix: "a/b", Ancestor: "a"}},
+		"store error":        {marker: ownership.ErrNoMarker, claimErr: apiError(http.StatusInternalServerError, "InternalError")},
+		"denied":             {marker: ownership.ErrNoMarker, claimErr: apiError(http.StatusForbidden, "AccessDenied")},
+	} {
+		code, out := run(t, opts("claim"), st)
+		if code != ExitError || st.claims != 0 || st.puts != 0 || !strings.Contains(out, "nothing claimed") {
+			t.Errorf("%s: %d, %d claims\n%s", name, code, st.claims, out)
+		}
+		if name == "denied" && !strings.Contains(out, "admin key") {
+			t.Errorf("a 403 isn't explained:\n%s", out)
+		}
+	}
+}
+
+// claim without -confirm, or with a wrong one, exits 2 and touches nothing.
+func TestClaimConfirm(t *testing.T) {
+	for _, confirm := range []string{"", "bkt", "bkt/", "bkt/cache/", "other/cache", "bkt/Cache"} {
+		st := &fakeStore{marker: ownership.ErrNoMarker}
+		o := opts("claim")
+		o.Confirm = confirm
+		if code, out := run(t, o, st); code != ExitUsage || st.claims != 0 {
+			t.Fatalf("-confirm=%q: %d, %d claims\n%s", confirm, code, st.claims, out)
+		}
+	}
+	st := &fakeStore{marker: ownership.ErrNoMarker}
+	o := opts("claim")
+	o.Prefix, o.Confirm = "", "bkt/"
+	if code, out := run(t, o, st); code != ExitOK || st.claims != 1 {
+		t.Fatalf("empty prefix: %d\n%s", code, out)
+	}
+}
+
+// Main: claim needs -confirm, and reads no tokens file.
+func TestMainClaim(t *testing.T) {
+	for _, k := range []string{blobstore.EnvEndpoint, blobstore.EnvRegion, blobstore.EnvAccessKeyID, blobstore.EnvSecretAccessKey} {
+		t.Setenv(k, "")
+	}
+	t.Setenv(blobstore.EnvBucket, "bkt")
+	t.Setenv(blobstore.EnvPrefix, "cache")
+	st := &fakeStore{marker: ownership.ErrNoMarker}
+	opened := 0
+	open := func(context.Context, blobstore.S3Config) (Store, error) { opened++; return st, nil }
+	main := func(args ...string) (int, string) {
+		var out, errOut bytes.Buffer
+		code := Main(context.Background(), args, &out, &errOut, open)
+		return code, out.String() + errOut.String()
+	}
+	for _, args := range [][]string{{"claim"}, {"claim", "-confirm=bkt/other"}} {
+		if code, out := main(args...); code != ExitUsage || opened != 0 || st.claims != 0 {
+			t.Fatalf("%q: %d, opened %d\n%s", args, code, opened, out)
+		}
+	}
+	if code, out := main("claim", "-confirm=bkt/cache", "-tokens-file", "/does/not/exist"); code != ExitOK || st.claims != 1 {
+		t.Fatalf("claim: %d\n%s", code, out)
 	}
 }

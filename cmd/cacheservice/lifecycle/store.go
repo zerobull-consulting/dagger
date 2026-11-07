@@ -35,6 +35,10 @@ type Store interface {
 	PutLifecycle(ctx context.Context, cfg Config) error
 	// ReadMarker reads the prefix's ownership marker (ownership.ReadMarker).
 	ReadMarker(ctx context.Context, prefix string) (ownership.Marker, error)
+	// Claim creates the prefix's ownership marker when the prefix is empty,
+	// as a writer does at startup (ownership.Check with writer set). It
+	// writes nothing when the marker is already there.
+	Claim(ctx context.Context, prefix string) (ownership.State, ownership.Marker, error)
 }
 
 // S3Store is a Store in S3. Every request is bounded by CallTimeout.
@@ -77,6 +81,12 @@ func (s *S3Store) ReadMarker(ctx context.Context, prefix string) (ownership.Mark
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
 	return ownership.ReadMarker(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix)
+}
+
+func (s *S3Store) Claim(ctx context.Context, prefix string) (ownership.State, ownership.Marker, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return ownership.Check(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix, true, time.Now())
 }
 
 // errorCode is an S3 error's code, such as AccessDenied.
