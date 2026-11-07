@@ -67,7 +67,7 @@ func debugJSON(t *testing.T, url string, v any) {
 // refuses, before the welcome, one of any other: the refusal is logged,
 // counted in /metrics, and reaches the engine's own log.
 func TestBinaryEngineVersionRefused(t *testing.T) {
-	_, logs, addrs := storelessBinary(t, 2, "-debug-listen", anyPort)
+	_, logs, addrs := storelessBinary(t, []string{"engine", "debug"}, "-debug-listen", anyPort)
 	listen, debug := addrs["engine"], addrs["debug"]
 	m := compat.Embedded()
 	// slog quotes the list once it has a space.
@@ -116,7 +116,7 @@ func TestBinaryEngineVersionRefused(t *testing.T) {
 // -allow-engine-version-mismatch says loudly that the check is off, and
 // welcomes an engine of any version, logging it.
 func TestBinaryEngineVersionMismatchAllowed(t *testing.T) {
-	_, logs, addrs := storelessBinary(t, 2, "-debug-listen", anyPort, "-allow-engine-version-mismatch")
+	_, logs, addrs := storelessBinary(t, []string{"engine", "debug"}, "-debug-listen", anyPort, "-allow-engine-version-mismatch")
 	listen, debug := addrs["engine"], addrs["debug"]
 	if !strings.Contains(logs.String(), `level=WARN msg="ENGINE VERSION CHECK OFF`) {
 		t.Fatalf("no warning that the check is off:\n%s", logs.String())

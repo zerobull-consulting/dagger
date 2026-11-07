@@ -100,10 +100,10 @@ func TestBinaryDebugListenStartupErrors(t *testing.T) {
 }
 
 // storelessBinary runs the command without a store, waits until it listens
-// on its listeners addresses, and stops it at the end of the test. It
-// returns the bound addresses by listener name (engine, debug, metrics); the
+// on each of the listeners named (engine, debug, metrics), and stops it at
+// the end of the test. It returns the bound addresses by listener name; the
 // engine address is anyPort unless args set -listen.
-func storelessBinary(t *testing.T, listeners int, args ...string) (*exec.Cmd, *syncBuffer, map[string]string) {
+func storelessBinary(t *testing.T, listeners []string, args ...string) (*exec.Cmd, *syncBuffer, map[string]string) {
 	t.Helper()
 	bin := buildBinary(t)
 	cmd := exec.Command(bin, append([]string{"-listen", anyPort}, args...)...)
@@ -125,7 +125,7 @@ func storelessBinary(t *testing.T, listeners int, args ...string) (*exec.Cmd, *s
 			t.Logf("the service's log:\n%s", logs.String())
 		}
 	})
-	addrs := waitListening(t, logs, exited, listeners, 30*time.Second)
+	addrs := waitListening(t, logs, exited, 30*time.Second, listeners...)
 	return cmd, logs, addrs
 }
 
@@ -150,7 +150,7 @@ func get(t *testing.T, url, auth string) (int, string) {
 // A loopback -debug-listen without -tokens-file starts open, with a
 // warning that says so.
 func TestBinaryDebugLoopbackOpen(t *testing.T) {
-	_, logs, addrs := storelessBinary(t, 2, "-debug-listen", anyPort)
+	_, logs, addrs := storelessBinary(t, []string{"engine", "debug"}, "-debug-listen", anyPort)
 	debug := addrs["debug"]
 	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on "+anyPort) {
 		t.Errorf("no warning that the debug API is open:\n%s", logs.String())
@@ -167,7 +167,7 @@ func TestBinaryDebugLoopbackOpen(t *testing.T) {
 func TestBinaryDebugToken(t *testing.T) {
 	debugFile := writeFile(t, "debug-token", binDebugToken+"\n")
 	tokens := writeFile(t, "tokens", "engine-token-0123456789 team-a\n")
-	cmd, logs, addrs := storelessBinary(t, 3, "-debug-listen", "0.0.0.0:0", "-debug-token-file", debugFile,
+	cmd, logs, addrs := storelessBinary(t, []string{"engine", "debug", "metrics"}, "-debug-listen", "0.0.0.0:0", "-debug-token-file", debugFile,
 		"-tokens-file", tokens, "-metrics-listen", anyPort)
 	debug, metrics := "http://"+loopback(t, addrs["debug"]), addrs["metrics"]
 	for _, path := range []string{"/debug/engines", "/debug/drain", "/metrics"} {
@@ -219,12 +219,12 @@ func TestBinaryDebugToken(t *testing.T) {
 // used the debug API keeps starting after an upgrade.
 func TestBinaryDebugOffByDefaultWithTokens(t *testing.T) {
 	tokens := writeFile(t, "tokens", "engine-token-0123456789 team-a\n")
-	_, logs, _ := storelessBinary(t, 1, "-tokens-file", tokens)
+	_, logs, _ := storelessBinary(t, []string{"engine"}, "-tokens-file", tokens)
 	out := logs.String()
 	if !strings.Contains(out, "debug API off") {
 		t.Errorf("no warning that the debug API is off:\n%s", out)
 	}
-	if strings.Contains(out, "addr=127.0.0.1:8091") || strings.Contains(out, "UNAUTHENTICATED debug API") {
+	if strings.Contains(out, "listener=debug") || strings.Contains(out, "addr=127.0.0.1:8091") || strings.Contains(out, "UNAUTHENTICATED debug API") {
 		t.Errorf("the debug API listens:\n%s", out)
 	}
 }
@@ -236,7 +236,7 @@ func TestBinaryDebugIPv6LoopbackOpen(t *testing.T) {
 		t.Skip("no IPv6 loopback here")
 	}
 	ln.Close()
-	_, logs, _ := storelessBinary(t, 2, "-debug-listen", "[::1]:0")
+	_, logs, _ := storelessBinary(t, []string{"engine", "debug"}, "-debug-listen", "[::1]:0")
 	if !strings.Contains(logs.String(), "UNAUTHENTICATED debug API on [::1]:0") {
 		t.Errorf("no open-API warning:\n%s", logs.String())
 	}

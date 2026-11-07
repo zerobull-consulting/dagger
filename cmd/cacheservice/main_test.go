@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,27 +102,27 @@ const anyPort = "127.0.0.1:0"
 var listeningLine = regexp.MustCompile(`msg=listening addr=\S* bound=(\S+) tls=\S+ listener=(\w+)`)
 
 // waitListening waits, up to timeout, until the binary logged that it
-// bound n listeners, and returns their bound addresses, by listener name
-// (engine, debug, metrics). It fails the test if the binary exits first.
-func waitListening(t *testing.T, logs *syncBuffer, exited <-chan struct{}, n int, timeout time.Duration) map[string]string {
+// bound each of the listeners named (engine, debug, metrics), and returns
+// the bound addresses of all it logged, by listener name. It fails the test
+// if the binary exits first.
+func waitListening(t *testing.T, logs *syncBuffer, exited <-chan struct{}, timeout time.Duration, names ...string) map[string]string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		matches := listeningLine.FindAllStringSubmatch(logs.String(), -1)
-		if len(matches) >= n {
-			addrs := make(map[string]string, len(matches))
-			for _, m := range matches {
-				addrs[m[2]] = m[1]
-			}
+		addrs := map[string]string{}
+		for _, m := range listeningLine.FindAllStringSubmatch(logs.String(), -1) {
+			addrs[m[2]] = m[1]
+		}
+		if !slices.ContainsFunc(names, func(name string) bool { return addrs[name] == "" }) {
 			return addrs
 		}
 		select {
 		case <-exited:
-			t.Fatalf("the service exited before it listened on %d addresses:\n%s", n, logs.String())
+			t.Fatalf("the service exited before it listened on %v:\n%s", names, logs.String())
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the service didn't listen on %d addresses within %s:\n%s", n, timeout, logs.String())
+			t.Fatalf("the service didn't listen on %v within %s:\n%s", names, timeout, logs.String())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -282,7 +283,7 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 // addresses, and sets b.url and b.debug to them.
 func (b *binaryTest) waitListening(timeout time.Duration) {
 	b.t.Helper()
-	addrs := waitListening(b.t, b.logs, b.exited, 2, timeout)
+	addrs := waitListening(b.t, b.logs, b.exited, timeout, "engine", "debug")
 	b.url, b.debug = "http://"+addrs["engine"], "http://"+addrs["debug"]
 }
 

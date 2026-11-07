@@ -363,8 +363,8 @@ func main() {
 		// Only the engine address is served over TLS: the debug and
 		// metrics addresses are for local use.
 		tls := i == 0 && tlsCert != ""
-		// Bound before it is logged, so "listening" means it takes
-		// connections, and bound is the port a :0 address got.
+		// Bound before it is logged, so "listening" means its port is
+		// bound, and bound is the port a :0 address got.
 		// An empty address is ListenAndServe's default.
 		addr := srv.Addr
 		if addr == "" {
