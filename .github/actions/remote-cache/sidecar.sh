@@ -177,23 +177,31 @@ duration_seconds() {
 # sooner, once that event arrived. 15s is the service's default too.
 linger_seconds=15
 
-# The version a dagger CLI says it is, such as v1.0.0-beta.25, from the first
-# line of `dagger version` ("dagger v1.0.0-beta.25 (image://...) linux/amd64");
+# The version a dagger CLI says it is, such as v1.0.0-beta.25, from the line
+# of `dagger version` that reads "dagger v1.0.0-beta.25 (image://...) linux/amd64";
 # nothing, and a failure, for anything else (a dev build included). The CLI
 # runs as the wrapper runs it: none of the caller's trace or DAGGER_*
 # settings, no engine needed, and bounded.
 cli_version() {
-	local out v
-	out="$(
-		for v in $(compgen -e); do
-			case "$v" in TRACEPARENT | TRACESTATE | OTEL_* | DAGGER_* | _EXPERIMENTAL_DAGGER_*) unset "$v" ;; esac
-		done
-		export DAGGER_NO_NAG=1
-		timeout 30 "$1" --silent version </dev/null 2>/dev/null
-	)" || return 1
-	out="${out%%$'\n'*}"
-	[[ "$out" =~ ^dagger\ (v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)(\ |$) ]] || return 1
-	echo "${BASH_REMATCH[1]}"
+	local out line
+	out="$(cli_run "$1" --silent version 2>/dev/null)" || return 1
+	while IFS= read -r line; do
+		if [[ "$line" =~ ^dagger\ (v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)(\ |$) ]]; then
+			echo "${BASH_REMATCH[1]}"
+			return 0
+		fi
+	done <<<"$out"
+	return 1
+}
+
+# cli_run CLI ARGS...: the CLI as the wrapper runs it, and bounded.
+cli_run() {
+	local v
+	for v in $(compgen -e); do
+		case "$v" in TRACEPARENT | TRACESTATE | OTEL_* | DAGGER_* | _EXPERIMENTAL_DAGGER_*) unset "$v" ;; esac
+	done
+	export DAGGER_NO_NAG=1
+	timeout 30 "$@" </dev/null
 }
 
 # check_cli CLI VERSION: fails unless CLI is an executable that says it is
@@ -206,7 +214,7 @@ check_cli() {
 	[[ -n "$want" ]] ||
 		die "a CLI is given, but no version selects the engine: give version, which the CLI must match (engine-image, deprecated, can't be checked)"
 	got="$(cli_version "$cli")" ||
-		die "the CLI $cli didn't say its version (dagger --silent version): a release of the CLI is needed, to match the engine $want"
+		die "the CLI $cli didn't say its version (dagger --silent version printed: '$(cli_run "$cli" --silent version 2>&1 | head -c 300 | tr '\n' ' ' || true)'): a release of the CLI is needed, to match the engine $want"
 	[[ "$got" == "$want" ]] ||
 		die "the CLI ($cli) is $got but the engine is $want: they must be the same version. Install CLI $want (the version input of the action does)"
 }
