@@ -507,6 +507,10 @@ func TestFlushTokenForm(t *testing.T) {
 	if res := postFlush(t, h.srv.URL+"/v1/engines/flush", "engine-token"); res.code != http.StatusConflict {
 		t.Fatalf("two caches: %d %s", res.code, res.body)
 	}
+	// The timeout is checked before the caches are.
+	if res := postFlush(t, h.srv.URL+"/v1/engines/flush?timeout=bad", "engine-token"); res.code != http.StatusBadRequest {
+		t.Fatalf("two caches, a bad timeout: %d %s", res.code, res.body)
+	}
 }
 
 // The debug twin flushes a connection's cache.
@@ -537,6 +541,9 @@ func TestFlushBadRequests(t *testing.T) {
 		{flushURL(h.srv.URL, h.cache.ID, "-1s"), "engine-token", http.StatusBadRequest},
 		{flushURL(h.srv.URL, h.cache.ID, "11m"), "engine-token", http.StatusBadRequest},
 		{h.srv.URL + "/v1/engines/flush?timeout=soon", "engine-token", http.StatusBadRequest},
+		// Named with no value: unreadable, not the default.
+		{flushURL(h.srv.URL, h.cache.ID, "") + "?timeout=", "engine-token", http.StatusBadRequest},
+		{h.srv.URL + "/v1/engines/flush?timeout=", "engine-token", http.StatusBadRequest},
 	} {
 		if res := postFlush(t, tc.url, tc.token); res.code != tc.code {
 			t.Errorf("%s (token %q): %d, want %d: %s", tc.url, tc.token, res.code, tc.code, res.body)
@@ -630,6 +637,28 @@ func TestFlushRefusals(t *testing.T) {
 			if res.code != http.StatusConflict || !strings.Contains(res.body, tc.want) {
 				t.Fatalf("%s %s: %d %s", tc.name, path, res.code, res.body)
 			}
+		}
+	}
+
+	// A read-only service that drains, or whose stop began, says so: its
+	// export path being off doesn't hide it.
+	drainingRO := New(slog.New(slog.DiscardHandler), "")
+	if err := drainingRO.SetReadOnly(); err != nil {
+		t.Fatal(err)
+	}
+	drainFor(drainingRO, time.Second)
+	stoppingRO := New(slog.New(slog.DiscardHandler), "")
+	if err := stoppingRO.SetReadOnly(); err != nil {
+		t.Fatal(err)
+	}
+	stoppingRO.CloseEngines()
+	for _, tc := range []struct {
+		name string
+		svc  *Service
+		want string
+	}{{"read-only, draining", drainingRO, ErrDraining.Error()}, {"read-only, stopping", stoppingRO, ErrStopping.Error()}} {
+		if res := postFlush(t, serve(t, tc.svc)+"/v1/engines/cache-a/flush", "engine-token"); res.code != http.StatusServiceUnavailable || !strings.Contains(res.body, tc.want) {
+			t.Fatalf("%s: %d %s", tc.name, res.code, res.body)
 		}
 	}
 

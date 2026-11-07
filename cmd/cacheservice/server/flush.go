@@ -147,13 +147,17 @@ func (p *exportPath) broadcast() {
 // flushRefusal is the error of a flush the service refuses now: the export
 // path off or read-only, a drain, or the stop begun.
 func (s *Service) flushRefusal() error {
+	// The service's state first: a read-only service drains and stops too,
+	// and says so as any other does.
 	p := s.export
 	switch {
-	case p == nil:
-		return s.exportOff()
 	case s.draining.Load():
 		return ErrDraining
-	case s.closing.Load() || p.ctx.Err() != nil:
+	case s.closing.Load():
+		return ErrStopping
+	case p == nil:
+		return s.exportOff()
+	case p.ctx.Err() != nil:
 		return ErrStopping
 	}
 	return nil
@@ -312,10 +316,11 @@ func validCacheID(id string) bool {
 // flushTimeout reads a flush request's timeout: DefaultFlushTimeout when
 // it names none, and a Go duration from 0 to MaxFlushTimeout otherwise.
 func flushTimeout(r *http.Request) (time.Duration, error) {
-	v := r.URL.Query().Get("timeout")
-	if v == "" {
+	q := r.URL.Query()
+	if !q.Has("timeout") {
 		return DefaultFlushTimeout, nil
 	}
+	v := q.Get("timeout")
 	d, err := time.ParseDuration(v)
 	switch {
 	case err != nil:
@@ -370,13 +375,14 @@ func (s *Service) serveFlushToken(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Before the caches: a bad timeout is a 400 whatever the token holds.
+	if _, err := flushTimeout(r); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	caches := s.cachesOfToken(ns, key)
 	switch len(caches) {
 	case 0:
-		if _, err := flushTimeout(r); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
 		if err := s.flushRefusal(); err != nil {
 			writeFlushError(w, err)
 			return
