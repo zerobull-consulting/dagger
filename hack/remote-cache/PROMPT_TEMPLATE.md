@@ -170,9 +170,9 @@ agreement's full text below:
   one fix push, review 2, and **no push after review 2**;
 - review 2's confirmed findings become issues, the rest go to the tracking
   issue's rolling leads issue, then the squash merge of review 2's head, or
-  the head of a push the exception or a CI fix allowed after it, once the
-  ruleset's required checks have passed on that head, with its explicit
-  message, made by the session itself unless the prompt says the
+  the head of a push step 4's exception or step 6's CI fix allowed after it,
+  once the ruleset's required checks have passed on that head, with its
+  explicit message, made by the session itself unless the prompt says the
   user merges;
 - the exception for deleting data, publishing unverified blobs or bundles, or
   exposing a token.
