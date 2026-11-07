@@ -886,14 +886,17 @@ only decides when it runs and with which token.
    new release is handled first, and only one at a time:
    - if a release-check PR for it is open, the run waits for it (and turns
      auto-merge on for an accept PR once the gate is on);
-   - if its image isn't on `registry.dagger.io` yet, it's skipped this hour,
-     and the next one is tried. Only a multi-platform index digest counts;
-     a registry error fails the run rather than skipping.
+   - if its image isn't on `registry.dagger.io` yet, the run waits for it
+     and tries nothing newer: a newer release accepted first would make it
+     old, and it would never be checked. Only a multi-platform index digest
+     counts; a registry error, or an upstream that can't be listed, fails
+     the run rather than reading as "nothing new".
 3. **Verify (A).** It dispatches `remote-cache-tests.yml` on
    `feature/remote-cache` with `candidate-version` and `candidate-digest`,
    and waits for it (at most 150 minutes): the e2e and the sidecar demo of
-   the service as it is, against that stock engine. With the tag merged into
-   a scratch copy of the branch, it runs `TestBundleVersionMatchesEngineCapture`.
+   the service as it is, against that stock engine. Meanwhile, with the tag
+   merged into a scratch copy of the branch, it runs
+   `TestBundleVersionMatchesEngineCapture`; both must pass.
    It writes the advisory diff of the engine's side of the remote cache from
    the manifest's `base` to the release, and whether the bundle or protocol
    version changed. **The run is the gate**; the diff only informs.
@@ -907,8 +910,9 @@ only decides when it runs and with which token.
      auto-merges (squash).
    - **B, otherwise:** `release-check/rebuild/<version>`, as
      `CACHE_BOT_SYNC_TOKEN`: the tag merged with a merge commit, the `base`
-     line moved. That branch is verified the same way (a dispatch on it),
-     and if green, gets the accept line, citing that run, and a PR. If the
+     line moved. That branch is verified the same way (a dispatch on it, and
+     the bundle test), and if green, gets the accept line, citing that run,
+     and a PR. If the
      bundle or protocol version changed, the accept list resets to that one
      version. **A human merges it, with a merge commit.** No rebuild is
      tried if the merge conflicts, or if the branch already contains the
@@ -924,7 +928,8 @@ only decides when it runs and with which token.
 on; nothing newer is tried meanwhile. A release whose `compat-break` issue
 is open but whose reject branch doesn't exist (a run that stopped between
 them) gets its reject PR, without a second issue. Once a line for it is
-merged, it's no longer new. A `release-check/*/<version>` branch with no
+merged, it's no longer new. A release whose image never appears holds
+up everything newer: add a `reject` line for it by hand. A `release-check/*/<version>` branch with no
 open PR (a PR closed by hand, or a run that died) **fails the run** with
 the branch named: delete it to try that release again, or add its line by
 hand. To verify a rejected release again, remove its `reject` line.
@@ -948,15 +953,24 @@ variable) stays unset until `accept line only` is a required check. Then:
 2. add it to the ruleset's required checks;
 3. set `RELEASE_CHECK_AUTO_MERGE` to `true`.
 
-The check, `.github/workflows/remote-cache-accept-line.yml`, runs the base
-branch's copy of `accept-line-only.sh`, and fails an accept PR unless, from
+The check, `.github/workflows/remote-cache-accept-line.yml`, runs on
+`pull_request_target`, so its workflow and the scripts it runs
+(`accept-line-only.sh`, `engines.sh`) are always the base branch's: a PR
+that edits any of them is still measured by the base's. It runs none of the
+PR's code, only diffs its commits and parses its manifest, and requests no
+environment. It reports on PRs into branches that have it. It fails an
+accept PR unless, from
 its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
 one added line (no mode change, no rename), that line is
 `accept <the branch's version> <digest> verified: <run URL>`, it is the
 first accept line, and `engines.sh` takes the result. On failure it turns
 the PR's auto-merge off. The release check's `auto-merge` job checks the
 same before enabling it, and only on PRs from this repository's own
-branches.
+branches. If the PR's required checks have all passed before the gate is
+on, GitHub refuses to enable auto-merge on it ("clean status"), so the job
+squash-merges it instead, with `GITHUB_TOKEN`, at the head it checked;
+`GITHUB_TOKEN` can't bypass the ruleset, so that merge still needs every
+required check.
 
 **Running it by hand.** Actions, "Remote cache release check", Run
 workflow. Off `feature/remote-cache` it is always a dry run, which can't

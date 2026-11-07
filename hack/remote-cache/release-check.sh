@@ -52,7 +52,8 @@
 #       <version> with the reject line and opens its PR.
 #
 # plan prints action=, one of:
-#   none            nothing new, or nothing new with an image yet
+#   none            nothing new, or the oldest new release has no image
+#                   yet (nothing newer is tried before it has)
 #   verify          version= and digest=: a new release to verify
 #   pending         kind= (accept, rebuild, reject) and pr=: the release's
 #                   PR is open; nothing else happens until it's merged or
@@ -105,7 +106,7 @@ tag_re='^v1\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
 version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
 digest_re='^sha256:[0-9a-f]{64}$'
 repo_re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
-run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$'
+run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[0-9]+)?$'
 
 die() {
 	echo "::error::release-check.sh: $*" >&2
@@ -220,6 +221,19 @@ new_tree() {
 	tree="$(mktemp -d)"
 	git worktree add -q --detach "$tree" release-check/head
 }
+# manifest_edit <engines.sh edit args...>: edits the worktree's manifest.
+# In a dry run, an edit engines.sh would refuse because the version is
+# listed already (a dry run of a chosen, accepted version) is printed
+# instead, so the rest of the dry run still shows.
+manifest_edit() {
+	local f="$tree/$manifest_path"
+	if is_dry && [[ "$1" != set-base ]] && ENGINES_FILE="$f" "$engines" listed | grep -qxF "$2"; then
+		would "run 'engines.sh $*' on $manifest_path (refused for real: $2 is listed already)"
+		echo "# dry run: $*" >>"$f"
+		return
+	fi
+	ENGINES_FILE="$f" "$engines" "$@" >&2
+}
 commit() {
 	git -C "$tree" -c user.name="$bot_name" -c user.email="$bot_email" commit -q "$@"
 }
@@ -321,16 +335,23 @@ failing_jobs() {
 		echo "- (couldn't list the run's jobs)"
 }
 
-# run_tests <ref> <version> <digest> <prefix>: dispatches the e2e and the
-# sidecar demo against the candidate, waits, and writes <prefix>_run,
+# The e2e and the sidecar demo against the candidate, waited on, write
+# <prefix>_run,
 # <prefix>_conclusion and <prefix>-jobs.md to the notes. Prints pass or
 # fail; anything else is an error.
-run_tests() {
-	local ref="$1" v="$2" d="$3" p="$4" id url conclusion
-	id="$(dispatch remote-cache-tests.yml "$ref" "$(jq -n --arg v "$v" --arg d "$d" '{"candidate-version": $v, "candidate-digest": $d}')")"
+# start_tests <ref> <version> <digest>: the dispatch alone; prints the run's
+# id. finish_tests <id> <prefix>: the wait and the verdict. Apart, so the
+# bundle test runs while the run does.
+start_tests() {
+	local id
+	id="$(dispatch remote-cache-tests.yml "$1" "$(jq -n --arg v "$2" --arg d "$3" '{"candidate-version": $v, "candidate-digest": $d}')")"
+	need_run "$server/$repo/actions/runs/$id"
+	say "verifying $2 on $1: $server/$repo/actions/runs/$id"
+	echo "$id"
+}
+finish_tests() {
+	local id="$1" p="$2" url conclusion
 	url="$server/$repo/actions/runs/$id"
-	need_run "$url"
-	say "verifying $v on $ref: $url"
 	conclusion="$(wait_run "$id")"
 	note "${p}_run" "$url"
 	note "${p}_conclusion" "$conclusion"
@@ -384,6 +405,10 @@ advisory() {
 	fetch_tag "$base"
 	old="$(bundle_const "refs/tags/$base")"
 	new="$(bundle_const "refs/tags/$tag")"
+	# An unread version is never "unchanged": that would keep accept lines a
+	# changed bundle format invalidates.
+	[[ -n "$old" && -n "$new" ]] ||
+		die "couldn't read dagql's valueBundleVersion in $base or $tag (dagql/cache_transfer_types.go): update bundle_const for its new form"
 	local paths=(engine/remotecache cmd/engine/remotecache.go 'engine/server/remote_cache*.go' 'dagql/cache*.go' ':!**/*_test.go')
 	git diff --quiet "refs/tags/$base" "refs/tags/$tag" -- engine/remotecache/protocol ':!**/*_test.go' || proto=yes
 	local reset=no
@@ -450,10 +475,14 @@ cmd_plan() {
 		need_tag "$forced"
 		tags=("$forced")
 	else
-		mapfile -t tags < <(upstream_tags | while IFS= read -r t; do
-			[[ "$(printf '%s\n%s\n' "$newest" "$t" | vsort | tail -n1)" == "$t" && "$t" != "$newest" ]] && echo "$t"
+		# Listed first, in this shell: a failed poll fails the run, never
+		# reads as "nothing new".
+		local all
+		all="$(upstream_tags)"
+		mapfile -t tags < <(while IFS= read -r t; do
+			[[ -n "$t" && "$(printf '%s\n%s\n' "$newest" "$t" | vsort | tail -n1)" == "$t" && "$t" != "$newest" ]] && echo "$t"
 			true
-		done)
+		done <<<"$all")
 		say "the manifest's newest version is $newest; newer upstream releases: ${tags[*]:-none}"
 	fi
 	for t in "${tags[@]}"; do
@@ -483,8 +512,11 @@ cmd_plan() {
 		local rc=0
 		d="$(image_digest "$t")" || rc=$?
 		if ((rc == 3)); then
-			say "$t: no $engine_repo:$t image yet; skipped this hour"
-			continue
+			# Not skipped past: a newer release accepted first would make
+			# this one old, and it would never be checked.
+			say "$t: no $engine_repo:$t image yet; waiting for it before anything newer"
+			out action none
+			return
 		fi
 		((rc == 0)) || exit "$rc"
 		say "$t: new, image $d: verifying it"
@@ -506,6 +538,8 @@ cmd_verify() {
 	note digest "$d"
 	fetch_tag "$v"
 	advisory "$v"
+	local id
+	id="$(start_tests "$branch" "$v" "$d")"
 	new_tree
 	merge="$(merge_tag "$v")"
 	note merge "$merge"
@@ -517,7 +551,7 @@ cmd_verify() {
 		note bundle "$bundle"
 	fi
 	say "TestBundleVersionMatchesEngineCapture with $v merged: $bundle"
-	a="$(run_tests "$branch" "$v" "$d" a)"
+	a="$(finish_tests "$id" a)"
 	if [[ "$a" == pass && "$bundle" != fail ]]; then
 		out result pass
 	else
@@ -534,7 +568,7 @@ cmd_accept() {
 	need_digest "$d"
 	need_run "$run"
 	new_tree
-	ENGINES_FILE="$tree/$manifest_path" "$engines" add-accept "$v" "$d" "$run" >&2
+	manifest_edit add-accept "$v" "$d" "$run" >&2
 	git -C "$tree" add "$manifest_path"
 	commit -m "remote cache: accept engine $v" -m "Verified by $run (release check)."
 	push "release-check/accept/$v"
@@ -588,13 +622,27 @@ cmd_auto_merge() {
 		out auto_merge on
 		return
 	fi
+	local msg="Adds the accept line the release check verified (zerobull-consulting/dagger#117, D5, outcome A)." err sha
 	# shellcheck disable=SC2016 # GraphQL variables, not shell
-	api graphql -f query='mutation($id: ID!, $title: String!, $body: String!) {
+	if err="$(api graphql -f query='mutation($id: ID!, $title: String!, $body: String!) {
 		enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $title, commitBody: $body}) { clientMutationId }
-	}' -f id="$node" -f title="$title" -f body="Adds the accept line the release check verified (zerobull-consulting/dagger#117, D5, outcome A)." >/dev/null ||
-		die "enabling auto-merge on #$pr failed"
-	say "auto-merge (squash) enabled on #$pr"
-	out auto_merge on
+	}' -f id="$node" -f title="$title" -f body="$msg" 2>&1)"; then
+		say "auto-merge (squash) enabled on #$pr"
+		out auto_merge on
+		return
+	fi
+	# GitHub refuses auto-merge on a PR whose required checks have all
+	# passed already ("clean status"): what auto-merge would do then is
+	# merge it now, so this does, with GITHUB_TOKEN, pinned to the head the
+	# files were checked at. The ruleset still applies: GITHUB_TOKEN can't
+	# bypass it, so a check that hasn't passed refuses the merge.
+	grep -qi 'clean status' <<<"$err" || { say "$err"; die "enabling auto-merge on #$pr failed"; }
+	sha="$(jq -r .head.sha <<<"$info")"
+	[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "PR #$pr's head isn't a commit id"
+	jq -n --arg t "$title" --arg m "$msg" --arg s "$sha" '{merge_method: "squash", commit_title: $t, commit_message: $m, sha: $s}' |
+		api -X PUT "repos/$repo/pulls/$pr/merge" --input - >/dev/null || die "#$pr's checks have passed, but merging it failed"
+	say "#$pr's required checks had passed already, so auto-merge couldn't be enabled: squash-merged it at ${sha:0:12}"
+	out auto_merge merged
 }
 
 cmd_rebuild() {
@@ -621,7 +669,7 @@ cmd_rebuild() {
 		;;
 	esac
 	old="$("$engines" base)"
-	ENGINES_FILE="$tree/$manifest_path" "$engines" set-base "$v" >&2
+	manifest_edit set-base "$v" >&2
 	git -C "$tree" add "$manifest_path"
 	commit -m "remote cache: build on upstream $v" -m "Moves the manifest's base from $old (release check)."
 	push "release-check/rebuild/$v"
@@ -632,7 +680,13 @@ cmd_rebuild() {
 		out result dry-run
 		return
 	fi
-	b="$(run_tests "release-check/rebuild/$v" "$v" "$d" b)"
+	local id bundle
+	id="$(start_tests "release-check/rebuild/$v" "$v" "$d")"
+	bundle="$(bundle_test)"
+	note b_bundle "$bundle"
+	say "TestBundleVersionMatchesEngineCapture on the rebuild: $bundle"
+	b="$(finish_tests "$id" b)"
+	[[ "$bundle" == pass ]] || b=fail
 	note b "$b"
 	if [[ "$b" != pass ]]; then
 		out result fail
@@ -641,9 +695,9 @@ cmd_rebuild() {
 	run="$(get b_run)"
 	reset="$(get reset)"
 	if [[ "$reset" == yes ]]; then
-		ENGINES_FILE="$tree/$manifest_path" "$engines" reset-accept "$v" "$d" "$run" >&2
+		manifest_edit reset-accept "$v" "$d" "$run" >&2
 	else
-		ENGINES_FILE="$tree/$manifest_path" "$engines" add-accept "$v" "$d" "$run" >&2
+		manifest_edit add-accept "$v" "$d" "$run" >&2
 	fi
 	git -C "$tree" add "$manifest_path"
 	commit -m "remote cache: accept engine $v" -m "Verified by $run (release check)."
@@ -716,7 +770,7 @@ cmd_reject() {
 	fi
 	out issue "$issue"
 	new_tree
-	ENGINES_FILE="$tree/$manifest_path" "$engines" add-reject "$v" "$repo#$issue" >&2
+	manifest_edit add-reject "$v" "$repo#$issue" >&2
 	git -C "$tree" add "$manifest_path"
 	commit -m "remote cache: reject engine $v" -m "It fails against the cache service: $repo#$issue (release check)."
 	push "release-check/reject/$v"

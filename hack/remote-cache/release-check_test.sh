@@ -85,7 +85,7 @@ case "$method $path" in
 "POST repos/o/r/pulls")
 	num=$(n pr)
 	jq --argjson n "$num" --argjson in "$input" '. + [{number: $n, state: "open", title: $in.title, body: $in.body,
-		head: {ref: $in.head, repo: {full_name: "o/r"}}, base: {ref: $in.base}, auto_merge: null, node_id: "PR_\($n)"}]' "$FAKE/pulls.json" >"$FAKE/p.tmp"
+		head: {ref: $in.head, sha: "0123456789012345678901234567890123456789", repo: {full_name: "o/r"}}, base: {ref: $in.base}, auto_merge: null, node_id: "PR_\($n)"}]' "$FAKE/pulls.json" >"$FAKE/p.tmp"
 	mv "$FAKE/p.tmp" "$FAKE/pulls.json"
 	echo "{\"number\": $num}" ;;
 "GET repos/o/r/pulls/"*/files*)
@@ -123,7 +123,10 @@ case "$method $path" in
 	sha="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
 	echo "{\"commit\": {\"sha\": \"$sha\", \"commit\": {\"committer\": {\"date\": \"${FAKE_HEAD_DATE:-2020-01-01T00:00:00Z}\"}}}}" ;;
 "GET repos/o/r/actions/workflows/cacheservice-publish.yml/runs?head_sha="*) echo "{\"total_count\": ${FAKE_PUBLISH_RUNS:-0}}" ;;
-"POST graphql") printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
+"POST graphql")
+	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
+	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
+"PUT repos/o/r/pulls/"*/merge) echo "$input" >"$FAKE/merged"; echo '{"merged": true}' ;;
 *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
 esac
 EOF
@@ -213,7 +216,12 @@ check "plan: and nothing is done" has "$tmp/out" "action=none"
 
 printf 'v1.0.0-beta.27 application/vnd.oci.image.index.v1+json %s\n' "$d2" >"$FAKE/images"
 run plan
-check "plan: a newer release with an image is verified past one without" has "$tmp/out" "version=v1.0.0-beta.27"
+check "plan: a newer release with an image waits for an older one without" has "$tmp/out" "action=none"
+check "plan: so the older one is never left behind" not has "$tmp/out" "version=v1.0.0-beta.27"
+
+ARGS=(plan); rc env RELEASE_CHECK_UPSTREAM="$tmp/no-such-repo"
+check "plan: an upstream that can't be listed fails the run" test "$status" -ne 0
+check "plan: rather than reading as nothing new" not has "$tmp/out" "action=none"
 
 printf 'v1.0.0-beta.26 application/vnd.oci.image.manifest.v1+json %s\n' "$d2" >"$FAKE/images"
 run plan
@@ -302,6 +310,10 @@ check "auto-merge: on with it" has "$tmp/out" "auto_merge=on"
 check "auto-merge: squash, with GITHUB_TOKEN" has "$FAKE/calls" "gh POST graphql"
 check "auto-merge: titled with the full PR reference" has "$FAKE/graphql" "(zerobull-consulting/dagger#1)"
 rm -f "$FAKE/graphql"
+ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true FAKE_CLEAN=1
+check "auto-merge: a PR whose checks passed already is squash-merged" has "$tmp/out" "auto_merge=merged"
+check "auto-merge: with GITHUB_TOKEN, pinned to the checked head" jq -e '.merge_method == "squash" and .sha == "0123456789012345678901234567890123456789" and (.commit_title | endswith("(zerobull-consulting/dagger#1)"))' "$FAKE/merged"
+check "auto-merge: by GITHUB_TOKEN" has "$FAKE/calls" "gh PUT repos/o/r/pulls/1/merge"
 echo '[{"filename": "cmd/cacheservice/compat/engines.txt", "status": "modified", "additions": 2, "deletions": 0}]' >"$FAKE/files-1.json"
 ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true
 check "auto-merge: refused for a PR adding two lines" test "$status" -ne 0
@@ -387,6 +399,13 @@ check "B ancestor: skipped, it would be the code A ran" has "$tmp/out" "result=s
 check "B ancestor: nothing pushed or opened" test "$(writes)" = 0
 
 setup
+printf 'failure\nsuccess\n' >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" FAKE_GO_FAIL=1
+check "B bundle: a rebuild whose bundle test fails fails, whatever its e2e" has "$tmp/out" "result=fail"
+check "B bundle: and opens no PR" test "$(jq length "$FAKE/pulls.json")" = 0
+
+setup
 printf 'failure\nfailure\n' >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
 run_bot rebuild v1.0.0-beta.26 "$d2"
@@ -422,6 +441,27 @@ jq 'map(.state = "closed")' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE
 run plan
 check "stuck: a branch with no open PR fails the run" test "$status" -ne 0
 check "stuck: naming the branch" has "$tmp/out" "release-check/reject/v1.0.0-beta.26"
+
+echo "--- the bundle version"
+setup
+git -C "$up" checkout -q -b odd v1.0.0-beta.25
+echo 'const valueBundleVersion uint = 3 // typed now' >"$up/dagql/cache_transfer_types.go"
+git -C "$up" commit -qam odd && git -C "$up" tag -f -a -m odd v1.0.0-beta.26 >/dev/null
+echo success >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "advisory: a bundle version it can't read fails the run" test "$status" -ne 0
+check "advisory: saying so" has "$tmp/out" "couldn't read dagql's valueBundleVersion"
+git -C "$up" checkout -q main
+git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
+
+echo "--- dry run of a listed version"
+setup
+run --dry-run accept v1.0.0-beta.25 "$d1" https://github.com/o/r/actions/runs/7
+check "dry run listed: accept still shows its PR" has "$tmp/out" "dry run: would open a PR from release-check/accept/v1.0.0-beta.25"
+check "dry run listed: and says the edit would be refused" has "$tmp/out" "is listed already"
+run --dry-run reject v1.0.0-beta.25
+check "dry run listed: reject still shows its PR" has "$tmp/out" "dry run: would open a PR from release-check/reject/v1.0.0-beta.25"
+check "dry run listed: nothing written" test "$(writes)" = 0
 
 echo "--- dry run"
 setup

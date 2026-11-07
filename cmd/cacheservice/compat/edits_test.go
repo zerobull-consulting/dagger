@@ -120,3 +120,18 @@ func TestEnginesScriptCandidateAgain(t *testing.T) {
 	require.Error(t, err, out)
 	require.Equal(t, start, string(mustRead(t, path)))
 }
+
+// TestEnginesScriptCandidateAgainOnly: verifying the manifest's only accept
+// line again (after a reset, say) keeps it.
+func TestEnginesScriptCandidateAgainOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "engines.txt")
+	require.NoError(t, os.WriteFile(path, []byte("base v1.0.0-beta.25\n"+acceptLine("v1.0.0-beta.25", digestA)+"\n"), 0o644))
+	t.Setenv("GITHUB_SERVER_URL", "https://github.com")
+	t.Setenv("GITHUB_REPOSITORY", "zerobull-consulting/dagger")
+	t.Setenv("GITHUB_RUN_ID", "42300000000")
+	out, err := runScript(t, path, "candidate", "v1.0.0-beta.25", digestA)
+	require.NoError(t, err, out)
+	m, err := Parse(mustRead(t, path))
+	require.NoError(t, err)
+	require.Equal(t, []Accepted{{Version: "v1.0.0-beta.25", Digest: digestA, Verified: runB}}, m.Accept)
+}
