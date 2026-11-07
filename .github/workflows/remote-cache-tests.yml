@@ -389,7 +389,7 @@ jobs:
       # installed, with TRACEPARENT (job env above) set.
       - name: "Writer: the installed CLI is the engine's version"
         run: |
-          [[ "$(dagger version | cut -d' ' -f2)" == "$STOCK_ENGINE_TAG" ]]
+          [[ "$(dagger version | sed -n 's/^version: *//p')" == "$STOCK_ENGINE_TAG" ]]
           [[ "${{ steps.writer.outputs.dagger }}" == "$(command -v dagger)" ]]
       - name: "Writer: run the demo"
         timeout-minutes: 10

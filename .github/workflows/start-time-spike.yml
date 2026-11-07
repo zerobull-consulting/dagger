@@ -1,0 +1,59 @@
+name: start-time-spike
+"on":
+  push:
+    branches: [remote-cache/action-start]
+permissions:
+  contents: read
+# Temporary (zerobull-consulting/dagger#161): the start's time before and after,
+# on cold runners, the same way. Removed before the PR is marked ready.
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./hack/remote-cache/engines.sh pin | tee -a "$GITHUB_ENV"
+      - run: docker build -f cmd/cacheservice/Dockerfile --build-arg REVISION=x -t cacheservice:ci .
+      - id: store
+        run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
+      - run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
+      - id: s
+        uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar@af0f26080e39f9fa5a4ed982da95bcd402f133df
+        with:
+          role: read-only
+          version: ${{ env.STOCK_ENGINE_TAG }}
+          service-image: cacheservice:ci
+          s3-endpoint: ${{ steps.store.outputs.endpoint }}
+          s3-region: ${{ steps.store.outputs.region }}
+          s3-bucket: ${{ steps.store.outputs.bucket }}
+          s3-prefix: demo/spike-before
+          s3-access-key-id: ${{ steps.store.outputs.readonly-access-key-id }}
+          s3-secret-access-key: ${{ steps.store.outputs.readonly-secret-access-key }}
+          s3-path-style: "true"
+      - run: ./hack/remote-cache/ci/report-start-time.sh before "$T0"
+      - if: always()
+        uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@af0f26080e39f9fa5a4ed982da95bcd402f133df
+  after:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./hack/remote-cache/engines.sh pin | tee -a "$GITHUB_ENV"
+      - run: docker build -f cmd/cacheservice/Dockerfile --build-arg REVISION=x -t cacheservice:ci .
+      - id: store
+        run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
+      - run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
+      - id: s
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: read-only
+          version: ${{ env.STOCK_ENGINE_TAG }}
+          service-image: cacheservice:ci
+          s3-endpoint: ${{ steps.store.outputs.endpoint }}
+          s3-region: ${{ steps.store.outputs.region }}
+          s3-bucket: ${{ steps.store.outputs.bucket }}
+          s3-prefix: demo/spike-after
+          s3-access-key-id: ${{ steps.store.outputs.readonly-access-key-id }}
+          s3-secret-access-key: ${{ steps.store.outputs.readonly-secret-access-key }}
+          s3-path-style: "true"
+      - run: ./hack/remote-cache/ci/report-start-time.sh after "$T0"
