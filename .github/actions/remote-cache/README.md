@@ -218,6 +218,19 @@ needs the header.
 - **Stop:** fails when the service exited before the stop, or its stop
   wasn't clean.
 
+## The installer's probe
+
+`dagger/dagger-for-github` looks for a `dagger` on `PATH` first and runs
+`dagger --silent version` on it, a flag the CLI of this release rejects, so
+its install step fails whenever any `dagger` is on `PATH`: the one a first
+`start` of the same job installed, or its wrapper, which stays on `PATH` after
+its stop. The runner puts every `GITHUB_PATH` entry in front of a step's own
+`PATH`, so `start` puts a small shim first instead
+(`$RUNNER_TEMP/remote-cache-installer-probe/dagger`): it answers that one
+probe with no version, so the official action installs (about 1.5s), and runs
+the installed CLI for any other command. A job can therefore start a second
+sidecar after stopping the first.
+
 ## The stop at the end of the job
 
 `start` is a composite action around a small JavaScript action

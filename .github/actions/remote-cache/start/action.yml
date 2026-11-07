@@ -152,30 +152,38 @@ runs:
           { echo "::error::remote-cache/start: reading the manifest failed"; exit 1; }
         echo "version=$tag" >>"$GITHUB_OUTPUT"
     # The official action looks for a dagger on PATH first, and runs
-    # `dagger --silent version` on it, which a CLI of this release rejects:
-    # the step would fail with a wrapper of an earlier sidecar of this job
-    # (it stays on PATH after its stop) or any other dagger in the way. So
-    # the install step sees a PATH without any dagger, and always installs
-    # into $RUNNER_TEMP/bin.
-    - name: Hide any dagger already on PATH from the install
-      id: clean
+    # `dagger --silent version` on it, a flag the CLI of this release rejects:
+    # the step would fail with any dagger already on PATH, such as the one a
+    # first start of this job installed, or its wrapper (which stays on PATH
+    # after its stop). The runner puts every GITHUB_PATH entry in front of a
+    # step's own PATH, so this can't be hidden; a small shim goes in front
+    # instead. It answers that probe with no version, so the action installs
+    # (about 1.5s) into $RUNNER_TEMP/bin, and runs the installed CLI for any
+    # other command. The wrapper, added after the install, goes in front of it.
+    - name: Put the installer's probe shim first on PATH
       shell: bash
       run: |
         set -euo pipefail
-        clean=""
-        IFS=: read -r -a dirs <<<"$PATH"
-        for d in "${dirs[@]}"; do
-          [[ -x "$d/dagger" ]] && continue
-          clean+="${clean:+:}$d"
-        done
-        echo "path=$clean" >>"$GITHUB_OUTPUT"
+        dir="${RUNNER_TEMP:?}/remote-cache-installer-probe"
+        mkdir -p "$dir"
+        cat >"$dir/dagger" <<EOF2
+        #!/usr/bin/env bash
+        # Written by remote-cache/start (.github/actions/remote-cache/start/action.yml).
+        if [[ "\$*" == "--silent version" ]]; then
+          echo "dagger none (the installer's probe: remote-cache/start installs the CLI)"
+          exit 0
+        fi
+        real="$RUNNER_TEMP/bin/dagger"
+        [[ -x "\$real" ]] || { echo "dagger isn't installed" >&2; exit 127; }
+        exec "\$real" "\$@"
+        EOF2
+        chmod +x "$dir/dagger"
+        echo "$dir" >>"$GITHUB_PATH"
     # Only installs: with no call, args, check or shell it runs no command
     # (and so never sets DAGGER_CLOUD_TOKEN from its empty cloud-token, or
     # skips the wrapper's TRACEPARENT guard). Pinned by commit: v8.4.1.
     - name: Install the dagger CLI
       uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
-      env:
-        PATH: ${{ steps.clean.outputs.path }}
       with:
         version: ${{ steps.pin.outputs.version }}
     - name: Find the installed CLI
