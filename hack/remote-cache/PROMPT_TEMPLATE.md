@@ -1,6 +1,6 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#NEW](https://github.com/zerobull-consulting/dagger/pull/NEW)
+**Version:** [zerobull-consulting/dagger#171](https://github.com/zerobull-consulting/dagger/pull/171)
 
 Every work item's prompt for the remote cache work is generated from this file. It holds the template, the conventions for the
 whole prompt, and the working agreement for review and merge (section 12).
