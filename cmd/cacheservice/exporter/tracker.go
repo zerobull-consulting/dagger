@@ -99,6 +99,10 @@ type Tracker struct {
 	// draining is set by StartDrain: the tracker takes spans only for the
 	// sessions it tracks, and DrainDue makes everything pending due.
 	draining bool
+	// flushing counts the flushes of each cache under way (StartFlush):
+	// while one is, every dirty entry of the cache is due at once, as in a
+	// drain, but spans and sessions are taken as usual.
+	flushing map[string]int
 
 	// slots are the caches with an export in flight, by cache ID, and
 	// slotWaiters the explicit exports waiting for a cache's slot
@@ -238,6 +242,7 @@ func NewTracker(cfg TrackerConfig) *Tracker {
 		caches:      map[string]*trackedCache{},
 		slots:       map[string]bool{},
 		slotWaiters: map[string]int{},
+		flushing:    map[string]int{},
 		freed:       make(chan struct{}),
 	}
 }
@@ -431,9 +436,22 @@ func (t *Tracker) scheduleLocked(c *trackedCache, n uint64, e *trackedEntry, now
 		// only run Due for nothing, on every span.
 		return
 	}
-	if at, ok := t.dueAtLocked(e, now, t.draining); ok {
+	if at, ok := t.dueAtLocked(e, now, t.urgentLocked(c.id)); ok {
 		t.soonLocked(at)
 	}
+}
+
+// urgentLocked reports whether a cache's dirty entries are due at once,
+// without waiting for them to settle: while the tracker drains, or a flush
+// of the cache is under way.
+func (t *Tracker) urgentLocked(cacheID string) bool {
+	return t.draining || t.flushingLocked(cacheID)
+}
+
+// flushingLocked reports whether a flush of cacheID is under way
+// (StartFlush).
+func (t *Tracker) flushingLocked(cacheID string) bool {
+	return t.flushing[cacheID] > 0
 }
 
 // heldLocked reports whether cacheID's slot is taken, or an explicit export
@@ -702,6 +720,7 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 			}
 		}
 		held := t.heldLocked(cacheID)
+		urgent := drain || t.flushingLocked(cacheID)
 		type dueRoot struct {
 			n  uint64
 			at time.Time
@@ -724,14 +743,14 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 				}
 				continue
 			}
-			at, ok := t.dueAtLocked(e, now, drain)
+			at, ok := t.dueAtLocked(e, now, urgent)
 			if !ok {
 				// Worth exporting with nothing scheduled: treated as
 				// changed now, so it settles and is exported. Nothing is
 				// known to leave an entry so; this keeps one from waiting
 				// forever.
 				e.dirtySince = now
-				at, _ = t.dueAtLocked(e, now, drain)
+				at, _ = t.dueAtLocked(e, now, urgent)
 			}
 			if now.Before(at) {
 				if !held && (t.next.IsZero() || at.Before(t.next)) {
@@ -1126,7 +1145,7 @@ func (t *Tracker) EntriesAt(cacheID string, now time.Time) []EntryState {
 		}
 		if !e.inFlight && t.wantedLocked(c, n, e, now) {
 			s.Dirty = !e.dirtySince.IsZero()
-			if at, ok := t.dueAtLocked(e, now, t.draining); ok {
+			if at, ok := t.dueAtLocked(e, now, t.urgentLocked(cacheID)); ok {
 				s.DueAt = at.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 			}
 		}
@@ -1211,35 +1230,94 @@ func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
 	defer t.mu.Unlock()
 	var out []DrainState
 	for _, cacheID := range slices.Sorted(maps.Keys(t.caches)) {
-		c := t.caches[cacheID]
-		st := DrainState{CacheID: cacheID}
-		for n, e := range c.entries {
-			switch {
-			case e.inFlight:
-				st.InFlight++
-			case !t.wantedLocked(c, n, e, now):
-			case e.recheck && e.retryAt.IsZero():
-				// Due at the next DrainDue (see cache).
-				st.Retrying++
-			case e.retryAt.IsZero():
-				st.Pending++
-			case !deadline.IsZero() && e.retryAt.After(deadline):
-				st.Later++
-			default:
-				st.Retrying++
-			}
-		}
-		for _, s := range c.sessions {
-			if s.generation < c.generation {
-				continue
-			}
-			if !s.ended() || (s.seenSpans < s.expectSpans && now.Sub(s.lastSpanAt) < t.drainSessionWait()) {
-				st.Sessions++
-			}
-		}
+		st := t.leftLocked(t.caches[cacheID], now, deadline, true)
 		if st.Sessions > 0 || st.Roots() > 0 {
 			out = append(out, st)
 		}
 	}
 	return out
+}
+
+// leftLocked is what cache c has left to export at now, for a drain (drain)
+// or a flush that ends at deadline. A drain waits for the sessions that
+// haven't ended too, until its first DrainDue stops tracking them; a flush
+// waits only for those that ended with some of their counted spans missing,
+// and only until Settle (at most maxDrainSessionWait) passed with none of
+// them, as a drain does.
+func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain bool) DrainState {
+	st := DrainState{CacheID: c.id}
+	for n, e := range c.entries {
+		switch {
+		case e.inFlight:
+			st.InFlight++
+		case !t.wantedLocked(c, n, e, now):
+		case e.recheck && e.retryAt.IsZero():
+			// Due at the next Due or DrainDue (see cache).
+			st.Retrying++
+		case e.retryAt.IsZero():
+			st.Pending++
+		case !deadline.IsZero() && e.retryAt.After(deadline):
+			st.Later++
+		default:
+			st.Retrying++
+		}
+	}
+	for _, s := range c.sessions {
+		if s.generation < c.generation {
+			continue
+		}
+		waiting := s.ended() && s.seenSpans < s.expectSpans && now.Sub(s.lastSpanAt) < t.drainSessionWait()
+		if waiting || (drain && !s.ended()) {
+			st.Sessions++
+		}
+	}
+	return st
+}
+
+// StartFlush starts a flush of one cache: until end is called, every
+// dirty entry of cacheID is due at once, without waiting for it to settle,
+// as in a drain; and every root of it waiting for another try is due now,
+// once. Retries after that wait their normal backoff. Unlike StartDrain, it
+// changes nothing else: spans, session ends and other caches are taken and
+// scheduled as usual, and the scheduler runs the exports (Due), one at a
+// time per cache. Flushes of one cache may overlap: the cache is flushing
+// until each has ended. FlushStatus is what the flush waits for.
+func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.flushing[cacheID]++
+	if c := t.caches[cacheID]; c != nil {
+		for _, e := range c.entries {
+			if !e.inFlight && e.retryAt.After(now) {
+				e.retryAt = now
+			}
+		}
+	}
+	// Due at once: wake the scheduler. It finds nothing to do for a cache
+	// whose slot is taken, and is woken again when it's freed.
+	t.notifyLocked()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			if t.flushing[cacheID]--; t.flushing[cacheID] <= 0 {
+				delete(t.flushing, cacheID)
+			}
+		})
+	}
+}
+
+// FlushStatus is what cacheID has left to export at now, for a flush that
+// ends at deadline: what a drain would count of it (see DrainState), except
+// that Sessions counts only the ended sessions still waited for (see
+// leftLocked). A cache the tracker doesn't know has nothing left.
+func (t *Tracker) FlushStatus(cacheID string, now, deadline time.Time) DrainState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c := t.caches[cacheID]
+	if c == nil {
+		return DrainState{CacheID: cacheID}
+	}
+	return t.leftLocked(c, now, deadline, false)
 }

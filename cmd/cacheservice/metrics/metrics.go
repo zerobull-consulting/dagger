@@ -121,6 +121,9 @@ type Metrics struct {
 	drainStoredRoots    prometheus.Counter
 	drainLeftRoots      prometheus.Counter
 	drainRefused        *prometheus.CounterVec
+	flushes             *prometheus.CounterVec
+	flushDuration       prometheus.Histogram
+	flushLeftRoots      prometheus.Counter
 	otlpRefused         *prometheus.CounterVec
 	otlpRequestBytes    *prometheus.HistogramVec
 	collectors          []prometheus.Collector
@@ -362,6 +365,19 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "drain_refused_total",
 			Help: "New work refused while draining, by kind: connection (an engine WebSocket, 503) or span (a cache span or session end of a session the service doesn't track).",
 		}, []string{"kind"}),
+		flushes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "flush_total",
+			Help: "Flushes of one engine cache (POST /v1/engines/{cacheID}/flush), by outcome: complete (nothing left), timeout (something left when its timeout passed, or only retries due after it), not_connected (its engine wasn't connected) or canceled (the request or the export path ended).",
+		}, []string{"outcome"}),
+		flushDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: ns, Name: "flush_duration_seconds",
+			Help:    "Time of each flush of one engine cache, from its start to its report.",
+			Buckets: promotionBuckets,
+		}),
+		flushLeftRoots: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "flush_unexported_roots_total",
+			Help: "Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry.",
+		}),
 		otlpRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "otlp_refused_total",
 			Help: "OTLP requests refused for their body, by route (traces, logs, metrics) and reason: too_large (413, over the route's limit as received or decoded, or decoding to a message the decode budget could never hold), busy (503, the decode budget full) or timeout (408, not received within the read timeout). Nothing of a refused request is recorded.",
@@ -388,6 +404,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule, m.gcUnexpectedKeys, m.gcRefused,
 		m.exportCollected,
 		m.draining, m.exportEnabled, m.exportWaiting, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
+		m.flushes, m.flushDuration, m.flushLeftRoots,
 		m.otlpRefused, m.otlpRequestBytes,
 	}
 	if reg != nil {
@@ -801,6 +818,31 @@ const (
 	// signal).
 	DrainCanceled = "canceled"
 )
+
+// Flush outcomes.
+const (
+	// FlushComplete left nothing of its cache to export.
+	FlushComplete = "complete"
+	// FlushTimeout left something when its timeout passed, or only retries
+	// due after it.
+	FlushTimeout = "timeout"
+	// FlushNotConnected found its cache's engine not connected.
+	FlushNotConnected = "not_connected"
+	// FlushCanceled ended because its request was canceled, or the export
+	// path stopped.
+	FlushCanceled = "canceled"
+)
+
+// FlushEnded records a flush's end: its outcome, how long it took, and how
+// many roots it left unexported.
+func (m *Metrics) FlushEnded(outcome string, d time.Duration, left int) {
+	if m == nil {
+		return
+	}
+	m.flushes.WithLabelValues(outcome).Inc()
+	m.flushDuration.Observe(d.Seconds())
+	m.flushLeftRoots.Add(float64(left))
+}
 
 // Kinds of work refused while draining.
 const (

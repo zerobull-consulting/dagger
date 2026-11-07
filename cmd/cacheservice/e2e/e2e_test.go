@@ -90,6 +90,9 @@ func TestRealEngines(t *testing.T) {
 	// Streaming exports (zerobull-consulting/dagger#134): an entry stored
 	// while its session still runs.
 	env.Run("streaming", st.streaming)
+	// The flush of one engine cache (zerobull-consulting/dagger#136): its
+	// own service and engine, flushed, then stopped with the service up.
+	env.Run("flush", st.flush)
 	// A read-only service (-export=false, #65): its own service and engine,
 	// and nothing written.
 	env.Run("readonly", st.readonly)
