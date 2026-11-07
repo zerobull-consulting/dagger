@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -129,3 +130,19 @@ func (tf *TokenFile) Lookup(token string) (string, bool) {
 // ErrNoTokensFile is returned by ReloadTokens when the service was started
 // without a tokens file: it is unauthenticated, and stays so.
 var ErrNoTokensFile = errors.New("the service has no tokens file: it is unauthenticated")
+
+// NamespaceNames returns the distinct namespaces the file maps to, sorted:
+// the lifecycle command's namespaces (package lifecycle). It never returns
+// tokens.
+func (tf *TokenFile) NamespaceNames() []string {
+	set := map[string]bool{}
+	var out []string
+	for _, e := range tf.entries {
+		if !set[e.namespace] {
+			set[e.namespace] = true
+			out = append(out, e.namespace)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
