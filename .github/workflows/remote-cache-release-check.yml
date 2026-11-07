@@ -15,6 +15,11 @@ name: Remote cache release check
 # (zerobull-consulting/dagger#152). Everything else, dispatches, issues and
 # auto-merge included, uses GITHUB_TOKEN. Neither token merges anything.
 "on":
+  # TEMPORARY, for zerobull-consulting/dagger#156's dry runs: GitHub only
+  # dispatches a workflow it has seen run. Removed before the merge.
+  push:
+    branches:
+      - remote-cache/release-check
   schedule:
     # Hourly, off the hour.
     - cron: "17 * * * *"
