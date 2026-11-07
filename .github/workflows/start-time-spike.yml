@@ -8,6 +8,10 @@ permissions:
 # on cold runners, the same way. Removed before the PR is marked ready.
 jobs:
   before:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -34,6 +38,10 @@ jobs:
       - if: always()
         uses: zerobull-consulting/dagger/.github/actions/remote-cache-sidecar/stop@af0f26080e39f9fa5a4ed982da95bcd402f133df
   after:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -44,7 +52,7 @@ jobs:
         run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
       - run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
       - id: s
-        uses: ./.github/actions/remote-cache/start
+        uses: zerobull-consulting/dagger/.github/actions/remote-cache/start@02346916a3bf0753c4d39439954910e0599cbe1e
         with:
           role: read-only
           version: ${{ env.STOCK_ENGINE_TAG }}
