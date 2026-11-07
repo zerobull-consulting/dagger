@@ -26,12 +26,14 @@
 #       version (dry run only), that release, listed or not.
 #   release-check.sh [--dry-run] verify <version> <digest>
 #       Runs the current service against that stock engine: dispatches
-#       remote-cache-tests.yml on the branch with the candidate inputs and
+#       remote-cache-tests.yml on the branch (RELEASE_CHECK_TEST_REF: a dry
+#       run's own ref) with the candidate inputs and
 #       waits for it, runs TestBundleVersionMatchesEngineCapture with the
 #       tag merged in, and writes the advisory diff. Prints result=pass or
 #       result=fail. A run that doesn't end in success or failure
-#       (cancelled, timed out waiting) is an error, never a failure: it
-#       must not lead to a reject line.
+#       (cancelled, timed out waiting), or that failed before testing (its
+#       checkout or pin step), is an error, never a failure: it must not
+#       lead to a reject line.
 #   release-check.sh [--dry-run] accept <version> <digest> <run URL>
 #       Outcome A: pushes release-check/accept/<version> with the accept
 #       line, and opens its PR.
@@ -357,7 +359,17 @@ finish_tests() {
 	note "${p}_conclusion" "$conclusion"
 	case "$conclusion" in
 	success) : >"$notes/$p-jobs.md"; echo pass ;;
-	failure) failing_jobs "$id" >"$notes/$p-jobs.md"; echo fail ;;
+	failure)
+		# A job that failed before testing anything (its checkout, or the
+		# pin step refusing the candidate) says nothing about the engine.
+		local early
+		early="$(api "repos/$repo/actions/runs/$id/jobs?per_page=100" | jq -r '[.jobs[] | select(.conclusion == "failure") |
+			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")')" ||
+			die "couldn't read the verifying run $url's jobs"
+		[[ -z "$early" ]] || die "the verifying run $url failed before testing ($early): not deciding on it"
+		failing_jobs "$id" >"$notes/$p-jobs.md"
+		echo fail
+		;;
 	*) die "the verifying run $url ended '$conclusion', neither green nor red: not deciding on it" ;;
 	esac
 }
@@ -539,7 +551,9 @@ cmd_verify() {
 	fetch_tag "$v"
 	advisory "$v"
 	local id
-	id="$(start_tests "$branch" "$v" "$d")"
+	# The service as it is: the branch's, or in a dry run (from the
+	# workflow), the dry run's own ref.
+	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
 	new_tree
 	merge="$(merge_tag "$v")"
 	note merge "$merge"

@@ -114,7 +114,9 @@ case "$method $path" in
 	echo "$c" >"$FAKE/run-$id"
 	echo "{\"workflow_run_id\": $id, \"run_url\": \"x\", \"html_url\": \"x\"}" ;;
 "GET repos/o/r/actions/runs/"*/jobs*)
-	echo '{"jobs": [{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/1/job/2"},
+	failed_step="${FAKE_FAILED_STEP:-Real engines}"
+	echo '{"jobs": [{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/1/job/2",
+		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "failure"}]},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
 "GET repos/o/r/actions/runs/"*)
 	c="$(cat "$FAKE/run-${path##*/}")"
@@ -263,6 +265,17 @@ setup
 echo success >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_GO_FAIL=1
 check "verify: a failing bundle test fails it, whatever the e2e" has "$tmp/out" "result=fail"
+
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_FAILED_STEP="The engine pin, from the manifest"
+check "verify: a run that failed at its pin step is an error, not a failure" test "$status" -ne 0
+check "verify: saying it failed before testing" has "$tmp/out" "failed before testing"
+
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF=remote-cache/some-branch
+check "verify: a dry run's verification runs on its own ref" jq -e '.ref == "remote-cache/some-branch"' "$FAKE/dispatch-remote-cache-tests.yml-1"
 
 setup
 echo cancelled >"$FAKE/conclusions"

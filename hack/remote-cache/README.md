@@ -900,8 +900,9 @@ only decides when it runs and with which token.
    It writes the advisory diff of the engine's side of the remote cache from
    the manifest's `base` to the release, and whether the bundle or protocol
    version changed. **The run is the gate**; the diff only informs.
-   A run that is cancelled, or that the check can't read, is an error: it
-   never leads to a reject line.
+   A run that is cancelled, that failed before testing (its checkout or its
+   pin step), or that the check can't read, is an error: it never leads to
+   a reject line.
 4. **The outcome:**
    - **A, both green:** a PR from `release-check/accept/<version>`, as
      `CACHE_BOT_PR_TOKEN`, adding only
@@ -977,8 +978,9 @@ workflow. Off `feature/remote-cache` it is always a dry run, which can't
 reach the bots' environments: it polls, prints the plan, and prints each
 push, PR and issue the outcome would make, after a real, local merge. On
 `feature/remote-cache`, `dry-run` (default on) does the same. In a dry run:
-- `verify` also runs the real verification (about an hour); it changes no
-  file in the repository;
+- `verify` also runs the real verification (about an hour), on the dry
+  run's own branch, so a branch's dry run tests that branch's service; it
+  changes no file in the repository;
 - `version` checks a chosen release, listed or not. For an accepted one,
   `engines.sh candidate` moves its own line first, with its digest, so the
   run runs it.

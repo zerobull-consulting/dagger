@@ -100,6 +100,9 @@ jobs:
           fi
           echo "dry=$dry" >>"$GITHUB_OUTPUT"
           echo "RELEASE_CHECK_DRY_RUN=$dry" >>"$GITHUB_ENV"
+          # A dry run verifies the service on its own ref, so a branch's dry
+          # run tests that branch's code.
+          if [[ "$dry" == true ]]; then echo "RELEASE_CHECK_TEST_REF=$GITHUB_REF_NAME" >>"$GITHUB_ENV"; fi
           echo "dry run: $dry" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Setup Go
         uses: actions/setup-go@v6
