@@ -275,6 +275,38 @@ func TestPlanDiff(t *testing.T) {
 	}
 }
 
+// A rule of the command's with the wanted ID that drifted in a detail the
+// summary used to leave out (a transition, a tag, noncurrent versions) is
+// updated, not kept.
+func TestPlanDiffSeesDetails(t *testing.T) {
+	wanted, _ := Rules(prefix, []string{"a"}, false)
+	transition := expireRule(StagingID(prefix, "a"), "cache/ns/a/staging/")
+	transition.Transitions = []types.Transition{{Days: aws.Int32(7), StorageClass: types.TransitionStorageClassGlacier}}
+	otherTransition := expireRule(StagingID(prefix, "a"), "cache/ns/a/staging/")
+	otherTransition.Transitions = []types.Transition{{Days: aws.Int32(30), StorageClass: types.TransitionStorageClassGlacier}}
+	tagged := expireRule(StagingID(prefix, "a"), "")
+	tagged.Filter = &types.LifecycleRuleFilter{And: &types.LifecycleRuleAndOperator{Prefix: aws.String("cache/ns/a/staging/"), Tags: []types.Tag{{Key: aws.String("k"), Value: aws.String("v")}}}}
+	noncurrent := expireRule(StagingID(prefix, "a"), "cache/ns/a/staging/")
+	noncurrent.NoncurrentVersionExpiration = &types.NoncurrentVersionExpiration{NoncurrentDays: aws.Int32(3)}
+	for name, r := range map[string]types.LifecycleRule{"a transition": transition, "a tag": tagged, "noncurrent versions": noncurrent} {
+		p, err := NewPlan(prefix, []types.LifecycleRule{r}, wanted, MaxRules)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Changes[0].Kind != Update {
+			t.Errorf("%s: %s, want an update", name, p.Changes[0].Kind)
+		}
+	}
+	if describe(transition) == describe(otherTransition) {
+		t.Fatal("two transitions of different days compare equal")
+	}
+	// The generated rules carry no details, so they still compare equal to
+	// themselves read back.
+	if p, err := NewPlan(prefix, wanted, wanted, MaxRules); err != nil || p.Changed() {
+		t.Fatalf("the wanted rules against themselves: %+v, %v", p, err)
+	}
+}
+
 func TestPlanRuleLimit(t *testing.T) {
 	var current []types.LifecycleRule
 	for i := range 8 {
@@ -324,6 +356,9 @@ func TestCheck(t *testing.T) {
 		{"disabled", append(slices.Clone(good), disabled), nil, nil, 0, true},
 		{"broad own", []types.LifecycleRule{expireRule(OwnedIDPrefix+prefixTag(prefix)+"-x", "cache/ns/a/")}, []string{"a", "b"}, []string{"a"}, 1, false},
 		{"abort above the prefix", []types.LifecycleRule{abortRule("x", "")}, []string{"a", "b"}, nil, 0, true},
+		{"abort filtered by size", []types.LifecycleRule{{ID: aws.String("x"), Status: types.ExpirationStatusEnabled,
+			Filter:                         &types.LifecycleRuleFilter{And: &types.LifecycleRuleAndOperator{Prefix: aws.String("cache/"), ObjectSizeGreaterThan: aws.Int64(1 << 30)}},
+			AbortIncompleteMultipartUpload: &types.AbortIncompleteMultipartUpload{DaysAfterInitiation: aws.Int32(1)}}}, []string{"a", "b"}, nil, 0, false},
 		{"a transition", append(slices.Clone(good), types.LifecycleRule{ID: aws.String("cold"), Status: types.ExpirationStatusEnabled,
 			Filter: &types.LifecycleRuleFilter{Prefix: aws.String("cache/ns/a/blobs/")}, Transitions: []types.Transition{{Days: aws.Int32(7), StorageClass: types.TransitionStorageClassGlacier}}}), nil, []string{"a"}, 0, true},
 	} {
@@ -525,6 +560,16 @@ func TestApplyStoreErrors(t *testing.T) {
 	if code, out := run(t, opts("apply", "a"), st); code != ExitError || !strings.Contains(out, "other rules aren't as they were written") {
 		t.Fatalf("a foreign rule lost: %d\n%s", code, out)
 	}
+	// The configuration's other setting, read back as other than written.
+	st = &fakeStore{cfg: Config{TransitionDefaultMinimumObjectSize: "varies_by_storage_class"}}
+	st.onGet = func(n int) {
+		if n == 2 {
+			st.cfg.TransitionDefaultMinimumObjectSize = "all_storage_classes_128K"
+		}
+	}
+	if code, out := run(t, opts("apply", "a"), st); code != ExitError || !strings.Contains(out, "TransitionDefaultMinimumObjectSize") {
+		t.Fatalf("TransitionDefaultMinimumObjectSize changed: %d\n%s", code, out)
+	}
 	tagged := func(v string) types.LifecycleRule {
 		r := expireRule("logs", "")
 		r.Filter = &types.LifecycleRuleFilter{And: &types.LifecycleRuleAndOperator{Prefix: aws.String("logs/"), Tags: []types.Tag{{Key: aws.String("k"), Value: aws.String(v)}}}}
@@ -593,6 +638,11 @@ func TestMain(t *testing.T) {
 	}
 	if code, out := main("apply", "-tokens-file", tokens, "-confirm=bkt/other"); code != ExitUsage || st.puts != 0 {
 		t.Fatalf("a -confirm mismatch: %d\n%s", code, out)
+	}
+	// Before anything is read: a missing tokens file would exit 1.
+	gets := st.gets
+	if code, out := main("apply", "-tokens-file", filepath.Join(dir, "missing"), "-confirm=bkt/other"); code != ExitUsage || st.gets != gets {
+		t.Fatalf("a -confirm mismatch with a missing tokens file: %d, %d gets\n%s", code, st.gets-gets, out)
 	}
 	if code, out := main("apply", "-tokens-file", tokens, "-confirm=bkt/cache"); code != ExitOK || st.puts != 1 {
 		t.Fatalf("apply: %d\n%s", code, out)

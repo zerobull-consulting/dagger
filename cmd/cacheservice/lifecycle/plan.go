@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -180,11 +181,13 @@ func Check(prefix string, rules []types.LifecycleRule, namespaces []string) (*Re
 		if r.Status != types.ExpirationStatusEnabled {
 			continue
 		}
-		p, _ := filterPrefix(r)
+		p, only := filterPrefix(r)
 		if e := r.Expiration; (e != nil && (aws.ToInt32(e.Days) > 0 || e.Date != nil)) || len(r.Transitions) > 0 {
 			expiring = append(expiring, p)
 		}
-		if a := r.AbortIncompleteMultipartUpload; a != nil && aws.ToInt32(a.DaysAfterInitiation) > 0 && len(p) <= len(root) && root[:len(p)] == p {
+		// Only a rule filtered by prefix alone aborts every upload under
+		// the prefix.
+		if a := r.AbortIncompleteMultipartUpload; a != nil && only && aws.ToInt32(a.DaysAfterInitiation) > 0 && strings.HasPrefix(root, p) {
 			rep.Abort = true
 		}
 		if Owned(r, prefix) {

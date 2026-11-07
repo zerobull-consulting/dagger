@@ -37,9 +37,11 @@ package lifecycle
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -250,7 +252,42 @@ func describe(r types.LifecycleRule) string {
 	if a := r.AbortIncompleteMultipartUpload; a != nil {
 		parts = append(parts, fmt.Sprintf("abort incomplete uploads after %d day(s)", aws.ToInt32(a.DaysAfterInitiation)))
 	}
+	if d := details(r, only); d != "" {
+		parts = append(parts, d)
+	}
 	return fmt.Sprintf("%q: %s", p, strings.Join(parts, ", "))
+}
+
+// details are, in full, the parts of a rule the command never generates
+// (other filters, a date, delete markers, noncurrent versions,
+// transitions), or "" when it has none: so a rule of the command's that
+// drifted from what it generates never compares equal to it, and is
+// updated (TestPlanDiffSeesDetails).
+func details(r types.LifecycleRule, only bool) string {
+	var d struct {
+		Filter                       *types.LifecycleRuleFilter          `json:",omitempty"`
+		Date                         string                              `json:",omitempty"`
+		ExpiredObjectDeleteMarker    *bool                               `json:",omitempty"`
+		NoncurrentVersionExpiration  *types.NoncurrentVersionExpiration  `json:",omitempty"`
+		Transitions                  []types.Transition                  `json:",omitempty"`
+		NoncurrentVersionTransitions []types.NoncurrentVersionTransition `json:",omitempty"`
+	}
+	if !only {
+		d.Filter = r.Filter
+	}
+	if e := r.Expiration; e != nil {
+		if e.Date != nil {
+			d.Date = e.Date.UTC().Format(time.RFC3339)
+		}
+		d.ExpiredObjectDeleteMarker = e.ExpiredObjectDeleteMarker
+	}
+	d.NoncurrentVersionExpiration = r.NoncurrentVersionExpiration
+	d.Transitions, d.NoncurrentVersionTransitions = r.Transitions, r.NoncurrentVersionTransitions
+	b, err := json.Marshal(d)
+	if err != nil || string(b) == "{}" {
+		return ""
+	}
+	return "details " + string(b)
 }
 
 // target is what a rule of the command's is for, regardless of its ID: a

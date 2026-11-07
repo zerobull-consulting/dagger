@@ -134,6 +134,22 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	if timeout <= 0 || o.MaxRules <= 0 {
 		return fail(ExitUsage, "-timeout and -max-rules must be positive")
 	}
+	cfg, err := blobstore.S3ConfigFromEnv()
+	if err != nil {
+		return fail(ExitUsage, "%v", err)
+	}
+	if cfg.Bucket == "" {
+		return fail(ExitUsage, "%s is not set", blobstore.EnvBucket)
+	}
+	o.Bucket, o.Prefix = cfg.Bucket, cfg.Prefix
+	if slices.ContainsFunc(strings.Split(strings.Trim(o.Prefix, "/"), "/"), func(s string) bool { return s == ".." || s == "." }) {
+		return fail(ExitUsage, "%s is %q: it can't contain . or .. segments", blobstore.EnvPrefix, o.Prefix)
+	}
+	// A wrong -confirm stops apply before anything is read, the tokens
+	// file included (Run checks it again, for its other callers).
+	if o.Action == "apply" && o.Confirm != ConfirmValue(o.Bucket, o.Prefix) {
+		return fail(ExitUsage, "apply needs -confirm=%s, repeating the bucket and prefix it changes (got %q); nothing read or written", ConfirmValue(o.Bucket, o.Prefix), o.Confirm)
+	}
 	if tokensFile != "" {
 		tf, err := server.LoadTokenFile(tokensFile)
 		if err != nil {
@@ -145,17 +161,6 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 			return fail(ExitUsage, "-scope: %v", err)
 		}
 		o.Namespaces, o.Source, o.Scope = []string{scope}, "-scope, without a tokens file", scope
-	}
-	cfg, err := blobstore.S3ConfigFromEnv()
-	if err != nil {
-		return fail(ExitUsage, "%v", err)
-	}
-	if cfg.Bucket == "" {
-		return fail(ExitUsage, "%s is not set", blobstore.EnvBucket)
-	}
-	o.Bucket, o.Prefix = cfg.Bucket, cfg.Prefix
-	if slices.ContainsFunc(strings.Split(strings.Trim(o.Prefix, "/"), "/"), func(s string) bool { return s == ".." || s == "." }) {
-		return fail(ExitUsage, "%s is %q: it can't contain . or .. segments", blobstore.EnvPrefix, o.Prefix)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -257,6 +262,9 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	after, err := st.GetLifecycle(ctx)
 	if err != nil {
 		return fail(ExitError, "written, but can't read it back to verify: %v", explainRead(err))
+	}
+	if w := current.TransitionDefaultMinimumObjectSize; w != "" && after.TransitionDefaultMinimumObjectSize != w {
+		return fail(ExitError, "written, but the configuration's TransitionDefaultMinimumObjectSize is %q, not the %q written back", after.TransitionDefaultMinimumObjectSize, w)
 	}
 	if err := verify(o.Prefix, p, after.Rules, o.MaxRules); err != nil {
 		return fail(ExitError, "written, but what the bucket holds now isn't what was written: %v", err)
