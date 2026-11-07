@@ -28,12 +28,19 @@
 #       Runs the current service against that stock engine: dispatches
 #       remote-cache-tests.yml on the branch (RELEASE_CHECK_TEST_REF: a dry
 #       run's own ref) with the candidate inputs and
-#       waits for it, runs TestBundleVersionMatchesEngineCapture with the
-#       tag merged in, and writes the advisory diff. Prints result=pass or
-#       result=fail. A run that doesn't end in success or failure
+#       waits for it, and writes the advisory diff. Prints result=pass or
+#       result=fail: the e2e and the sidecar demo's verdict. A run that doesn't end in success or failure
 #       (cancelled, timed out waiting), or that failed before testing (its
 #       checkout or pin step), is an error, never a failure: it must not
 #       lead to a reject line.
+#   release-check.sh bundle <version>
+#       TestBundleVersionMatchesEngineCapture with the tag merged in. It
+#       runs upstream's code, so the workflow runs it in a job of its own
+#       with no credential, and it refuses to run if a token is in its
+#       environment. Prints bundle=pass, fail or conflict (not run: the tag
+#       conflicts with the branch), and merge=. A needs verify's pass and
+#       this pass; the outcome commands read this verdict from
+#       RELEASE_CHECK_BUNDLE.
 #   release-check.sh [--dry-run] accept <version> <digest> <run URL>
 #       Outcome A: pushes release-check/accept/<version> with the accept
 #       line, and opens its PR.
@@ -47,7 +54,8 @@
 #       does, and if it passes adds the accept line (or resets the list to
 #       it, if the bundle or protocol version changed) and opens its PR.
 #       Prints result=pass, fail or skipped (the tag is already merged, so
-#       a rebuild is the code A ran; or the merge conflicts).
+#       a rebuild is the code A ran; the merge conflicts; or the bundle
+#       test of that same merge didn't pass).
 #   release-check.sh [--dry-run] reject <version> [<issue number>]
 #       Outcome C: files (or finds) the compat-break issue with the failing
 #       jobs and the advisory diff, then pushes release-check/reject/
@@ -330,11 +338,10 @@ wait_run() {
 	done
 }
 
-# failing_jobs <id>: the run's failed jobs, as a Markdown list.
+# failing_jobs: a run's failed jobs (its jobs JSON on stdin), as a
+# Markdown list.
 failing_jobs() {
-	api "repos/$repo/actions/runs/$1/jobs?per_page=100" |
-		jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "- [\(.name)](\(.html_url)): \(.conclusion)"' ||
-		echo "- (couldn't list the run's jobs)"
+	jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "- [\(.name)](\(.html_url)): \(.conclusion)"'
 }
 
 # The e2e and the sidecar demo against the candidate, waited on, write
@@ -362,12 +369,14 @@ finish_tests() {
 	failure)
 		# A job that failed before testing anything (its checkout, or the
 		# pin step refusing the candidate) says nothing about the engine.
-		local early
-		early="$(api "repos/$repo/actions/runs/$id/jobs?per_page=100" | jq -r '[.jobs[] | select(.conclusion == "failure") |
-			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")')" ||
-			die "couldn't read the verifying run $url's jobs"
+		# The jobs are read once, and a failed read decides nothing.
+		local jobs early
+		jobs="$(api "repos/$repo/actions/runs/$id/jobs?per_page=100")" && jq -e '.jobs | type == "array"' <<<"$jobs" >/dev/null ||
+			die "couldn't read the verifying run $url's jobs: not deciding on it"
+		early="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
+			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
 		[[ -z "$early" ]] || die "the verifying run $url failed before testing ($early): not deciding on it"
-		failing_jobs "$id" >"$notes/$p-jobs.md"
+		failing_jobs <<<"$jobs" >"$notes/$p-jobs.md"
 		echo fail
 		;;
 	*) die "the verifying run $url ended '$conclusion', neither green nor red: not deciding on it" ;;
@@ -439,7 +448,13 @@ advisory() {
 	cat "$notes/advisory.md" >&2
 }
 
-# bundle_test: TestBundleVersionMatchesEngineCapture in the worktree.
+# bundle_result: the bundle job's verdict (RELEASE_CHECK_BUNDLE, from the
+# workflow), or the notes'.
+bundle_result() { echo "${RELEASE_CHECK_BUNDLE:-$(get bundle)}"; }
+
+# bundle_test: TestBundleVersionMatchesEngineCapture in the worktree. It
+# compiles and runs upstream's code, so only cmd_bundle calls it, in a job
+# that holds no credential.
 bundle_test() {
 	if (cd "$tree" && timeout 1200 go test -count=1 -run '^TestBundleVersionMatchesEngineCapture$' ./cmd/cacheservice/metastore/ >&2); then
 		echo pass
@@ -540,8 +555,32 @@ cmd_plan() {
 	out action none
 }
 
+# cmd_bundle: the bundle test with the tag merged, on its own: it runs
+# upstream's code, which must never share a process tree, or a job, with a
+# token (it could read one from its environment or its parent's). Refused
+# if any token is in the environment.
+cmd_bundle() {
+	local v="$1" merge bundle var
+	need_tag "$v"
+	for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
+		[[ -z "${!var:-}" ]] || die "$var is set: the bundle test runs upstream's code, and must run without any credential"
+	done
+	fetch_tag "$v"
+	new_tree
+	merge="$(merge_tag "$v")"
+	if [[ "$merge" == conflict ]]; then
+		# Not run, so not passed: it verified nothing.
+		bundle=conflict
+	else
+		bundle="$(bundle_test)"
+	fi
+	say "TestBundleVersionMatchesEngineCapture with $v merged: $bundle"
+	out merge "$merge"
+	out bundle "$bundle"
+}
+
 cmd_verify() {
-	local v="$1" d="$2" a bundle merge
+	local v="$1" d="$2" a
 	need_tag "$v"
 	need_digest "$d"
 	mkdir -p "$notes"
@@ -554,25 +593,11 @@ cmd_verify() {
 	# The service as it is: the branch's, or in a dry run (from the
 	# workflow), the dry run's own ref.
 	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
-	new_tree
-	merge="$(merge_tag "$v")"
-	note merge "$merge"
-	if [[ "$merge" == conflict ]]; then
-		bundle="not run (merging $v conflicts)"
-		note bundle conflict
-	else
-		bundle="$(bundle_test)"
-		note bundle "$bundle"
-	fi
-	say "TestBundleVersionMatchesEngineCapture with $v merged: $bundle"
 	a="$(finish_tests "$id" a)"
-	# Both must pass: a bundle test that didn't run (the tag conflicts with
-	# the branch) verified nothing, so it is no accept line.
-	if [[ "$a" == pass && "$bundle" == pass ]]; then
-		out result pass
-	else
-		out result fail
-	fi
+	# The e2e and the sidecar demo's verdict. A is this and the bundle job's
+	# both passing (the workflow decides): a bundle test that didn't run (the
+	# tag conflicts with the branch) verified nothing.
+	out result "$a"
 	out run "$(get a_run)"
 }
 
@@ -597,7 +622,7 @@ cmd_accept() {
 		echo '```'
 		echo
 		echo "- **Verifying run** (the e2e and the sidecar demo against \`$engine_repo:$v@$d\`): $run"
-		echo "- **TestBundleVersionMatchesEngineCapture** with \`$v\` merged in: $(get bundle)."
+		echo "- **TestBundleVersionMatchesEngineCapture** with \`$v\` merged in: $(bundle_result)."
 		echo
 		[[ -f "$notes/advisory.md" ]] && cat "$notes/advisory.md" && echo
 		if [[ "$auto_merge" == true ]]; then
@@ -684,6 +709,15 @@ cmd_rebuild() {
 		return
 		;;
 	esac
+	# The rebuild's code is this same merge (plus a manifest line), whose
+	# bundle test the bundle job ran: if it didn't pass, no rebuild can.
+	if [[ "$(bundle_result)" != pass ]]; then
+		say "the bundle test with $v merged didn't pass ($(bundle_result)): a rebuild is that merge, so not rebuilding"
+		note b_merge bundle
+		note b skipped
+		out result skipped
+		return
+	fi
 	old="$("$engines" base)"
 	manifest_edit set-base "$v" >&2
 	git -C "$tree" add "$manifest_path"
@@ -696,13 +730,9 @@ cmd_rebuild() {
 		out result dry-run
 		return
 	fi
-	local id bundle
+	local id
 	id="$(start_tests "release-check/rebuild/$v" "$v" "$d")"
-	bundle="$(bundle_test)"
-	note b_bundle "$bundle"
-	say "TestBundleVersionMatchesEngineCapture on the rebuild: $bundle"
 	b="$(finish_tests "$id" b)"
-	[[ "$bundle" == pass ]] || b=fail
 	note b "$b"
 	if [[ "$b" != pass ]]; then
 		out result fail
@@ -755,10 +785,16 @@ cmd_reject() {
 			echo "**As it is** (e2e and sidecar demo of \`$branch\` against it): $(get a_run), $(get a_conclusion)."
 			cat "$notes/a-jobs.md" 2>/dev/null || true
 			echo
-			echo "- TestBundleVersionMatchesEngineCapture with \`$v\` merged in: $(get bundle)."
+			echo "- TestBundleVersionMatchesEngineCapture with \`$v\` merged in: $(bundle_result)."
 			case "$(get b)" in
 			fail) echo "- **Rebuilt on \`$v\`** (branch \`release-check/rebuild/$v\`): $(get b_run), $(get b_conclusion)." && cat "$notes/b-jobs.md" 2>/dev/null ;;
-			skipped) echo "- **Not rebuilt:** merging \`$v\` into \`$branch\` $([[ "$(get b_merge)" == ancestor ]] && echo "changes nothing (it's merged already), so a rebuild is the code above" || echo conflicts)." ;;
+			skipped)
+				case "$(get b_merge)" in
+				ancestor) echo "- **Not rebuilt:** \`$branch\` contains \`$v\` already, so a rebuild is the code above." ;;
+				conflict) echo "- **Not rebuilt:** merging \`$v\` into \`$branch\` conflicts." ;;
+				*) echo "- **Not rebuilt:** the bundle test with \`$v\` merged didn't pass, and a rebuild is that same merge." ;;
+				esac
+				;;
 			*) echo "- Not rebuilt." ;;
 			esac
 			echo
@@ -813,9 +849,10 @@ case "${1:-}" in
 publish) [[ $# -eq 1 ]] || die "usage: release-check.sh publish"; cmd_publish ;;
 plan) [[ $# -le 2 ]] || die "usage: release-check.sh plan [<version>]"; cmd_plan "${2:-}" ;;
 verify) [[ $# -eq 3 ]] || die "usage: release-check.sh verify <version> <digest>"; cmd_verify "$2" "$3" ;;
+bundle) [[ $# -eq 2 ]] || die "usage: release-check.sh bundle <version>"; cmd_bundle "$2" ;;
 accept) [[ $# -eq 4 ]] || die "usage: release-check.sh accept <version> <digest> <run URL>"; cmd_accept "$2" "$3" "$4" ;;
 auto-merge) [[ $# -eq 2 ]] || die "usage: release-check.sh auto-merge <PR>"; cmd_auto_merge "$2" ;;
 rebuild) [[ $# -eq 3 ]] || die "usage: release-check.sh rebuild <version> <digest>"; cmd_rebuild "$2" "$3" ;;
 reject) [[ $# -le 3 && $# -ge 2 ]] || die "usage: release-check.sh reject <version> [<issue>]"; cmd_reject "$2" "${3:-}" ;;
-*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | verify <version> <digest> | accept <version> <digest> <run> | auto-merge <PR> | rebuild <version> <digest> | reject <version> [<issue>]" ;;
+*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | verify <version> <digest> | bundle <version> | accept <version> <digest> <run> | auto-merge <PR> | rebuild <version> <digest> | reject <version> [<issue>]" ;;
 esac

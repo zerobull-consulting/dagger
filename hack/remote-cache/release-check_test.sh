@@ -6,6 +6,8 @@
 #
 #   hack/remote-cache/release-check_test.sh
 set -uo pipefail
+# The caller's own tokens never reach the script under test.
+unset GITHUB_TOKEN BOT_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 script="$here/release-check.sh"
@@ -114,6 +116,9 @@ case "$method $path" in
 	echo "$c" >"$FAKE/run-$id"
 	echo "{\"workflow_run_id\": $id, \"run_url\": \"x\", \"html_url\": \"x\"}" ;;
 "GET repos/o/r/actions/runs/"*/jobs*)
+	[[ -n "${FAKE_JOBS_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
+	# FAKE_JOBS_FAIL_AFTER=1: the first read works, every later one fails.
+	if [[ -n "${FAKE_JOBS_FAIL_AFTER:-}" ]] && (($(n jobs-read) > FAKE_JOBS_FAIL_AFTER)); then echo "HTTP 502" >&2; exit 1; fi
 	failed_step="${FAKE_FAILED_STEP:-Real engines}"
 	echo '{"jobs": [{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/1/job/2",
 		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "failure"}]},
@@ -191,7 +196,8 @@ rc() {
 			PATH="$tmp/bin:$PATH" BOT_SECRET="$bot_secret" GH_SECRET="$gh_secret" GH_TOKEN="$gh_secret" \
 				ENGINES_FILE="$work/$manifest" RELEASE_CHECK_REPO=o/r RELEASE_CHECK_REMOTE="$FAKE/origin.git" \
 				RELEASE_CHECK_UPSTREAM="$up" RELEASE_CHECK_DIR="$FAKE/notes" RELEASE_CHECK_POLL_SECONDS=0 \
-				GITHUB_SERVER_URL=https://github.com GITHUB_OUTPUT="$FAKE/output" "$@" "$script" "${ARGS[@]}"
+				GITHUB_SERVER_URL=https://github.com GITHUB_OUTPUT="$FAKE/output" RELEASE_CHECK_BUNDLE="${BUNDLE-pass}" \
+				"$@" "$script" "${ARGS[@]}"
 	) >"$tmp/out" 2>&1
 	status=$?
 }
@@ -246,14 +252,13 @@ echo "--- verify"
 setup
 echo success >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
-check "verify: a green run and bundle test pass" has "$tmp/out" "result=pass"
+check "verify: a green run passes" has "$tmp/out" "result=pass"
 check "verify: cites the run" has "$tmp/out" "run=https://github.com/o/r/actions/runs/5001"
 check "verify: dispatches remote-cache-tests.yml on the branch with the candidate" \
 	jq -e --arg d "$d2" '.ref == "feature/remote-cache" and .inputs == {"candidate-version": "v1.0.0-beta.26", "candidate-digest": $d}' "$FAKE/dispatch-remote-cache-tests.yml-1"
 check "verify: dispatches with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/actions/workflows/remote-cache-tests.yml/dispatches"
-check "verify: runs the bundle test" has "$FAKE/go-calls" "TestBundleVersionMatchesEngineCapture"
+check "verify: never runs upstream's code (the bundle job does)" not test -f "$FAKE/go-calls"
 check "verify: writes the advisory diff" has "$FAKE/notes/advisory.md" "dagql/cache_live.go"
-check "verify: notes the tag merges" has "$FAKE/notes/notes.env" "merge=merged"
 
 setup
 echo failure >"$FAKE/conclusions"
@@ -262,9 +267,33 @@ check "verify: a red run fails" has "$tmp/out" "result=fail"
 check "verify: and lists its failing jobs" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
 
 setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_GO_FAIL=1
-check "verify: a failing bundle test fails it, whatever the e2e" has "$tmp/out" "result=fail"
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
+check "verify: a red run whose jobs can't be read is an error, not a failure" test "$status" -ne 0
+check "verify: so no result is given" not has "$tmp/out" "result="
+
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_AFTER=1
+check "verify: a red run's jobs are read once, so a failing second read can't stand in for them" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
+check "verify: and no placeholder list is written" not has "$FAKE/notes/a-jobs.md" "couldn't list"
+
+echo "--- the bundle test"
+setup
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
+check "bundle: runs the bundle test with the tag merged" has "$FAKE/go-calls" "TestBundleVersionMatchesEngineCapture"
+check "bundle: passes" has "$tmp/out" "bundle=pass"
+check "bundle: notes the tag merges" has "$tmp/out" "merge=merged"
+check "bundle: writes nothing" test "$(writes)" = 0
+setup
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN FAKE_GO_FAIL=1
+check "bundle: a failing bundle test fails" has "$tmp/out" "bundle=fail"
+for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN; do
+	setup
+	ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN "$var=x"
+	check "bundle: refuses to run upstream's code with $var set" test "$status" -ne 0
+	check "bundle: before compiling anything ($var)" not test -f "$FAKE/go-calls"
+done
 
 setup
 echo failure >"$FAKE/conclusions"
@@ -414,9 +443,14 @@ check "B ancestor: nothing pushed or opened" test "$(writes)" = 0
 setup
 printf 'failure\nsuccess\n' >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
-ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" FAKE_GO_FAIL=1
-check "B bundle: a rebuild whose bundle test fails fails, whatever its e2e" has "$tmp/out" "result=fail"
-check "B bundle: and opens no PR" test "$(jq length "$FAKE/pulls.json")" = 0
+before="$(writes)"
+ARGS=(rebuild v1.0.0-beta.26 "$d2"); BUNDLE=fail rc env BOT_TOKEN="$bot_secret"
+check "B bundle: no rebuild when the bundle test of that merge failed" has "$tmp/out" "result=skipped"
+check "B bundle: nothing pushed, dispatched or opened" test "$(writes)" = "$before"
+check "B bundle: no rebuild branch" test -z "$(git -C "$FAKE/origin.git" for-each-ref refs/heads/release-check/)"
+check "B bundle: never runs upstream's code itself" not test -f "$FAKE/go-calls"
+run_bot reject v1.0.0-beta.26
+check "B bundle: C's issue says why it wasn't rebuilt" jq -e '.[0].body | contains("the bundle test with")' "$FAKE/issues.json"
 
 setup
 printf 'failure\nfailure\n' >"$FAKE/conclusions"
@@ -461,10 +495,9 @@ git -C "$up" checkout -q -b conflicting v1.0.0-beta.25
 mkdir -p "$up/cmd/cacheservice/compat"
 echo "upstream's own" >"$up/cmd/cacheservice/compat/engines.txt"
 git -C "$up" add -A && git -C "$up" commit -qm conflicting && git -C "$up" tag -f -a -m conflicting v1.0.0-beta.26 >/dev/null
-echo success >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "conflict: a green run with the bundle test not run (the tag conflicts) is no pass" has "$tmp/out" "result=fail"
-check "conflict: noted as such" has "$FAKE/notes/notes.env" "bundle=conflict"
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
+check "conflict: the bundle test isn't run, which is no pass" has "$tmp/out" "bundle=conflict"
+check "conflict: nothing compiled" not test -f "$FAKE/go-calls"
 git -C "$up" checkout -q main
 git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
 

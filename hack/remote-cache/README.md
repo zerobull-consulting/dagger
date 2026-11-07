@@ -903,11 +903,15 @@ only decides when it runs and with which token.
 3. **Verify (A).** It dispatches `remote-cache-tests.yml` on
    `feature/remote-cache` with `candidate-version` and `candidate-digest`,
    and waits for it (at most 150 minutes): the e2e and the sidecar demo of
-   the service as it is, against that stock engine. Meanwhile, with the tag
-   merged into a scratch copy of the branch, it runs
-   `TestBundleVersionMatchesEngineCapture`; both must pass. If the tag
+   the service as it is, against that stock engine. Meanwhile, a job of its
+   own (`bundle test`) merges the tag into a scratch copy of the branch and
+   runs `TestBundleVersionMatchesEngineCapture`; both must pass. If the tag
    conflicts with the branch, the bundle test can't run, and that counts as
-   not passing.
+   not passing. The bundle test compiles and runs upstream's code, so that
+   job holds no credential: no environment, no token in any step, a
+   read-only `GITHUB_TOKEN`, and `release-check.sh bundle` refuses to run
+   with a token in its environment. It is the only place upstream's code
+   runs in this workflow.
    It writes the advisory diff of the engine's side of the remote cache from
    the manifest's `base` to the release, and whether the bundle or protocol
    version changed. **The run is the gate**; the diff only informs.
@@ -922,13 +926,13 @@ only decides when it runs and with which token.
      auto-merges (squash).
    - **B, otherwise:** `release-check/rebuild/<version>`, as
      `CACHE_BOT_SYNC_TOKEN`: the tag merged with a merge commit, the `base`
-     line moved. That branch is verified the same way (a dispatch on it, and
-     the bundle test), and if green, gets the accept line, citing that run,
-     and a PR. If the
-     bundle or protocol version changed, the accept list resets to that one
-     version. **A human merges it, with a merge commit.** No rebuild is
-     tried if the merge conflicts, or if the branch already contains the
-     tag: that rebuild would be the code A ran.
+     line moved. That branch is verified the same way: a dispatch on it, and
+     the bundle test's verdict, which is for this same merge. If green, it
+     gets the accept line, citing that run, and a PR. If the bundle or
+     protocol version changed, the accept list resets to that one version.
+     **A human merges it, with a merge commit.** No rebuild is tried if the
+     merge conflicts, if the bundle test didn't pass, or if the branch
+     already contains the tag: that rebuild would be the code A ran.
    - **C, the rebuild red or not tried:** an issue titled
      `compat-break: engine <version> fails against the cache service`,
      labeled `compat-break` (with `GITHUB_TOKEN`), with both runs' failing
