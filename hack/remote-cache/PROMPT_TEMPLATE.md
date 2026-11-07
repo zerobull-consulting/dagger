@@ -1,13 +1,17 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#106](https://github.com/zerobull-consulting/dagger/pull/106)
+**Version:** [zerobull-consulting/dagger#171](https://github.com/zerobull-consulting/dagger/pull/171)
 
-Every work item's prompt for the remote cache work
-([zerobull-consulting/dagger#1](https://github.com/zerobull-consulting/dagger/issues/1))
-is generated from this file. It holds the template, the conventions for the
+Every work item's prompt for the remote cache work is generated from this file. It holds the template, the conventions for the
 whole prompt, and the working agreement for review and merge (section 12).
 It is the process's source, and it changes by PR (see
 [Changing this file](#changing-this-file)).
+
+**Tracking issues.** zerobull-consulting/dagger#1, the original tracking
+issue, is closed. Each prompt names its item's own tracking issue (for
+example zerobull-consulting/dagger#117 or zerobull-consulting/dagger#139, or
+the item's issue itself when it has none). Wherever this file says "the
+tracking issue", it means that one.
 
 **How the pieces fit:**
 
@@ -31,6 +35,17 @@ Repository, the issue or issues it works on, the tracking issue, where it sits
 in the plan, and *why it matters now*.
 
 *Why:* the agent weighs trade-offs better when it knows what the work is for.
+
+### 1a. Running alongside
+
+When the item runs in parallel with others: each sibling session's ID and
+title, the issue it works on, and the files and sections it owns. Then: stay
+in your own files; when `feature/remote-cache` moves, merge it in, never
+rebase (force-pushes are blocked); and whoever merges second resolves the
+conflict, keeping both changes.
+
+*Why:* every parallel round so far needed this, written by hand, and
+sessions had to be sent each other's IDs after they started.
 
 ### 2. Before starting, read
 
@@ -103,17 +118,31 @@ guards".
 
 Invariants:
 
-- no engine changes without stopping first;
+- no engine changes without stopping first (the `fork paths` check,
+  zerobull-consulting/dagger#141, also fails any change outside the
+  service's paths);
+- **verify by running:** a claim about the engine's, GitHub's or a store's
+  behaviour goes into an issue, a doc or the code only after a real run shows
+  it, not from reading code (zerobull-consulting/dagger#127 corrected a
+  code-reading claim that a real kept-volume run disproved);
 - never delete on an engine's signal;
 - bound everything;
 - no engine- or bucket-supplied strings in labels, keys or file names without
   validating them;
 - known-gap tests plus issues for confirmed gaps not fixed; unconfirmed leads
-  go in one issue, with no test;
+  are appended to the tracking issue's rolling leads issue (see section 12),
+  with no test;
 - stage files explicitly, and never commit built binaries or `dagger.lock`
   changes by accident.
 
 *Why:* the lines that must never move, whatever the task.
+
+**Sections 9, 10 and 12 may be given by reference.** A prompt can say
+"Rules, environment notes and review: sections 9, 10 and 12 of
+`hack/remote-cache/PROMPT_TEMPLATE.md`, as of the version named at the end",
+and add only what differs for the item (an extra rule, an environment quirk
+it will hit). The agent reads the file. Copying
+them into every prompt cost about 3k characters each, and the copies drifted.
 
 ### 10. Environment notes
 
@@ -137,10 +166,12 @@ agreement's full text below:
 - decide on splitting once, from the first diff's lines added plus deleted;
 - run `/code-review high` against `origin/feature/remote-cache` and fix the
   real findings, then mark the PR ready;
-- one push per round, at most four review rounds;
-- then known-gap tests and issues for confirmed findings, one issue of
-  unverified leads for the rest, one final push, then the squash merge with
-  its explicit message;
+- at most **two** Copilot reviews in all, counting every push's: review 1,
+  one fix push, review 2, and **no push after review 2**;
+- review 2's confirmed findings become issues, the rest go to the tracking
+  issue's rolling leads issue, then the squash merge of review 2's head with
+  its explicit message, made by the session itself unless the prompt says the
+  user merges;
 - the exception for deleting data, publishing unverified blobs or bundles, or
   exposing a token.
 
@@ -168,14 +199,25 @@ keeps the rounds productive.
 
 - An org ruleset has Copilot review **every push** to a ready PR, and not
   drafts. So each push is a review round.
-- `feature/remote-cache` requires `unit tests`, `S3 tests against MinIO`,
-  `real engines (e2e)` and `sidecar demo`. Copilot is not a required check, so
-  the merge waits on those checks only.
+- `feature/remote-cache`'s ruleset is the source of truth for required checks.
+  Read them from the ruleset, not from this file and not from a PR's checks
+  list, which also shows optional checks. Use the PR's checks only to confirm
+  that each required one passed on the head being merged. Copilot is not a
+  required check, so the merge waits on those checks only.
 
 **The limit:**
 
-- Every PR gets at most **four** review rounds (reviews 1 to 4), whatever its
-  size.
+- Every PR gets at most **two** Copilot reviews (reviews 1 and 2), whatever
+  its size or what it touches. **Every push to a ready PR counts,** so there
+  is exactly one fix push, and nothing is pushed after review 2.
+  - *Why the final push counts:* the earlier text capped "rounds" but required
+    a final push after the last one, so a cap of four meant five reviews
+    (zerobull-consulting/dagger#121 and #141 had five). Counting every
+    review makes the cap what it says.
+  - *Why two:* under the earlier cap of four, most PRs from
+    zerobull-consulting/dagger#107 to #168 already finished in two, thanks to
+    the self-review before marking ready. zerobull-consulting/dagger#168 met
+    every target under a cap of two.
 - **Decide on splitting once, from the first diff:** when the draft first does
   what the prompt asks, before `/code-review` or any other review. Its size is
   the lines added plus the lines deleted, counting every file (tests, docs and
@@ -215,45 +257,42 @@ keeps the rounds productive.
      threads you've handled.
    - Push all of it in **one push**. Gather everything into that push: no
      README touch-ups, rebases or follow-up commits in between.
-4. **After the last round** (review 4), no more fix rounds. Handle whatever
-   that review reports (new findings, a 🔵 "Needs a closer look" with or
-   without text, findings only in its session) like this:
-   - **Confirmed** (you traced a real path to the failure): pin it with a
-     known-gap test whose comment links the issue, and file an issue under
-     zerobull-consulting/dagger#1.
-   - **Not confirmed, or text you can't read:** list them in one issue under
-     zerobull-consulting/dagger#1 as unverified leads (file, lines, type),
-     with no test.
+4. **After review 2, push nothing more.** Handle whatever it reports (new
+   findings, a 🔵 "Needs a closer look" with or without text, findings only in
+   its session) without changing the PR:
+   - **Confirmed** (you traced a real path to the failure): file an issue that
+     references the tracking issue, says how to reproduce it, and asks for a
+     known-gap test or the fix. The test comes with that later work, not in
+     this PR.
+   - **Not confirmed, or text you can't read:** append them to the tracking
+     issue's **rolling leads issue** (file, lines, type, and the PR they came
+     from), with no test. Find it by title ("unverified leads", under the
+     tracking issue); open one only if none exists. Don't open a leads issue
+     per PR: twelve of those piled up untriaged.
      Don't ask for Copilot's session findings.
    - Answer each thread with its issue link, and resolve it.
-   - **The one exception:** fix it with a test in this same push, instead of
-     filing it, if a confirmed finding means the PR deletes data it shouldn't,
-     publishes an unverified blob or bundle, or exposes a token. If that fix
-     needs a design decision, don't merge: stop and report.
-5. **Merge:** push those known-gap tests and fixes as one final push. **Then**
-   squash-merge, with the title and message set as in section 4:
-   - where the auto-merge tool can set the title and message, enable
-     auto-merge (squash) with them;
-   - where it can't, wait for the required checks on the final push to pass,
-     then squash-merge with the explicit title and message, pinned to the head
-     commit.
-
-   Enabling auto-merge before the push could merge the old head the moment its
-   checks are green. The checks gate the merge; Copilot's review of that push
-   doesn't.
+   - **The one exception:** a confirmed finding that means the PR deletes
+     data it shouldn't, publishes an unverified blob or bundle, or exposes a
+     token is fixed with a test in one more push, instead of being filed. The
+     review that push starts is handled like review 2: nothing more is pushed
+     for it. If the fix needs a design decision, don't merge: stop and report.
+5. **Merge** (the session merges, unless the prompt says the user does):
+   squash-merge review 2's head (or the exception's push), once the ruleset's
+   required checks have passed on it, with the title and message set as in
+   section 4, pinned to that head commit. Where the auto-merge tool can set
+   the title and message and pin the head, enabling auto-merge (squash) is
+   fine.
 6. **CI red at any point:** fix it at the root cause; never retry or loosen a
-   check. After the last round, the reviews these pushes start are handled
-   like the final push's.
+   check. A fix push after review 2 is allowed only for CI that is red on
+   review 2's head, and its review is handled like review 2's.
 7. **After the merge:**
-   - If Copilot reviewed the final push, file anything new in it as issues
-     under zerobull-consulting/dagger#1. No new PR.
    - Close the PR's issue by hand, and unsubscribe.
    - Report how many review rounds were used, what was fixed, and which
      issues were filed.
 
 **Stop instead of merging** only when CI stays red after a genuine fix, or for
 the exception in step 4. Copilot's verdict alone doesn't block a merge once
-the round limit is reached.
+review 2 has come back.
 
 ### 13. After the merge
 
@@ -274,6 +313,17 @@ Observable outcomes, each shown by a test or a run.
 - Say when to **stop and ask** rather than decide: design decisions, a missing
   prerequisite, anything irreversible.
 - **Measure before choosing a number,** and put the measurement in the PR.
+- **Decisions that are the requester's are settled before the session starts,**
+  and written into the prompt as decided: credentials, engine changes,
+  ruleset changes, design forks. A question that only the requester can answer
+  stalls a session that hits it.
+- **Who merges** is stated: by default the session, as in section 12.
+- When picking several items to run in parallel: refresh the state first
+  (commits, open PRs, issues filed since the last round, and running sessions,
+  not just PRs); map which files each item touches and avoid two items in the
+  same hot file; follow the tracking issues' stated order; pair a critical-path
+  item with an independent one and, where there is one, a small reliability
+  fix such as a CI flake, which speeds up the others.
 - End the prompt with a line naming the template version it was generated
   from:
 
