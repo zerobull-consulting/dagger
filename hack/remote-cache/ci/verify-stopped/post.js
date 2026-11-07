@@ -44,5 +44,5 @@ if (problems.length) {
   for (const p of problems) console.log(`::error::verify-stopped: ${p}`);
   process.exitCode = 1;
 } else {
-  console.log(`verify-stopped: ${names.join(', ')} stopped (post-stopped: ${byPost.join(', ') || 'none'})`);
+  console.log(`verify-stopped: ${names.join(', ')} stopped`);
 }
