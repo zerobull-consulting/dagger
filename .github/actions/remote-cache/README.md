@@ -2,7 +2,8 @@
 
 Two actions manage the remote cache service (`cmd/cacheservice`) and a stock
 engine of one accepted version, side by side on a GitHub Actions runner:
-`start` starts them, and `stop` stops them.
+`start` starts them (and stops them at the end of the job), and `stop` stops
+them earlier.
 
 - **`start`** installs the `dagger` CLI with
   [`dagger/dagger-for-github`](https://github.com/dagger/dagger-for-github),
