@@ -1,0 +1,201 @@
+name: Cache service image publish
+# The service's release images (zerobull-consulting/dagger#117, D4 and D6).
+# Every push to feature/remote-cache is a release candidate:
+#
+#   1. build: builds cmd/cacheservice/Dockerfile stamped as the manifest's
+#      base release (RELEASE, from cmd/cacheservice/compat/engines.txt's
+#      base line) and the commit (REVISION), and smoke-tests it, its identity
+#      included (hack/remote-cache/image-smoke.sh);
+#   2. verify: runs the e2e and the sidecar demo against every accept line
+#      of the manifest, a matrix of remote-cache-tests.yml's jobs, the
+#      sidecar with this very image;
+#   3. publish, only once the whole matrix is green: pushes
+#      ghcr.io/zerobull-consulting/dagger-remote-cache:<commit SHA>, the
+#      immutable pin, and copies it to the old name,
+#      ghcr.io/zerobull-consulting/cacheservice:<commit SHA>, for the
+#      transition;
+#   4. engine-tags: moves each floating :<engine version> tag, one per
+#      accept line, to the newest verified build (the newest commit of the
+#      branch whose commit tag is pushed), and the old name's
+#      :feature-remote-cache with them. There is no :latest.
+#
+# A workflow_dispatch on another branch is a dry run: steps 1 and 2 run, and
+# nothing is pushed. Pull requests build and smoke-test the image in
+# cacheservice-image.yml. See cmd/cacheservice/README.md, "Image".
+"on":
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  # A group per commit, so none is dropped while another waits, and each
+  # pushes its SHA tag once verified; the engine-tags job below serializes
+  # the floating tags across them.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/zerobull-consulting/dagger-remote-cache
+  # The name before zerobull-consulting/dagger#117's D4, still published
+  # for pinned consumers until the transition ends. Never delete its tags.
+  OLD_IMAGE: ghcr.io/zerobull-consulting/cacheservice
+jobs:
+  build:
+    name: release image build and smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      base: ${{ steps.manifest.outputs.base }}
+      versions: ${{ steps.manifest.outputs.versions }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # The release this build is stamped as, and the matrix: the manifest's
+      # base line and its accept lines, checked as the service's parser
+      # checks them.
+      - name: The manifest's base and accept list
+        id: manifest
+        run: |
+          base="$(./hack/remote-cache/engines.sh base)"
+          versions="$(./hack/remote-cache/engines.sh versions)"
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          echo "versions=$versions" >>"$GITHUB_OUTPUT"
+          echo "base $base, accepts $versions" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+          RELEASE: ${{ steps.manifest.outputs.base }}
+        run: |
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" --build-arg RELEASE="$RELEASE" -t cacheservice:release .
+          docker image inspect cacheservice:release \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      # Its identity must report the base, not dev, and this commit.
+      - name: Smoke test
+        env:
+          EXPECT_BASE: ${{ steps.manifest.outputs.base }}
+          EXPECT_REVISION: ${{ github.sha }}
+        run: ./hack/remote-cache/image-smoke.sh cacheservice:release
+      # The image the matrix tests is the one published: the matrix loads
+      # it, and publish pushes it.
+      - name: Save the image
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-image"
+          docker save cacheservice:release | gzip >"$RUNNER_TEMP/release-image/image.tar.gz"
+      - name: Upload the image
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-image
+          path: ${{ runner.temp }}/release-image/image.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+      - name: Dry run
+        if: github.ref != 'refs/heads/feature/remote-cache'
+        run: |
+          echo "dry run on $GITHUB_REF: the matrix verifies this image, and nothing is pushed (only feature/remote-cache publishes)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # D6: the e2e and the sidecar demo against every accept line, before any
+  # tag moves. No fail-fast: a red run names every version that failed.
+  verify:
+    name: verify ${{ matrix.version }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.build.outputs.versions) }}
+    uses: ./.github/workflows/remote-cache-tests.yml
+    with:
+      engine-version: ${{ matrix.version }}
+      service-image-artifact: release-image
+
+  # Pushes the commit's tag, once the whole matrix is green. This job and
+  # engine-tags are the only ones with packages: write.
+  publish:
+    name: release image push
+    needs: [build, verify]
+    if: github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download the image
+        uses: actions/download-artifact@v7
+        with:
+          name: release-image
+          path: ${{ runner.temp }}/release-image
+      - name: Load the image
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          timeout 300 docker load -i "$RUNNER_TEMP/release-image/image.tar.gz"
+          docker tag cacheservice:release "$IMAGE:$REVISION"
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # The old name gets a registry-side copy of the same manifest, with
+      # the same digest.
+      - name: Push
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          timeout 600 docker push "$IMAGE:$REVISION"
+          timeout 300 docker buildx imagetools create --prefer-index=false -t "$OLD_IMAGE:$REVISION" "$IMAGE:$REVISION"
+          digest="$(timeout 60 docker buildx imagetools inspect "$IMAGE:$REVISION" --format '{{.Manifest.Digest}}')"
+          {
+            echo "pushed $IMAGE:$REVISION ($digest)"
+            echo "copied to $OLD_IMAGE:$REVISION"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  # Moves the floating tags, after a publish pushed its commit's tag.
+  # :<engine version> is the newest verified build that accepts that engine:
+  # the newest commit of the branch (first parents, from its head as it is
+  # when this job runs) whose commit tag is pushed, which only a green
+  # matrix leads to; each accept line of that commit's manifest. A version
+  # it no longer accepts keeps its tag on the last build that did.
+  # Publishes of different commits can overlap, and this job's group runs
+  # one at a time across them, so its lookups and retags can't interleave
+  # with another's. GitHub keeps only the newest pending job of a group, and
+  # jobs arrive in the order their publishes finish, not their commits'; so
+  # each run looks from the head, not from its own commit: a run never moves
+  # a tag to an older build than the one an earlier run chose, and a red
+  # head leaves the tags on the newest green commit before it.
+  engine-tags:
+    name: release image engine-version tags
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-engine-tags
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The head as it is now, with its recent history.
+      - name: Checkout the branch head
+        uses: actions/checkout@v5
+        with:
+          ref: feature/remote-cache
+          fetch-depth: 50
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # Registry-side copies of the chosen build's manifest, with the same
+      # digest: nothing is pulled or rebuilt.
+      # hack/remote-cache/release-tags.sh, tested offline in the unit job
+      # (release-tags_test.sh).
+      - name: Move the engine-version tags to the newest verified build
+        # Explicit, for pipefail: the tee mustn't hide the script's failure.
+        shell: bash
+        run: ./hack/remote-cache/release-tags.sh | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io

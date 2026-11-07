@@ -1,0 +1,31 @@
+name: "Remote cache: stop"
+description: >-
+  Stops what remote-cache/start started: the service first, which drains
+  its exports, then, once the drain is done, the engine, then it waits for
+  the service to exit. remote-cache/start stops by itself at the end of the
+  job; use this to stop earlier, with a timeout of its own: run it with
+  if: always(), and a timeout-minutes above the drain timeout plus 2
+  minutes: the drain's wait (the drain timeout plus 5s), then the engine's
+  stop (cut off at 90s), then the cleanup. The stop at the end of the job
+  then finds nothing to stop, and does nothing; stopping twice is safe.
+
+inputs:
+  name:
+    description: "The name given to remote-cache/start"
+    required: false
+    default: "remote-cache"
+
+outputs:
+  logs:
+    description: "Where the service's and the engine's logs are (service.log, engine.log)"
+    value: ${{ steps.stop.outputs.logs }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Stop the cache service, then the engine
+      id: stop
+      shell: bash
+      env:
+        SIDECAR_NAME: ${{ inputs.name }}
+      run: '"$GITHUB_ACTION_PATH/../sidecar.sh" stop'

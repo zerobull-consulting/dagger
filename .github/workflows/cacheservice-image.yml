@@ -1,0 +1,63 @@
+name: Cache service image
+# Builds cmd/cacheservice/Dockerfile as a release image is built (stamped
+# as the manifest's base) and smoke-tests it (hack/remote-cache/
+# image-smoke.sh), its identity included, and pushes nothing. Publishing, on
+# pushes to feature/remote-cache, is cacheservice-publish.yml: a separate
+# workflow, so pull requests don't list its jobs as skipped checks. See
+# cmd/cacheservice/README.md, "Image".
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    # Everything in the image's build context (Dockerfile.dockerignore's
+    # allowlist), so a change to any package the service builds from is
+    # checked before it merges.
+    paths:
+      - cmd/cacheservice/**
+      - dagql/**
+      - engine/**
+      - internal/**
+      - sdk/go/**
+      - util/**
+      - go.mod
+      - go.sum
+      - hack/remote-cache/image-smoke.sh
+      - hack/remote-cache/engines.sh
+      - .github/workflows/cacheservice-image.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: image build and smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # The Go build runs inside the Dockerfile (the builder stage), so the
+      # image builds the same from a fresh clone and here; its cache mounts
+      # start empty on each runner.
+      # Stamped as the manifest's base release, as cacheservice-publish.yml
+      # stamps the release images, so the smoke test checks the identity a
+      # published image will report.
+      - name: Build
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          release="$(./hack/remote-cache/engines.sh base)"
+          echo "RELEASE=$release" >>"$GITHUB_ENV"
+          docker build -f cmd/cacheservice/Dockerfile \
+            --build-arg REVISION="$REVISION" --build-arg RELEASE="$release" -t cacheservice:ci .
+          docker image inspect cacheservice:ci \
+            --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        env:
+          EXPECT_REVISION: ${{ github.sha }}
+        run: EXPECT_BASE="$RELEASE" ./hack/remote-cache/image-smoke.sh cacheservice:ci

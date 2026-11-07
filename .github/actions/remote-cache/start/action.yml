@@ -1,0 +1,233 @@
+name: "Remote cache: start"
+description: >-
+  Gets the dagger CLI (dagger/dagger-for-github), runs the remote cache
+  service and a stock engine of the same version on this runner, and puts a
+  wrapper of the CLI first on PATH for later steps; ready once the service
+  has welcomed the engine. The sidecar is stopped, draining its exports, at
+  the end of the job, whatever happened; remote-cache/stop stops it earlier.
+
+inputs:
+  role:
+    description: >-
+      writer (exports to the bucket; for jobs on the default branch) or
+      read-only (-export=false and a read-only key; for pull-request jobs)
+    required: true
+  version:
+    description: >-
+      The engine and CLI version, such as v1.0.0-beta.25: an accept line of
+      the service's engine manifest, cmd/cacheservice/compat/engines.txt, at
+      this action's commit (default: its first accept line). It selects the
+      CLI (installed with dagger/dagger-for-github, which must then say this
+      version), the stock registry.dagger.io/engine of that version, pinned
+      by the manifest's digest, and the service image that accepts it,
+      ghcr.io/zerobull-consulting/dagger-remote-cache:<version>. A version
+      the manifest doesn't accept fails the step before anything is installed
+      or pulled
+    required: false
+    default: ""
+  service-image:
+    description: >-
+      Overrides the service image, such as a build of your own, or
+      ghcr.io/zerobull-consulting/dagger-remote-cache:<commit SHA> (or
+      @sha256:...) to pin one build; version still selects the engine. The
+      step fails if this service refuses that engine (default: the
+      version's dagger-remote-cache:<version>)
+    required: false
+    default: ""
+  s3-endpoint:
+    description: "The store's endpoint URL, such as https://nyc3.digitaloceanspaces.com"
+    required: true
+  s3-region:
+    description: "The store's region"
+    required: true
+  s3-bucket:
+    description: "The bucket"
+    required: true
+  s3-prefix:
+    description: >-
+      The prefix the service owns in the bucket; empty for the whole bucket.
+      Nothing else may write under it.
+    required: false
+    default: ""
+  s3-access-key-id:
+    description: "The key's ID, from the caller's secrets. A read-only key for role read-only."
+    required: true
+  s3-secret-access-key:
+    description: "The key's secret, from the caller's secrets"
+    required: true
+  s3-path-style:
+    description: "true for path-style addressing (MinIO); empty for the service's default"
+    required: false
+    default: ""
+  namespace:
+    description: "The namespace entries are stored in and imported from (the service's -scope)"
+    required: false
+    default: "default"
+  drain-timeout:
+    description: >-
+      How long the stop lets the service finish its exports (-drain-timeout).
+      The stop at the end of the job is not a step of yours, so it has no
+      timeout-minutes of its own: the job's timeout bounds it, so set one
+      above the job's work plus this plus 2 minutes (the drain's wait, this
+      plus 5s, then the engine's stop, cut off at 90s, then the cleanup). As a
+      last resort the shim also kills a stop that runs past this plus 5
+      minutes and 25s.
+    required: false
+    default: "10m"
+  name:
+    description: >-
+      Prefix of the containers, volume and network; set another one to run a
+      second sidecar in the same job, after the first is stopped. Pass the
+      same to remote-cache/stop.
+    required: false
+    default: "remote-cache"
+  debug-port:
+    description: >-
+      Publish the service's debug API on 127.0.0.1:<port> of the runner
+      (default: not published). It requires a token, generated for this
+      start: send the content of the debug-token-file output as
+      Authorization: Bearer <token>
+    required: false
+    default: ""
+  engine-config:
+    description: >-
+      A file to mount as the engine's engine.json (default: the action's
+      engine.json, with the engine's GC off; see README.md)
+    required: false
+    default: ""
+  verbose:
+    description: "true: the service logs every cache span (-v)"
+    required: false
+    default: "false"
+
+outputs:
+  dagger:
+    description: "The wrapper of the dagger CLI for the sidecar (also first on PATH for later steps)"
+    value: ${{ steps.start.outputs.dagger }}
+  version:
+    description: "The engine and CLI version the sidecar runs"
+    value: ${{ steps.start.outputs.version }}
+  service-image:
+    description: "The service image it runs"
+    value: ${{ steps.start.outputs.service-image }}
+  engine-image:
+    description: "The engine image it runs, pinned by digest"
+    value: ${{ steps.start.outputs.engine-image }}
+  runner-host:
+    description: "The engine, as _EXPERIMENTAL_DAGGER_RUNNER_HOST"
+    value: ${{ steps.start.outputs.runner-host }}
+  service-url:
+    description: "The service's URL, as the engine and the CLI reach it"
+    value: ${{ steps.start.outputs.service-url }}
+  service-container:
+    description: "The service's container"
+    value: ${{ steps.start.outputs.service-container }}
+  engine-container:
+    description: "The engine's container"
+    value: ${{ steps.start.outputs.engine-container }}
+  logs:
+    description: "Where the stop puts the service's and the engine's logs (in the job's temporary directory, remote-cache-sidecar/<name>/logs)"
+    value: ${{ steps.start.outputs.logs }}
+  debug-token-file:
+    description: >-
+      With debug-port: the file holding the debug API's token (masked in the
+      job's log), removed by the stop; empty otherwise
+    value: ${{ steps.start.outputs.debug-token-file }}
+
+runs:
+  using: "composite"
+  steps:
+    # The version is checked against the manifest before anything uses it:
+    # dagger/dagger-for-github takes it into a script.
+    - name: Check the version against the manifest
+      id: pin
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        pin="$(env -u ENGINES_FILE ENGINES_FILE="$GITHUB_ACTION_PATH/../../../../cmd/cacheservice/compat/engines.txt" \
+          "$GITHUB_ACTION_PATH/../../../../hack/remote-cache/engines.sh" pin ${VERSION:+"$VERSION"} 2>&1)" ||
+          { echo "::error::remote-cache/start: version: ${pin#engines.sh: }"; exit 1; }
+        tag="$(sed -n 's/^STOCK_ENGINE_TAG=//p' <<<"$pin")"
+        [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+          { echo "::error::remote-cache/start: reading the manifest failed"; exit 1; }
+        echo "version=$tag" >>"$GITHUB_OUTPUT"
+    # The official action looks for a dagger on PATH first, and runs
+    # `dagger --silent version` on it, a flag the CLI of this release rejects:
+    # the step would fail with any dagger already on PATH, such as the one a
+    # first start of this job installed, or its wrapper (which stays on PATH
+    # after its stop). The runner puts every GITHUB_PATH entry in front of a
+    # step's own PATH, so this can't be hidden; a small shim goes in front
+    # instead. It answers that probe with no version, so the action installs
+    # (about 1.5s) into $RUNNER_TEMP/bin, and runs the installed CLI for any
+    # other command. The wrapper, added after the install, goes in front of it.
+    - name: Put the installer's probe shim first on PATH
+      shell: bash
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP:?}/remote-cache-installer-probe"
+        mkdir -p "$dir"
+        cat >"$dir/dagger" <<EOF2
+        #!/usr/bin/env bash
+        # Written by remote-cache/start (.github/actions/remote-cache/start/action.yml).
+        # Only while the installer runs (the file is removed after it).
+        if [[ -e "$dir/armed" && "\$*" == "--silent version" ]]; then
+          echo "dagger none (the installer's probe: remote-cache/start installs the CLI)"
+          exit 0
+        fi
+        real="$RUNNER_TEMP/bin/dagger"
+        [[ -x "\$real" ]] || { echo "dagger isn't installed at \$real (remote-cache/start installs it)" >&2; exit 127; }
+        exec "\$real" "\$@"
+        EOF2
+        chmod +x "$dir/dagger"
+        : >"$dir/armed"
+        echo "$dir" >>"$GITHUB_PATH"
+    # Only installs: with no call, args, check or shell it runs no command
+    # (and so never sets DAGGER_CLOUD_TOKEN from its empty cloud-token, or
+    # skips the wrapper's TRACEPARENT guard). Pinned by commit: v8.4.1.
+    - name: Install the dagger CLI
+      uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+      with:
+        version: ${{ steps.pin.outputs.version }}
+    - name: Find the installed CLI
+      id: cli
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The probe shim answers the installer's probe only until now.
+        rm -f "${RUNNER_TEMP:?}/remote-cache-installer-probe/armed"
+        cli="${RUNNER_TEMP:?}/bin/dagger"
+        [[ -x "$cli" ]] || { echo "::error::remote-cache/start: the dagger CLI isn't installed at $cli"; exit 1; }
+        echo "cli=$cli" >>"$GITHUB_OUTPUT"
+    # A JavaScript action, so the job's end can stop the sidecar (its post
+    # step, whatever happened); it runs sidecar.sh start now. Pinned by
+    # commit: a composite action can't reference a sibling at its own commit
+    # (`uses: ./...` resolves against the caller's workspace). The shim runs
+    # the sidecar.sh of this action's checkout (SIDECAR_SCRIPT), so the pin
+    # only fixes the shim. It is a commit already on feature/remote-cache
+    # (hack/remote-cache/check-shim-pin.sh checks it in CI); after a change in
+    # start/run, merge it, then re-pin (README, "Changing the shim"). The settings reach the script as environment
+    # variables only, never expanded into a script.
+    - name: Start the cache service and the engine
+      id: start
+      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@32ed76f8c5ee68ac142273af836b546b9da77fca
+      env:
+        SIDECAR_SCRIPT: ${{ github.action_path }}/../sidecar.sh
+        SIDECAR_ROLE: ${{ inputs.role }}
+        SIDECAR_VERSION: ${{ steps.pin.outputs.version }}
+        SIDECAR_CLI: ${{ steps.cli.outputs.cli }}
+        SIDECAR_SERVICE_IMAGE: ${{ inputs.service-image }}
+        SIDECAR_NAMESPACE: ${{ inputs.namespace }}
+        SIDECAR_DRAIN_TIMEOUT: ${{ inputs.drain-timeout }}
+        SIDECAR_NAME: ${{ inputs.name }}
+        SIDECAR_DEBUG_PORT: ${{ inputs.debug-port }}
+        SIDECAR_VERBOSE: ${{ inputs.verbose }}
+        SIDECAR_ENGINE_CONFIG: ${{ inputs.engine-config }}
+        CACHESERVICE_S3_ENDPOINT: ${{ inputs.s3-endpoint }}
+        CACHESERVICE_S3_REGION: ${{ inputs.s3-region }}
+        CACHESERVICE_S3_BUCKET: ${{ inputs.s3-bucket }}
+        CACHESERVICE_S3_PREFIX: ${{ inputs.s3-prefix }}
+        CACHESERVICE_S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id }}
+        CACHESERVICE_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key }}
+        CACHESERVICE_S3_PATH_STYLE: ${{ inputs.s3-path-style }}

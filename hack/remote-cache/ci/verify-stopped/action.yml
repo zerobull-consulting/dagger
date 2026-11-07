@@ -1,0 +1,20 @@
+name: "Remote cache: verify the sidecars were stopped"
+description: >-
+  CI only. Declared before remote-cache/start, its post step runs after the
+  start's own post steps (which run in reverse order), and fails the job
+  unless every named sidecar was stopped, by the start's post step or by an
+  explicit remote-cache/stop before: no container, volume or network is left,
+  its state file is gone, and its stop kept the service's log. A sidecar with
+  no stop step in the job, such as the read-only one in CI's sidecar demo, is
+  stopped by its start's post step.
+
+inputs:
+  names:
+    description: "The sidecars' names, space separated, that must be stopped"
+    required: true
+
+runs:
+  using: node24
+  main: noop.js
+  post: post.js
+  post-if: always()
