@@ -3,7 +3,7 @@
 // `post` (post-if: always(), so after a failed or cancelled job too) runs
 // `sidecar.sh stop`. It holds no logic of its own and has no dependencies:
 // the Docker steps are sidecar.sh's alone, the script the demo and the
-// deprecated aliases run too.
+// stop action run too.
 //
 // It runs the script named by SIDECAR_SCRIPT, which start/action.yml sets to
 // the sidecar.sh of its own checkout. That makes the shim generic, so the
