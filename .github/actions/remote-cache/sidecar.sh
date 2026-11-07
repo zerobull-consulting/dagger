@@ -178,15 +178,17 @@ duration_seconds() {
 linger_seconds=15
 
 # The version a dagger CLI says it is, such as v1.0.0-beta.25, from the line
-# of `dagger version` that reads "dagger v1.0.0-beta.25 (image://...) linux/amd64";
-# nothing, and a failure, for anything else (a dev build included). The CLI
-# runs as the wrapper runs it: none of the caller's trace or DAGGER_*
-# settings, no engine needed, and bounded.
+# of `dagger version` that reads "version:     v1.0.0-beta.25" (the CLI's
+# output: version, commit, dirty, platform and runner-host lines), or, in the
+# older form, "dagger v1.0.0-beta.25 (image://...) linux/amd64"; nothing, and
+# a failure, for anything else (a dev build included). The CLI runs as the
+# wrapper runs it: none of the caller's trace or DAGGER_* settings, no engine
+# needed, and bounded.
 cli_version() {
-	local out line
+	local out line semver='v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?'
 	out="$(cli_run "$1" version 2>/dev/null)" || return 1
 	while IFS= read -r line; do
-		if [[ "$line" =~ ^dagger\ (v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)(\ |$) ]]; then
+		if [[ "$line" =~ ^version:[[:space:]]+($semver)[[:space:]]*$ || "$line" =~ ^dagger\ ($semver)(\ |$) ]]; then
 			echo "${BASH_REMATCH[1]}"
 			return 0
 		fi

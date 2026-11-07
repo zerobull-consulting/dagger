@@ -522,7 +522,15 @@ cat >"$fake_cli" <<'EOF2'
 case "$*" in
 # As the real CLI: its version command takes no --silent.
 *--silent*) echo 'Error: flag --silent is not supported by command "dagger version"' >&2; exit 1 ;;
-*version*) [ -n "$FAKE_CLI_SILENT" ] || echo "dagger ${FAKE_CLI_VERSION} (image://registry.dagger.io/engine:x) linux/amd64" ;;
+*version*)
+	[ -n "$FAKE_CLI_SILENT" ] && exit 0
+	if [ -n "$FAKE_CLI_OLD" ]; then
+		echo "dagger ${FAKE_CLI_VERSION} (image://registry.dagger.io/engine:x) linux/amd64"
+	else
+		# The CLI's own output.
+		printf 'version:     %s\ncommit:      a45241b2\ndirty:       no\nplatform:    linux/amd64\nrunner-host: image://registry.dagger.io/engine:%s\n' "$FAKE_CLI_VERSION" "$FAKE_CLI_VERSION"
+	fi
+	;;
 *) echo "TRACEPARENT=${TRACEPARENT-unset} DAGGER_ENGINE=${DAGGER_ENGINE-unset} OTEL_X=${OTEL_X-unset} RUNNER=$_EXPERIMENTAL_DAGGER_RUNNER_HOST CLOUD=$DAGGER_CLOUD_URL $DAGGER_CLOUD_TOKEN" ;;
 esac
 EOF2
@@ -530,6 +538,8 @@ chmod +x "$fake_cli"
 cli_says() { (FAKE_CLI_VERSION="$1" cli_version "$fake_cli"); }
 check "the CLI's version is read from the first line of dagger version" [ "$(cli_says v1.0.0-beta.25)" = v1.0.0-beta.25 ]
 check "... a release's too" [ "$(cli_says v0.20.8)" = v0.20.8 ]
+check "... the older 'dagger v1.0.0 (...)' form too" [ "$(FAKE_CLI_OLD=1 cli_says v0.20.8)" = v0.20.8 ]
+check "... only on its version line, not in runner-host's tag" not bash -c "export FAKE_CLI_VERSION=devel; source '$here/sidecar.sh'; cli_version '$fake_cli'"
 check "... a dev build isn't one" not cli_says devel
 check "... nor is a version that is not semver" not cli_says v1.0
 check "... a CLI that says nothing is refused" not bash -c "FAKE_CLI_SILENT=1 FAKE_CLI_VERSION=x; export FAKE_CLI_SILENT FAKE_CLI_VERSION; source '$here/sidecar.sh'; cli_version '$fake_cli'"
