@@ -103,7 +103,10 @@ check "a bad timeout fails" not run ok FETCH_TIMEOUT=abc
 work deep "      uses: $uses@$c1"
 check "a shallow fetch is deepened to find an old ancestor" run deep FETCH_DEPTH=1 DEEPEN_STEP=1 DEEPEN_TRIES=5 FETCH_TIMEOUT=30
 work deep0 "      uses: $uses@$c1"
-check "  ...but only DEEPEN_TRIES times" not run deep0 FETCH_DEPTH=1 DEEPEN_STEP=1 DEEPEN_TRIES=0 FETCH_TIMEOUT=30
+check "  ...but only DEEPEN_TRIES times" not run deep0 FETCH_DEPTH=1 DEEPEN_STEP=1 DEEPEN_TRIES=1 FETCH_TIMEOUT=30
+work deep1 "      uses: $uses@$c1"
+check "  ...and says it gave up on the pin, not on a bad setting" grep -q "is not on feature/remote-cache" <(runerr deep1 FETCH_DEPTH=1 DEEPEN_STEP=1 DEEPEN_TRIES=1 FETCH_TIMEOUT=30)
+check "DEEPEN_TRIES=0 is refused as a setting" not run deep0 DEEPEN_TRIES=0 FETCH_TIMEOUT=30
 
 if ((failures)); then
 	echo "$failures failed" >&2
