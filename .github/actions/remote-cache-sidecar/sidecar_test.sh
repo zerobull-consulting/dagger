@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests of sidecar.sh that need no Docker daemon: its validation, and its
-# stop against a fake docker command. CI's sidecar demo job runs it; run it
+# Tests of sidecar.sh that need no Docker daemon: its validation, the
+# images its version selects, its start and its stop against a fake docker
+# command. CI's sidecar demo job runs it; run it
 # the same locally:
 #
 #   .github/actions/remote-cache-sidecar/sidecar_test.sh
@@ -56,7 +57,7 @@ start_refuses() {
 	rm -rf "$tmp/refuse"
 	! (
 		PATH="$tmp/nodocker:$PATH"
-		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s SIDECAR_ENGINE_IMAGE=e SIDECAR_DIR="$tmp/refuse"
+		export SIDECAR_ROLE=writer SIDECAR_DIR="$tmp/refuse"
 		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
 		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
 		export "$@"
@@ -68,6 +69,46 @@ check "start refuses s3-path-style 'yes'" start_refuses CACHESERVICE_S3_PATH_STY
 check "start refuses verbose '1'" start_refuses SIDECAR_VERBOSE=1
 check "start refuses role 'admin'" start_refuses SIDECAR_ROLE=admin
 check "start refuses a missing secret key" start_refuses CACHESERVICE_S3_SECRET_ACCESS_KEY=
+
+# --- the images the version selects ---
+engines="$here/../../../hack/remote-cache/engines.sh"
+pin_of() { "$engines" pin ${1:+"$1"} | sed -n 's/^STOCK_ENGINE=//p'; }
+first_version="$("$engines" pin | sed -n 's/^STOCK_ENGINE_TAG=//p')"
+# Every accept line, the first and the rest.
+mapfile -t accepted < <("$engines" versions | tr -d '[]"' | tr ',' '\n')
+# selected [VAR=value...]: what select_images picks, as "version|service|engine".
+selected() {
+	(
+		unset SIDECAR_VERSION SIDECAR_SERVICE_IMAGE SIDECAR_ENGINE_IMAGE GITHUB_ACTIONS
+		(($#)) && export "$@"
+		select_images && echo "$version|$service_image|$engine_image"
+	) 2>"$tmp/selected.err"
+}
+check "no version: the manifest's first accept line selects both images" \
+	[ "$(selected)" = "$first_version|ghcr.io/zerobull-consulting/dagger-remote-cache:$first_version|$(pin_of)" ]
+for v in "${accepted[@]}"; do
+	check "version $v selects its engine by the manifest's digest, and dagger-remote-cache:$v" \
+		[ "$(selected SIDECAR_VERSION="$v")" = "$v|ghcr.io/zerobull-consulting/dagger-remote-cache:$v|$(pin_of "$v")" ]
+done
+check "... the engine image is pinned by digest" grep -qE '^registry\.dagger\.io/engine:v[^@]+@sha256:[0-9a-f]{64}$' <<<"$(pin_of)"
+check "service-image overrides the service; the version still selects the engine" \
+	[ "$(selected SIDECAR_VERSION="${accepted[-1]}" SIDECAR_SERVICE_IMAGE=cacheservice:ci)" = "${accepted[-1]}|cacheservice:ci|$(pin_of "${accepted[-1]}")" ]
+check "an unknown version is refused" not selected SIDECAR_VERSION=v0.0.1
+check "... and says which versions are accepted" grep -qF "it accepts only ${accepted[*]}" "$tmp/selected.err"
+check "a prefix of an accepted version is refused" not selected SIDECAR_VERSION="${first_version%?}"
+check "a version that isn't one is refused" not selected SIDECAR_VERSION=--privileged
+check "... without repeating it" not grep -qF -- --privileged "$tmp/selected.err"
+check "the deprecated engine-image with service-image: both as given" \
+	[ "$(selected SIDECAR_ENGINE_IMAGE=e:1 SIDECAR_SERVICE_IMAGE=s:1)" = "|s:1|e:1" ]
+check "... with a warning" grep -q "warning: engine-image is deprecated" "$tmp/selected.err"
+check "engine-image with version is refused" not selected SIDECAR_ENGINE_IMAGE=e:1 SIDECAR_SERVICE_IMAGE=s:1 SIDECAR_VERSION="$first_version"
+check "engine-image without service-image is refused" not selected SIDECAR_ENGINE_IMAGE=e:1
+check "a caller's ENGINES_FILE doesn't change the manifest read" \
+	[ "$(selected ENGINES_FILE=/nonexistent)" = "$first_version|ghcr.io/zerobull-consulting/dagger-remote-cache:$first_version|$(pin_of)" ]
+# Before anything is created or pulled.
+check "start refuses an unknown version" start_refuses SIDECAR_VERSION=v0.0.1
+check "start refuses engine-image with version" start_refuses SIDECAR_VERSION="$first_version" SIDECAR_ENGINE_IMAGE=e SIDECAR_SERVICE_IMAGE=s
+check "start refuses engine-image without service-image" start_refuses SIDECAR_ENGINE_IMAGE=e
 
 # --- stop, against a fake docker ---
 # The service and the engine run while $FAKE_DIR/<service|engine>.running
@@ -182,6 +223,7 @@ in_order() {
 		prev="$n"
 	done
 }
+took_hello_at_most() { [[ "$(cat "$tmp/hello.took")" -le "$1" ]]; }
 cleaned_up() { called "rm -f t-engine" && called "volume rm -f t-engine-state" && called "network rm t-net" && [[ ! -e "$tmp/sc/t/state" ]]; }
 took_at_most() { [[ "$(cat "$tmp/stop.took")" -le "$1" ]]; }
 
@@ -305,7 +347,7 @@ chmod +x "$tmp/volbin/docker"
 existing_volume_refused() {
 	! (
 		export PATH="$tmp/volbin:$PATH" FAKE_DIR="$tmp/volfake" SIDECAR_DIR="$tmp/vol"
-		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s SIDECAR_ENGINE_IMAGE=e
+		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s
 		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
 		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
 		unset GITHUB_ACTIONS GITHUB_ENV GITHUB_OUTPUT
@@ -332,7 +374,7 @@ fake_start() {
 	shift
 	(
 		export PATH="$tmp/$bin:$PATH" FAKE_DIR="$tmp/$bin.fake" SIDECAR_DIR="$tmp/$bin.sc" SIDECAR_START_TIMEOUT=5
-		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s SIDECAR_ENGINE_IMAGE=e
+		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s
 		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
 		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
 		(($#)) && export "$@"
@@ -379,6 +421,80 @@ start_shows_both_logs() {
 	[[ "$out" == *"the service exited while the engine started"* && "$out" == *"LOG OF remote-cache-engine"* && "$out" == *"LOG OF remote-cache-service"* ]]
 }
 check "a service that exits while the engine starts fails the start with both logs" start_shows_both_logs
+
+# --- start waits for the welcome, and fails on a refusal (#146) ---
+# A docker on which the start runs to the end. Once the engine has started,
+# the service's log says, per FAKE_HELLO: welcome, it welcomed the engine;
+# refused, it refused its version; silent, it connected and said no more;
+# none, nothing. Every docker run is recorded in $FAKE_DIR/runs, and docker
+# cp writes a fake CLI.
+mkdir -p "$tmp/okbin"
+cat >"$tmp/okbin/docker" <<'EOF2'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == "network inspect -f" ]] && { echo 10.9.0.1; exit 0; }
+case "$1 $2" in
+"container inspect" | "volume inspect" | "network inspect") exit 1 ;;
+"image inspect" | "network create" | "volume create") exit 0 ;;
+"run -d")
+	echo "$*" >>"$FAKE_DIR/runs"
+	[[ " $* " == *" --privileged "* ]] && : >"$FAKE_DIR/engine.started"
+	exit 0
+	;;
+"port "*) echo 10.9.0.1:30000 ;;
+"inspect -f") echo true ;;
+"logs --tail") echo "LOG OF $4" ;;
+"logs "*)
+	echo 'time=x level=INFO msg=listening addr=:8090'
+	[[ -f "$FAKE_DIR/engine.started" ]] || exit 0
+	case "$FAKE_HELLO" in
+	welcome)
+		echo 'time=x level=INFO msg="engine connected" conn=1'
+		echo 'time=x level=INFO msg="engine welcomed" conn=1 engineVersion=v1.0.0-beta.25 versionAccepted=true'
+		;;
+	refused)
+		echo 'time=x level=INFO msg="engine connected" conn=1'
+		echo 'time=x level=WARN msg="engine refused: its version is not accepted" conn=1 engineVersion=v1.0.0-beta.24 accept=[v1.0.0-beta.25] base=dev closeStatus=4002'
+		;;
+	silent) echo 'time=x level=INFO msg="engine connected" conn=1' ;;
+	esac
+	;;
+"cp "*) printf '#!/bin/sh\necho dagger fake\n' >"$3" ;;
+*) exit 0 ;;
+esac
+EOF2
+chmod +x "$tmp/okbin/docker"
+# hello_start <FAKE_HELLO> [VAR=value...]: a start against okbin, its
+# output in $tmp/hello.out, its time in $tmp/hello.took.
+hello_start() {
+	local hello="$1" t=$SECONDS rc
+	shift
+	rm -rf "$tmp/okbin.fake" "$tmp/okbin.sc"
+	fake_start okbin FAKE_HELLO="$hello" "$@" >"$tmp/hello.out" 2>&1
+	rc=$?
+	echo $((SECONDS - t)) >"$tmp/hello.took"
+	return $rc
+}
+runs() { cat "$tmp/okbin.fake/runs" 2>/dev/null; }
+check "a welcomed engine: the start reports ready" hello_start welcome SIDECAR_SERVICE_IMAGE=
+check "... after the welcome" grep -q "the service welcomed the engine ($first_version)" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "... running the version's service image" grep -qF -- " ghcr.io/zerobull-consulting/dagger-remote-cache:$first_version -scope " <<<"$(runs)"
+check "... and its engine, by digest" grep -qF -- " $(pin_of) --debug" <<<"$(runs)"
+v_last="${accepted[-1]}"
+hello_start welcome SIDECAR_SERVICE_IMAGE= SIDECAR_VERSION="$v_last" >/dev/null
+check "version $v_last: the start runs its service image" grep -qF -- " ghcr.io/zerobull-consulting/dagger-remote-cache:$v_last -scope " <<<"$(runs)"
+check "... and its engine, by digest" grep -qF -- " $(pin_of "$v_last") --debug" <<<"$(runs)"
+check "a refused engine fails the start (zerobull-consulting/dagger#146)" not hello_start refused
+check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "... says why, with the refusal" grep -q "refused the engine .*engineVersion=v1.0.0-beta.24 accept=\[v1.0.0-beta.25\] base=dev" "$tmp/hello.out"
+check "... at once, not at the timeout" took_hello_at_most 3
+check "... and shows both logs" grep -q "LOG OF remote-cache-engine" "$tmp/hello.out"
+check "a service that never welcomes nor refuses: the start fails" not hello_start silent
+check "... within its timeout (5s) and a little" took_hello_at_most 9
+check "... says so" grep -q "neither welcomed nor refused it within 5s" "$tmp/hello.out"
+check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "an engine that never connects: the start fails" not hello_start none
+check "... says so" grep -q "the engine didn't connect to the service within 5s" "$tmp/hello.out"
 
 # --- debug-port: a generated token, in a file mounted read-only ---
 # A docker that records the service's docker run, then has it exit.

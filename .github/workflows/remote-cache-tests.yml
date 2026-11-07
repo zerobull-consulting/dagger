@@ -25,6 +25,20 @@ name: Remote cache tests
         description: "Its registry.dagger.io/engine image index digest (sha256:...)"
         required: false
         default: ""
+  # The release matrix (cacheservice-publish.yml): its e2e and sidecar demo
+  # against one accept line of the manifest, the sidecar with the release
+  # image the caller built, not one built here. The unit and MinIO jobs
+  # don't depend on the engine, and don't run.
+  workflow_call:
+    inputs:
+      engine-version:
+        description: "The accept line to run, such as v1.0.0-beta.24"
+        type: string
+        required: true
+      service-image-artifact:
+        description: "The artifact of this run holding the service image to test (image.tar.gz, tagged cacheservice:release)"
+        type: string
+        required: true
 permissions:
   contents: read
 # The stock Dagger release the e2e and the sidecar demo run is not set here:
@@ -36,13 +50,19 @@ permissions:
 # TestPinsMatchManifest (unit tests) checks every pin the docs name against
 # it (zerobull-consulting/dagger#117, D1).
 # A candidate's run is a group of its own, so verifying a version neither
-# cancels nor is cancelled by the branch's other runs.
+# cancels nor is cancelled by the branch's other runs. So is each of the
+# release matrix's entries (workflow_call, where github.workflow is the
+# caller's): one per version and commit, so no entry cancels another, nor
+# one of another commit's matrix.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.candidate-version }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.candidate-version }}${{ inputs.engine-version && format('-matrix-{0}-{1}', inputs.engine-version, github.sha) || '' }}
   cancel-in-progress: true
 jobs:
   unit:
     name: unit tests
+    # Not in the release matrix (workflow_call): it doesn't depend on the
+    # engine.
+    if: inputs.engine-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -82,7 +102,7 @@ jobs:
           go test -race -count=1 -run 'RemoteCache|SkippedMessage|ExportLogAttrs' \
             ./engine/server/ ./cmd/engine/ ./core/schema/
       - name: Save Go cache
-        if: github.event_name == 'push' && !cancelled()
+        if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
         uses: actions/cache/save@v5
         with:
           path: |
@@ -91,6 +111,7 @@ jobs:
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
   minio:
     name: S3 tests against MinIO
+    if: inputs.engine-version == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -127,7 +148,7 @@ jobs:
         if: always()
         run: ./hack/remote-cache/dev.sh reset
       - name: Save Go cache
-        if: github.event_name == 'push' && !cancelled()
+        if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
         uses: actions/cache/save@v5
         with:
           path: |
@@ -146,16 +167,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       # STOCK_ENGINE and STOCK_ENGINE_TAG, from the manifest's first accept
-      # line, or a candidate's (workflow_dispatch). See the top of this file.
+      # line, a candidate's (workflow_dispatch), or the release matrix's
+      # entry (workflow_call), which must be an accept line. See the top of
+      # this file.
       - name: The engine pin, from the manifest
         env:
           CANDIDATE_VERSION: ${{ inputs.candidate-version }}
           CANDIDATE_DIGEST: ${{ inputs.candidate-digest }}
+          ENGINE_VERSION: ${{ inputs.engine-version }}
         run: |
           if [[ -n "$CANDIDATE_VERSION$CANDIDATE_DIGEST" ]]; then
             ./hack/remote-cache/engines.sh candidate "$CANDIDATE_VERSION" "$CANDIDATE_DIGEST"
           fi
-          ./hack/remote-cache/engines.sh pin | tee -a "$GITHUB_ENV"
+          ./hack/remote-cache/engines.sh pin ${ENGINE_VERSION:+"$ENGINE_VERSION"} | tee -a "$GITHUB_ENV"
       # Warns when this branch's engine side of the remote cache differs from
       # STOCK_ENGINE's (run `E2E_BUILD_ENGINE=1 dev.sh e2e` to test it);
       # fails only on a pin that contradicts itself. See the script.
@@ -210,14 +234,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: e2e-runs
+          name: e2e-runs${{ inputs.engine-version && format('-{0}', inputs.engine-version) || '' }}
           path: ${{ runner.temp }}/e2e/runs
           if-no-files-found: ignore
       - name: Stop MinIO
         if: always()
         run: ./hack/remote-cache/dev.sh reset
       - name: Save Go cache
-        if: github.event_name == 'push' && !cancelled()
+        if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
         uses: actions/cache/save@v5
         with:
           path: |
@@ -241,18 +265,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       # STOCK_ENGINE and STOCK_ENGINE_TAG, from the manifest's first accept
-      # line, or a candidate's (workflow_dispatch). See the top of this file.
+      # line, a candidate's (workflow_dispatch), or the release matrix's
+      # entry (workflow_call), which must be an accept line. See the top of
+      # this file.
       - name: The engine pin, from the manifest
         env:
           CANDIDATE_VERSION: ${{ inputs.candidate-version }}
           CANDIDATE_DIGEST: ${{ inputs.candidate-digest }}
+          ENGINE_VERSION: ${{ inputs.engine-version }}
         run: |
           if [[ -n "$CANDIDATE_VERSION$CANDIDATE_DIGEST" ]]; then
             ./hack/remote-cache/engines.sh candidate "$CANDIDATE_VERSION" "$CANDIDATE_DIGEST"
           fi
-          ./hack/remote-cache/engines.sh pin | tee -a "$GITHUB_ENV"
-      # sidecar.sh's validation and stop, against a fake docker.
+          ./hack/remote-cache/engines.sh pin ${ENGINE_VERSION:+"$ENGINE_VERSION"} | tee -a "$GITHUB_ENV"
+      # sidecar.sh's validation, start and stop, against a fake docker. Not
+      # in the release matrix: it doesn't depend on the engine.
       - name: Test the action's script
+        if: inputs.engine-version == ''
         run: ./.github/actions/remote-cache-sidecar/sidecar_test.sh
       # Warns when this branch's engine side of the remote cache differs from
       # STOCK_ENGINE's; fails only on a pin that contradicts itself. See the
@@ -262,15 +291,30 @@ jobs:
         run: ./hack/remote-cache/compare-client.sh "the sidecar demo"
       # The demo's default engine and the docs' examples are checked against
       # the manifest by TestPinsMatchManifest, in unit tests.
-      # The service as cacheservice-image.yml builds it; the engine pulled
-      # alongside, bounded as the action's own pull is (15 minutes).
+      # The service as cacheservice-image.yml builds it, or, in the release
+      # matrix, the release image its caller built and smoke-tested; the
+      # engine pulled alongside, bounded as the action's own pull is (15
+      # minutes).
+      - name: Download the release image
+        if: inputs.service-image-artifact != ''
+        timeout-minutes: 10
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.service-image-artifact }}
+          path: ${{ runner.temp }}/release-image
       - name: Build the service's image, pull the engine's
         env:
           REVISION: ${{ github.sha }}
+          RELEASE_IMAGE: ${{ inputs.service-image-artifact && format('{0}/release-image/image.tar.gz', runner.temp) || '' }}
         run: |
           timeout 900 docker pull -q "$STOCK_ENGINE" &
-          docker build -f cmd/cacheservice/Dockerfile \
-            --build-arg REVISION="$REVISION" -t cacheservice:ci .
+          if [[ -n "$RELEASE_IMAGE" ]]; then
+            timeout 300 docker load -i "$RELEASE_IMAGE"
+            docker tag cacheservice:release cacheservice:ci
+          else
+            docker build -f cmd/cacheservice/Dockerfile \
+              --build-arg REVISION="$REVISION" -t cacheservice:ci .
+          fi
           wait $!
       # MinIO on the Docker bridge gateway, where the sidecar's containers
       # reach it, with a read-only user for the demo's prefix (demo/). The
@@ -284,8 +328,9 @@ jobs:
         with:
           role: writer
           name: demo-writer
+          version: ${{ env.STOCK_ENGINE_TAG }}
+          # The image this run built or loaded, not the published one.
           service-image: cacheservice:ci
-          engine-image: ${{ env.STOCK_ENGINE }}
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
@@ -332,8 +377,9 @@ jobs:
         with:
           role: read-only
           name: demo-reader
+          version: ${{ env.STOCK_ENGINE_TAG }}
+          # The image this run built or loaded, not the published one.
           service-image: cacheservice:ci
-          engine-image: ${{ env.STOCK_ENGINE }}
           s3-endpoint: ${{ steps.store.outputs.endpoint }}
           s3-region: ${{ steps.store.outputs.region }}
           s3-bucket: ${{ steps.store.outputs.bucket }}
@@ -360,7 +406,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: sidecar-demo
+          name: sidecar-demo${{ inputs.engine-version && format('-{0}', inputs.engine-version) || '' }}
           path: |
             ${{ runner.temp }}/remote-cache-sidecar/*/logs
             ${{ runner.temp }}/demo

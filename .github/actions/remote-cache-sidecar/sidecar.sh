@@ -14,10 +14,22 @@
 # variables:
 #
 #   SIDECAR_ROLE            writer | read-only (required)
-#   SIDECAR_SERVICE_IMAGE   the cache service image (required)
-#   SIDECAR_ENGINE_IMAGE    the engine image: a stock Dagger release with the
-#                           remote cache client (required); its own dagger
-#                           CLI is the one used
+#   SIDECAR_VERSION         the engine version, such as v1.0.0-beta.25: an
+#                           accept line of the service's manifest
+#                           (cmd/cacheservice/compat/engines.txt, at this
+#                           script's own commit; default: its first). It
+#                           selects both images: the stock engine of that
+#                           version, pinned by the manifest's digest, whose
+#                           own dagger CLI is the one used, and the service
+#                           image that accepts it,
+#                           ghcr.io/zerobull-consulting/dagger-remote-cache:<version>
+#   SIDECAR_SERVICE_IMAGE   overrides the service image (such as a build of
+#                           your own, or one pinned by digest); the version
+#                           still selects the engine, and the start fails if
+#                           the service refuses it
+#   SIDECAR_ENGINE_IMAGE    deprecated: the engine image, in place of
+#                           SIDECAR_VERSION, which it can't be given with;
+#                           it needs SIDECAR_SERVICE_IMAGE, and warns
 #   CACHESERVICE_S3_*       the store: ENDPOINT, REGION, BUCKET, ACCESS_KEY_ID
 #                           and SECRET_ACCESS_KEY (required), PREFIX and
 #                           PATH_STYLE (optional); passed to the service by
@@ -39,7 +51,8 @@
 #                           $RUNNER_TEMP/remote-cache-sidecar, or a temporary
 #                           directory)
 #   SIDECAR_START_TIMEOUT   seconds to wait for the service to listen, and
-#                           then for the engine to connect (default: 120)
+#                           then for it to welcome or refuse the engine
+#                           (default: 120)
 #   SIDECAR_ENGINE_CA_FILE  local use only: a CA bundle to mount as the
 #                           engine's, for a host behind a TLS-intercepting
 #                           proxy. The actions never set it.
@@ -55,6 +68,25 @@ die() {
 	exit 1
 }
 
+warn() {
+	if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+		echo "::warning::remote-cache-sidecar: $*"
+	else
+		echo "remote-cache-sidecar: warning: $*" >&2
+	fi
+}
+
+# The service's images, one floating tag per engine version it accepts
+# (zerobull-consulting/dagger#117, D4): :<engine version> is the newest
+# verified build that accepts that engine.
+service_repository=ghcr.io/zerobull-consulting/dagger-remote-cache
+
+# The manifest at this script's own commit, and its reader: the one source
+# of the engine versions and their digests (zerobull-consulting/dagger#117,
+# D1). Never a caller's ENGINES_FILE.
+engines_sh="$here/../../../hack/remote-cache/engines.sh"
+engines_file="$here/../../../cmd/cacheservice/compat/engines.txt"
+
 # --- validation: everything that becomes a name, a path or a flag ---
 
 # Container, volume and network names; a file name too.
@@ -66,6 +98,45 @@ valid_namespace() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && "$1" != *..
 # An image reference: registry, path, tag and digest characters only, and
 # not an option.
 valid_image() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,254}$ ]]; }
+
+# An engine version of a release's shape, as the manifest names them
+# (compat.ValidVersion); whether it is accepted is the manifest's to say.
+valid_version() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ && ${#1} -le 64 ]]; }
+
+# select_images sets version, engine_image and service_image from the
+# settings (SIDECAR_VERSION, SIDECAR_SERVICE_IMAGE, SIDECAR_ENGINE_IMAGE):
+#
+#   version alone (or nothing: the manifest's first accept line): the
+#     stock engine of that version by the manifest's digest, and
+#     dagger-remote-cache:<version>;
+#   service-image too: that service image, the same engine;
+#   engine-image (deprecated), with service-image and without version:
+#     both as given, with a warning.
+#
+# A version that isn't an accept line of this commit's manifest fails, as
+# does engine-image with version, or without service-image. Nothing is
+# created or pulled before this.
+select_images() {
+	version="${SIDECAR_VERSION:-}" service_image="${SIDECAR_SERVICE_IMAGE:-}" engine_image="${SIDECAR_ENGINE_IMAGE:-}"
+	if [[ -n "$engine_image" ]]; then
+		[[ -z "$version" ]] ||
+			die "engine-image and version are both set: give version alone, which selects the engine by the manifest's digest (engine-image is deprecated)"
+		[[ -n "$service_image" ]] ||
+			die "engine-image (deprecated) needs service-image: give version instead, which selects both images"
+		warn "engine-image is deprecated and will be removed: give version (such as $(ENGINES_FILE="$engines_file" "$engines_sh" pin | sed -n 's/^STOCK_ENGINE_TAG=//p')), which selects the engine by the manifest's digest and the service image that accepts it"
+		return 0
+	fi
+	if [[ -n "$version" ]]; then
+		valid_version "$version" || die "version isn't an engine version such as v1.0.0-beta.25"
+	fi
+	local pin
+	pin="$(ENGINES_FILE="$engines_file" "$engines_sh" pin ${version:+"$version"} 2>&1)" ||
+		die "version: ${pin#engines.sh: }"
+	engine_image="$(sed -n 's/^STOCK_ENGINE=//p' <<<"$pin")"
+	version="$(sed -n 's/^STOCK_ENGINE_TAG=//p' <<<"$pin")"
+	valid_version "$version" && [[ -n "$engine_image" ]] || die "reading the manifest $engines_file failed"
+	[[ -n "$service_image" ]] || service_image="$service_repository:$version"
+}
 
 # A bucket prefix: key segments of letters, digits, '.', '_' and '-',
 # separated by '/', none of them '.' or '..'; or empty (the whole bucket).
@@ -233,7 +304,7 @@ start() {
 	local drain="${SIDECAR_DRAIN_TIMEOUT:-10m}"
 	local debug_port="${SIDECAR_DEBUG_PORT:-}"
 	local wait="${SIDECAR_START_TIMEOUT:-120}"
-	local service_image="${SIDECAR_SERVICE_IMAGE:-}" engine_image="${SIDECAR_ENGINE_IMAGE:-}"
+	local version service_image engine_image
 
 	case "$role" in
 	writer | read-only) ;;
@@ -241,6 +312,7 @@ start() {
 	esac
 	valid_name "$name" || die "name '$name' isn't valid: 1-40 of a-z, 0-9, '.', '_' and '-', starting with a letter or digit"
 	valid_namespace "$namespace" || die "namespace '$namespace' isn't valid: 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit, without '..'"
+	select_images
 	valid_image "$service_image" || die "service-image '$service_image' isn't an image reference"
 	valid_image "$engine_image" || die "engine-image '$engine_image' isn't an image reference"
 	local drain_seconds
@@ -413,15 +485,36 @@ start() {
 		-e DAGGER_CLOUD_TOKEN=sidecar-engine \
 		"$engine_image" --debug >/dev/null || die "starting the engine failed"
 	echo "created=engine" >>"$state"
-	deadline=$((SECONDS + wait)) up=false
+	# Ready once the service has welcomed the engine: "engine connected" is
+	# logged at the WebSocket upgrade, before the hello says whether the
+	# engine's version is accepted (zerobull-consulting/dagger#146). A
+	# refusal fails the start: builds would run on without the cache, and a
+	# service that refuses this engine is a misconfiguration (a service-image
+	# that doesn't accept the version), not a fleet mid-upgrade, which is
+	# what the service's own refusal leaves builds running for.
+	local log welcomed=false
+	deadline=$((SECONDS + wait))
 	while ((SECONDS < deadline)); do
 		running "$service" || { show_log "$engine" 100; show_log "$service" 200; die "the service exited while the engine started"; }
 		running "$engine" || { show_log "$engine" 200; die "the engine exited at startup"; }
-		log_has "$service" 'msg="engine connected"' && { up=true; break; }
+		log="$(timeout "$(step_bound "$deadline")" docker logs "$service" 2>&1 || true)"
+		if grep -q 'msg="engine refused: its version is not accepted"' <<<"$log"; then
+			show_log "$engine" 50
+			show_log "$service" 100
+			die "the service ($service_image) refused the engine ($engine_image): $(grep -m1 'msg="engine refused: its version is not accepted"' <<<"$log" | redact | grep -oE 'engineVersion=[^ ]* accept="?\[[^]]*\]"? base=[^ ]*'). Give a version the service accepts, or a service-image that accepts this version"
+		fi
+		grep -q 'msg="engine welcomed"' <<<"$log" && { welcomed=true; break; }
 		sleep 1
 	done
-	[[ "$up" == true ]] || { show_log "$engine" 100; show_log "$service" 100; die "the engine didn't connect to the service within ${wait}s"; }
-	echo "remote-cache-sidecar: the engine is connected"
+	if [[ "$welcomed" != true ]]; then
+		show_log "$engine" 100
+		show_log "$service" 100
+		if grep -q 'msg="engine connected"' <<<"$log"; then
+			die "the engine connected, but the service neither welcomed nor refused it within ${wait}s (a service image older than the version input logs no welcome)"
+		fi
+		die "the engine didn't connect to the service within ${wait}s"
+	fi
+	echo "remote-cache-sidecar: the service welcomed the engine (${version:-$engine_image})"
 
 	# The engine image's own CLI, which matches the engine.
 	timeout 120 docker cp "$engine:/usr/local/bin/dagger" "$dir/dagger" >/dev/null ||
@@ -469,6 +562,9 @@ EOF
 	if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
 		{
 			echo "dagger=$bin/dagger"
+			echo "version=$version"
+			echo "service-image=$service_image"
+			echo "engine-image=$engine_image"
 			echo "runner-host=docker-container://$engine"
 			echo "service-url=$url"
 			echo "service-container=$service"
