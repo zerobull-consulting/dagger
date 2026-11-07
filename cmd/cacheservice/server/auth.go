@@ -15,6 +15,7 @@ import (
 const (
 	endpointEngine = "engine"
 	endpointOTLP   = "otlp"
+	endpointFlush  = "flush"
 )
 
 // UseTokensFile loads a tokens file and authenticates engines with it from

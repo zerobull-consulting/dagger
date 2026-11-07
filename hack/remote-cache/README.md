@@ -70,13 +70,18 @@ local/dagger-cache/dev/`) to start over, or after a change of layout.
 
 The dev bucket has no lifecycle rule: staged uploads that were never
 promoted (an export cut short) stay until `dev.sh reset`, and are never read.
-To try the rule the service's README recommends
+To try the rules the service's README recommends
 ([lifecycle rule for staging](../../cmd/cacheservice/README.md#lifecycle-rule-for-staging)),
-once per namespace:
+with the service's prefix claimed (run it once), and the settings of
+`dev.sh env`:
 
 ```bash
-docker compose -f hack/remote-cache/compose.yaml exec minio sh -c 'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc ilm rule add --prefix <prefix>/ns/<namespace>/staging/ --expire-days 1 local/dagger-cache'
+go run ./cmd/cacheservice lifecycle plan -tokens-file <tokens> -abort-rule=false
+go run ./cmd/cacheservice lifecycle apply -tokens-file <tokens> -abort-rule=false -confirm=dagger-cache/<prefix>
 ```
+
+`-abort-rule=false`, since MinIO refuses the rule aborting incomplete
+multipart uploads ([below](#what-each-store-does)).
 
 Configure an AWS SDK client for MinIO with a base endpoint, a static
 credential, path-style addressing and checksums only when required. The SDK's
@@ -236,7 +241,7 @@ npx @dotenvx/dotenvx run -- bash -c '
 | `CACHESERVICE_TEST_EXTERNAL` | `1` uses that bucket instead of starting MinIO. |
 | `CACHESERVICE_TEST_STORE` | `minio` (default) or `spaces`: what the tests expect where stores differ ([below](#what-each-store-does)). |
 | `E2E_S3_RESIGN` | `1` makes the e2e's proxy sign requests again for any store, to run that path against MinIO. |
-| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration. Leave it unset on a shared bucket. |
+| `CACHESERVICE_TEST_DISPOSABLE_BUCKET` | `1` lets `TestMinIOGC` replace the bucket's lifecycle configuration, and the `lifecycle` command's tests (`TestMinIOLifecycle*`) merge into it and put it back. Leave it unset on a shared bucket. |
 
 ### What keeps a shared bucket safe
 
@@ -259,8 +264,11 @@ enforces this in test setup:
   bucket-level change. The one exception is the lifecycle configuration with
   `CACHESERVICE_TEST_DISPOSABLE_BUCKET=1`, since
   `PutBucketLifecycleConfiguration` replaces the whole bucket's. Without it,
-  `TestMinIOGC` skips that part, and expects no rule. Reads are not limited:
-  they change nothing.
+  `TestMinIOGC` skips that part, and expects no rule, and the `lifecycle`
+  command's tests skip. Those tests and `TestMinIOGC` take a lock on this
+  machine (`s3test.LockLifecycle`), since `go test` runs their packages at
+  once. The `lifecycle` tests put back the configuration they found when
+  they end. Reads are not limited: they change nothing.
 - Each test deletes its objects, with their versions and delete markers on a
   versioned bucket, and aborts its uploads when it ends, failed or not, and
   fails if any are left. The key needs to be allowed to list versions.
@@ -315,7 +323,7 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
-| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)** | Both accepted with a full-access key; **403 with a more limited key** | Whether they take effect isn't checked: rules run on a scale of days. |
+| Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. Whether a `Read/Write/Delete` limited key can *read* them: not run | Set only by `cacheservice lifecycle apply`, with a full-access key (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |
 | A blob over 5 GiB | Not run | Not run | The multipart path ran with its limits lowered to 5 MiB. |
 | Path-style and virtual-hosted addressing | Path-style | Both work | None needed. |
 | Region | Pinned in `compose.yaml` | The endpoint's region signs correctly | None needed. |
@@ -607,6 +615,7 @@ the main service's exports by polling the index.
 | `superseded` | [#32](https://github.com/zerobull-consulting/dagger/issues/32), [#27](https://github.com/zerobull-consulting/dagger/issues/27) | Writes a Dang module (`ttlmod` in the run's directory) whose function `stamp2` has a cache TTL of `E2E_TTL` seconds, runs it on A, waits for it to expire, and runs it again. Then starts engine F, empty, waits until both bundles are merged into it, and reads the value on it. | A replaced the value in place, the index kept its service number and moved it to a newer bundle, and F's call resolved to the imported entry (its `withExec` hit; a function with a TTL is evaluated on every call). It reports which record F got by the layer it read: the newer one passes; the older one is logged as `GAP` (#27), without failing; neither fails. F, the first engine started after `prune` moved C's imports, gets C's bundles holding them merged, with their roots and the imported entries (#47). |
 | `parts` | [zerobull-consulting/dagger#133](https://github.com/zerobull-consulting/dagger/issues/133) | Three sessions on A, with a nonce. One: exec V, which writes the nonce to its stdout (its `execMeta` part) and to `/v` (`fs`). Engine F1, empty, then imports V. Two: exec W over V. Three: exec Y over X, alpine with a variable set, which the engine doesn't retain. Engine F2, empty, then imports. F1 and F2 read V; F2 reads X's variable, then Y's stdout. | A stored V as a root with its parts, and W's bundle holds V's record with fewer (the engine exports only the roots' outputs), and the index kept V's first record and parts all the same; before #133's fix, V's entry moved to W's bundle with `fs` only. F1 and F2 read A's V (stdout and file) as a cache hit, with no exec run. The store holds X only in Y's bundle, with no parts, and F2 still reads X's variable as A set it: a partial import doesn't fail. F2 hits Y with A's stdout. |
 | `streaming` | [zerobull-consulting/dagger#134](https://github.com/zerobull-consulting/dagger/issues/134) | A runs one session with a nonce: an exec, then `sleep 40` over it. | The first exec's entry is stored while the session still runs (the sleep), within `-export-settle` plus one scheduler tick, plus the export itself, of the last span naming it; then A's retained entries are all stored once the session ends. |
+| `flush` | [zerobull-consulting/dagger#136](https://github.com/zerobull-consulting/dagger/issues/136) | Starts its own service and engine F on it. F runs a build with a nonce (two execs); as soon as its CLI returns, the scenario flushes F's cache with F's token by the form that needs no cache ID (`POST /v1/engines/flush`, as the sidecar calls it), then stops F's container (`docker stop --time 30`) with the service still up. | The flush answers `complete` for F's cache, with nothing left; the build's last retained exec is in the index when it returns, and every retained entry of F's is stored, with nothing waited for after it; F stops cleanly, and the entry is still in the index after. |
 | `readonly` | [#65](https://github.com/zerobull-consulting/dagger/issues/65) | Starts a second service with `-export=false` (`ServiceOptions.ReadOnly`), on an S3 proxy of its own and, on MinIO, with the read-only user `dev.sh` creates, and engine R, empty, on it. Waits until A's roots are merged into R, runs A's pipeline on R, then a pipeline of R's own, and waits past `-export-max-delay` (13s), by which a writer would have exported it. | R's `withExec` calls hit, with A's stamps; no request but GET and HEAD reached the service's proxy (the other services, writers still running, use the run's); the index has no mapping of R's cache and no entry from it; the service tracks nothing (`ErrReadOnly`) and runs no GC (`ErrGCReadOnly`); `CheckConsistent` passes. |
 
 The resilience scenarios ([#12](https://github.com/zerobull-consulting/dagger/issues/12))
@@ -637,7 +646,7 @@ progress, and oversized bundles).
 Each check is logged as `ok` or `FAIL`; a failed check fails its scenario
 without stopping it. Run some scenarios only with
 `E2E_SCENARIOS="renew prune" ./hack/remote-cache/dev.sh e2e` (the names:
-`reexport`, `renew`, `prune`, `superseded`, `parts`, `streaming`, `readonly`, `namespaces`, `verify`, `gc`, `disconnect`,
+`reexport`, `renew`, `prune`, `superseded`, `parts`, `streaming`, `flush`, `readonly`, `namespaces`, `verify`, `gc`, `disconnect`,
 `engine-restart`, `s3-faults`, `service-restart`, `drain`), or pass `go
 test` flags after `e2e`, such as `-run 'TestRealEngines/^renew$'`. The first
 part always runs.

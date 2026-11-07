@@ -146,6 +146,7 @@ func TestMinIOGC(t *testing.T) {
 	// dev bucket has none.
 	wantRuleB := "missing"
 	if s3test.Disposable() {
+		s3test.LockLifecycle(t, e.bucket)
 		wantRuleB = "present"
 		rule := e.prefix + "/ns/team-b/staging/"
 		rules := []types.LifecycleRule{{

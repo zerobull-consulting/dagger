@@ -109,6 +109,10 @@
 //	_EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL=http://<host>:8090
 //	DAGGER_CLOUD_TOKEN=<a token of the tokens file; anything without one>
 //	DAGGER_CLOUD_URL=http://<host>:8090   (optional: receive the cache events)
+//
+// `cacheservice lifecycle plan|apply|check` is a one-shot subcommand, not the
+// service: it sets or checks the bucket's lifecycle rules, with the admin
+// key (package lifecycle; README.md, "The lifecycle command").
 package main
 
 import (
@@ -128,10 +132,29 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/compat"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
+	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
+// subcommands are the one-shot commands of the binary, by name: each reads
+// the CACHESERVICE_S3_* settings as the service does, and returns its exit
+// code. A later one, such as wipe (zerobull-consulting/dagger#94), follows
+// lifecycle's shape: plan by default, -confirm=<bucket>/<prefix> to change
+// anything, exit 2 on a mismatch.
+var subcommands = map[string]func(ctx context.Context, args []string) int{
+	"lifecycle": func(ctx context.Context, args []string) int {
+		return lifecycle.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
+	},
+}
+
 func main() {
+	// A one-shot subcommand, run by an operator rather than as the service,
+	// exits with its own code. Any other first argument is the service's.
+	if len(os.Args) > 1 {
+		if sub, ok := subcommands[os.Args[1]]; ok {
+			os.Exit(sub(context.Background(), os.Args[2:]))
+		}
+	}
 	var (
 		listen        string
 		debugListen   string

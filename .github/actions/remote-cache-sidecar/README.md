@@ -106,7 +106,7 @@ of its own.
 | `service-image` | no | `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>` | Overrides the service image. The step fails if it refuses the engine. |
 | `engine-image` | no | | Deprecated: the engine image, only with `service-image` and without `version`; warns. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
-| `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. |
+| `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. A `Read/Write/Delete` key for a writer, a `Read` key for a read-only sidecar; **never the admin key** that sets lifecycle rules (on Spaces, a full-access key): the action never sets them, so no job needs it ([The keys](../../../cmd/cacheservice/README.md#the-keys)). |
 | `s3-prefix` | no | empty: the whole bucket | The prefix the service [owns](../../../cmd/cacheservice/README.md#bucket-ownership): nothing else may write under it. Segments of letters, digits, `.`, `_` and `-`, separated by `/`, none of them `.` or `..`, with no leading or trailing `/`. |
 | `s3-path-style` | no | the service's | `true` for path-style addressing, such as MinIO's, or `false`. |
 | `namespace` | no | `default` | The namespace entries are stored in and imported from (`-scope`). Writers and readers that should share a cache use the same one. |

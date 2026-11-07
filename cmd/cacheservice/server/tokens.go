@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -98,13 +99,7 @@ func ParseTokens(data []byte) (*TokenFile, error) {
 func (tf *TokenFile) Len() int { return len(tf.entries) }
 
 // Namespaces returns how many distinct namespaces the file maps to.
-func (tf *TokenFile) Namespaces() int {
-	set := map[string]bool{}
-	for _, e := range tf.entries {
-		set[e.namespace] = true
-	}
-	return len(set)
-}
+func (tf *TokenFile) Namespaces() int { return len(tf.NamespaceNames()) }
 
 // Lookup returns the namespace of token. It hashes the token and compares
 // the hash with every entry's in constant time, so how long it takes says
@@ -129,3 +124,19 @@ func (tf *TokenFile) Lookup(token string) (string, bool) {
 // ErrNoTokensFile is returned by ReloadTokens when the service was started
 // without a tokens file: it is unauthenticated, and stays so.
 var ErrNoTokensFile = errors.New("the service has no tokens file: it is unauthenticated")
+
+// NamespaceNames returns the distinct namespaces the file maps to, sorted:
+// the lifecycle command's namespaces (package lifecycle). It never returns
+// tokens.
+func (tf *TokenFile) NamespaceNames() []string {
+	set := map[string]bool{}
+	var out []string
+	for _, e := range tf.entries {
+		if !set[e.namespace] {
+			set[e.namespace] = true
+			out = append(out, e.namespace)
+		}
+	}
+	slices.Sort(out)
+	return out
+}

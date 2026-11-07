@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -40,6 +42,11 @@ type exportPath struct {
 	// wake and drainWake wake the scheduler and the drain: a tracker's
 	// entries came due sooner, or a cache's slot was freed (kick).
 	wake, drainWake chan struct{}
+	// changedCh is closed, and replaced, on every kick: flushes wait on it
+	// (changed).
+	changedMu      sync.Mutex
+	changedCh      chan struct{}
+	changedWaiters atomic.Int32
 
 	wg workGroup
 }
@@ -107,6 +114,7 @@ func (s *Service) EnableExport(ctx context.Context, cfg ExportConfig) error {
 		ctx:          ctx,
 		wake:         make(chan struct{}, 1),
 		drainWake:    make(chan struct{}, 1),
+		changedCh:    make(chan struct{}),
 	}
 	p.trackerCfg.Notify = p.kick
 	s.export = p
@@ -128,6 +136,7 @@ func (p *exportPath) kick() {
 		default:
 		}
 	}
+	p.broadcast()
 }
 
 // minSchedulerWait bounds how often the scheduler looks for due exports
@@ -220,6 +229,7 @@ func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.B
 	if len(res.Stored) > 0 && s.draining.Load() {
 		s.drainStored(eng.CacheID(), len(res.Stored))
 	}
+	s.flushStored(eng.ns, eng.CacheID(), len(res.Stored))
 	outcome := s.recordExport(ctx, eng, b, res, err)
 	if s.testHookExportRecorded != nil {
 		s.testHookExportRecorded()

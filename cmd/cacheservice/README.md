@@ -15,9 +15,12 @@ spike, and only logs what the engine does on the wire.
 | `-listen` (`:8090`) | `/v1/engine` | The engine WebSocket (`protocol.EnginePath`) |
 | `-listen` | `/v1/logs`, `/v1/traces`, `/v1/metrics` | OTLP/HTTP receivers for the engine's Cloud telemetry, each body bounded (see [OTLP limits](#otlp-limits)) |
 | `-listen` | `PUT /blobs/{digest}` | A stand-in for presigned PUTs: checks the blob against its digest, logs it, keeps nothing |
+| `-listen` | `POST /v1/engines/{cacheID}/flush?timeout=<d>` | Exports what is pending for one engine cache now, through the scheduler, within `timeout` (default `10s`, at most `10m`), and answers with what is left. Authenticated as the engine's requests are. 409 on a read-only instance or with the export path off, 503 while draining or stopping (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `-listen` | `POST /v1/engines/flush?timeout=<d>` | The same, for the engine cache of the connections that authenticated with the request's token: the form for a sidecar, which doesn't know its engine's cache ID. 409 when that token's connections hold more than one cache |
 | `-debug-listen` (`127.0.0.1:8091`) | `GET /debug/engines` | Lists the welcomed engines |
 | `-debug-listen` | `POST /debug/engines/{conn}/request?type=<t>` | Sends a request to one engine and returns its reply |
 | `-debug-listen` | `POST /debug/engines/{conn}/export` | Exports now: the posted `{"roots":[...],"outputs":[...]}`, or every tracked entry worth it. Answers with what was stored. It takes the engine cache's export slot: it waits for the export of that cache in flight to end, and the scheduler starts none beside it (see [Export path](#export-path)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `POST /debug/engines/{conn}/flush?timeout=<d>` | The flush of a connection's engine cache, as `POST /v1/engines/{cacheID}/flush` does it, keyed like the other debug routes |
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache, with each entry's `dirty` and `dueAt` |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
@@ -195,7 +198,10 @@ ones the unit tests use. The stores and the export and import logic are in
 [`exporter`](exporter/) and [`importer`](importer/), and garbage collection
 in [`gc`](gc/). What the service measures is in [`metrics`](metrics/). Every
 key the service writes is in [`layout`](layout/), and the ownership marker
-and its startup check in [`ownership`](ownership/).
+and its startup check in [`ownership`](ownership/). The one-shot
+`cacheservice lifecycle` subcommand, which sets the bucket's lifecycle rules,
+is [`lifecycle`](lifecycle/) (see
+[The lifecycle command](#the-lifecycle-command)).
 
 ## Bucket ownership
 
@@ -547,50 +553,139 @@ can't match `<prefix>/ns/*/staging/`. The options, and the choice:
 Plus one rule for the whole prefix that aborts incomplete multipart uploads
 (a promotion aborts its own, but a service killed mid-copy leaves its parts).
 
+#### The `lifecycle` command
+
+`cacheservice lifecycle` generates these rules from the tokens file, merges
+them into the bucket's configuration, and checks a bucket against them
+([zerobull-consulting/dagger#140](https://github.com/zerobull-consulting/dagger/issues/140)).
+It is a subcommand of the service's binary, so it ships in the image, and it
+reads the same `CACHESERVICE_S3_*` settings:
+
+```bash
+cacheservice lifecycle plan  -tokens-file tokens   # the default: print the rules and the diff; changes nothing
+cacheservice lifecycle apply -tokens-file tokens -confirm=dagger-cache/cache
+cacheservice lifecycle check -tokens-file tokens   # read-only: exit 3 if a rule is missing or too broad
+```
+
+or, from the image (`docker run --rm --env-file s3.env -v "$PWD/tokens:/tokens:ro"
+ghcr.io/zerobull-consulting/dagger-remote-cache:<tag> lifecycle plan -tokens-file /tokens`).
+Without `-tokens-file`, the one namespace is `-scope` (`default`), as for
+the service.
+
+**Run `apply` with the admin key, interactively.** Setting lifecycle rules
+takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
+key), since a rule can expire anything in the bucket. Run it once when a
+bucket is set up, and again when the tokens file's namespaces change, from
+your own shell, with the key in your environment for that one command. Never
+put the admin key in the service's secrets or a CI job's: no job needs it.
+`plan` and `check` only read, so they run with the writer's key, which needs
+`s3:GetLifecycleConfiguration` for them (see [the keys](#the-keys)). See
+[Retention and garbage collection](#retention-and-garbage-collection) for
+the three keys.
+
+What it does:
+
+- **`plan`** prints the bucket and prefix, the namespaces and where they came
+  from, the ownership marker, then one line per rule of the command's: `=`
+  kept, `+` added, `~` updated (same ID, other content) or replaced (another
+  ID of the command's for the same prefix and action, such as the former
+  hand-made IDs below), `-` removed. Then how many other rules there are, the
+  total against the store's limit, and the command's rules as JSON. It warns
+  of any rule that expires a namespace's live data, and ends with the `apply`
+  command for this plan: the same `-tokens-file` or `-scope`, the same
+  options, and `-allow-removals` when it removes rules.
+- **`apply` merges.** `PutBucketLifecycleConfiguration` replaces the whole
+  configuration, so `apply` reads it, replaces only the rules it owns, and
+  writes every other rule back as it read it. It owns a rule whose ID
+  starts with `cacheservice-<hash>-`, the hash of its prefix (see Rule IDs
+  below), and whose filter's prefix is under the service's prefix, or one
+  with a former hand-made ID on exactly that ID's target (below): two
+  services on two prefixes of one bucket, nested or not, each own their
+  own, and other tools' rules are never touched. After writing, it reads
+  the configuration back and checks that its rules are as wanted and the
+  others exactly as they were. S3 has no conditional write for the
+  configuration, so a change another tool makes between `apply`'s read and
+  its write is lost, and that check reports it: don't run `apply` while
+  something else changes the rules. When nothing changes, it writes
+  nothing.
+- **`apply` refuses**, exit 2 and nothing written: without `-confirm`
+  repeating the bucket and the prefix (`<bucket>/<prefix>`, `<bucket>/` for
+  an empty prefix); and when it would remove a rule nothing replaces, such
+  as the staging rule of a namespace no longer in the tokens file, unless
+  `-allow-removals` is passed. A removal costs nothing (GC expires that
+  namespace's staged uploads itself), but a wrong tokens file, or a missing
+  `-tokens-file`, would otherwise remove every namespace's rule at once.
+- **`apply` refuses**, exit 1: a prefix without the service's ownership marker
+  of this layout, as GC does (start the service on it first: a writer claims
+  an empty prefix); a configuration it can't read (it never writes one it
+  couldn't merge); a result over the store's limit (`-max-rules`, 1,000 as
+  on AWS); a wanted ID that a rule it doesn't own already has; and any rule
+  broader than a namespace's staging prefix, except the rule that only aborts
+  uploads, on the prefix itself. That last check (`lifecycle.CheckSafe`) runs
+  on every rule it would write, so no rule it writes can expire live data.
+- **`check`** reads the configuration and exits 3 when a namespace lacks its
+  staging rule (what `gc_staging_rule_missing` reports, by the same rule
+  parsing), when a rule expires a namespace's live data (GC's `liveRules`
+  warning, and also a rule that expires on a date, filters by a tag or
+  size too, or transitions objects to another storage class, which can
+  leave them unreadable), or when a rule of the command's is too broad. It exits 1 when
+  the configuration can't be read (`TestMinIOLifecycleCheckUnreadable`). The
+  abort rule's absence is a note, not a failure. It doesn't run GC, and it
+  checks the tokens file's namespaces, not those with data in the bucket:
+  GC's metric covers those.
+
+Exit codes: 0 ok, 1 an error or a refusal, 2 a flag or confirmation error,
+3 `check` found something. Every request is bounded (30s), and the whole
+run by `-timeout` (2m). It prints no key or token: the tokens file is read
+for its namespaces only.
+
+**Rule IDs** are `cacheservice-<hash>-staging-<namespace>` and
+`cacheservice-<hash>-incomplete-uploads`, where `<hash>` is 8 hex digits of
+the SHA-256 of the prefix with its trailing slash (`cache/` gives
+`daa886c7`). The hash keeps IDs unique between prefixes of one bucket, as S3
+requires. Namespaces are validated as the service validates them (at most
+128 letters, digits, `.`, `_` or `-`), so an ID is at most 158 characters,
+under S3's 255; `CheckSafe` checks every ID again before writing.
+
+**Stores.** MinIO refuses a rule with `AbortIncompleteMultipartUpload` (400
+`InvalidArgument`, see `hack/remote-cache/README.md`, "What each store
+does"). `apply` fails, writes nothing, and names that as the likely cause
+of a 400: run it with `-abort-rule=false` there. MinIO drops stale uploads itself after 24 hours (its `api
+stale_uploads_expiry`), and GC aborts stale ones at blob keys. A Spaces key
+that isn't full-access gets 403, which `apply` explains as needing the admin
+key. Tested against MinIO (`TestMinIOLifecycle`: plan, apply, a foreign rule
+kept, a second apply writing nothing, a removed namespace losing its rule
+with `-allow-removals`, check before and after, the abort rule refused) and
+in unit tests; not yet run on Spaces.
+
+#### The rules, for reference
+
 On AWS, with the service's prefix `cache` and namespaces `team-a` and
-`team-b`:
+`team-b`, `plan` prints these:
 
 ```json
 {
   "Rules": [
-    {"ID": "cacheservice-staging-team-a", "Status": "Enabled",
+    {"ID": "cacheservice-daa886c7-staging-team-a", "Status": "Enabled",
      "Filter": {"Prefix": "cache/ns/team-a/staging/"}, "Expiration": {"Days": 1}},
-    {"ID": "cacheservice-staging-team-b", "Status": "Enabled",
+    {"ID": "cacheservice-daa886c7-staging-team-b", "Status": "Enabled",
      "Filter": {"Prefix": "cache/ns/team-b/staging/"}, "Expiration": {"Days": 1}},
-    {"ID": "cacheservice-incomplete-copies", "Status": "Enabled",
+    {"ID": "cacheservice-daa886c7-incomplete-uploads", "Status": "Enabled",
      "Filter": {"Prefix": "cache/"}, "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}
   ]
 }
 ```
 
-```bash
-aws s3api put-bucket-lifecycle-configuration --bucket dagger-cache --lifecycle-configuration file://lifecycle.json
-```
-
-That call replaces the bucket's whole lifecycle configuration: merge these
-rules into any the bucket has. The rules can be generated from the tokens
-file (a namespace's rule is the same whichever of its tokens names it):
-
-```bash
-awk '!/^#/ && NF >= 2 {print $2}' tokens | sort -u |
-  jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
-    Filter: {Prefix: ($p + "/ns/" + . + "/staging/")}, Expiration: {Days: 1}}' |
-  jq -s --arg p cache '{Rules: (. + [{ID: "cacheservice-incomplete-copies", Status: "Enabled",
-    Filter: {Prefix: ($p + "/")}, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}}])}' > lifecycle.json
-```
-
-Without a tokens file, the one namespace is `-scope` (`default`):
-`cache/ns/default/staging/`.
-
-On MinIO, with `mc` (the alias `local` and bucket `dagger-cache` of
-`hack/remote-cache`):
-
-```bash
-mc ilm rule add --prefix cache/ns/team-a/staging/ --expire-days 1 local/dagger-cache
-```
-
-once per namespace. MinIO drops incomplete multipart uploads on its own
-(after 24 hours, its `api stale_uploads_expiry`).
+Before the command, this section built them by hand from the tokens file
+(an `awk` and `jq` pipeline) and applied them with `aws s3api
+put-bucket-lifecycle-configuration` or `mc ilm rule add`, with IDs
+`cacheservice-staging-<namespace>` and `cacheservice-incomplete-copies`.
+`apply` takes a rule with one of those IDs over as its own only on exactly
+its target under the prefix (`<prefix>/ns/<namespace>/staging/`, or
+`<prefix>/`), and replaces it with the IDs above. Use the
+command rather than writing the configuration by hand: that call replaces
+the bucket's whole configuration, and a hand-made merge can drop another
+tool's rules.
 
 ### Repairing blobs stored before verification
 
@@ -1367,6 +1462,12 @@ bucket, other namespaces' included, so give the cache a bucket of its own.
 Spaces also refuses a limited access key on a bucket with a bucket policy
 (`PutBucketPolicy`).
 
+Spaces keys come at three levels, which match the
+[three keys](#the-keys): a limited key with `Read` here, a limited key with
+`Read/Write/Delete` for the writer, and a full-access key only for setting
+lifecycle rules (`cacheservice lifecycle apply`), which a limited key can't
+(403). Keep the full-access key out of the jobs' secrets.
+
 ## OTLP limits
 
 The OTLP receivers bound what a request can make the service read and hold
@@ -1654,16 +1755,11 @@ the defaults: neither file decides that a namespace's data goes.
 - A namespace can have limits and no tokens: `-scope` without a tokens file,
   or a namespace whose tokens were all revoked, whose data still needs
   collecting.
-- It is the one list of namespaces an operator maintains: the staging
-  lifecycle rules can be generated from it (below and
-  [Lifecycle rule for staging](#lifecycle-rule-for-staging)), as they can
-  from the tokens file:
-
-```bash
-awk '!/^#/ && NF >= 1 && $1 != "*" {print $1}' namespaces | sort -u |
-  jq -R --arg p cache '{ID: ("cacheservice-staging-" + .), Status: "Enabled",
-    Filter: {Prefix: ($p + "/ns/" + . + "/staging/")}, Expiration: {Days: 1}}' | jq -s .
-```
+- It is the one list of namespaces an operator maintains. The staging
+  lifecycle rules come from the tokens file, though
+  ([The lifecycle command](#the-lifecycle-command)): only a namespace with
+  tokens has engines that stage uploads, and one whose tokens were all
+  revoked keeps its rule until `lifecycle apply -allow-removals` runs.
 
 ### Blobs are kept per namespace
 
@@ -2200,7 +2296,8 @@ under the prefix, once per run (`FilterAllUploads`). It doesn't on AWS
 S3, which lists by prefix. MinIO also drops stale uploads itself after 24h.
 
 **Lifecycle rules.** Keep the staging rules and the multipart rule of
-[Lifecycle rule for staging](#lifecycle-rule-for-staging): they cost the
+[Lifecycle rule for staging](#lifecycle-rule-for-staging), set with
+[`cacheservice lifecycle apply`](#the-lifecycle-command): they cost the
 service nothing. Don't add rules for bundles, resolutions, blobs or the
 index: whether one is in use depends on the index, not its age, and a rule
 by age would delete live entries' data, leaving the index naming missing
@@ -2265,7 +2362,39 @@ The service's credentials also need `s3:ListBucket`,
 to report namespaces without a staging rule,
 `s3:GetLifecycleConfiguration` on the bucket.
 
+#### The keys
+
+Keep three credentials, each with only what it needs
+([zerobull-consulting/dagger#140](https://github.com/zerobull-consulting/dagger/issues/140)):
+
+| Key | Who holds it | What it needs |
+| --- | --- | --- |
+| **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
+| **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs. On Spaces, a full-access key: a limited key gets 403. |
+
+The admin key is the most powerful: a lifecycle rule can expire anything in
+the bucket. Use it only for `lifecycle apply`, interactively, and keep it out
+of every CI secret and the service's environment. Neither the service nor
+the sidecar action ever writes lifecycle rules: they only read them, once
+per GC run (`TestServiceNeverWritesLifecycleSource` checks the sources,
+`TestMinIOBinaryNeverWritesLifecycle` a running writer's requests through a
+proxy that refuses any lifecycle write). Whether a Spaces `Read/Write/Delete`
+key can read the configuration hasn't been run; if it can't, GC falls back
+to expiring staged uploads itself, which is safe but costs requests.
+
 ## Stopping and draining
+
+There are two ways to get what is pending exported before something stops:
+
+- **The flush**, for an orchestrator stopping one engine while the service
+  stays up: `POST /v1/engines/{cacheID}/flush`, then stop the engine, then,
+  if the service goes too, stop it with no drain (`-drain-timeout 0`). It is
+  per engine cache, bounded by the caller, and takes new work all along (see
+  [Flushing one engine cache](#flushing-one-engine-cache)).
+- **The drain**, for a shared service restarting under its engines: on
+  SIGTERM, every cache, until `-drain-timeout`, taking no new work, and the
+  service stops after it. The rest of this section is the drain.
 
 The service runs as a sidecar on an ephemeral CI runner, and the end of the
 job is its only chance to store what the job built
@@ -2354,6 +2483,100 @@ bounded shutdown. A CI job sets it long, such as `10m`.
 |------|---------|---|
 | `-drain-timeout` | `30s` | How long the drain may take (0: no drain, and no linger). A negative one is refused at startup |
 | `-drain-linger` | `15s` | After the drain, at most how long the service keeps answering the engines' OTLP requests, so each connected engine whose events come here can deliver `engine.stop` (0: none; see [The linger](#the-linger)). A negative one is refused at startup |
+
+### Flushing one engine cache
+
+`POST /v1/engines/{cacheID}/flush?timeout=<Go duration>`, on the engine
+address (`-listen`), exports what is pending for one engine cache now, and
+answers once nothing is left or the timeout passed
+([zerobull-consulting/dagger#136](https://github.com/zerobull-consulting/dagger/issues/136)).
+An orchestrator calls it before it stops a long-lived engine, while the
+service is fully up, so the engine still delivers its last events.
+
+```bash
+curl -fsS -X POST -u "$ENGINE_TOKEN:" "http://cache:8090/v1/engines/$CACHE_ID/flush?timeout=10s"
+# A sidecar, which doesn't know its engine's cache ID: the cache of the
+# connections that authenticated with this token.
+curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?timeout=10s"
+```
+
+- **Auth**, as the engine's own requests: the HTTP Basic username is the
+  token (401 without one, or with one the tokens file doesn't know), and the
+  token's namespace is the one flushed. With `-tokens-file`, only the token
+  of the cache's latest connection (its owner, as for its engine events)
+  may flush it: another token of the namespace gets 403. A token of
+  another namespace sees only its own, where the cache isn't: it gets
+  `not_connected`, the same answer as for a cache that doesn't exist. Without
+  a tokens file, any token is taken, as on the WebSocket. The cache ID is
+  1 to 128 letters, digits, `.`, `_` or `-` (400 otherwise).
+- **The token form**, `POST /v1/engines/flush`, flushes the cache of the
+  welcomed connections that authenticated with the request's token, in its
+  namespace: one in a sidecar. With none, it reports `not_connected`; with
+  more than one cache, it answers 409, and the caller flushes each by its
+  ID. The report names the cache (`cacheID`).
+- **The timeout** is optional: `10s` when the request names none, at most
+  `10m` (400 beyond that, or for a negative or unreadable one). The cap is
+  fixed, not `-drain-timeout`, since a service stopped with no drain runs
+  with `-drain-timeout 0`. `timeout=0` makes nothing due, and only reports
+  what is pending.
+- **What it does.** Every dirty entry of the cache is due at once, without
+  waiting for `-export-settle`, and stays so while the flush runs, so what
+  becomes dirty meanwhile is exported too. Roots waiting out a retry's
+  backoff (busy, failed, interrupted) are due now, once; a retry after that
+  waits its normal backoff. A session whose spans may still come (one that
+  hasn't ended, or ended with some of the cache spans its carrier counted
+  missing) is waited for until it ended with every span in, or
+  `-export-settle` (at most 2s) passed since its last span: so a flush right
+  after the client returned waits for its last spans and its carrier, which
+  are on their way. Its late spans are taken and exported. A flush starts
+  each failing root's retry at once: a caller that loops flushes retries
+  them at its own rate. The scheduler runs the exports, one
+  at a time per engine cache: the flush starts none of its own. Other
+  caches are scheduled as usual.
+- **It isn't a drain.** New engines, sessions and spans are taken as usual.
+  An engine still running builds can keep a flush busy until its timeout.
+- **When it returns:** once nothing of the cache is dirty, waiting for
+  spans, in flight or due for a retry before the timeout (`complete`); once
+  the timeout passes, or only retries due after it are left (`timeout`; such
+  a retry isn't waited for, and is counted `later`); at once, with what is
+  left, when the cache's engine isn't connected or disconnects
+  (`not_connected`); and when the request is canceled (`canceled`). **It
+  never cancels an export**: one in flight when it returns runs on until it
+  ends, or the engine stops and interrupts it. A canceled request ends the
+  wait, not the exports.
+- **Concurrent flushes** of one cache each wait on the cache's state, and
+  each reports on its own: what was stored while it ran, and what was left
+  when it returned.
+- **Refusals:** 409 on a read-only instance (`-export=false`) or with the
+  export path off, as the explicit export hook; 503 while draining
+  (`ErrDraining`), and once the stop has begun (`ErrStopping`).
+
+The answer is 200 for every outcome, and the body says which; errors are
+only for auth, bad requests and refusals. The report:
+
+```json
+{
+  "outcome": "complete",
+  "cacheID": "6e1f...",
+  "took": "1.234s",
+  "stored": 5,
+  "left": {"dirty": 0, "waitingSpans": 0, "inFlight": 0, "retrying": 0, "later": 0}
+}
+```
+
+- `outcome`: `complete` (nothing left), `timeout`, `not_connected` or
+  `canceled`.
+- `stored`: the roots stored by exports of the cache that ended during the
+  flush.
+- `left`, as the drain counts them: `dirty` (worth exporting, not in flight
+  or waiting for a retry), `waitingSpans` (sessions still waited
+  for), `inFlight`, `retrying` (a retry due before the timeout), `later` (a
+  retry due after it).
+
+Each flush logs one `flush: done` line, with the outcome and these counts,
+and is counted in `flush_total{outcome}`, `flush_duration_seconds` and
+`flush_unexported_roots_total` (see [Metrics](#metrics)). The debug API has
+a twin, `POST /debug/engines/{conn}/flush`, keyed by connection.
 
 ### The linger
 
@@ -2543,7 +2766,7 @@ paths record into them through their metadata store. All are prefixed
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
 | `export_roots_waiting` | `scope` | Roots due for export and waiting, as the scheduler last saw them: for their engine cache's export in flight to end, or for the next batch |
-| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, or `debug` (the debug API; see [The debug API](#the-debug-api)) |
+| `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, `flush` (see [Flushing one engine cache](#flushing-one-engine-cache)), or `debug` (the debug API; see [The debug API](#the-debug-api)) |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
 | `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
@@ -2564,6 +2787,9 @@ paths record into them through their metadata store. All are prefixed
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
+| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `flush_duration_seconds` | | Time of each flush |
+| `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
 | `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full) or `timeout` (408). Nothing of them is recorded |
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
