@@ -85,3 +85,17 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: hack/remote-cache/check-fork-paths_test.sh
+      # The shim's pin (start/action.yml) must be a commit on
+      # feature/remote-cache, so it stays fetchable (zerobull-consulting/dagger#169).
+      # In this job, which is required, so a pull request can't merge a pin
+      # that isn't on the branch. It comes from the checkout like the test
+      # above, and fetches the branch itself, bounded.
+      - name: Check the shim's pin
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          FORK_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          # The test runs the script it tests; the pin is checked in this checkout.
+          hack/remote-cache/check-shim-pin_test.sh
+          hack/remote-cache/check-shim-pin.sh
