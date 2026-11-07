@@ -959,7 +959,13 @@ The check, `.github/workflows/remote-cache-accept-line.yml`, runs on
 (`accept-line-only.sh`, `engines.sh`) are always the default branch's
 (`feature/remote-cache`): a PR that edits any of them is still measured by
 the versions it would replace. It runs none of the PR's code, only diffs its
-commits and parses its manifest, and requests no environment. It fails an
+commits and parses its manifest, and requests no environment. It has no
+`pull_request` trigger, so no skipped job of its name reports (a skipped
+required check counts as passed). **A gap:** a required status check is
+matched by name, so a PR from a branch of this repository (its author has
+write access) can add a `pull_request` workflow with its own job named
+`accept line only`. Requiring this workflow through the ruleset's "Require
+workflows to pass", rather than as a status check, closes that. It fails an
 accept PR unless, from
 its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
 one added line (no mode change, no rename), that line is
@@ -992,6 +998,8 @@ hack/remote-cache/release-check.sh --dry-run plan
 hack/remote-cache/release-check_test.sh      # offline, fake gh, docker and go
 hack/remote-cache/accept-line-only_test.sh   # offline
 ```
+
+Both run in `remote-cache-tests.yml`'s `unit tests` job.
 
 **What it never does.** It never merges, never pushes to
 `feature/remote-cache`, and never gives a bot token to anything but a push

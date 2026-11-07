@@ -6,17 +6,16 @@ name: Remote cache accept line
 # the PR's auto-merge off. Make it a required check before setting
 # RELEASE_CHECK_AUTO_MERGE (hack/remote-cache/README.md, "Release check").
 #
-# The check runs on pull_request_target, so this file and the scripts it
-# runs are always the default branch's (feature/remote-cache): a PR that
-# edits this workflow, the check or engines.sh is measured by the versions
-# it would replace. It runs
-# none of the PR's code: it only diffs the PR's commits and parses its
-# manifest, with the base's scripts. It requests no environment (only
-# schedule and workflow_dispatch jobs may: hack/remote-cache/README.md,
-# "Automation tokens"), and its token can only turn auto-merge off.
-#
-# The release check's own tests run on pull_request, on the PR's code,
-# read-only.
+# It runs on pull_request_target, so this file and the scripts it runs are
+# always the default branch's (feature/remote-cache): a PR that edits this
+# workflow, the check or engines.sh is measured by the versions it would
+# replace. It runs none of the PR's code: it only diffs the PR's commits and
+# parses its manifest. It requests no environment (only schedule and
+# workflow_dispatch jobs may: hack/remote-cache/README.md, "Automation
+# tokens"), and its token can only turn auto-merge off. It has no
+# pull_request trigger, so no skipped job of the same name ever reports (a
+# skipped required check counts as passed). The release check's own tests
+# run in remote-cache-tests.yml's unit job.
 "on":
   pull_request_target:
     types:
@@ -26,21 +25,14 @@ name: Remote cache accept line
       - ready_for_review
       # A changed base branch changes the diff.
       - edited
-  pull_request:
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
   accept-line-only:
     name: accept line only
-    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -83,20 +75,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: '"$CHECK_DIR/accept-line-only.sh" disable-auto-merge "$PR"'
-
-  tests:
-    name: release check scripts
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-      - name: The release check's tests
-        timeout-minutes: 5
-        run: ./hack/remote-cache/release-check_test.sh
-      - name: The accept-line-only check's tests
-        timeout-minutes: 5
-        run: ./hack/remote-cache/accept-line-only_test.sh
