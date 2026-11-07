@@ -151,11 +151,31 @@ runs:
         [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
           { echo "::error::remote-cache/start: reading the manifest failed"; exit 1; }
         echo "version=$tag" >>"$GITHUB_OUTPUT"
+    # The official action looks for a dagger on PATH first, and runs
+    # `dagger --silent version` on it, which a CLI of this release rejects:
+    # the step would fail with a wrapper of an earlier sidecar of this job
+    # (it stays on PATH after its stop) or any other dagger in the way. So
+    # the install step sees a PATH without any dagger, and always installs
+    # into $RUNNER_TEMP/bin.
+    - name: Hide any dagger already on PATH from the install
+      id: clean
+      shell: bash
+      run: |
+        set -euo pipefail
+        clean=""
+        IFS=: read -r -a dirs <<<"$PATH"
+        for d in "${dirs[@]}"; do
+          [[ -x "$d/dagger" ]] && continue
+          clean+="${clean:+:}$d"
+        done
+        echo "path=$clean" >>"$GITHUB_OUTPUT"
     # Only installs: with no call, args, check or shell it runs no command
     # (and so never sets DAGGER_CLOUD_TOKEN from its empty cloud-token, or
     # skips the wrapper's TRACEPARENT guard). Pinned by commit: v8.4.1.
     - name: Install the dagger CLI
       uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+      env:
+        PATH: ${{ steps.clean.outputs.path }}
       with:
         version: ${{ steps.pin.outputs.version }}
     - name: Find the installed CLI
@@ -163,17 +183,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Where the action installs it, unless a dagger of the version was
-        # already on PATH (not a wrapper of an earlier sidecar of this job).
         cli="${RUNNER_TEMP:?}/bin/dagger"
-        if [[ ! -x "$cli" ]]; then
-          cli=""
-          IFS=: read -r -a dirs <<<"$PATH"
-          for d in "${dirs[@]}"; do
-            [[ "$d" == "$RUNNER_TEMP/remote-cache-sidecar/"* || ! -x "$d/dagger" ]] || { cli="$d/dagger"; break; }
-          done
-        fi
-        [[ -n "$cli" && -x "$cli" ]] || { echo "::error::remote-cache/start: the dagger CLI isn't installed"; exit 1; }
+        [[ -x "$cli" ]] || { echo "::error::remote-cache/start: the dagger CLI isn't installed at $cli"; exit 1; }
         echo "cli=$cli" >>"$GITHUB_OUTPUT"
     # A JavaScript action, so the job's end can stop the sidecar (its post
     # step, whatever happened); it runs sidecar.sh start now. Pinned by
