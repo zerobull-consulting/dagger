@@ -155,7 +155,17 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	}
 	if o.Action == "claim" {
 		// The marker is the prefix's, not a namespace's: no tokens file or
-		// -scope is read.
+		// -scope is read, so a flag meant for another action is an error,
+		// not silently ignored.
+		var unused []string
+		fs.Visit(func(f *flag.Flag) {
+			if slices.Contains([]string{"tokens-file", "scope", "allow-removals", "abort-rule", "max-rules"}, f.Name) {
+				unused = append(unused, "-"+f.Name)
+			}
+		})
+		if len(unused) > 0 {
+			return fail(ExitUsage, "claim doesn't use %s; nothing read or written", strings.Join(unused, ", "))
+		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		st, err := open(ctx, cfg)
@@ -308,7 +318,7 @@ func runClaim(ctx context.Context, o Options, st Store, out io.Writer, fail func
 	state, m, err := st.Claim(ctx, o.Prefix)
 	if err != nil {
 		if denied(err) {
-			err = fmt.Errorf("%w (the key isn't allowed to read, list or write there: claim needs the admin key on a fresh bucket)", err)
+			err = fmt.Errorf("%w (the key isn't allowed to list the prefix and its multipart uploads and to write the marker there: a limited Read/Write/Delete key is, a Read key is not)", err)
 		}
 		return fail(ExitError, "%v; nothing claimed", err)
 	}

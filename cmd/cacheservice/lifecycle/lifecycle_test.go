@@ -743,7 +743,7 @@ func TestClaimRefuses(t *testing.T) {
 		if code != ExitError || st.claims != 0 || st.puts != 0 || !strings.Contains(out, "nothing claimed") {
 			t.Errorf("%s: %d, %d claims\n%s", name, code, st.claims, out)
 		}
-		if name == "denied" && !strings.Contains(out, "admin key") {
+		if name == "denied" && !strings.Contains(out, "a Read key is not") {
 			t.Errorf("a 403 isn't explained:\n%s", out)
 		}
 	}
@@ -767,7 +767,7 @@ func TestClaimConfirm(t *testing.T) {
 	}
 }
 
-// Main: claim needs -confirm, and reads no tokens file.
+// Main: claim needs -confirm, and takes none of the flags of the other actions.
 func TestMainClaim(t *testing.T) {
 	for _, k := range []string{blobstore.EnvEndpoint, blobstore.EnvRegion, blobstore.EnvAccessKeyID, blobstore.EnvSecretAccessKey} {
 		t.Setenv(k, "")
@@ -787,7 +787,12 @@ func TestMainClaim(t *testing.T) {
 			t.Fatalf("%q: %d, opened %d\n%s", args, code, opened, out)
 		}
 	}
-	if code, out := main("claim", "-confirm=bkt/cache", "-tokens-file", "/does/not/exist"); code != ExitOK || st.claims != 1 {
+	for _, flag := range []string{"-tokens-file=/does/not/exist", "-scope=ci", "-allow-removals", "-abort-rule=false"} {
+		if code, out := main("claim", "-confirm=bkt/cache", flag); code != ExitUsage || st.claims != 0 || opened != 0 {
+			t.Fatalf("claim %s: %d\n%s", flag, code, out)
+		}
+	}
+	if code, out := main("claim", "-confirm=bkt/cache"); code != ExitOK || st.claims != 1 {
 		t.Fatalf("claim: %d\n%s", code, out)
 	}
 }

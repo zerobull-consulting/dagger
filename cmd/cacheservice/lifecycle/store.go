@@ -83,8 +83,11 @@ func (s *S3Store) ReadMarker(ctx context.Context, prefix string) (ownership.Mark
 	return ownership.ReadMarker(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix)
 }
 
+// Claim is ownership.Check in writer mode: several requests (the marker, a
+// listing, one GET per ancestor prefix, the multipart listing, one
+// conditional PUT), so the run's own bound applies, not CallTimeout's one.
 func (s *S3Store) Claim(ctx context.Context, prefix string) (ownership.State, ownership.Marker, error) {
-	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, DefaultTimeout)
 	defer cancel()
 	return ownership.Check(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix, true, time.Now())
 }

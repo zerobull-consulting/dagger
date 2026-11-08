@@ -610,7 +610,7 @@ What it does:
   mode, with `If-None-Match: *`), and does nothing else: it starts no
   server and runs no conditional-write probe, and the marker is the only
   object it writes. It needs `-confirm=<bucket>/<prefix>` (`<bucket>/` for an
-  empty prefix), like `apply`, and reads no tokens file. It is idempotent: with
+  empty prefix), like `apply`, and reads no tokens file (`-tokens-file`, `-scope`, `-allow-removals`, `-abort-rule` and `-max-rules` are usage errors, exit 2). It is idempotent: with
   a marker of this layout there already, it prints `already claimed`, writes
   nothing and exits 0. It exits 1, writing nothing, on a prefix that holds keys
   and no marker, one with a marker of another layout, a prefix inside another
