@@ -112,7 +112,9 @@ case "$method $path" in
 	wf="${path#repos/o/r/actions/workflows/}"; wf="${wf%/dispatches}"
 	echo "$input" >"$FAKE/dispatch-$wf-$(n dispatch-$wf)"
 	# Whether the advisory diff was written before this dispatch.
-	if [[ -f "$FAKE/notes/advisory.md" ]]; then echo "$wf" >>"$FAKE/advisory-before-dispatch"; else echo "$wf" >>"$FAKE/dispatch-saw-no-advisory"; fi
+	# How many tags had been fetched by now.
+		git tag -l | wc -l >>"$FAKE/tags-at-dispatch"
+		if [[ -f "$FAKE/notes/advisory.md" ]]; then echo "$wf" >>"$FAKE/advisory-before-dispatch"; else echo "$wf" >>"$FAKE/dispatch-saw-no-advisory"; fi
 	[[ -n "${FAKE_NO_RUN_ID:-}" ]] && exit 0
 	id=$((5000 + $(n run)))
 	c="$(head -n1 "$FAKE/conclusions" 2>/dev/null || echo success)"
@@ -519,6 +521,8 @@ echo success >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
 check "dispatch first (zerobull-consulting/dagger#163): no advisory diff existed at the dispatch" has "$FAKE/dispatch-saw-no-advisory" "remote-cache-tests.yml"
 check "dispatch first (zerobull-consulting/dagger#163): and none was written before it" not test -s "$FAKE/advisory-before-dispatch"
+check "dispatch first (zerobull-consulting/dagger#163): no tag was fetched at the dispatch" test "$(tr -d ' \n' <"$FAKE/tags-at-dispatch")" = 0
+check "dispatch first (zerobull-consulting/dagger#163): both the tag and the base are fetched after" test "$(git -C "$work" tag -l | wc -l)" -eq 2
 check "dispatch first (zerobull-consulting/dagger#163): and it is written after" test -s "$FAKE/notes/advisory.md"
 check "dispatch first (zerobull-consulting/dagger#163): the verdict is the same" has "$tmp/out" "result=pass"
 # A fetch that fails after the dispatch is an error, never a verdict.
@@ -534,6 +538,11 @@ setup
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
 check "a test ref that isn't a branch name is refused" test "$status" -ne 0
 check "a test ref that isn't a branch name: before any dispatch" test "$(writes)" = 0
+setup
+git -C "$work" push -q origin HEAD:refs/heads/fix/a+b@c
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='fix/a+b@c'
+check "a valid branch name with odd characters is accepted" has "$tmp/out" "result=pass"
 
 echo "--- a tag that conflicts"
 setup

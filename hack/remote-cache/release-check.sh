@@ -139,9 +139,9 @@ need_run() { [[ "$1" =~ $run_re ]] || die "'$1' is not a GitHub Actions run URL"
 need_number() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || die "'$1' is not a number"; }
 
 [[ "$repo" =~ $repo_re ]] || die "RELEASE_CHECK_REPO '$repo' is not owner/name"
-# A branch name, as the workflow gives it, never a refspec.
-test_ref_re='^[A-Za-z0-9_][A-Za-z0-9._/-]*$'
-[[ -z "${RELEASE_CHECK_TEST_REF:-}" || "${RELEASE_CHECK_TEST_REF:-}" =~ $test_ref_re ]] ||
+# A branch name, as the workflow gives it, never a refspec: whatever git
+# accepts as a branch name has no ':', '~', '^', '?', '*', '[', '\\' or space.
+[[ -z "${RELEASE_CHECK_TEST_REF:-}" ]] || git check-ref-format "refs/heads/$RELEASE_CHECK_TEST_REF" ||
 	die "RELEASE_CHECK_TEST_REF is not a branch name"
 [[ "$poll" =~ ^[0-9]{1,4}$ && "$wait_minutes" =~ ^[0-9]{1,4}$ && "$min_head_age" =~ ^[0-9]{1,6}$ ]] ||
 	die "RELEASE_CHECK_POLL_SECONDS, RELEASE_CHECK_WAIT_MINUTES and RELEASE_CHECK_MIN_HEAD_AGE must be numbers"

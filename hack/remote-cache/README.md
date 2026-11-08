@@ -902,7 +902,7 @@ only decides when it runs and with which token.
      counts; a registry error, or an upstream that can't be listed, fails
      the run rather than reading as "nothing new".
 3. **Verify (A).** It dispatches `remote-cache-tests.yml` on
-   `feature/remote-cache` with `candidate-version` and `candidate-digest`,
+   `feature/remote-cache` (a dry run: on its own branch) with `candidate-version` and `candidate-digest`,
    and waits for it (at most 150 minutes): the e2e and the sidecar demo of
    the service as it is, against that stock engine. Meanwhile, a job of its
    own (`bundle test`) merges the tag into a scratch copy of the branch and
