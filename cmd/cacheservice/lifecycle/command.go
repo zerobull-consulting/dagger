@@ -70,6 +70,19 @@ func ConfirmValue(bucket, prefix string) string {
 	return bucket + "/" + strings.Trim(prefix, "/")
 }
 
+// confirmProblem is why o.Confirm doesn't authorize changing o's bucket and
+// prefix (apply, claim), or "" when it does.
+func confirmProblem(o Options) string {
+	want := ConfirmValue(o.Bucket, o.Prefix)
+	switch {
+	case o.Confirm == want:
+		return ""
+	case o.Confirm == "":
+		return fmt.Sprintf("needs -confirm=%s, repeating the bucket and prefix it changes", want)
+	}
+	return fmt.Sprintf("-confirm=%s doesn't match the bucket and prefix it would change, %s", o.Confirm, want)
+}
+
 // Opener makes the Store for an S3 configuration.
 type Opener func(ctx context.Context, cfg blobstore.S3Config) (Store, error)
 
@@ -150,8 +163,10 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	}
 	// A wrong -confirm stops apply and claim before anything is read, the
 	// tokens file included (Run checks it again, for its other callers).
-	if (o.Action == "apply" || o.Action == "claim") && o.Confirm != ConfirmValue(o.Bucket, o.Prefix) {
-		return fail(ExitUsage, "%s needs -confirm=%s, repeating the bucket and prefix it changes (got %q); nothing read or written", o.Action, ConfirmValue(o.Bucket, o.Prefix), o.Confirm)
+	if o.Action == "apply" || o.Action == "claim" {
+		if msg := confirmProblem(o); msg != "" {
+			return fail(ExitUsage, "%s %s; nothing read or written", o.Action, msg)
+		}
 	}
 	if o.Action == "claim" {
 		// The marker is the prefix's, not a namespace's: no tokens file or
@@ -166,15 +181,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 		if len(unused) > 0 {
 			return fail(ExitUsage, "claim doesn't use %s; nothing read or written", strings.Join(unused, ", "))
 		}
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		st, err := open(ctx, cfg)
-		if err != nil {
-			return fail(ExitError, "%v", err)
-		}
-		return Run(ctx, o, st, stdout, stderr)
-	}
-	if tokensFile != "" {
+	} else if tokensFile != "" {
 		tf, err := server.LoadTokenFile(tokensFile)
 		if err != nil {
 			return fail(ExitError, "%v", err)
@@ -204,23 +211,19 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 	root := layout.Root(o.Prefix)
 	fmt.Fprintf(out, "bucket %s, prefix %q\n", o.Bucket, root)
+	if o.Action == "apply" || o.Action == "claim" {
+		// Before anything is read: a wrong bucket or prefix is refused at
+		// once, whatever the store says.
+		if msg := confirmProblem(o); msg != "" {
+			return fail(ExitUsage, "%s; nothing written", msg)
+		}
+	}
 	if o.Action == "claim" {
 		return runClaim(ctx, o, st, out, fail)
 	}
 	fmt.Fprintf(out, "namespaces, from %s (%d): %s\n", o.Source, len(o.Namespaces), strings.Join(o.Namespaces, ", "))
 	if len(o.Namespaces) == 0 {
 		fmt.Fprintln(out, "warning: no namespaces: no staging rules are wanted")
-	}
-
-	if o.Action == "apply" {
-		// Before anything is read: a wrong bucket or prefix is refused at
-		// once, whatever the store says.
-		if o.Confirm == "" {
-			return fail(ExitUsage, "needs -confirm=%s, repeating the bucket and prefix it changes", ConfirmValue(o.Bucket, o.Prefix))
-		}
-		if want := ConfirmValue(o.Bucket, o.Prefix); o.Confirm != want {
-			return fail(ExitUsage, "-confirm=%s doesn't match the bucket and prefix it would change, %s; nothing written", o.Confirm, want)
-		}
 	}
 
 	marker, merr := st.ReadMarker(ctx, o.Prefix)
@@ -309,12 +312,6 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 // at startup (ownership.Check), and nothing else: no server, no probe. With
 // the marker there already, it writes nothing.
 func runClaim(ctx context.Context, o Options, st Store, out io.Writer, fail func(int, string, ...any) int) int {
-	if o.Confirm == "" {
-		return fail(ExitUsage, "needs -confirm=%s, repeating the bucket and prefix it claims", ConfirmValue(o.Bucket, o.Prefix))
-	}
-	if want := ConfirmValue(o.Bucket, o.Prefix); o.Confirm != want {
-		return fail(ExitUsage, "-confirm=%s doesn't match the bucket and prefix it would claim, %s; nothing written", o.Confirm, want)
-	}
 	state, m, err := st.Claim(ctx, o.Prefix)
 	if err != nil {
 		if denied(err) {
