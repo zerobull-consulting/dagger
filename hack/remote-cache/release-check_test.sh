@@ -124,6 +124,8 @@ case "$method $path" in
 "GET repos/o/r/actions/runs/"*/jobs*)
 	[[ -n "${FAKE_JOBS_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
 	# FAKE_JOBS_FAIL_AFTER=1: the first read works, every later one fails.
+	# FAKE_JOBS_FAIL_FIRST=1: the first read fails, the later ones work.
+	if [[ -n "${FAKE_JOBS_FAIL_FIRST:-}" ]] && (($(n jobs-try) <= FAKE_JOBS_FAIL_FIRST)); then echo "HTTP 502" >&2; exit 1; fi
 	if [[ -n "${FAKE_JOBS_FAIL_AFTER:-}" ]] && (($(n jobs-read) > FAKE_JOBS_FAIL_AFTER)); then echo "HTTP 502" >&2; exit 1; fi
 	# FAKE_JOBS: the jobs array as it is; otherwise the four jobs of a
 	# candidate run, all green in a green run and with the e2e red in a red
@@ -290,6 +292,15 @@ check "verify: a red run whose jobs can't be read is an error, not a failure" te
 check "verify: so no result is given" not has "$tmp/out" "result="
 
 setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_FIRST=1
+check "verify: a jobs read that fails once is tried again" has "$tmp/out" "result=pass"
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:failure"
+check "publish: lists the runs of the branch only" has "$FAKE/calls" "&branch=feature/remote-cache"
+check "engine jobs: the names are the workflow's own" bash -c "grep -qxF '    name: real engines (e2e)' '$here/../../.github/workflows/remote-cache-tests.yml' && grep -qxF '    name: sidecar demo' '$here/../../.github/workflows/remote-cache-tests.yml'"
+
+setup
 echo failure >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_AFTER=1
 check "verify: a red run's jobs are read once, so a failing second read can't stand in for them" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
@@ -327,6 +338,16 @@ setup
 echo failure >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)")"
 check "verify: a red run without its sidecar job is an error, not a failure" test "$status" -ne 0
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)" "$(job 'sidecar demo' skipped)")"
+check "verify: a red engine job beside a skipped one is an error, not a failure" test "$status" -ne 0
+check "verify: so no result is given" not has "$tmp/out" "result="
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: a duplicated engine job is an error" test "$status" -ne 0
+check "verify: not a failure verdict" not has "$tmp/out" "result="
 setup
 echo success >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" success)" "$(job 'sidecar demo' skipped)")"

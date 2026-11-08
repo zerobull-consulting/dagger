@@ -929,7 +929,7 @@ only decides when it runs and with which token.
    cancelled (best effort), since nothing would read it. In a dry run the bundle test builds on the dry run's own branch,
    as the e2e does. **The run is the gate**; the diff only informs.
    Only the run's `real engines (e2e)` and `sidecar demo` jobs decide, read
-   from the run's jobs by name. The run's other jobs (`unit tests`,
+   from the run's jobs by name (a jobs read that fails is tried three times). The run's other jobs (`unit tests`,
    `S3 tests against MinIO`) don't depend on the engine: if one of them
    fails, or an engine job is missing or skipped, that is an error too, and
    the next hour verifies the release again.
