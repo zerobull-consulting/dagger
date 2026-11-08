@@ -917,8 +917,8 @@ only decides when it runs and with which token.
    don't eat into the step's timeout), it fetches the tags and writes the
    advisory diff of the engine's side of the remote cache from the manifest's
    `base` to the release, and whether the bundle or protocol version
-   changed; if that fails, the step errors and the dispatched run is left
-   unread. In a dry run the bundle test builds on the dry run's own branch,
+   changed; if that fails, the step errors and the dispatched run is
+   cancelled (best effort), since nothing would read it. In a dry run the bundle test builds on the dry run's own branch,
    as the e2e does. **The run is the gate**; the diff only informs.
    A run that is cancelled, that failed before testing (its checkout or its
    pin step), or that the check can't read, is an error: it never leads to

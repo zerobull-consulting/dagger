@@ -139,6 +139,10 @@ need_run() { [[ "$1" =~ $run_re ]] || die "'$1' is not a GitHub Actions run URL"
 need_number() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || die "'$1' is not a number"; }
 
 [[ "$repo" =~ $repo_re ]] || die "RELEASE_CHECK_REPO '$repo' is not owner/name"
+# A branch name, as the workflow gives it, never a refspec.
+test_ref_re='^[A-Za-z0-9_][A-Za-z0-9._/-]*$'
+[[ -z "${RELEASE_CHECK_TEST_REF:-}" || "${RELEASE_CHECK_TEST_REF:-}" =~ $test_ref_re ]] ||
+	die "RELEASE_CHECK_TEST_REF is not a branch name"
 [[ "$poll" =~ ^[0-9]{1,4}$ && "$wait_minutes" =~ ^[0-9]{1,4}$ && "$min_head_age" =~ ^[0-9]{1,6}$ ]] ||
 	die "RELEASE_CHECK_POLL_SECONDS, RELEASE_CHECK_WAIT_MINUTES and RELEASE_CHECK_MIN_HEAD_AGE must be numbers"
 
@@ -226,7 +230,17 @@ fetch_tag() {
 # tree: a fresh worktree of the branch's head (or of new_tree's argument), in
 # $tree.
 tree=""
+# pending_run: a dispatched candidate run nothing is waiting on yet. If the
+# script ends in failure with one pending, it is cancelled (best effort, with
+# GITHUB_TOKEN), not left to run unread.
+pending_run=""
+wait_since=""
 cleanup() {
+	local rc=$?
+	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
+		say "the candidate run $server/$repo/actions/runs/$pending_run is not awaited and no result is given: cancelling it"
+		api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1 || say "cancelling run $pending_run failed; it will finish unread"
+	fi
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
@@ -325,7 +339,9 @@ dispatch() {
 # conclusion.
 wait_run() {
 	local id="$1" deadline run status conclusion
-	deadline=$((SECONDS + wait_minutes * 60))
+	# From the dispatch (wait_since, if set), not from here: work done between
+	# the two doesn't extend the wait past the step's timeout.
+	deadline=$((${wait_since:-$SECONDS} + wait_minutes * 60))
 	while :; do
 		if run="$(api "repos/$repo/actions/runs/$id")"; then
 			status="$(jq -r .status <<<"$run")"
@@ -594,18 +610,20 @@ cmd_verify() {
 	note version "$v"
 	note digest "$d"
 	local id
+	wait_since=$SECONDS
 	# The service as it is: the branch's, or in a dry run (from the
 	# workflow), the dry run's own ref. Dispatched first: the fetches and the
 	# advisory diff run while the candidate run does, not before it, out of
 	# the step's timeout.
 	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
-	# A failure here is an error (a step that fails), never a verdict. The
-	# dispatched run is left to finish unread: nothing reads it, and the next
+	# A failure here is an error (a step that fails), never a verdict, and the
+	# exit trap cancels the dispatched run, which nothing would read: the next
 	# hour verifies the release again.
-	(
-		fetch_tag "$v"
-		advisory "$v"
-	) || die "the fetches or the advisory diff failed after the candidate run $server/$repo/actions/runs/$id was dispatched: it is not awaited, and no result is given"
+	wait_since=$SECONDS
+	pending_run="$id"
+	fetch_tag "$v"
+	advisory "$v"
+	pending_run=""
 	a="$(finish_tests "$id" a)"
 	# The e2e and the sidecar demo's verdict. A is this and the bundle job's
 	# both passing (the workflow decides): a bundle test that didn't run (the

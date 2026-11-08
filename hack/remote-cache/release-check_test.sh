@@ -112,7 +112,7 @@ case "$method $path" in
 	wf="${path#repos/o/r/actions/workflows/}"; wf="${wf%/dispatches}"
 	echo "$input" >"$FAKE/dispatch-$wf-$(n dispatch-$wf)"
 	# Whether the advisory diff was written before this dispatch.
-	[[ -f "$FAKE/notes/advisory.md" ]] && echo "$wf" >>"$FAKE/advisory-before-dispatch"
+	if [[ -f "$FAKE/notes/advisory.md" ]]; then echo "$wf" >>"$FAKE/advisory-before-dispatch"; else echo "$wf" >>"$FAKE/dispatch-saw-no-advisory"; fi
 	[[ -n "${FAKE_NO_RUN_ID:-}" ]] && exit 0
 	id=$((5000 + $(n run)))
 	c="$(head -n1 "$FAKE/conclusions" 2>/dev/null || echo success)"
@@ -137,6 +137,7 @@ case "$method $path" in
 "POST graphql")
 	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
 	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
+"POST repos/o/r/actions/runs/"*/cancel) echo "{}" ;;
 "PUT repos/o/r/pulls/"*/merge) echo "$input" >"$FAKE/merged"; echo '{"merged": true}' ;;
 *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
 esac
@@ -516,7 +517,8 @@ check "bundle on the branch (zerobull-consulting/dagger#162): not on another ref
 setup
 echo success >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
-check "dispatch first (zerobull-consulting/dagger#163): no advisory diff existed at the dispatch" not test -s "$FAKE/advisory-before-dispatch"
+check "dispatch first (zerobull-consulting/dagger#163): no advisory diff existed at the dispatch" has "$FAKE/dispatch-saw-no-advisory" "remote-cache-tests.yml"
+check "dispatch first (zerobull-consulting/dagger#163): and none was written before it" not test -s "$FAKE/advisory-before-dispatch"
 check "dispatch first (zerobull-consulting/dagger#163): and it is written after" test -s "$FAKE/notes/advisory.md"
 check "dispatch first (zerobull-consulting/dagger#163): the verdict is the same" has "$tmp/out" "result=pass"
 # A fetch that fails after the dispatch is an error, never a verdict.
@@ -527,6 +529,11 @@ check "dispatch first: a tag that can't be fetched is an error" test "$status" -
 check "dispatch first: after the dispatch" test -f "$FAKE/dispatch-remote-cache-tests.yml-1"
 check "dispatch first: so no result is given" not has "$tmp/out" "result="
 check "dispatch first: saying the run isn't awaited" has "$tmp/out" "is not awaited"
+check "dispatch first: and cancelling it" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+setup
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
+check "a test ref that isn't a branch name is refused" test "$status" -ne 0
+check "a test ref that isn't a branch name: before any dispatch" test "$(writes)" = 0
 
 echo "--- a tag that conflicts"
 setup
