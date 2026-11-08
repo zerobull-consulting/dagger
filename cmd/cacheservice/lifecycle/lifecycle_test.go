@@ -805,7 +805,7 @@ func TestMainClaim(t *testing.T) {
 func TestClaimLostRace(t *testing.T) {
 	st := &fakeStore{marker: ownership.ErrNoMarker, lost: true}
 	code, out := run(t, opts("claim"), st)
-	if code != ExitOK || st.claims != 0 || !strings.Contains(out, "nothing written") || strings.Contains(out, "created cache/") {
+	if code != ExitOK || st.claims != 0 || !strings.Contains(out, "nothing written") || strings.Contains(out, "claim: created ") {
 		t.Fatalf("claim that lost the race: %d, %d claims\n%s", code, st.claims, out)
 	}
 }
