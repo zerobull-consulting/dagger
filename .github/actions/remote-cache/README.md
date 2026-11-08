@@ -306,7 +306,7 @@ pin the images to the action's commit, as above.
 | Code | Meaning | The step |
 | --- | --- | --- |
 | 0 | A clean stop: everything ended within the bound. | passes |
-| 1 | The stop was unclean: the bound cut the shutdown off with work still running, something else (such as engine connections still closing) left it unclean, a signal arrived during the shutdown, or an HTTP server failed, including one that failed as the stop ended. Logged as `stopped uncleanly`, with the reason in `error=` and what was running; the message says the shutdown's bound passed only when it did. | fails |
+| 1 | The stop was unclean: the bound cut the shutdown off with work still running, something else (such as engine connections still closing) left it unclean, a signal arrived during the shutdown, or an HTTP server failed, including one that failed as the stop ended. A shutdown that ends in error is logged as `stopped uncleanly`, with the reason in `error=` and what was running (the message says the shutdown's bound passed only when it did); a signal during the shutdown is logged as `signal during the shutdown: exiting at once`, and a step that overran its own bound as `stopped: the shutdown overran its bound`. | fails |
 | 137 | Killed before its stop ended, not by the stop (such as out of memory). What it was exporting is lost. | fails |
 | any | Still running past the stop's bound, `drain-timeout` plus 25s: the stop stopped it. | fails |
 | any | The service had exited before the stop. | fails |

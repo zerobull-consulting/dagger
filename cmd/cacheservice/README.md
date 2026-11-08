@@ -2530,9 +2530,13 @@ answer).
   1 when the bound cut the shutdown off, with work still running (an HTTP
   request, or an engine connection still closing after it was dropped), or a
   signal did: it logs what was still running (`exports`, `imports`, `gc`,
-  `engines`), and exits without waiting for it. 1 also when an HTTP server
+  `engines`), and exits without waiting for it. A shutdown that ends in
+  error logs `stopped uncleanly` with the reason in `error=`, and says the
+  shutdown's bound passed only when it did. 1 also when an HTTP server
   failed (such as its address in use), which stops the service too, or
-  failed during the drain or the shutdown. A
+  failed during the drain or the shutdown, including as the shutdown ended:
+  the shutdown waits, within its bound, for the servers to return before
+  their errors are read. A
   process manager, and the tests, can tell a clean stop from a cut-off one
   (`TestMinIOBinaryStopBoundedExitsOne`, `TestMinIOBinaryCleanStopExitsZero`).
 - **Signals.** A second signal during the drain ends the drain at once, and
@@ -3244,11 +3248,14 @@ ends the linger at once, and the engine's last event goes undelivered.
   shutdown, or when an HTTP server failed (including one that failed as the
   stop ended: the stop waits, within its bound, for the servers to return
   before it reads their errors); 137 when it was killed (by `docker stop`
-  past its `--time`, or out of memory). An unclean stop is logged as
-  `stopped uncleanly`, with the reason in `error=` and what was running;
-  the message says `the shutdown's bound passed` only when it did, not for
-  an error that comes sooner, such as engine connections still closing
-  (about 2.5s in). The action's stop fails the step on anything but 0, and
+  past its `--time`, or out of memory). A shutdown that ends in error is
+  logged as `stopped uncleanly`, with the reason in `error=` and what was
+  running; the message says `the shutdown's bound passed` only when it did,
+  not for an error that comes sooner, such as engine connections still
+  closing (about 2.5s in). Two exits log differently: a signal during the
+  shutdown (`signal during the shutdown: exiting at once`) and the outer
+  backstop for a step that overran its own bound (`stopped: the shutdown
+  overran its bound`). The action's stop fails the step on anything but 0, and
   on a service that exited before the stop, with the service's log.
 - The drain logs what it stored (`drain: stored`) and its outcome
   (`drain: done outcome=complete`). Most exports are stored before it:
