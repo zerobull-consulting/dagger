@@ -1,0 +1,6 @@
+# State holds the keys' secrets.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
