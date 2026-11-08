@@ -1048,31 +1048,67 @@ func TestOTLPDeeplyNestedBodyTaken(t *testing.T) {
 // An unknown start-group is kept by proto.Unmarshal as raw bytes, so the
 // estimate charges it at least its wire size, not a flat cost.
 func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
-	const field = 100 // not a field of ExportMetricsServiceRequest
-	inner := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), make([]byte, testOTLPLimit/2))
-	body := protowire.AppendTag(nil, field, protowire.StartGroupType)
-	body = append(body, inner...)
-	body = protowire.AppendTag(body, field, protowire.EndGroupType)
-
+	const field = 100 // not a field of any message below
+	group := func(size int) []byte {
+		b := protowire.AppendTag(nil, field, protowire.StartGroupType)
+		b = protowire.AppendTag(b, 1, protowire.BytesType)
+		b = protowire.AppendBytes(b, make([]byte, size))
+		return protowire.AppendTag(b, field, protowire.EndGroupType)
+	}
 	req := &colmetricspb.ExportMetricsServiceRequest{}
-	got, err := otlpDecodedSize(body, req, false)
+	flat, err := otlpDecodedSize(nil, req, false)
 	if err != nil {
-		t.Fatalf("estimate: %v", err)
-	}
-	if got < int64(len(body)) {
-		t.Fatalf("a group of %d bytes estimated at %d", len(body), got)
-	}
-	// The decoder does keep it, so the estimate has to cover it.
-	if err := proto.Unmarshal(body, req); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(req.ProtoReflect().GetUnknown()); n != len(body) {
-		t.Fatalf("decoder kept %d unknown bytes, want %d", n, len(body))
+	half := testOTLPLimit / 2
+	for name, body := range map[string][]byte{
+		// An unknown group at the top level.
+		"top level": group(half),
+		// One inside a known nested message (ResourceMetrics, field 1).
+		"nested": protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), group(half)),
+		// A known field number (ResourceMetrics, 1) sent as a group, so
+		// the wrong wire type for its number.
+		"wrong wire type": func() []byte {
+			b := protowire.AppendTag(nil, 1, protowire.StartGroupType)
+			b = protowire.AppendTag(b, 1, protowire.BytesType)
+			b = protowire.AppendBytes(b, make([]byte, half))
+			return protowire.AppendTag(b, 1, protowire.EndGroupType)
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := otlpDecodedSize(body, &colmetricspb.ExportMetricsServiceRequest{}, false)
+			if err != nil {
+				t.Fatalf("estimate: %v", err)
+			}
+			// The estimate of an empty request is its struct; the group has
+			// to add at least its own size on top.
+			if got-flat < int64(half) {
+				t.Fatalf("a group of %d bytes added %d to the estimate", len(body), got-flat)
+			}
+			// The decoder does keep it as unknown bytes.
+			m := &colmetricspb.ExportMetricsServiceRequest{}
+			if err := proto.Unmarshal(body, m); err != nil {
+				t.Fatal(err)
+			}
+			if len(m.ProtoReflect().GetUnknown()) == 0 && name != "nested" {
+				t.Fatalf("decoder kept no unknown bytes")
+			}
+		})
 	}
 
-	// With a budget under the group's size the body is refused.
-	_, _, srv := limitedService(t, int64(len(body))/2)
-	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	// End to end: a budget that admits the request's reserve and reading
+	// the body, but not the estimate on top, refuses it as too large (413).
+	// Reading a body of about 32 KiB holds otlpRequestReserve plus a 32 KiB
+	// and a 64 KiB buffer at its peak (114,688 bytes), then the 64 KiB buffer
+	// (81,920); the group's estimate is its 32,776 bytes plus the request's
+	// struct, so 114,700 admits the read and the flat charge (82,008 held) but
+	// not the size charge (about 114,784).
+	body := group(half)
+	if len(body) != 32776 {
+		t.Fatalf("body of %d bytes: the budget below is sized for 32776", len(body))
+	}
+	_, _, srv := limitedService(t, 114700)
+	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
 	}
 }
