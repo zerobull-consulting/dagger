@@ -15,11 +15,14 @@
 # here. Each subcommand is one job's work:
 #
 #   release-check.sh [--dry-run] publish
-#       If the branch's head has no publish run (an auto-merge by
-#       GITHUB_TOKEN starts no workflows), dispatches
-#       cacheservice-publish.yml on it, which moves the floating
-#       :<engine version> tags. Skips a head younger than 10 minutes,
-#       whose push run may not be listed yet.
+#       If the branch's head has no successful publish run and none
+#       queued or in progress (an auto-merge by GITHUB_TOKEN starts no
+#       workflows; a publish may fail), dispatches cacheservice-publish.yml
+#       on it, which moves the floating :<engine version> tags. At most two
+#       dispatches per head (counting its workflow_dispatch runs, a hand
+#       re-run too): past that it prints publish=bounded and a warning and
+#       dispatches nothing. Skips a head with no run at all younger than 10
+#       minutes, whose push run may not be listed yet.
 #   release-check.sh [--dry-run] plan [<version>]
 #       Finds the oldest upstream v1 release newer than every version the
 #       manifest names, and prints what to do with it (below). With a
@@ -29,10 +32,13 @@
 #       remote-cache-tests.yml on the branch (RELEASE_CHECK_TEST_REF: a dry
 #       run's own ref) with the candidate inputs, writes the advisory diff
 #       while it runs, and waits for it. Prints result=pass or
-#       result=fail: the e2e and the sidecar demo's verdict. A run that doesn't end in success or failure
-#       (cancelled, timed out waiting), or that failed before testing (its
-#       checkout or pin step), is an error, never a failure: it must not
-#       lead to a reject line.
+#       result=fail: the verdict of the "real engines (e2e)" and "sidecar demo"
+#       jobs alone, read by name from the run's jobs. A run that doesn't end
+#       in success or failure (cancelled, timed out waiting), that failed
+#       before testing (its checkout or pin step), in which any other job
+#       (unit tests, MinIO) failed, or in which an engine job is missing or
+#       skipped, is an error, never a failure: it must not lead to a reject
+#       line.
 #   release-check.sh bundle <version>
 #       TestBundleVersionMatchesEngineCapture with the tag merged into the
 #       branch (RELEASE_CHECK_TEST_REF: a dry run's own ref, as verify's).
@@ -363,10 +369,20 @@ wait_run() {
 	done
 }
 
-# failing_jobs: a run's failed jobs (its jobs JSON on stdin), as a
+# The jobs of remote-cache-tests.yml whose result is the engine's: the
+# verdict is theirs alone (zerobull-consulting/dagger#166). Any other job
+# (unit tests, the MinIO tests) doesn't depend on the engine.
+engine_jobs=("real engines (e2e)" "sidecar demo")
+
+engine_json="$(printf '%s\n' "${engine_jobs[@]}" | jq -R . | jq -s -c .)"
+# is_engine: jq's filter for "this job is an engine job", $e being the list.
+is_engine='(.name as $n | $e | index($n)) != null'
+
+# failing_jobs: an engine job's failures (a run's jobs JSON on stdin), as a
 # Markdown list.
 failing_jobs() {
-	jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "- [\(.name)](\(.html_url)): \(.conclusion)"'
+	jq -r --argjson e "$engine_json" \
+		'.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | select('"$is_engine"') | "- [\(.name)](\(.html_url)): \(.conclusion)"'
 }
 
 # The e2e and the sidecar demo against the candidate, waited on, write
@@ -384,27 +400,62 @@ start_tests() {
 	echo "$id"
 }
 finish_tests() {
-	local id="$1" p="$2" url conclusion
+	local id="$1" p="$2" url conclusion jobs names early other n
 	url="$server/$repo/actions/runs/$id"
 	conclusion="$(wait_run "$id")"
 	note "${p}_run" "$url"
 	note "${p}_conclusion" "$conclusion"
 	case "$conclusion" in
-	success) : >"$notes/$p-jobs.md"; echo pass ;;
-	failure)
+	success | failure) ;;
+	*) die "the verifying run $url ended '$conclusion', neither green nor red: not deciding on it" ;;
+	esac
+	# The verdict is the engine jobs' alone, so the jobs are read, once, on
+	# a green run too (a skipped engine job leaves the run green). A failed
+	# read decides nothing.
+	# (tried three times: a transient error shouldn't cost the whole run).
+	local try
+	for try in 1 2 3; do
+		jobs="$(api "repos/$repo/actions/runs/$id/jobs?per_page=100")" && jq -e '.jobs | type == "array"' <<<"$jobs" >/dev/null && break
+		jobs=""
+		((try == 3)) || sleep "$poll"
+	done
+	[[ -n "$jobs" ]] ||
+		die "couldn't read the verifying run $url's jobs: not deciding on it"
+	jq -e '(.total_count // (.jobs | length)) <= (.jobs | length)' <<<"$jobs" >/dev/null ||
+		die "the verifying run $url has more jobs than were listed: not deciding on it"
+	# A job that isn't the engine's and didn't pass says nothing about the
+	# engine: an error, and the next hour verifies the release again.
+	other="$(jq -r --argjson e "$engine_json" \
+		'[.jobs[] | select('"$is_engine"' | not) | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name): \(.conclusion)"] | join(", ")' <<<"$jobs")"
+	[[ -z "$other" ]] || die "the verifying run $url had jobs fail that don't test the engine ($other): not deciding on it"
+	# Each engine job must be there, once.
+	for n in "${engine_jobs[@]}"; do
+		[[ "$(jq -r --arg n "$n" '[.jobs[] | select(.name == $n)] | length' <<<"$jobs")" == 1 ]] ||
+			die "the verifying run $url has no single '$n' job: not deciding on it"
+	done
+	names="$(jq -r --argjson e "$engine_json" \
+		'[.jobs[] | select('"$is_engine"') | .conclusion] | join(" ")' <<<"$jobs")"
+	# Every engine job has to have run to a green or red end first: one
+	# failed and the other skipped or cancelled never tested both engines.
+	jq -e --argjson e "$engine_json" '[.jobs[] | select('"$is_engine"') | .conclusion] | all(. == "success" or . == "failure" or . == "timed_out")' <<<"$jobs" >/dev/null ||
+		die "the verifying run $url ended '$conclusion' with its engine jobs '$names': not deciding on it"
+	case " $names " in
+	*" failure "* | *" timed_out "*)
 		# A job that failed before testing anything (its checkout, or the
 		# pin step refusing the candidate) says nothing about the engine.
-		# The jobs are read once, and a failed read decides nothing.
-		local jobs early
-		jobs="$(api "repos/$repo/actions/runs/$id/jobs?per_page=100")" && jq -e '.jobs | type == "array"' <<<"$jobs" >/dev/null ||
-			die "couldn't read the verifying run $url's jobs: not deciding on it"
 		early="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
 			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
 		[[ -z "$early" ]] || die "the verifying run $url failed before testing ($early): not deciding on it"
 		failing_jobs <<<"$jobs" >"$notes/$p-jobs.md"
 		echo fail
 		;;
-	*) die "the verifying run $url ended '$conclusion', neither green nor red: not deciding on it" ;;
+	*)
+		# Green is both engine jobs green, in a run that is green.
+		[[ "$names" == "success success" && "$conclusion" == success ]] ||
+			die "the verifying run $url ended '$conclusion' with its engine jobs '$names': not deciding on it"
+		: >"$notes/$p-jobs.md"
+		echo pass
+		;;
 	esac
 }
 
@@ -490,27 +541,53 @@ bundle_test() {
 
 # --- the subcommands ---
 
+# The most dispatches of cacheservice-publish.yml for one head: a publish
+# that failed is retried, but not forever (zerobull-consulting/dagger#166).
+max_publish_dispatches=2
+
 cmd_publish() {
-	local head sha date age runs
+	local head sha date age runs total ok active dispatched
 	head="$(api "repos/$repo/branches/$branch")" || die "couldn't read $branch"
 	sha="$(jq -r .commit.sha <<<"$head")"
 	[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "$branch's head isn't a commit id"
 	date="$(jq -r .commit.commit.committer.date <<<"$head")"
 	age=$(($(date +%s) - $(date -d "$date" +%s)))
-	runs="$(api "repos/$repo/actions/workflows/cacheservice-publish.yml/runs?head_sha=$sha&per_page=1" | jq -r .total_count)"
-	need_number "$runs"
-	if ((runs > 0)); then
-		say "$branch's head ${sha:0:12} has a publish run: nothing to dispatch"
+	runs="$(api "repos/$repo/actions/workflows/cacheservice-publish.yml/runs?head_sha=$sha&branch=$branch&per_page=100")" || die "couldn't read the publish runs of ${sha:0:12}"
+	# A failed read decides nothing, and neither does a reply that isn't a
+	# list of runs: both are errors, never "no run".
+	jq -e '.workflow_runs | type == "array"' <<<"$runs" >/dev/null || die "the publish runs of ${sha:0:12} aren't a list"
+	# More runs than were listed (a head with over 100) decides nothing.
+	jq -e '(.total_count // (.workflow_runs | length)) <= (.workflow_runs | length)' <<<"$runs" >/dev/null || die "the head ${sha:0:12} has more publish runs than were listed"
+	total="$(jq -r '.workflow_runs | length' <<<"$runs")"
+	need_number "$total"
+	ok="$(jq -r '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$runs")"
+	# Queued, waiting, in progress: anything that isn't completed may still
+	# publish.
+	active="$(jq -r '[.workflow_runs[] | select(.status != "completed")] | length' <<<"$runs")"
+	dispatched="$(jq -r '[.workflow_runs[] | select(.event == "workflow_dispatch")] | length' <<<"$runs")"
+	need_number "$ok"
+	need_number "$active"
+	need_number "$dispatched"
+	if ((ok > 0)); then
+		say "$branch's head ${sha:0:12} has a successful publish run: nothing to dispatch"
 		out publish none
-	elif ((age < min_head_age)); then
+	elif ((active > 0)); then
+		say "$branch's head ${sha:0:12} has a publish run queued or in progress: nothing to dispatch"
+		out publish none
+	elif ((total == 0 && age < min_head_age)); then
 		say "$branch's head ${sha:0:12} is ${age}s old, and its push's run may not be listed yet: next hour"
 		out publish none
+	elif ((dispatched >= max_publish_dispatches)); then
+		# On stdout, for the run's summary: nothing else will say it.
+		say "::warning::$branch's head ${sha:0:12} has no successful publish after $dispatched dispatches (the most: $max_publish_dispatches); not dispatching again. Re-run cacheservice-publish.yml by hand."
+		echo "$branch's head ${sha:0:12} has no successful publish after $dispatched dispatches (the most: $max_publish_dispatches); not dispatching again. Re-run cacheservice-publish.yml by hand."
+		out publish bounded
 	elif is_dry; then
-		would "dispatch cacheservice-publish.yml on $branch (head ${sha:0:12} has no publish run)"
+		would "dispatch cacheservice-publish.yml on $branch (head ${sha:0:12} has no successful or running publish)"
 		out publish dispatched
 	else
 		dispatch cacheservice-publish.yml "$branch" '{}' >/dev/null
-		say "dispatched cacheservice-publish.yml on $branch for ${sha:0:12}, which no workflow published"
+		say "dispatched cacheservice-publish.yml on $branch for ${sha:0:12}, which has $total publish run(s), none successful"
 		out publish dispatched
 	fi
 }
