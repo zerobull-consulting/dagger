@@ -12,34 +12,35 @@ and removes them again.
 | `-read` | `read` on the bucket | Pull-request jobs, `-export=false`. Can't write. |
 
 The bucket is private and has `force_destroy`: **tear-down deletes its
-objects.** Use a name nobody else's data lives under.
+objects.** The name is generated, so it is a fresh bucket each time.
 
 ## Use
 
-You need a DigitalOcean API token and a Spaces key that can create buckets,
-in the environment (the provider reads these names):
+The only input is one DigitalOcean API token (a sensitive variable,
+`do_token`), read from `DIGITALOCEAN_TOKEN` or `TF_VAR_do_token`. The admin key
+it creates is what creates the bucket, so no Spaces key is supplied by hand.
 
 ```bash
-export DIGITALOCEAN_TOKEN=... SPACES_ACCESS_KEY_ID=... SPACES_SECRET_ACCESS_KEY=...
+export DIGITALOCEAN_TOKEN=...
+./hack/remote-cache/spaces/spaces.sh up
 ```
 
-```bash
-./hack/remote-cache/spaces/spaces.sh up -var bucket_name=dagger-rc-test-<you>
-```
+The bucket is named `dagger-rc-test-<6 random characters>`
+(`bucket_name_prefix` changes the prefix; `-var bucket_name=...` sets the whole
+name).
 
 ```bash
 eval "$(./hack/remote-cache/spaces/spaces.sh env write)"   # or read, or admin
 export CACHESERVICE_TEST_EXTERNAL=1 CACHESERVICE_TEST_STORE=spaces CACHESERVICE_S3_PREFIX=test
 ```
 
-Tear down (destroys the keys, then the bucket and everything in it):
+Tear down (destroys the bucket and everything in it, then the keys):
 
 ```bash
-./hack/remote-cache/spaces/spaces.sh down -var bucket_name=dagger-rc-test-<you>
+./hack/remote-cache/spaces/spaces.sh down
 ```
 
-Pass the same `-var` flags to `down` as to `up`, or put them in a
-`terraform.tfvars` (git-ignored).
+The slug lives in the state, so `down` needs the same state directory as `up`.
 
 ## Things to know
 

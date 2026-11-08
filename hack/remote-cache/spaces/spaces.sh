@@ -5,9 +5,10 @@
 #   spaces.sh env admin|write|read  print one key's CACHESERVICE_S3_* settings as exports
 #   spaces.sh down                destroy the keys and the bucket, objects included
 #
-# Needs terraform (or tofu via TF=tofu), DIGITALOCEAN_TOKEN, and
-# SPACES_ACCESS_KEY_ID / SPACES_SECRET_ACCESS_KEY of a key that can manage
-# buckets. Extra arguments go to terraform: spaces.sh up -var bucket_name=...
+# Needs terraform (or tofu via TF=tofu) and one DigitalOcean API token in
+# DIGITALOCEAN_TOKEN (or TF_VAR_do_token). The bucket is named
+# <bucket_name_prefix>-<random slug> unless -var bucket_name=... is given.
+# Extra arguments go to terraform.
 # See README.md.
 set -euo pipefail
 
@@ -16,13 +17,11 @@ tf="${TF:-terraform}"
 cd "$here"
 
 need() {
-	local v
-	for v in DIGITALOCEAN_TOKEN SPACES_ACCESS_KEY_ID SPACES_SECRET_ACCESS_KEY; do
-		[[ -n "${!v:-}" ]] || {
-			echo "spaces.sh: $v is not set" >&2
-			exit 2
-		}
-	done
+	export TF_VAR_do_token="${TF_VAR_do_token:-${DIGITALOCEAN_TOKEN:-}}"
+	[[ -n "$TF_VAR_do_token" ]] || {
+		echo "spaces.sh: set DIGITALOCEAN_TOKEN (or TF_VAR_do_token)" >&2
+		exit 2
+	}
 }
 
 cmd="${1:-}"

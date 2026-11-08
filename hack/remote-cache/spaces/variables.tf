@@ -4,10 +4,22 @@ variable "region" {
   default     = "nyc3"
 }
 
-variable "bucket_name" {
-  description = "Bucket name. Spaces names are unique within a region, so add your own suffix."
+variable "do_token" {
+  description = "DigitalOcean API token (read and write scopes). The only credential needed."
   type        = string
-  default     = "dagger-remote-cache-test"
+  sensitive   = true
+}
+
+variable "bucket_name_prefix" {
+  description = "The bucket is named <this>-<6 random characters>, since Spaces names are unique within a region."
+  type        = string
+  default     = "dagger-rc-test"
+}
+
+variable "bucket_name" {
+  description = "Set to use this exact name instead of the generated one."
+  type        = string
+  default     = null
 }
 
 variable "prefix" {

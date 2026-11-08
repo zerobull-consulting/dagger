@@ -7,11 +7,23 @@ terraform {
       # digitalocean_spaces_key arrived in 2.54.
       version = ">= 2.54"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.5"
+    }
   }
 }
 
-# Credentials come from the environment, never from files in this directory:
-#   DIGITALOCEAN_TOKEN        a personal access token (manages the bucket and keys)
-#   SPACES_ACCESS_KEY_ID      a Spaces key that can create buckets
-#   SPACES_SECRET_ACCESS_KEY  (the provider reads both of these names)
-provider "digitalocean" {}
+# The one input is a DigitalOcean API token (var.do_token). It creates the keys;
+# the admin key it makes then creates and removes the bucket, so no Spaces key
+# has to be supplied by hand.
+provider "digitalocean" {
+  token = var.do_token
+}
+
+provider "digitalocean" {
+  alias             = "spaces"
+  token             = var.do_token
+  spaces_access_id  = digitalocean_spaces_key.admin.access_key
+  spaces_secret_key = digitalocean_spaces_key.admin.secret_key
+}

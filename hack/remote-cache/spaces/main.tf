@@ -5,8 +5,23 @@
 # cache objects. That is the point of a test bucket; do not point this
 # configuration at a bucket you care about.
 
+resource "random_string" "slug" {
+  length  = 6
+  lower   = true
+  upper   = false
+  numeric = true
+  special = false
+}
+
+locals {
+  bucket_name = coalesce(var.bucket_name, "${var.bucket_name_prefix}-${random_string.slug.result}")
+}
+
+# Created with the admin key (provider alias), so destroy removes the bucket
+# before the key.
 resource "digitalocean_spaces_bucket" "cache" {
-  name          = var.bucket_name
+  provider      = digitalocean.spaces
+  name          = local.bucket_name
   region        = var.region
   acl           = "private"
   force_destroy = true
