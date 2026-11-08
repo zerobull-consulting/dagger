@@ -226,9 +226,9 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		fmt.Fprintf(out, "ownership marker: can't read it: %v\n", merr)
 	}
 	if o.Action == "apply" && merr != nil {
-		hint := "check " + blobstore.EnvPrefix
+		hint := "Check " + blobstore.EnvPrefix
 		if errors.Is(merr, ownership.ErrNoMarker) {
-			hint = "if the prefix is empty, claim it with `cacheservice lifecycle claim -confirm=" + ConfirmValue(o.Bucket, o.Prefix) + "` " +
+			hint = "If the prefix is empty, claim it with `cacheservice lifecycle claim -confirm=" + ConfirmValue(o.Bucket, o.Prefix) + "` " +
 				"(or start a writer on it); otherwise check " + blobstore.EnvPrefix
 		}
 		return fail(ExitError, "refusing a prefix the service doesn't own, as GC does: %v. %s", merr, hint)

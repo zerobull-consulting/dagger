@@ -699,6 +699,14 @@ back) and `lifecycle check` (ok, exit 0). A limited Read/Write/Delete key
 could not read the lifecycle configuration (`GetBucketLifecycleConfiguration`
 returned 403 `AccessDenied`), so `lifecycle check` needs the admin key.
 
+Run again on 2026-11-08 on another Spaces bucket (nyc3), with a full-access,
+a limited `Read/Write/Delete` and a limited `Read` key: `lifecycle claim` on an
+empty prefix created the marker with the full-access key (a second one wrote
+nothing), and `plan`, `apply` (2 rules added, read back) and `check` (ok) followed.
+`claim` on a prefix holding a key exited 1 and wrote nothing. Every key-level
+fact in [The keys](#the-keys) and [A read-only key](#a-read-only-key) was
+seen again there.
+
 #### The rules, for reference
 
 On AWS, with the service's prefix `cache` and namespaces `team-a` and
