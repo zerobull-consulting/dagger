@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"os"
 	"slices"
@@ -381,5 +382,29 @@ func TestMinIOLifecycleClaimRefusesKeys(t *testing.T) {
 	}
 	if !slices.Equal(keys, []string{stray}) {
 		t.Fatalf("keys after a refused claim: %v, want only %s", keys, stray)
+	}
+}
+
+// claim refuses a prefix with an upload in progress under a key that isn't
+// the prefix itself: MinIO lists uploads only by exact key, so the claim
+// must list the bucket's and filter, as the service's startup does
+// (S3Store.FilterAllUploads, set by OpenS3 for a custom endpoint).
+func TestMinIOLifecycleClaimRefusesUploadInProgress(t *testing.T) {
+	e := newMinIOEnv(t)
+	ctx := context.Background()
+	key := e.cfg.Prefix + "/ns/default/staging/in-progress"
+	up, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &e.cfg.Bucket, Key: &key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = e.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{Bucket: &e.cfg.Bucket, Key: &key, UploadId: up.UploadId})
+	})
+	code, out := e.main("claim", "-confirm="+ConfirmValue(e.cfg.Bucket, e.cfg.Prefix))
+	if code != ExitError || !strings.Contains(out, "upload:"+key) {
+		t.Fatalf("claim with an upload in progress: %d", code)
+	}
+	if _, err := (&S3Store{Client: e.client, Bucket: e.cfg.Bucket}).ReadMarker(ctx, e.cfg.Prefix); !errors.Is(err, ownership.ErrNoMarker) {
+		t.Fatalf("a refused claim left a marker: %v", err)
 	}
 }

@@ -2423,7 +2423,7 @@ Keep three credentials, each with only what it needs
 | --- | --- | --- |
 | **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
 | **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
-| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs. On Spaces, a full-access key: a limited key gets 403. |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs. `lifecycle claim` on a fresh prefix also needs what a writer's startup check needs there: `s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:PutObject` for the marker. On Spaces, a full-access key: a limited key gets 403. |
 
 The admin key is the most powerful: a lifecycle rule can expire anything in
 the bucket. Use it only for `lifecycle apply`, interactively, and keep it out

@@ -96,7 +96,7 @@ func OpenS3(ctx context.Context, cfg blobstore.S3Config) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &S3Store{Client: client, Bucket: cfg.Bucket}, nil
+	return &S3Store{Client: client, Bucket: cfg.Bucket, FilterAllUploads: cfg.Endpoint != ""}, nil
 }
 
 const usage = `usage: cacheservice lifecycle [plan|claim|apply|check] [flags]
@@ -249,7 +249,7 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	if o.Action == "apply" && merr != nil {
 		hint := "Check " + blobstore.EnvPrefix
 		if errors.Is(merr, ownership.ErrNoMarker) {
-			hint = "If the prefix is empty, claim it with `cacheservice lifecycle claim -confirm=" + ConfirmValue(o.Bucket, o.Prefix) + "` " +
+			hint = "If the prefix is empty, claim it with `cacheservice lifecycle claim " + confirmFlag(o) + "` " +
 				"(or start a writer on it); otherwise check " + blobstore.EnvPrefix
 		}
 		return fail(ExitError, "refusing a prefix the service doesn't own, as GC does: %v. %s", merr, hint)
@@ -334,7 +334,7 @@ func runClaim(ctx context.Context, o Options, st Store, out io.Writer, fail func
 	case ownership.ClaimedByOther:
 		fmt.Fprintf(out, "claim: already claimed, by a writer that created %s first (layout %d); nothing written\n", marker, m.Layout)
 	default:
-		fmt.Fprintf(out, "claim: created %s (layout %d); next: cacheservice lifecycle apply -confirm=%s\n", marker, m.Layout, ConfirmValue(o.Bucket, o.Prefix))
+		fmt.Fprintf(out, "claim: created %s (layout %d); next: cacheservice lifecycle apply %s\n", marker, m.Layout, confirmFlag(o))
 	}
 	return ExitOK
 }
@@ -460,7 +460,13 @@ func applyCommand(o Options, removals bool) string {
 	if removals {
 		args = append(args, "-allow-removals")
 	}
-	return strings.Join(append(args, shellQuote("-confirm="+ConfirmValue(o.Bucket, o.Prefix))), " ")
+	return strings.Join(append(args, confirmFlag(o)), " ")
+}
+
+// confirmFlag is the -confirm flag for o's bucket and prefix, quoted for a
+// shell.
+func confirmFlag(o Options) string {
+	return shellQuote("-confirm=" + ConfirmValue(o.Bucket, o.Prefix))
 }
 
 // safeShell are the characters a word needs no quotes for.

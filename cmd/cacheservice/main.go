@@ -110,9 +110,9 @@
 //	DAGGER_CLOUD_TOKEN=<a token of the tokens file; anything without one>
 //	DAGGER_CLOUD_URL=http://<host>:8090   (optional: receive the cache events)
 //
-// `cacheservice lifecycle plan|apply|check` is a one-shot subcommand, not the
-// service: it sets or checks the bucket's lifecycle rules, with the admin
-// key (package lifecycle; README.md, "The lifecycle command").
+// `cacheservice lifecycle plan|claim|apply|check` is a one-shot subcommand, not
+// the service: it claims the prefix, sets or checks the bucket's lifecycle
+// rules, with the admin key (package lifecycle; README.md, "The lifecycle command").
 package main
 
 import (

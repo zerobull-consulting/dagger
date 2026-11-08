@@ -45,6 +45,11 @@ type Store interface {
 type S3Store struct {
 	Client *s3.Client
 	Bucket string
+	// FilterAllUploads is set for a custom endpoint (an S3-compatible store
+	// such as MinIO), which may list multipart uploads only by exact key:
+	// the ownership check then lists the bucket's and filters, as the
+	// service does (metastore.NewS3Objects).
+	FilterAllUploads bool
 }
 
 var _ Store = (*S3Store)(nil)
@@ -83,13 +88,39 @@ func (s *S3Store) ReadMarker(ctx context.Context, prefix string) (ownership.Mark
 	return ownership.ReadMarker(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix)
 }
 
-// Claim is ownership.Check in writer mode: several requests (the marker, a
-// listing, one GET per ancestor prefix, the multipart listing, one
-// conditional PUT), so the run's own bound applies, not CallTimeout's one.
+// Claim is ownership.Check in writer mode, on the same object store the
+// service uses (FilterAllUploads included). Each of its requests is bounded
+// by CallTimeout, and the whole of it by ctx.
 func (s *S3Store) Claim(ctx context.Context, prefix string) (ownership.State, ownership.Marker, error) {
-	ctx, cancel := context.WithTimeout(ctx, DefaultTimeout)
+	objs := &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket, FilterAllUploads: s.FilterAllUploads}
+	return ownership.Check(ctx, timedObjects{objs}, prefix, true, time.Now())
+}
+
+// timedObjects bounds each request of an ownership.Store by CallTimeout.
+type timedObjects struct{ ownership.Store }
+
+func (t timedObjects) Get(ctx context.Context, key string) ([]byte, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
-	return ownership.Check(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix, true, time.Now())
+	return t.Store.Get(ctx, key)
+}
+
+func (t timedObjects) Put(ctx context.Context, key string, body []byte, cond metastore.Condition) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.Put(ctx, key, body, cond)
+}
+
+func (t timedObjects) ListKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.ListKeys(ctx, prefix, max)
+}
+
+func (t timedObjects) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.ListUploadKeys(ctx, prefix, max)
 }
 
 // errorCode is an S3 error's code, such as AccessDenied.

@@ -19,6 +19,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
 
@@ -825,6 +826,84 @@ func TestConfirmRefusalOutput(t *testing.T) {
 		code, out = run(t, o, &fakeStore{marker: ownership.ErrNoMarker})
 		if code != ExitUsage || strings.Contains(out, "namespaces") || !strings.Contains(out, "claim") || strings.Contains(out, "change") {
 			t.Fatalf("claim -confirm=%q: %d\n%s", confirm, code, out)
+		}
+	}
+}
+
+// The next-step and apply hints are commands to paste: a prefix with a space
+// is quoted, as plan's apply command quotes it.
+func TestClaimHintsAreShellQuoted(t *testing.T) {
+	o := opts("claim")
+	o.Prefix, o.Confirm = "a b", "bkt/a b"
+	code, out := run(t, o, &fakeStore{marker: ownership.ErrNoMarker})
+	if want := "lifecycle apply '-confirm=bkt/a b'"; code != ExitOK || !strings.Contains(out, want) {
+		t.Fatalf("claim next step, want %q: %d\n%s", want, code, out)
+	}
+	o = opts("apply", "x")
+	o.Prefix, o.Confirm = "a b", "bkt/a b"
+	code, out = run(t, o, &fakeStore{marker: ownership.ErrNoMarker})
+	if want := "lifecycle claim '-confirm=bkt/a b'"; code != ExitError || !strings.Contains(out, want) {
+		t.Fatalf("apply's hint, want %q: %d\n%s", want, code, out)
+	}
+}
+
+// deadlineStore is an ownership.Store that records each call's deadline.
+type deadlineStore struct{ got []time.Duration }
+
+func (d *deadlineStore) rec(ctx context.Context) {
+	if dl, ok := ctx.Deadline(); ok {
+		d.got = append(d.got, time.Until(dl))
+	} else {
+		d.got = append(d.got, -1)
+	}
+}
+func (d *deadlineStore) Get(ctx context.Context, _ string) ([]byte, string, error) {
+	d.rec(ctx)
+	return nil, "", nil
+}
+func (d *deadlineStore) Put(ctx context.Context, _ string, _ []byte, _ metastore.Condition) (string, error) {
+	d.rec(ctx)
+	return "", nil
+}
+func (d *deadlineStore) ListKeys(ctx context.Context, _ string, _ int) ([]string, error) {
+	d.rec(ctx)
+	return nil, nil
+}
+func (d *deadlineStore) ListUploadKeys(ctx context.Context, _ string, _ int) ([]string, error) {
+	d.rec(ctx)
+	return nil, nil
+}
+
+// Each request of a claim is bounded by CallTimeout, however long the whole
+// run is allowed; a shorter deadline of the caller's is kept.
+func TestClaimBoundsEachRequest(t *testing.T) {
+	call := func(ctx context.Context) []time.Duration {
+		d := &deadlineStore{}
+		tw := timedObjects{d}
+		_, _, _ = tw.Get(ctx, "k")
+		_, _ = tw.Put(ctx, "k", nil, metastore.Condition{})
+		_, _ = tw.ListKeys(ctx, "p", 1)
+		_, _ = tw.ListUploadKeys(ctx, "p", 1)
+		return d.got
+	}
+	long, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	for _, ctx := range []context.Context{context.Background(), long} {
+		got := call(ctx)
+		if len(got) != 4 {
+			t.Fatalf("calls %v", got)
+		}
+		for _, d := range got {
+			if d <= 0 || d > CallTimeout {
+				t.Fatalf("a request's deadline is %v away, want within (0, %v]: %v", d, CallTimeout, got)
+			}
+		}
+	}
+	short, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	for _, d := range call(short) {
+		if d <= 0 || d > time.Second {
+			t.Fatalf("the caller's shorter deadline wasn't kept: %v", d)
 		}
 	}
 }
