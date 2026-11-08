@@ -125,9 +125,17 @@ case "$method $path" in
 	[[ -n "${FAKE_JOBS_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
 	# FAKE_JOBS_FAIL_AFTER=1: the first read works, every later one fails.
 	if [[ -n "${FAKE_JOBS_FAIL_AFTER:-}" ]] && (($(n jobs-read) > FAKE_JOBS_FAIL_AFTER)); then echo "HTTP 502" >&2; exit 1; fi
+	# FAKE_JOBS: the jobs array as it is; otherwise the four jobs of a
+	# candidate run, all green in a green run and with the e2e red in a red
+	# one (at FAKE_FAILED_STEP).
+	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{\"jobs\": $FAKE_JOBS}"; exit 0; fi
 	failed_step="${FAKE_FAILED_STEP:-Real engines}"
-	echo '{"jobs": [{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/1/job/2",
-		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "failure"}]},
+	rid="${path#repos/o/r/actions/runs/}"; rid="${rid%%/*}"
+	e2e=success; [[ "$(cat "$FAKE/run-$rid")" == failure ]] && e2e=failure
+	echo '{"jobs": [{"name": "unit tests", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/4"},
+		{"name": "S3 tests against MinIO", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/5"},
+		{"name": "real engines (e2e)", "conclusion": "'"$e2e"'", "html_url": "https://github.com/o/r/actions/runs/1/job/2",
+		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "'"$e2e"'"}]},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
 "GET repos/o/r/actions/runs/"*)
 	c="$(cat "$FAKE/run-${path##*/}")"
@@ -135,7 +143,9 @@ case "$method $path" in
 "GET repos/o/r/branches/feature/remote-cache")
 	sha="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
 	echo "{\"commit\": {\"sha\": \"$sha\", \"commit\": {\"committer\": {\"date\": \"${FAKE_HEAD_DATE:-2020-01-01T00:00:00Z}\"}}}}" ;;
-"GET repos/o/r/actions/workflows/cacheservice-publish.yml/runs?head_sha="*) echo "{\"total_count\": ${FAKE_PUBLISH_RUNS:-0}}" ;;
+"GET repos/o/r/actions/workflows/cacheservice-publish.yml/runs?head_sha="*)
+	# FAKE_PUBLISH_RUNS: space-separated "<event>:<status>:<conclusion>".
+	jq -n --arg r "${FAKE_PUBLISH_RUNS:-}" '{workflow_runs: [$r | split(" ")[] | select(. != "") | split(":") | {event: .[0], status: .[1], conclusion: (.[2] // null)}]}' ;;
 "POST graphql")
 	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
 	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
@@ -285,6 +295,51 @@ ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_AFTER=1
 check "verify: a red run's jobs are read once, so a failing second read can't stand in for them" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
 check "verify: and no placeholder list is written" not has "$FAKE/notes/a-jobs.md" "couldn't list"
 
+# Only the engine jobs decide (zerobull-consulting/dagger#166).
+job() { printf '{"name": "%s", "conclusion": "%s", "html_url": "https://github.com/o/r/actions/runs/1/job/9", "steps": []}' "$1" "$2"; }
+jobs_of() { local IFS=,; echo "[$*]"; }
+e2e="real engines (e2e)"
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'S3 tests against MinIO' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: a red unit test job is an error, not a failure" test "$status" -ne 0
+check "verify: naming the job" has "$tmp/out" "unit tests: failure"
+check "verify: so no result is given" not has "$tmp/out" "result="
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'S3 tests against MinIO' timed_out)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: nor is a timed-out MinIO job a failure of the engine" test "$status" -ne 0
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'S3 tests against MinIO' success)" "$(job "$e2e" failure)" "$(job 'sidecar demo' success)")"
+check "verify: a red engine job with a red unit job is still an error" test "$status" -ne 0
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'S3 tests against MinIO' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' failure)")"
+check "verify: a red sidecar demo is the failure verdict" has "$tmp/out" "result=fail"
+check "verify: and the list names only it" has "$FAKE/notes/a-jobs.md" "sidecar demo"
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'S3 tests against MinIO' success)" "$(job 'sidecar demo' success)")"
+check "verify: a green run without its e2e job is an error" test "$status" -ne 0
+check "verify: not a pass" not has "$tmp/out" "result="
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)")"
+check "verify: a red run without its sidecar job is an error, not a failure" test "$status" -ne 0
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" success)" "$(job 'sidecar demo' skipped)")"
+check "verify: a skipped engine job in a green run is an error" test "$status" -ne 0
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
+check "verify: a green run whose jobs can't be read is an error" test "$status" -ne 0
+setup
+echo failure >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: a red run whose every job is green is an error" test "$status" -ne 0
+
 echo "--- the bundle test"
 setup
 ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
@@ -396,8 +451,34 @@ check "publish: a head with no publish run is published" has "$tmp/out" "publish
 check "publish: by dispatching cacheservice-publish.yml on the branch" jq -e '.ref == "feature/remote-cache"' "$FAKE/dispatch-cacheservice-publish.yml-1"
 check "publish: with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/actions/workflows/cacheservice-publish.yml/dispatches"
 setup
-ARGS=(publish); rc env FAKE_PUBLISH_RUNS=1
-check "publish: a head with a run isn't" has "$tmp/out" "publish=none"
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:success"
+check "publish: a head with a successful run isn't" has "$tmp/out" "publish=none"
+check "publish: and dispatches nothing" test "$(writes)" = 0
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:failure"
+check "publish: a head whose only run failed is published again" has "$tmp/out" "publish=dispatched"
+check "publish: by a dispatch" test -f "$FAKE/dispatch-cacheservice-publish.yml-1"
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:cancelled"
+check "publish: so is one whose run was cancelled" has "$tmp/out" "publish=dispatched"
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:failure workflow_dispatch:in_progress"
+check "publish: a retry in progress isn't dispatched over" has "$tmp/out" "publish=none"
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:queued"
+check "publish: nor is a queued run" has "$tmp/out" "publish=none"
+check "publish: dispatching nothing" test "$(writes)" = 0
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:failure workflow_dispatch:completed:failure"
+check "publish: one failed dispatch is retried once more" has "$tmp/out" "publish=dispatched"
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:failure workflow_dispatch:completed:failure workflow_dispatch:completed:failure"
+check "publish: past two dispatches it stops" has "$tmp/out" "publish=bounded"
+check "publish: saying so for the run's summary" has "$tmp/out" "not dispatching again"
+check "publish: and dispatches nothing" test "$(writes)" = 0
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="workflow_dispatch:completed:failure workflow_dispatch:completed:failure workflow_dispatch:completed:success"
+check "publish: the bound doesn't hide a success" has "$tmp/out" "publish=none"
 ARGS=(publish); rc env FAKE_HEAD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 check "publish: nor a head just pushed" has "$tmp/out" "publish=none"
 check "publish: neither dispatches" test "$(writes)" = 0

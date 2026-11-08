@@ -885,9 +885,15 @@ only decides when it runs and with which token.
 **Each hour** (minute 17, and by hand):
 
 1. **Publish what nothing published.** If `feature/remote-cache`'s head has
-   no `cacheservice-publish.yml` run (an auto-merge by `GITHUB_TOKEN`
-   starts none) and is older than 10 minutes, it dispatches one, which
-   moves the floating `dagger-remote-cache:<version>` tags.
+   no successful `cacheservice-publish.yml` run, and none queued or in
+   progress, it dispatches one, which moves the floating
+   `dagger-remote-cache:<version>` tags. A head with no run at all (an
+   auto-merge by `GITHUB_TOKEN` starts none) must be older than 10 minutes
+   first. A publish that failed or was cancelled is dispatched again on a
+   later hour, but at most twice per head: past that the step's summary says
+   so (`publish=bounded`) and nothing more is dispatched, so re-run the
+   publish by hand
+   ([zerobull-consulting/dagger#166](https://github.com/zerobull-consulting/dagger/issues/166)).
 2. **Poll.** `git ls-remote --tags https://github.com/dagger/dagger` for
    `v1.*`; a tag must match `^v1\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$` and be
    a version `engines.sh` takes. A release is **new** when it is newer than
@@ -920,6 +926,11 @@ only decides when it runs and with which token.
    changed; if that fails, the step errors and the dispatched run is
    cancelled (best effort), since nothing would read it. In a dry run the bundle test builds on the dry run's own branch,
    as the e2e does. **The run is the gate**; the diff only informs.
+   Only the run's `real engines (e2e)` and `sidecar demo` jobs decide, read
+   from the run's jobs by name. The run's other jobs (`unit tests`,
+   `S3 tests against MinIO`) don't depend on the engine: if one of them
+   fails, or an engine job is missing or skipped, that is an error too, and
+   the next hour verifies the release again.
    A run that is cancelled, that failed before testing (its checkout or its
    pin step), or that the check can't read, is an error: it never leads to
    a reject line.
