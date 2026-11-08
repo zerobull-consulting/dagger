@@ -80,8 +80,8 @@
 //     once.
 //     The process exits 0 only when everything ended within the bound, and
 //     1 when a signal or the bound cut the shutdown off, or an HTTP server
-//     failed, logging the reason and what was still running. GET /debug/drain shows the drain. See README.md,
-//     "Stopping and draining".
+//     failed, logging the reason and what was still running. GET /debug/drain
+//     shows the drain. See README.md, "Stopping and draining".
 //
 //   - with -export=false, a read-only instance: the import path alone. It
 //     never writes to or deletes from the bucket, so it runs with a
@@ -566,7 +566,8 @@ const shutdownMargin = 500 * time.Millisecond
 // (serversDone, nil when there are none), so that the error one sent as it
 // stopped is in errs when exitCode reads it.
 // It returns an error when that bound cut the wait off, with work still
-// running: the service's paths, an HTTP request or a server's goroutine. The cancel comes first, as when the signal itself canceled that
+// running: the service's paths, an HTTP request or a server's goroutine.
+// The cancel comes first, as when the signal itself canceled that
 // context: a request tied to it, such as POST /debug/gc, then ends at once
 // rather than holding the shutdown for grace.
 func shutdown(svc *server.Service, servers []*http.Server, serversDone <-chan struct{}, cancelPaths context.CancelFunc, grace time.Duration) error {
@@ -589,7 +590,13 @@ func shutdown(svc *server.Service, servers []*http.Server, serversDone <-chan st
 		select {
 		case <-serversDone:
 		case <-ctx.Done():
-			errs = append(errs, errors.New("http servers still serving"))
+			// Both can be ready (Shutdown used up the bound after the
+			// goroutines returned): the goroutines having returned wins.
+			select {
+			case <-serversDone:
+			default:
+				errs = append(errs, errors.New("http servers still serving"))
+			}
 		}
 	}
 	if err := svc.WaitContext(ctx); err != nil {

@@ -216,7 +216,11 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 			resp.Body.Close()
 		}
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request didn't reach its handler")
+	}
 	err = shutdown(svc, []*http.Server{srv}, nil, func() {}, 300*time.Millisecond)
 	if err == nil {
 		t.Fatal("shutdown with a request held past the bound reported nothing")
@@ -224,5 +228,20 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 	bound := log(err)
 	if !strings.Contains(bound, "the shutdown's bound passed") || !strings.Contains(bound, "requests still running") {
 		t.Errorf("the bound passing was logged as %q", bound)
+	}
+}
+
+// Servers that had returned by the time the bound passed are not reported as
+// still serving: with both the bound and serversDone ready, the select must
+// not pick the bound at random.
+func TestShutdownDoesNotBlameServersThatReturned(t *testing.T) {
+	svc := server.New(slog.New(slog.DiscardHandler), "")
+	done := make(chan struct{})
+	close(done)
+	for i := 0; i < 200; i++ {
+		err := shutdown(svc, nil, done, func() {}, time.Nanosecond)
+		if err != nil && strings.Contains(err.Error(), "servers still serving") {
+			t.Fatalf("run %d: servers that had returned were reported as still serving: %v", i, err)
+		}
 	}
 }

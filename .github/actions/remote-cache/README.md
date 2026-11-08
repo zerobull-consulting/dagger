@@ -306,16 +306,12 @@ pin the images to the action's commit, as above.
 | Code | Meaning | The step |
 | --- | --- | --- |
 | 0 | A clean stop: everything ended within the bound. | passes |
-| 1 | The bound cut the shutdown off with work still running (logged as `the shutdown's bound passed with work still running`, with what was running), a signal arrived during the shutdown, or an HTTP server failed. | fails |
+| 1 | The stop was unclean: the bound cut the shutdown off with work still running, something else (such as engine connections still closing) left it unclean, a signal arrived during the shutdown, or an HTTP server failed, including one that failed as the stop ended. Logged as `stopped uncleanly`, with the reason in `error=` and what was running; the message says the shutdown's bound passed only when it did. | fails |
 | 137 | Killed before its stop ended, not by the stop (such as out of memory). What it was exporting is lost. | fails |
 | any | Still running past the stop's bound, `drain-timeout` plus 25s: the stop stopped it. | fails |
 | any | The service had exited before the stop. | fails |
 
-Known gaps in the service's exit code and log:
-[zerobull-consulting/dagger#80](https://github.com/zerobull-consulting/dagger/issues/80)
-and
-[zerobull-consulting/dagger#81](https://github.com/zerobull-consulting/dagger/issues/81).
-Of the action: a read-only start doesn't wait for the service's first merge
+Known gaps of the action: a read-only start doesn't wait for the service's first merge
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)),
 and the leads in
 [zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
