@@ -2778,12 +2778,6 @@ for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
 `TestKnownGapDrainDoesNotWaitForExplicitImport`
 ([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
 
-**A server failing as the stop ends.** The exit code takes the errors the
-HTTP servers reported by the time the stop ended; one whose failure is
-reported a moment later is missed, and the stop can exit 0. Known gap,
-pinned by `TestKnownGapExitCodeMissesLateServerError`
-([#80](https://github.com/zerobull-consulting/dagger/issues/80)).
-
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight
@@ -3245,17 +3239,17 @@ ends the linger at once, and the engine's last event goes undelivered.
   so the step needs `-drain-timeout` plus 2 minutes, 12 for `10m`: the
   action's stop bounds every wait, and the caller sets the step's
   `timeout-minutes`.
-- **Exit codes:** 0 for a clean stop; 1 when the bound cut work off (logged
-  as `the shutdown's bound passed with work still running`, with what was
-  running), when a signal arrived during the shutdown, or when an HTTP
-  server failed; 137 when it was killed (by `docker stop` past its
-  `--time`, or out of memory). The action's stop fails
-  the step on anything but 0, and on a service that exited before the stop,
-  with the service's log. Known gaps:
-  [zerobull-consulting/dagger#80](https://github.com/zerobull-consulting/dagger/issues/80)
-  (a server failure racing the stop's end can leave 0), and
-  [zerobull-consulting/dagger#81](https://github.com/zerobull-consulting/dagger/issues/81)
-  (an unclean stop is always logged as the bound passing).
+- **Exit codes:** 0 for a clean stop; 1 when the bound cut work off, when
+  something else left the stop unclean, when a signal arrived during the
+  shutdown, or when an HTTP server failed (including one that failed as the
+  stop ended: the stop waits, within its bound, for the servers to return
+  before it reads their errors); 137 when it was killed (by `docker stop`
+  past its `--time`, or out of memory). An unclean stop is logged as
+  `stopped uncleanly`, with the reason in `error=` and what was running;
+  the message says `the shutdown's bound passed` only when it did, not for
+  an error that comes sooner, such as engine connections still closing
+  (about 2.5s in). The action's stop fails the step on anything but 0, and
+  on a service that exited before the stop, with the service's log.
 - The drain logs what it stored (`drain: stored`) and its outcome
   (`drain: done outcome=complete`). Most exports are stored before it:
   each entry within about `-export-settle` of its last span, or at its

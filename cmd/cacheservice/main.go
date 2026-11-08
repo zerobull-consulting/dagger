@@ -79,8 +79,8 @@
 //     once, and skips the linger; a signal during the shutdown exits at
 //     once.
 //     The process exits 0 only when everything ended within the bound, and
-//     1 when a signal or the bound cut the shutdown off, logging what was
-//     still running. GET /debug/drain shows the drain. See README.md,
+//     1 when a signal or the bound cut the shutdown off, or an HTTP server
+//     failed, logging the reason and what was still running. GET /debug/drain shows the drain. See README.md,
 //     "Stopping and draining".
 //
 //   - with -export=false, a read-only instance: the import path alone. It
@@ -125,6 +125,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -395,6 +396,9 @@ func main() {
 		names = append(names, "metrics")
 	}
 	errs := make(chan error, len(servers))
+	// serving ends when every server's goroutine has returned, its error, if
+	// any, already in errs: the stop waits for it before exitCode reads errs.
+	var serving sync.WaitGroup
 	for i, srv := range servers {
 		// Only the engine address is served over TLS: the debug and
 		// metrics addresses are for local use.
@@ -415,7 +419,9 @@ func main() {
 			continue
 		}
 		logger.Info("listening", "addr", srv.Addr, "bound", ln.Addr().String(), "tls", tls, "listener", names[i])
+		serving.Add(1)
 		go func() {
+			defer serving.Done()
 			var err error
 			if tls {
 				err = srv.ServeTLS(ln, tlsCert, tlsKey)
@@ -427,6 +433,9 @@ func main() {
 			}
 		}()
 	}
+
+	serversDone := make(chan struct{})
+	go func() { serving.Wait(); close(serversDone) }()
 
 	code := 0
 	select {
@@ -443,7 +452,7 @@ func main() {
 		logger.Error("serve", "error", err)
 		code = 1
 	}
-	clean := stopService(svc, servers, stop, sigs, logger, shutdownGrace)
+	clean := stopService(svc, servers, serversDone, stop, sigs, logger, shutdownGrace)
 	os.Exit(exitCode(clean && code == 0, errs, logger))
 }
 
@@ -451,7 +460,9 @@ func main() {
 // clean (clean) and no HTTP server failed, 1 otherwise. A server that failed
 // after the first signal, during the drain or the shutdown, left its error in
 // errs, which nothing read then: it is logged here, and makes the stop
-// unclean too.
+// unclean too. It does not wait: stopService has already waited for the
+// servers' goroutines, within the shutdown's bound, so every error they will
+// send is in errs; one still serving at the bound made the stop unclean.
 func exitCode(clean bool, errs <-chan error, logger *slog.Logger) int {
 	for {
 		select {
@@ -492,13 +503,13 @@ var testHookStop func(*server.Service, *slog.Logger)
 // what was still running, and returns false. So does the bound, should
 // shutdown itself overrun it. A false stop exits 1, so a process manager,
 // and the tests, can tell it from a clean one (0).
-func stopService(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, sigs <-chan os.Signal, logger *slog.Logger, grace time.Duration) bool {
+func stopService(svc *server.Service, servers []*http.Server, serversDone <-chan struct{}, cancelPaths context.CancelFunc, sigs <-chan os.Signal, logger *slog.Logger, grace time.Duration) bool {
 	if testHookStop != nil {
 		testHookStop(svc, logger)
 	}
 	start := time.Now()
 	done := make(chan error, 1)
-	go func() { done <- shutdown(svc, servers, cancelPaths, grace-shutdownMargin) }()
+	go func() { done <- shutdown(svc, servers, serversDone, cancelPaths, grace-shutdownMargin) }()
 	// shutdown's steps are bounded by grace less the margin; this backstop,
 	// at grace, is for a step that overruns its own bound.
 	bound := time.NewTimer(grace)
@@ -506,8 +517,7 @@ func stopService(svc *server.Service, servers []*http.Server, cancelPaths contex
 	select {
 	case err := <-done:
 		if err != nil {
-			logger.Error("stopped: the shutdown's bound passed with work still running; exiting without waiting for it",
-				append([]any{"bound", grace, "error", err}, svc.Running().LogAttrs()...)...)
+			logUncleanStop(logger, svc, err, grace)
 			return false
 		}
 		logger.Info("stopped", "took", time.Since(start).Round(time.Millisecond))
@@ -523,6 +533,25 @@ func stopService(svc *server.Service, servers []*http.Server, cancelPaths contex
 	}
 }
 
+// logUncleanStop logs why shutdown reported an unclean stop: err's text is the
+// reason, and the message names the bound only when it passed
+// (errShutdownGrace), as the wait on requests or the service's paths does.
+// Other causes, such as the engine connections still closing after the
+// 2s close bound (about 2.5s in), come well before it.
+func logUncleanStop(logger *slog.Logger, svc *server.Service, err error, grace time.Duration) {
+	msg := "stopped uncleanly; exiting without waiting for the work still running"
+	attrs := []any{"error", err}
+	if errors.Is(err, errShutdownGrace) {
+		msg = "stopped uncleanly: the shutdown's bound passed with work still running; exiting without waiting for it"
+		attrs = append(attrs, "bound", grace)
+	}
+	logger.Error(msg, append(attrs, svc.Running().LogAttrs()...)...)
+}
+
+// errShutdownGrace is the cause of shutdown's deadline, and is in the error
+// it returns when the deadline had passed.
+var errShutdownGrace = errors.New("shutdown grace passed")
+
 // shutdownMargin is how much of stopService's grace shutdown leaves unused,
 // so that the backstop at grace, for a step that overruns its bound, is
 // still within the documented bound.
@@ -533,12 +562,15 @@ const shutdownMargin = 500 * time.Millisecond
 // context the service's paths run on, closes the engine connections (within
 // server.CloseEnginesTimeout), shuts the servers down, and waits for their
 // requests and the service's paths, until grace has passed since it began.
+// It also waits, within the same bound, for the servers' goroutines
+// (serversDone, nil when there are none), so that the error one sent as it
+// stopped is in errs when exitCode reads it.
 // It returns an error when that bound cut the wait off, with work still
-// running: the service's paths, or an HTTP request. The cancel comes first, as when the signal itself canceled that
+// running: the service's paths, an HTTP request or a server's goroutine. The cancel comes first, as when the signal itself canceled that
 // context: a request tied to it, such as POST /debug/gc, then ends at once
 // rather than holding the shutdown for grace.
-func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.CancelFunc, grace time.Duration) error {
-	ctx, cancel := context.WithTimeoutCause(context.Background(), grace, errors.New("shutdown grace passed"))
+func shutdown(svc *server.Service, servers []*http.Server, serversDone <-chan struct{}, cancelPaths context.CancelFunc, grace time.Duration) error {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), grace, errShutdownGrace)
 	defer cancel()
 	cancelPaths()
 	closeCtx, cancelClose := context.WithTimeout(ctx, server.CloseEnginesTimeout)
@@ -553,8 +585,18 @@ func shutdown(svc *server.Service, servers []*http.Server, cancelPaths context.C
 			errs = append(errs, fmt.Errorf("http server %s: requests still running: %w", srv.Addr, err))
 		}
 	}
+	if serversDone != nil {
+		select {
+		case <-serversDone:
+		case <-ctx.Done():
+			errs = append(errs, errors.New("http servers still serving"))
+		}
+	}
 	if err := svc.WaitContext(ctx); err != nil {
 		errs = append(errs, err)
+	}
+	if len(errs) > 0 && errors.Is(context.Cause(ctx), errShutdownGrace) {
+		errs = append(errs, errShutdownGrace)
 	}
 	return errors.Join(errs...)
 }

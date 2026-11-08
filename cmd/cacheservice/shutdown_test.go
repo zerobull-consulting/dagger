@@ -77,7 +77,7 @@ func TestShutdownCancelsBeforeWaitingForRequests(t *testing.T) {
 
 	const grace = 3 * time.Second
 	start := time.Now()
-	shutdown(svc, []*http.Server{srv}, cancel, grace)
+	shutdown(svc, []*http.Server{srv}, nil, cancel, grace)
 	if took := time.Since(start); took >= grace/2 {
 		t.Fatalf("the stop took %s: it waited for the GC request before ending the service's paths", took)
 	}
@@ -115,7 +115,7 @@ func TestShutdownReportsRequestsStillRunning(t *testing.T) {
 		t.Fatal("the request didn't reach its handler")
 	}
 	const grace = 300 * time.Millisecond
-	err = shutdown(svc, []*http.Server{srv}, func() {}, grace)
+	err = shutdown(svc, []*http.Server{srv}, nil, func() {}, grace)
 	if err == nil || !strings.Contains(err.Error(), "requests still running") {
 		t.Fatalf("shutdown with a request still running reported %v", err)
 	}
@@ -139,18 +139,90 @@ func TestExitCodeTakesServerErrorsDuringTheStop(t *testing.T) {
 	}
 }
 
-// KNOWN GAP: exitCode reads errs without blocking, and nothing waits for the
-// servers' goroutines, so a server error sent just after that read (a Serve
-// that failed as the stop ended) is missed, and the stop exits 0. Tracked in
-// https://github.com/zerobull-consulting/dagger/issues/80.
-func TestKnownGapExitCodeMissesLateServerError(t *testing.T) {
+// A server whose Serve fails as the stop ends is counted: shutdown waits for
+// the servers' goroutines (within its bound) before exitCode reads errs, so
+// the error a goroutine sends after srv.Shutdown returned is in errs, and the
+// stop exits 1. Without the wait, exitCode read errs first and exited 0
+// (https://github.com/zerobull-consulting/dagger/issues/80).
+func TestShutdownWaitsForServerErrorsBeforeTheExitCode(t *testing.T) {
+	svc := server.New(slog.New(slog.DiscardHandler), "")
 	errs := make(chan error, 1)
-	if code := exitCode(true, errs, slog.New(slog.DiscardHandler)); code != 0 {
-		t.Fatalf("exit %d: exitCode waited for the servers' errors; the gap is fixed, update this test, the README and https://github.com/zerobull-consulting/dagger/issues/80", code)
+	var serving sync.WaitGroup
+	serving.Add(1)
+	go func() {
+		defer serving.Done()
+		// Fails a moment after the shutdown began, as an accept error
+		// racing the stop's end.
+		time.Sleep(200 * time.Millisecond)
+		errs <- errors.New("accept: too many open files")
+	}()
+	done := make(chan struct{})
+	go func() { serving.Wait(); close(done) }()
+	if err := shutdown(svc, nil, done, func() {}, 5*time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
 	}
-	// The server's goroutine sends its error after the read.
-	errs <- errors.New("accept: too many open files")
-	if len(errs) != 1 {
-		t.Fatal("the late error was read")
+	if code := exitCode(true, errs, slog.New(slog.DiscardHandler)); code != 1 {
+		t.Fatalf("exit %d: the late server error was missed, want 1", code)
+	}
+}
+
+// A server goroutine still running at the shutdown's bound makes the stop
+// unclean, and the bound is not exceeded waiting for it.
+func TestShutdownReportsServersStillServing(t *testing.T) {
+	svc := server.New(slog.New(slog.DiscardHandler), "")
+	never := make(chan struct{})
+	const grace = 300 * time.Millisecond
+	start := time.Now()
+	err := shutdown(svc, nil, never, func() {}, grace)
+	if err == nil || !strings.Contains(err.Error(), "servers still serving") || !errors.Is(err, errShutdownGrace) {
+		t.Fatalf("shutdown with a server still serving reported %v", err)
+	}
+	if took := time.Since(start); took > 2*grace {
+		t.Fatalf("shutdown took %s, past its bound %s", took, grace)
+	}
+}
+
+// The log of an unclean stop names its cause: the bound only when it passed,
+// not for an error that comes well before it, such as the engine connections
+// still closing after the close bound (https://github.com/zerobull-consulting/dagger/issues/81).
+func TestLogUncleanStopNamesTheCause(t *testing.T) {
+	svc := server.New(slog.New(slog.DiscardHandler), "")
+	log := func(err error) string {
+		var buf strings.Builder
+		logUncleanStop(slog.New(slog.NewTextHandler(&buf, nil)), svc, err, 5*time.Second)
+		return buf.String()
+	}
+	engines := log(errors.New("2 engine connections still closing after they were dropped"))
+	if !strings.Contains(engines, "engine connections still closing") || strings.Contains(engines, "bound") {
+		t.Errorf("the engine-close error was logged as %q: want its text as the reason and no bound", engines)
+	}
+	if !strings.Contains(engines, "stopped uncleanly") {
+		t.Errorf("the engine-close error was logged as %q: want \"stopped uncleanly\"", engines)
+	}
+	// The bound passing, from a real shutdown with a request held past it.
+	srv := &http.Server{Handler: http.NotFoundHandler()}
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) { close(entered); <-release })
+	srv.Handler = mux
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		if resp, err := http.Get("http://" + ln.Addr().String() + "/slow"); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	<-entered
+	err = shutdown(svc, []*http.Server{srv}, nil, func() {}, 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("shutdown with a request held past the bound reported nothing")
+	}
+	bound := log(err)
+	if !strings.Contains(bound, "the shutdown's bound passed") || !strings.Contains(bound, "requests still running") {
+		t.Errorf("the bound passing was logged as %q", bound)
 	}
 }
