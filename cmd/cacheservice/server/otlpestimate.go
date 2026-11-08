@@ -19,13 +19,17 @@ import (
 // pointer, so a body of them decodes to about 70 times its size. The
 // estimate errs high: each message at its Go struct's size plus an eighth
 // (allocation size classes), each element of a repeated field 16 bytes more
-// (its pointer, and the slice's growth), and each string or bytes field its
-// length plus a header.
+// (its pointer, and the slice's growth), each string or bytes field its
+// length plus a header, and each varint, fixed or group field its wire size,
+// tag included, or the header if that is more. A group the message doesn't
+// know, like any field of the wrong wire type for its number, is kept by
+// proto.Unmarshal as raw bytes, so it is charged at least its size.
 const (
 	// otlpListElemCost is what one element of a repeated field adds to its
 	// slice: a pointer or a scalar, and room for the slice's doubling.
 	otlpListElemCost = 16
-	// otlpFieldCost is a scalar field's or a string's header.
+	// otlpFieldCost is a scalar field's or a string's header, and the least a
+	// varint, fixed or group field is charged.
 	otlpFieldCost = 16
 	// otlpMaxDepth bounds how deep the estimate walks nested messages, as
 	// proto.Unmarshal does (protowire's default recursion limit).
@@ -62,12 +66,17 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 		b = b[n:]
 		fd := fields.ByNumber(num)
 		if typ != protowire.BytesType {
+			// A varint or fixed field is small, but a start-group runs to its
+			// end-group, and proto.Unmarshal keeps a group the message doesn't
+			// know (and any field of the wrong wire type for its number) as raw
+			// bytes. So charge every such field at least its wire size: the
+			// flat cost for the small ones, the size for a group.
 			n = protowire.ConsumeFieldValue(num, typ, b)
 			if n < 0 {
 				return 0, protowire.ParseError(n)
 			}
 			b = b[n:]
-			size += otlpFieldCost
+			size += max(int64(protowire.SizeTag(num)+n), otlpFieldCost)
 			continue
 		}
 		v, n := protowire.ConsumeBytes(b)

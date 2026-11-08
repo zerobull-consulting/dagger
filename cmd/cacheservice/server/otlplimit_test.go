@@ -27,6 +27,7 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -1041,5 +1042,100 @@ func TestOTLPDeeplyNestedBodyTaken(t *testing.T) {
 	}
 	if n := len(rec.find("otlp metrics")); n != 1 {
 		t.Fatalf("%d metric requests recorded", n)
+	}
+}
+
+// An unknown start-group is kept by proto.Unmarshal as raw bytes, so the
+// estimate charges it at least its wire size, not a flat cost.
+func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
+	// group is field num as a start-group holding a bytes field of size
+	// bytes. 100 is not a field of any message below; 1 (ResourceMetrics) is.
+	group := func(num protowire.Number, size int) []byte {
+		b := protowire.AppendTag(nil, num, protowire.StartGroupType)
+		b = protowire.AppendTag(b, 1, protowire.BytesType)
+		b = protowire.AppendBytes(b, make([]byte, size))
+		return protowire.AppendTag(b, num, protowire.EndGroupType)
+	}
+	req := &colmetricspb.ExportMetricsServiceRequest{}
+	flat, err := otlpDecodedSize(nil, req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	half := testOTLPLimit / 2
+	unknownGroup := group(100, half)
+	wrongType := group(1, half)
+	for _, c := range []struct {
+		name string
+		body []byte
+		// unknown is the wire size of the field the decoder keeps as
+		// unknown bytes, tags included; nested says it is kept in the
+		// request's first ResourceMetrics, not the request.
+		unknown int
+		nested  bool
+	}{
+		// An unknown group at the top level.
+		{"top level", unknownGroup, len(unknownGroup), false},
+		// One inside a known nested message (ResourceMetrics, field 1).
+		{"nested", protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), unknownGroup), len(unknownGroup), true},
+		// A known field number (ResourceMetrics, 1) sent as a group, so
+		// the wrong wire type for its number.
+		{"wrong wire type", wrongType, len(wrongType), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := otlpDecodedSize(c.body, &colmetricspb.ExportMetricsServiceRequest{}, false)
+			if err != nil {
+				t.Fatalf("estimate: %v", err)
+			}
+			// The decoder keeps the field as unknown bytes, tags included,
+			// all of them.
+			m := &colmetricspb.ExportMetricsServiceRequest{}
+			if err := proto.Unmarshal(c.body, m); err != nil {
+				t.Fatal(err)
+			}
+			kept := m.ProtoReflect().GetUnknown()
+			if c.nested {
+				if len(m.ResourceMetrics) != 1 {
+					t.Fatalf("%d ResourceMetrics decoded", len(m.ResourceMetrics))
+				}
+				kept = m.ResourceMetrics[0].ProtoReflect().GetUnknown()
+			}
+			if len(kept) != c.unknown {
+				t.Fatalf("decoder kept %d unknown bytes, want %d", len(kept), c.unknown)
+			}
+			// The empty request's estimate is its struct; the field adds at
+			// least its whole wire size on top (more when nested: the
+			// ResourceMetrics, and its slot in the list).
+			if got-flat < int64(c.unknown) {
+				t.Fatalf("a field of %d wire bytes added %d to the estimate", c.unknown, got-flat)
+			}
+		})
+	}
+
+	// A small field is charged the flat cost, not its few bytes: an unknown
+	// varint (field 100) adds otlpFieldCost.
+	small, err := otlpDecodedSize(protowire.AppendVarint(protowire.AppendTag(nil, 100, protowire.VarintType), 1), req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if small-flat != otlpFieldCost {
+		t.Fatalf("an unknown varint added %d to the estimate, want %d", small-flat, otlpFieldCost)
+	}
+
+	// End to end: a budget that admits the request's reserve and reading
+	// the body, but not the estimate on top, refuses it as too large (413).
+	// Reading a body of about 32 KiB holds otlpRequestReserve plus a 32 KiB
+	// and a 64 KiB buffer at its peak (114,688 bytes), then the 64 KiB buffer
+	// (81,920); the group's estimate is its 32,776 bytes plus the request's
+	// struct, so 114,700 admits the read and the flat charge (82,008 held) but
+	// not the size charge (about 114,784).
+	// A 413 here comes from the estimate: the body is far under the route's
+	// limit, and a read the budget can't hold is a 503.
+	body := unknownGroup
+	if len(body) != 32776 {
+		t.Fatalf("body of %d bytes: the budget below is sized for 32776", len(body))
+	}
+	_, _, srv := limitedService(t, 114700)
+	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
 	}
 }
