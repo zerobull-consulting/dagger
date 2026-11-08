@@ -5,6 +5,7 @@
 // checks a bucket against them.
 //
 //	cacheservice lifecycle plan  [-tokens-file …] [-scope …]
+//	cacheservice lifecycle claim -confirm=<bucket>/<prefix>
 //	cacheservice lifecycle apply [-tokens-file …] [-scope …] -confirm=<bucket>/<prefix>
 //	cacheservice lifecycle check [-tokens-file …] [-scope …]
 //

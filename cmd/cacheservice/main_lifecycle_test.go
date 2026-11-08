@@ -142,6 +142,9 @@ func TestBinaryLifecycleExitCodes(t *testing.T) {
 	}{
 		{[]string{"lifecycle", "apply", "-confirm=bkt/other"}, 2},
 		{[]string{"lifecycle", "apply"}, 2},
+		{[]string{"lifecycle", "claim"}, 2},
+		{[]string{"lifecycle", "claim", "-confirm=bkt/other"}, 2},
+		{[]string{"lifecycle", "claim", "-confirm=bkt/cache", "-timeout", "2s"}, 1}, // nothing answers
 		{[]string{"lifecycle", "bogus"}, 2},
 		{[]string{"lifecycle", "plan", "-timeout", "2s"}, 1}, // nothing answers
 	} {
