@@ -595,17 +595,17 @@ shell, in this order:
 Then start the service with its own key (the Read/Write/Delete one). A prefix
 a writer already started on needs no `claim`; running it anyway is harmless.
 
-**Run `apply` with the admin key, interactively, and `claim` and `check` with it on a
-fresh bucket.** Setting lifecycle rules takes the bucket's most powerful key
-(on DigitalOcean Spaces, a full-access key), since a rule can expire anything
-in the bucket; `claim` doesn't need that power, only a key that can write
-the marker, and the admin key is merely the one a fresh bucket has. Run `apply` once when a
+**Run `apply` with the admin key, interactively.** Setting lifecycle rules
+takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
+key), since a rule can expire anything in the bucket. `claim` doesn't need
+that power, only a key that can write the marker; on a fresh bucket the admin
+key is the only key there is, so that is the one to use. Run `apply` once when a
 bucket is set up, and again when the tokens file's namespaces change, from
 your own shell, with the key in your environment for that one command. Never
 put the admin key in the service's secrets or a CI job's: no job needs it.
-`plan` and `check` only read, so they run with the writer's key, if it has
-`s3:GetLifecycleConfiguration`, which on Spaces a limited key doesn't (see
-[the keys](#the-keys)). See
+`plan` and `check` only read, so they run with the writer's key when it has
+`s3:GetLifecycleConfiguration`; on Spaces a limited key doesn't, and they need
+the admin key (see [the keys](#the-keys)). See
 [Retention and garbage collection](#retention-and-garbage-collection) for
 the three keys.
 
@@ -708,7 +708,9 @@ returned 403 `AccessDenied`), so `lifecycle check` needs the admin key.
 Run again on 2026-11-08 on another Spaces bucket (nyc3), with a full-access,
 a limited `Read/Write/Delete` and a limited `Read` key: `lifecycle claim` on an
 empty prefix created the marker with the full-access key (a second one wrote
-nothing), and `plan`, `apply` (2 rules added, read back) and `check` (ok) followed.
+nothing; a limited key claimed an empty prefix at a writer's startup, by the
+same `ownership.Check`, but `lifecycle claim` itself was run with the
+full-access key only), and `plan`, `apply` (2 rules added, read back) and `check` (ok) followed.
 `claim` on a prefix holding a key exited 1 and wrote nothing. Every key-level
 fact in [The keys](#the-keys) and [A read-only key](#a-read-only-key) was
 seen again there.
@@ -2429,11 +2431,11 @@ Keep three credentials, each with only what it needs
 | --- | --- | --- |
 | **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
 | **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
-| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs, and `lifecycle check` the first of them. On Spaces, `apply` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs less: only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:PutObject` for the marker), so the Read/Write/Delete key can claim a prefix, and the Admin key can too. |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs less: only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:PutObject` for the marker), so the Read/Write/Delete key can claim a prefix, and the Admin key can too. |
 
 The admin key is the most powerful: a lifecycle rule can expire anything in
-the bucket. Use it only for `lifecycle apply` and `check`, and for `claim` on a
-fresh bucket, where it is the only key there is, interactively, and keep it out
+the bucket. Use it for `lifecycle apply`, and for `plan` and `check` where the writer's
+key can't read the rules, interactively, and keep it out
 of every CI secret and the service's environment. Neither the service nor
 the sidecar action ever writes lifecycle rules: they only read them, once
 per GC run (`TestServiceNeverWritesLifecycleSource` checks the sources,
