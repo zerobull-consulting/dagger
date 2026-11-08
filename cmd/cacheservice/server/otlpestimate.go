@@ -62,12 +62,17 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 		b = b[n:]
 		fd := fields.ByNumber(num)
 		if typ != protowire.BytesType {
+			// A varint or fixed field is small, but a start-group runs to its
+			// end-group, and proto.Unmarshal keeps a group the message doesn't
+			// know (and any field of the wrong wire type for its number) as raw
+			// bytes. So charge every such field at least its wire size: the
+			// flat cost for the small ones, the size for a group.
 			n = protowire.ConsumeFieldValue(num, typ, b)
 			if n < 0 {
 				return 0, protowire.ParseError(n)
 			}
 			b = b[n:]
-			size += otlpFieldCost
+			size += max(int64(n), otlpFieldCost)
 			continue
 		}
 		v, n := protowire.ConsumeBytes(b)

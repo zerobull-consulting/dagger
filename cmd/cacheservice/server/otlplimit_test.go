@@ -27,6 +27,7 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -1041,5 +1042,37 @@ func TestOTLPDeeplyNestedBodyTaken(t *testing.T) {
 	}
 	if n := len(rec.find("otlp metrics")); n != 1 {
 		t.Fatalf("%d metric requests recorded", n)
+	}
+}
+
+// An unknown start-group is kept by proto.Unmarshal as raw bytes, so the
+// estimate charges it at least its wire size, not a flat cost.
+func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
+	const field = 100 // not a field of ExportMetricsServiceRequest
+	inner := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), make([]byte, testOTLPLimit/2))
+	body := protowire.AppendTag(nil, field, protowire.StartGroupType)
+	body = append(body, inner...)
+	body = protowire.AppendTag(body, field, protowire.EndGroupType)
+
+	req := &colmetricspb.ExportMetricsServiceRequest{}
+	got, err := otlpDecodedSize(body, req, false)
+	if err != nil {
+		t.Fatalf("estimate: %v", err)
+	}
+	if got < int64(len(body)) {
+		t.Fatalf("a group of %d bytes estimated at %d", len(body), got)
+	}
+	// The decoder does keep it, so the estimate has to cover it.
+	if err := proto.Unmarshal(body, req); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(req.ProtoReflect().GetUnknown()); n != len(body) {
+		t.Fatalf("decoder kept %d unknown bytes, want %d", n, len(body))
+	}
+
+	// With a budget under the group's size the body is refused.
+	_, _, srv := limitedService(t, int64(len(body))/2)
+	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
 }
