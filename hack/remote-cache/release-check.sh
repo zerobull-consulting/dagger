@@ -27,15 +27,16 @@
 #   release-check.sh [--dry-run] verify <version> <digest>
 #       Runs the current service against that stock engine: dispatches
 #       remote-cache-tests.yml on the branch (RELEASE_CHECK_TEST_REF: a dry
-#       run's own ref) with the candidate inputs and
-#       waits for it, and writes the advisory diff. Prints result=pass or
+#       run's own ref) with the candidate inputs, writes the advisory diff
+#       while it runs, and waits for it. Prints result=pass or
 #       result=fail: the e2e and the sidecar demo's verdict. A run that doesn't end in success or failure
 #       (cancelled, timed out waiting), or that failed before testing (its
 #       checkout or pin step), is an error, never a failure: it must not
 #       lead to a reject line.
 #   release-check.sh bundle <version>
-#       TestBundleVersionMatchesEngineCapture with the tag merged in. It
-#       runs upstream's code, so the workflow runs it in a job of its own
+#       TestBundleVersionMatchesEngineCapture with the tag merged into the
+#       branch (RELEASE_CHECK_TEST_REF: a dry run's own ref, as verify's).
+#       It runs upstream's code, so the workflow runs it in a job of its own
 #       with no credential, and it refuses to run if a token is in its
 #       environment. Prints bundle=pass, fail or conflict (not run: the tag
 #       conflicts with the branch), and merge=. A needs verify's pass and
@@ -210,24 +211,27 @@ image_digest() {
 	echo "$digest"
 }
 
-# fetch_branch: the branch's head, fresh, as origin/<branch>-check.
+# fetch_branch [<ref>]: the branch's head (or the named branch's), fresh, as
+# release-check/head.
 fetch_branch() {
-	timeout 300 git fetch -q --no-tags "$remote" "+refs/heads/$branch:refs/remotes/release-check/head" ||
-		die "couldn't fetch $branch"
+	local ref="${1:-$branch}"
+	timeout 300 git fetch -q --no-tags "$remote" "+refs/heads/$ref:refs/remotes/release-check/head" ||
+		die "couldn't fetch $ref"
 }
 # fetch_tag <tag>: the upstream tag, as refs/tags/<tag>.
 fetch_tag() {
 	timeout 600 git fetch -q --no-tags "$upstream" "+refs/tags/$1:refs/tags/$1" || die "couldn't fetch $1 from $upstream"
 }
 
-# tree: a fresh worktree of the branch's head, in $tree.
+# tree: a fresh worktree of the branch's head (or of new_tree's argument), in
+# $tree.
 tree=""
 cleanup() {
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 new_tree() {
-	fetch_branch
+	fetch_branch "$@"
 	tree="$(mktemp -d)"
 	git worktree add -q --detach "$tree" release-check/head
 }
@@ -566,7 +570,9 @@ cmd_bundle() {
 		[[ -z "${!var:-}" ]] || die "$var is set: the bundle test runs upstream's code, and must run without any credential"
 	done
 	fetch_tag "$v"
-	new_tree
+	# The service as it is: the branch's, or in a dry run (from the workflow),
+	# the dry run's own ref, the one verify's e2e runs on.
+	new_tree "${RELEASE_CHECK_TEST_REF:-$branch}"
 	merge="$(merge_tag "$v")"
 	if [[ "$merge" == conflict ]]; then
 		# Not run, so not passed: it verified nothing.
@@ -587,12 +593,19 @@ cmd_verify() {
 	: >"$notes/notes.env"
 	note version "$v"
 	note digest "$d"
-	fetch_tag "$v"
-	advisory "$v"
 	local id
 	# The service as it is: the branch's, or in a dry run (from the
-	# workflow), the dry run's own ref.
+	# workflow), the dry run's own ref. Dispatched first: the fetches and the
+	# advisory diff run while the candidate run does, not before it, out of
+	# the step's timeout.
 	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
+	# A failure here is an error (a step that fails), never a verdict. The
+	# dispatched run is left to finish unread: nothing reads it, and the next
+	# hour verifies the release again.
+	(
+		fetch_tag "$v"
+		advisory "$v"
+	) || die "the fetches or the advisory diff failed after the candidate run $server/$repo/actions/runs/$id was dispatched: it is not awaited, and no result is given"
 	a="$(finish_tests "$id" a)"
 	# The e2e and the sidecar demo's verdict. A is this and the bundle job's
 	# both passing (the workflow decides): a bundle test that didn't run (the

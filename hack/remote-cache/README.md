@@ -913,9 +913,13 @@ only decides when it runs and with which token.
    read-only `GITHUB_TOKEN`, and `release-check.sh bundle` refuses to run
    with a token in its environment. It is the only place upstream's code
    runs in this workflow.
-   It writes the advisory diff of the engine's side of the remote cache from
-   the manifest's `base` to the release, and whether the bundle or protocol
-   version changed. **The run is the gate**; the diff only informs.
+   Once the run is dispatched (the dispatch comes first, so the fetches
+   don't eat into the step's timeout), it fetches the tags and writes the
+   advisory diff of the engine's side of the remote cache from the manifest's
+   `base` to the release, and whether the bundle or protocol version
+   changed; if that fails, the step errors and the dispatched run is left
+   unread. In a dry run the bundle test builds on the dry run's own branch,
+   as the e2e does. **The run is the gate**; the diff only informs.
    A run that is cancelled, that failed before testing (its checkout or its
    pin step), or that the check can't read, is an error: it never leads to
    a reject line.
@@ -1002,10 +1006,8 @@ reach the bots' environments: it polls, prints the plan, and prints each
 push, PR and issue the outcome would make, after a real, local merge. On
 `feature/remote-cache`, `dry-run` (default on) does the same. In a dry run:
 - `verify` also runs the real verification, on the dry run's own branch, so
-  a branch's dry run tests that branch's service in the e2e; it changes no
-  file in the repository. The bundle test still builds on
-  `feature/remote-cache` (a known gap,
-  [zerobull-consulting/dagger#162](https://github.com/zerobull-consulting/dagger/issues/162));
+  a branch's dry run tests that branch's service in the e2e and the bundle
+  test; it changes no file in the repository;
 - `version` checks a chosen release, listed or not. For an accepted one,
   `engines.sh candidate` moves its own line first, with its digest, so the
   run runs it.
