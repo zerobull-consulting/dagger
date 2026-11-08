@@ -1048,12 +1048,13 @@ func TestOTLPDeeplyNestedBodyTaken(t *testing.T) {
 // An unknown start-group is kept by proto.Unmarshal as raw bytes, so the
 // estimate charges it at least its wire size, not a flat cost.
 func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
-	const field = 100 // not a field of any message below
-	group := func(size int) []byte {
-		b := protowire.AppendTag(nil, field, protowire.StartGroupType)
+	// group is field num as a start-group holding a bytes field of size
+	// bytes. 100 is not a field of any message below; 1 (ResourceMetrics) is.
+	group := func(num protowire.Number, size int) []byte {
+		b := protowire.AppendTag(nil, num, protowire.StartGroupType)
 		b = protowire.AppendTag(b, 1, protowire.BytesType)
 		b = protowire.AppendBytes(b, make([]byte, size))
-		return protowire.AppendTag(b, field, protowire.EndGroupType)
+		return protowire.AppendTag(b, num, protowire.EndGroupType)
 	}
 	req := &colmetricspb.ExportMetricsServiceRequest{}
 	flat, err := otlpDecodedSize(nil, req, false)
@@ -1061,13 +1062,8 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	half := testOTLPLimit / 2
-	unknownGroup := group(half)
-	wrongType := func() []byte {
-		b := protowire.AppendTag(nil, 1, protowire.StartGroupType)
-		b = protowire.AppendTag(b, 1, protowire.BytesType)
-		b = protowire.AppendBytes(b, make([]byte, half))
-		return protowire.AppendTag(b, 1, protowire.EndGroupType)
-	}()
+	unknownGroup := group(100, half)
+	wrongType := group(1, half)
 	for _, c := range []struct {
 		name string
 		body []byte
@@ -1112,10 +1108,17 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 			if got-flat < int64(c.unknown) {
 				t.Fatalf("a field of %d wire bytes added %d to the estimate", c.unknown, got-flat)
 			}
-			if !c.nested && got-flat != int64(c.unknown) {
-				t.Fatalf("a field of %d wire bytes added %d to the estimate, want exactly its size", c.unknown, got-flat)
-			}
 		})
+	}
+
+	// A small field is charged the flat cost, not its few bytes: an unknown
+	// varint (field 100) adds otlpFieldCost.
+	small, err := otlpDecodedSize(protowire.AppendVarint(protowire.AppendTag(nil, 100, protowire.VarintType), 1), req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if small-flat != otlpFieldCost {
+		t.Fatalf("an unknown varint added %d to the estimate, want %d", small-flat, otlpFieldCost)
 	}
 
 	// End to end: a budget that admits the request's reserve and reading
@@ -1125,6 +1128,8 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 	// (81,920); the group's estimate is its 32,776 bytes plus the request's
 	// struct, so 114,700 admits the read and the flat charge (82,008 held) but
 	// not the size charge (about 114,784).
+	// A 413 here comes from the estimate: the body is far under the route's
+	// limit, and a read the budget can't hold is a 503.
 	body := unknownGroup
 	if len(body) != 32776 {
 		t.Fatalf("body of %d bytes: the budget below is sized for 32776", len(body))

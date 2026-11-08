@@ -19,13 +19,17 @@ import (
 // pointer, so a body of them decodes to about 70 times its size. The
 // estimate errs high: each message at its Go struct's size plus an eighth
 // (allocation size classes), each element of a repeated field 16 bytes more
-// (its pointer, and the slice's growth), and each string or bytes field its
-// length plus a header.
+// (its pointer, and the slice's growth), each string or bytes field its
+// length plus a header, and each varint, fixed or group field its wire size,
+// tag included, or the header if that is more. A group the message doesn't
+// know, like any field of the wrong wire type for its number, is kept by
+// proto.Unmarshal as raw bytes, so it is charged at least its size.
 const (
 	// otlpListElemCost is what one element of a repeated field adds to its
 	// slice: a pointer or a scalar, and room for the slice's doubling.
 	otlpListElemCost = 16
-	// otlpFieldCost is a scalar field's or a string's header.
+	// otlpFieldCost is a scalar field's or a string's header, and the least a
+	// varint, fixed or group field is charged.
 	otlpFieldCost = 16
 	// otlpMaxDepth bounds how deep the estimate walks nested messages, as
 	// proto.Unmarshal does (protowire's default recursion limit).
