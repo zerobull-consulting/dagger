@@ -792,7 +792,7 @@ func TestMainClaim(t *testing.T) {
 			t.Fatalf("%q: %d, opened %d\n%s", args, code, opened, out)
 		}
 	}
-	for _, flag := range []string{"-tokens-file=/does/not/exist", "-scope=ci", "-allow-removals", "-abort-rule=false"} {
+	for _, flag := range []string{"-tokens-file=/does/not/exist", "-scope=ci", "-allow-removals", "-abort-rule=false", "-max-rules=1000"} {
 		if code, out := main("claim", "-confirm=bkt/cache", flag); code != ExitUsage || st.claims != 0 || opened != 0 {
 			t.Fatalf("claim %s: %d\n%s", flag, code, out)
 		}
