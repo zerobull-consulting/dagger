@@ -72,7 +72,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 				return 0, protowire.ParseError(n)
 			}
 			b = b[n:]
-			size += max(int64(n), otlpFieldCost)
+			size += max(int64(protowire.SizeTag(num)+n), otlpFieldCost)
 			continue
 		}
 		v, n := protowire.ConsumeBytes(b)

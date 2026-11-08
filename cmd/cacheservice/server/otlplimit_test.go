@@ -1061,37 +1061,59 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	half := testOTLPLimit / 2
-	for name, body := range map[string][]byte{
+	unknownGroup := group(half)
+	wrongType := func() []byte {
+		b := protowire.AppendTag(nil, 1, protowire.StartGroupType)
+		b = protowire.AppendTag(b, 1, protowire.BytesType)
+		b = protowire.AppendBytes(b, make([]byte, half))
+		return protowire.AppendTag(b, 1, protowire.EndGroupType)
+	}()
+	for _, c := range []struct {
+		name string
+		body []byte
+		// unknown is the wire size of the field the decoder keeps as
+		// unknown bytes, tags included; nested says it is kept in the
+		// request's first ResourceMetrics, not the request.
+		unknown int
+		nested  bool
+	}{
 		// An unknown group at the top level.
-		"top level": group(half),
+		{"top level", unknownGroup, len(unknownGroup), false},
 		// One inside a known nested message (ResourceMetrics, field 1).
-		"nested": protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), group(half)),
+		{"nested", protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), unknownGroup), len(unknownGroup), true},
 		// A known field number (ResourceMetrics, 1) sent as a group, so
 		// the wrong wire type for its number.
-		"wrong wire type": func() []byte {
-			b := protowire.AppendTag(nil, 1, protowire.StartGroupType)
-			b = protowire.AppendTag(b, 1, protowire.BytesType)
-			b = protowire.AppendBytes(b, make([]byte, half))
-			return protowire.AppendTag(b, 1, protowire.EndGroupType)
-		}(),
+		{"wrong wire type", wrongType, len(wrongType), false},
 	} {
-		t.Run(name, func(t *testing.T) {
-			got, err := otlpDecodedSize(body, &colmetricspb.ExportMetricsServiceRequest{}, false)
+		t.Run(c.name, func(t *testing.T) {
+			got, err := otlpDecodedSize(c.body, &colmetricspb.ExportMetricsServiceRequest{}, false)
 			if err != nil {
 				t.Fatalf("estimate: %v", err)
 			}
-			// The estimate of an empty request is its struct; the group has
-			// to add at least its own size on top.
-			if got-flat < int64(half) {
-				t.Fatalf("a group of %d bytes added %d to the estimate", len(body), got-flat)
-			}
-			// The decoder does keep it as unknown bytes.
+			// The decoder keeps the field as unknown bytes, tags included,
+			// all of them.
 			m := &colmetricspb.ExportMetricsServiceRequest{}
-			if err := proto.Unmarshal(body, m); err != nil {
+			if err := proto.Unmarshal(c.body, m); err != nil {
 				t.Fatal(err)
 			}
-			if len(m.ProtoReflect().GetUnknown()) == 0 && name != "nested" {
-				t.Fatalf("decoder kept no unknown bytes")
+			kept := m.ProtoReflect().GetUnknown()
+			if c.nested {
+				if len(m.ResourceMetrics) != 1 {
+					t.Fatalf("%d ResourceMetrics decoded", len(m.ResourceMetrics))
+				}
+				kept = m.ResourceMetrics[0].ProtoReflect().GetUnknown()
+			}
+			if len(kept) != c.unknown {
+				t.Fatalf("decoder kept %d unknown bytes, want %d", len(kept), c.unknown)
+			}
+			// The empty request's estimate is its struct; the field adds at
+			// least its whole wire size on top (more when nested: the
+			// ResourceMetrics, and its slot in the list).
+			if got-flat < int64(c.unknown) {
+				t.Fatalf("a field of %d wire bytes added %d to the estimate", c.unknown, got-flat)
+			}
+			if !c.nested && got-flat != int64(c.unknown) {
+				t.Fatalf("a field of %d wire bytes added %d to the estimate, want exactly its size", c.unknown, got-flat)
 			}
 		})
 	}
@@ -1103,7 +1125,7 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 	// (81,920); the group's estimate is its 32,776 bytes plus the request's
 	// struct, so 114,700 admits the read and the flat charge (82,008 held) but
 	// not the size charge (about 114,784).
-	body := group(half)
+	body := unknownGroup
 	if len(body) != 32776 {
 		t.Fatalf("body of %d bytes: the budget below is sized for 32776", len(body))
 	}
