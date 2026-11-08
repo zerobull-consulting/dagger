@@ -112,7 +112,9 @@ case "$method $path" in
 	wf="${path#repos/o/r/actions/workflows/}"; wf="${wf%/dispatches}"
 	echo "$input" >"$FAKE/dispatch-$wf-$(n dispatch-$wf)"
 	# Whether the advisory diff was written before this dispatch.
-	[[ -f "$FAKE/notes/advisory.md" ]] && echo "$wf" >>"$FAKE/advisory-before-dispatch"
+	# How many tags had been fetched by now.
+		git tag -l | wc -l >>"$FAKE/tags-at-dispatch"
+		if [[ -f "$FAKE/notes/advisory.md" ]]; then echo "$wf" >>"$FAKE/advisory-before-dispatch"; else echo "$wf" >>"$FAKE/dispatch-saw-no-advisory"; fi
 	[[ -n "${FAKE_NO_RUN_ID:-}" ]] && exit 0
 	id=$((5000 + $(n run)))
 	c="$(head -n1 "$FAKE/conclusions" 2>/dev/null || echo success)"
@@ -137,6 +139,7 @@ case "$method $path" in
 "POST graphql")
 	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
 	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
+"POST repos/o/r/actions/runs/"*/cancel) echo "{}" ;;
 "PUT repos/o/r/pulls/"*/merge) echo "$input" >"$FAKE/merged"; echo '{"merged": true}' ;;
 *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
 esac
@@ -493,10 +496,9 @@ run plan
 check "stuck: a branch with no open PR fails the run" test "$status" -ne 0
 check "stuck: naming the branch" has "$tmp/out" "release-check/reject/v1.0.0-beta.26"
 
-echo "--- known gaps"
-# Known gap, zerobull-consulting/dagger#162: a dry run's bundle test builds
-# on the branch, not on RELEASE_CHECK_TEST_REF as its e2e does. The fix
-# flips this test.
+echo "--- the dry run's ref, and the order"
+# zerobull-consulting/dagger#162: a dry run's bundle test builds on the dry
+# run's ref, as its e2e does; a real run's on the branch.
 setup
 git -C "$work" checkout -q -b other
 echo "# other" >>"$work/$manifest"
@@ -505,16 +507,42 @@ other="$(git -C "$work" rev-parse HEAD)"
 git -C "$work" checkout -q feature/remote-cache
 main="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
 ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN RELEASE_CHECK_TEST_REF=other
-check "known gap (bundle on the dry run's ref, zerobull-consulting/dagger#162): it builds on the branch" has "$FAKE/go-calls" "built on $main"
-check "known gap (bundle on the dry run's ref, zerobull-consulting/dagger#162): not on the dry run's ref" not has "$FAKE/go-calls" "built on $other"
+check "bundle on the dry run's ref (zerobull-consulting/dagger#162): it builds on that ref" has "$FAKE/go-calls" "built on $other"
+check "bundle on the dry run's ref (zerobull-consulting/dagger#162): not on the branch" not has "$FAKE/go-calls" "built on $main"
+rm -f "$FAKE/go-calls"
+ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
+check "bundle on the branch (zerobull-consulting/dagger#162): a real run builds on the branch" has "$FAKE/go-calls" "built on $main"
+check "bundle on the branch (zerobull-consulting/dagger#162): not on another ref" not has "$FAKE/go-calls" "built on $other"
 
-# Known gap, zerobull-consulting/dagger#163: verify fetches the tags and
-# writes the advisory diff before it dispatches, which eats into the step's
-# timeout. The fix flips this test.
+# zerobull-consulting/dagger#163: verify dispatches before it fetches the
+# tags and writes the advisory diff.
 setup
 echo success >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
-check "known gap (advisory before the dispatch, zerobull-consulting/dagger#163)" has "$FAKE/advisory-before-dispatch" "remote-cache-tests.yml"
+check "dispatch first (zerobull-consulting/dagger#163): no advisory diff existed at the dispatch" has "$FAKE/dispatch-saw-no-advisory" "remote-cache-tests.yml"
+check "dispatch first (zerobull-consulting/dagger#163): and none was written before it" not test -s "$FAKE/advisory-before-dispatch"
+check "dispatch first (zerobull-consulting/dagger#163): no tag was fetched at the dispatch" test "$(head -n1 "$FAKE/tags-at-dispatch" | tr -d ' ')" = 0
+check "dispatch first (zerobull-consulting/dagger#163): both the tag and the base are fetched after" test "$(git -C "$work" tag -l | wc -l)" -eq 2
+check "dispatch first (zerobull-consulting/dagger#163): and it is written after" test -s "$FAKE/notes/advisory.md"
+check "dispatch first (zerobull-consulting/dagger#163): the verdict is the same" has "$tmp/out" "result=pass"
+# A fetch that fails after the dispatch is an error, never a verdict.
+setup
+echo success >"$FAKE/conclusions"
+run verify v1.0.0-beta.99 "$d2"
+check "dispatch first: a tag that can't be fetched is an error" test "$status" -ne 0
+check "dispatch first: after the dispatch" test -f "$FAKE/dispatch-remote-cache-tests.yml-1"
+check "dispatch first: so no result is given" not has "$tmp/out" "result="
+check "dispatch first: saying the run isn't awaited" has "$tmp/out" "is not awaited"
+check "dispatch first: and cancelling it" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+setup
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
+check "a test ref that isn't a branch name is refused" test "$status" -ne 0
+check "a test ref that isn't a branch name: before any dispatch" test "$(writes)" = 0
+setup
+git -C "$work" push -q origin HEAD:refs/heads/fix/a+b@c
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='fix/a+b@c'
+check "a valid branch name with odd characters is accepted" has "$tmp/out" "result=pass"
 
 echo "--- a tag that conflicts"
 setup

@@ -145,6 +145,8 @@ jobs:
         id: bundle
         timeout-minutes: 30
         env:
+          # A dry run's own ref, as the verify job's: the same service.
+          RELEASE_CHECK_TEST_REF: ${{ needs.check.outputs.dry == 'true' && github.ref_name || '' }}
           VERSION: ${{ needs.check.outputs.version }}
         run: ./hack/remote-cache/release-check.sh bundle "$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -156,7 +158,7 @@ jobs:
     needs: check
     if: needs.check.outputs.verify == 'true'
     runs-on: ubuntu-24.04
-    # The verifying run's wait (150 minutes) and the fetches.
+    # The verifying run's wait (150 minutes); the fetches run alongside it.
     timeout-minutes: 170
     permissions:
       contents: read

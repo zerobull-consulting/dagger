@@ -27,15 +27,16 @@
 #   release-check.sh [--dry-run] verify <version> <digest>
 #       Runs the current service against that stock engine: dispatches
 #       remote-cache-tests.yml on the branch (RELEASE_CHECK_TEST_REF: a dry
-#       run's own ref) with the candidate inputs and
-#       waits for it, and writes the advisory diff. Prints result=pass or
+#       run's own ref) with the candidate inputs, writes the advisory diff
+#       while it runs, and waits for it. Prints result=pass or
 #       result=fail: the e2e and the sidecar demo's verdict. A run that doesn't end in success or failure
 #       (cancelled, timed out waiting), or that failed before testing (its
 #       checkout or pin step), is an error, never a failure: it must not
 #       lead to a reject line.
 #   release-check.sh bundle <version>
-#       TestBundleVersionMatchesEngineCapture with the tag merged in. It
-#       runs upstream's code, so the workflow runs it in a job of its own
+#       TestBundleVersionMatchesEngineCapture with the tag merged into the
+#       branch (RELEASE_CHECK_TEST_REF: a dry run's own ref, as verify's).
+#       It runs upstream's code, so the workflow runs it in a job of its own
 #       with no credential, and it refuses to run if a token is in its
 #       environment. Prints bundle=pass, fail or conflict (not run: the tag
 #       conflicts with the branch), and merge=. A needs verify's pass and
@@ -136,6 +137,14 @@ need_tag() { valid_tag "$1" || die "'$1' is not a v1 release tag such as v1.0.0-
 need_digest() { [[ "$1" =~ $digest_re ]] || die "'$1' is not a sha256 digest"; }
 need_run() { [[ "$1" =~ $run_re ]] || die "'$1' is not a GitHub Actions run URL"; }
 need_number() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || die "'$1' is not a number"; }
+# need_test_ref: RELEASE_CHECK_TEST_REF, if set, is a branch name git accepts
+# (so no ':', '~', '^', '?', '*', '[', '\\', space or '..'), as the workflow
+# gives it. It is only ever used after "refs/heads/", in quoted arguments, and
+# only by verify and bundle.
+need_test_ref() {
+	[[ -z "${RELEASE_CHECK_TEST_REF:-}" ]] || git check-ref-format "refs/heads/$RELEASE_CHECK_TEST_REF" ||
+		die "RELEASE_CHECK_TEST_REF is not a branch name"
+}
 
 [[ "$repo" =~ $repo_re ]] || die "RELEASE_CHECK_REPO '$repo' is not owner/name"
 [[ "$poll" =~ ^[0-9]{1,4}$ && "$wait_minutes" =~ ^[0-9]{1,4}$ && "$min_head_age" =~ ^[0-9]{1,6}$ ]] ||
@@ -210,24 +219,38 @@ image_digest() {
 	echo "$digest"
 }
 
-# fetch_branch: the branch's head, fresh, as origin/<branch>-check.
+# fetch_branch [<ref>]: the branch's head (or the named branch's), fresh, as
+# release-check/head.
 fetch_branch() {
-	timeout 300 git fetch -q --no-tags "$remote" "+refs/heads/$branch:refs/remotes/release-check/head" ||
-		die "couldn't fetch $branch"
+	local ref="${1:-$branch}"
+	timeout 300 git fetch -q --no-tags "$remote" "+refs/heads/$ref:refs/remotes/release-check/head" ||
+		die "couldn't fetch $ref"
 }
 # fetch_tag <tag>: the upstream tag, as refs/tags/<tag>.
 fetch_tag() {
 	timeout 600 git fetch -q --no-tags "$upstream" "+refs/tags/$1:refs/tags/$1" || die "couldn't fetch $1 from $upstream"
 }
 
-# tree: a fresh worktree of the branch's head, in $tree.
+# pending_run: a dispatched candidate run nothing is waiting on yet. If the
+# script ends in failure with one pending, it is cancelled (best effort, with
+# GITHUB_TOKEN), not left to run unread. wait_since: when verify dispatched
+# (SECONDS), which wait_run counts its deadline from.
+pending_run=""
+wait_since=""
+# tree: a fresh worktree of the branch's head (or of new_tree's argument), in
+# $tree.
 tree=""
 cleanup() {
+	local rc=$?
+	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
+		say "the candidate run $server/$repo/actions/runs/$pending_run is not awaited and no result is given: cancelling it"
+		api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1 || say "cancelling run $pending_run failed; it will finish unread"
+	fi
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 new_tree() {
-	fetch_branch
+	fetch_branch "$@"
 	tree="$(mktemp -d)"
 	git worktree add -q --detach "$tree" release-check/head
 }
@@ -321,7 +344,9 @@ dispatch() {
 # conclusion.
 wait_run() {
 	local id="$1" deadline run status conclusion
-	deadline=$((SECONDS + wait_minutes * 60))
+	# From the dispatch (wait_since, if set), not from here: work done between
+	# the two doesn't extend the wait past the step's timeout.
+	deadline=$((${wait_since:-$SECONDS} + wait_minutes * 60))
 	while :; do
 		if run="$(api "repos/$repo/actions/runs/$id")"; then
 			status="$(jq -r .status <<<"$run")"
@@ -562,11 +587,14 @@ cmd_plan() {
 cmd_bundle() {
 	local v="$1" merge bundle var
 	need_tag "$v"
+	need_test_ref
 	for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
 		[[ -z "${!var:-}" ]] || die "$var is set: the bundle test runs upstream's code, and must run without any credential"
 	done
 	fetch_tag "$v"
-	new_tree
+	# The service as it is: the branch's, or in a dry run (from the workflow),
+	# the dry run's own ref, the one verify's e2e runs on.
+	new_tree "${RELEASE_CHECK_TEST_REF:-$branch}"
 	merge="$(merge_tag "$v")"
 	if [[ "$merge" == conflict ]]; then
 		# Not run, so not passed: it verified nothing.
@@ -583,16 +611,25 @@ cmd_verify() {
 	local v="$1" d="$2" a
 	need_tag "$v"
 	need_digest "$d"
+	need_test_ref
 	mkdir -p "$notes"
 	: >"$notes/notes.env"
 	note version "$v"
 	note digest "$d"
+	local id
+	wait_since=$SECONDS
+	# The service as it is: the branch's, or in a dry run (from the
+	# workflow), the dry run's own ref. Dispatched first: the fetches and the
+	# advisory diff run while the candidate run does, not before it, out of
+	# the step's timeout.
+	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
+	# A failure here is an error (a step that fails), never a verdict, and the
+	# exit trap cancels the dispatched run, which nothing would read: the next
+	# hour verifies the release again.
+	pending_run="$id"
 	fetch_tag "$v"
 	advisory "$v"
-	local id
-	# The service as it is: the branch's, or in a dry run (from the
-	# workflow), the dry run's own ref.
-	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
+	pending_run=""
 	a="$(finish_tests "$id" a)"
 	# The e2e and the sidecar demo's verdict. A is this and the bundle job's
 	# both passing (the workflow decides): a bundle test that didn't run (the
