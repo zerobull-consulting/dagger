@@ -99,7 +99,7 @@ func TestMinIOBinaryStopBoundedExitsOne(t *testing.T) {
 	if took < drainTimeout+shutdownGrace/2 {
 		t.Fatalf("the stop took %s: it didn't wait for the held work", took)
 	}
-	b.logHas(t, `msg="drain: done" outcome=deadline`, "the shutdown's bound passed with work still running", "held=1")
+	b.logHas(t, `msg="drain: done" outcome=deadline`, "stopped uncleanly: the shutdown's bound passed with work still running", "held=1")
 }
 
 // A clean stop exits 0, within the bound, and logs that it stopped.
