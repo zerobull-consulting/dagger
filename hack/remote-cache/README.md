@@ -903,7 +903,7 @@ only decides when it runs and with which token.
      the run rather than reading as "nothing new".
 3. **Verify (A).** It dispatches `remote-cache-tests.yml` on
    `feature/remote-cache` (a dry run: on its own branch) with `candidate-version` and `candidate-digest`,
-   and waits for it (at most 150 minutes): the e2e and the sidecar demo of
+   and waits for it (at most 150 minutes from the dispatch, the fetches below included): the e2e and the sidecar demo of
    the service as it is, against that stock engine. Meanwhile, a job of its
    own (`bundle test`) merges the tag into a scratch copy of the branch and
    runs `TestBundleVersionMatchesEngineCapture`; both must pass. If the tag

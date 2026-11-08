@@ -137,12 +137,16 @@ need_tag() { valid_tag "$1" || die "'$1' is not a v1 release tag such as v1.0.0-
 need_digest() { [[ "$1" =~ $digest_re ]] || die "'$1' is not a sha256 digest"; }
 need_run() { [[ "$1" =~ $run_re ]] || die "'$1' is not a GitHub Actions run URL"; }
 need_number() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || die "'$1' is not a number"; }
+# need_test_ref: RELEASE_CHECK_TEST_REF, if set, is a branch name git accepts
+# (so no ':', '~', '^', '?', '*', '[', '\\', space or '..'), as the workflow
+# gives it. It is only ever used after "refs/heads/", in quoted arguments, and
+# only by verify and bundle.
+need_test_ref() {
+	[[ -z "${RELEASE_CHECK_TEST_REF:-}" ]] || git check-ref-format "refs/heads/$RELEASE_CHECK_TEST_REF" ||
+		die "RELEASE_CHECK_TEST_REF is not a branch name"
+}
 
 [[ "$repo" =~ $repo_re ]] || die "RELEASE_CHECK_REPO '$repo' is not owner/name"
-# A branch name, as the workflow gives it, never a refspec: whatever git
-# accepts as a branch name has no ':', '~', '^', '?', '*', '[', '\\' or space.
-[[ -z "${RELEASE_CHECK_TEST_REF:-}" ]] || git check-ref-format "refs/heads/$RELEASE_CHECK_TEST_REF" ||
-	die "RELEASE_CHECK_TEST_REF is not a branch name"
 [[ "$poll" =~ ^[0-9]{1,4}$ && "$wait_minutes" =~ ^[0-9]{1,4}$ && "$min_head_age" =~ ^[0-9]{1,6}$ ]] ||
 	die "RELEASE_CHECK_POLL_SECONDS, RELEASE_CHECK_WAIT_MINUTES and RELEASE_CHECK_MIN_HEAD_AGE must be numbers"
 
@@ -227,14 +231,15 @@ fetch_tag() {
 	timeout 600 git fetch -q --no-tags "$upstream" "+refs/tags/$1:refs/tags/$1" || die "couldn't fetch $1 from $upstream"
 }
 
+# pending_run: a dispatched candidate run nothing is waiting on yet. If the
+# script ends in failure with one pending, it is cancelled (best effort, with
+# GITHUB_TOKEN), not left to run unread. wait_since: when verify dispatched
+# (SECONDS), which wait_run counts its deadline from.
+pending_run=""
+wait_since=""
 # tree: a fresh worktree of the branch's head (or of new_tree's argument), in
 # $tree.
 tree=""
-# pending_run: a dispatched candidate run nothing is waiting on yet. If the
-# script ends in failure with one pending, it is cancelled (best effort, with
-# GITHUB_TOKEN), not left to run unread.
-pending_run=""
-wait_since=""
 cleanup() {
 	local rc=$?
 	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
@@ -582,6 +587,7 @@ cmd_plan() {
 cmd_bundle() {
 	local v="$1" merge bundle var
 	need_tag "$v"
+	need_test_ref
 	for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
 		[[ -z "${!var:-}" ]] || die "$var is set: the bundle test runs upstream's code, and must run without any credential"
 	done
@@ -605,6 +611,7 @@ cmd_verify() {
 	local v="$1" d="$2" a
 	need_tag "$v"
 	need_digest "$d"
+	need_test_ref
 	mkdir -p "$notes"
 	: >"$notes/notes.env"
 	note version "$v"
@@ -619,7 +626,6 @@ cmd_verify() {
 	# A failure here is an error (a step that fails), never a verdict, and the
 	# exit trap cancels the dispatched run, which nothing would read: the next
 	# hour verifies the release again.
-	wait_since=$SECONDS
 	pending_run="$id"
 	fetch_tag "$v"
 	advisory "$v"

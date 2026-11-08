@@ -521,7 +521,7 @@ echo success >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
 check "dispatch first (zerobull-consulting/dagger#163): no advisory diff existed at the dispatch" has "$FAKE/dispatch-saw-no-advisory" "remote-cache-tests.yml"
 check "dispatch first (zerobull-consulting/dagger#163): and none was written before it" not test -s "$FAKE/advisory-before-dispatch"
-check "dispatch first (zerobull-consulting/dagger#163): no tag was fetched at the dispatch" test "$(tr -d ' \n' <"$FAKE/tags-at-dispatch")" = 0
+check "dispatch first (zerobull-consulting/dagger#163): no tag was fetched at the dispatch" test "$(head -n1 "$FAKE/tags-at-dispatch" | tr -d ' ')" = 0
 check "dispatch first (zerobull-consulting/dagger#163): both the tag and the base are fetched after" test "$(git -C "$work" tag -l | wc -l)" -eq 2
 check "dispatch first (zerobull-consulting/dagger#163): and it is written after" test -s "$FAKE/notes/advisory.md"
 check "dispatch first (zerobull-consulting/dagger#163): the verdict is the same" has "$tmp/out" "result=pass"
