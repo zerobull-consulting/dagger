@@ -892,7 +892,9 @@ only decides when it runs and with which token.
    first. A publish that failed or was cancelled is dispatched again on a
    later hour, but at most twice per head: past that the step's summary says
    so (`publish=bounded`) and nothing more is dispatched, so re-run the
-   publish by hand
+   publish by hand (the count includes a hand-run dispatch, and a cancelled
+   run is retried like a failed one; a run stuck queued holds the retry
+   back until GitHub ends it)
    ([zerobull-consulting/dagger#166](https://github.com/zerobull-consulting/dagger/issues/166)).
 2. **Poll.** `git ls-remote --tags https://github.com/dagger/dagger` for
    `v1.*`; a tag must match `^v1\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$` and be

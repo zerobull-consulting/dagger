@@ -483,6 +483,13 @@ ARGS=(publish); rc env FAKE_HEAD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 check "publish: nor a head just pushed" has "$tmp/out" "publish=none"
 check "publish: neither dispatches" test "$(writes)" = 0
 
+setup
+ARGS=(publish); rc env FAKE_HEAD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" FAKE_PUBLISH_RUNS="push:completed:failure"
+check "publish: a young head whose run already failed is retried at once" has "$tmp/out" "publish=dispatched"
+setup
+ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:success workflow_dispatch:completed:failure workflow_dispatch:completed:failure"
+check "publish: a success outranks the bound" has "$tmp/out" "publish=none"
+
 echo "--- outcome B"
 setup
 printf 'failure\nsuccess\n' >"$FAKE/conclusions"
