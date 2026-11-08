@@ -460,9 +460,11 @@ func main() {
 // clean (clean) and no HTTP server failed, 1 otherwise. A server that failed
 // after the first signal, during the drain or the shutdown, left its error in
 // errs, which nothing read then: it is logged here, and makes the stop
-// unclean too. It does not wait: stopService has already waited for the
-// servers' goroutines, within the shutdown's bound, so every error they will
-// send is in errs; one still serving at the bound made the stop unclean.
+// unclean too. It does not wait: when shutdown ended, it had waited for the
+// servers' goroutines within its bound, so every error they will send is in
+// errs, and one still serving at the bound made the stop unclean. A stop cut
+// off by a signal or the outer backstop is unclean already (exit 1), but a
+// server error sent after that is not logged.
 func exitCode(clean bool, errs <-chan error, logger *slog.Logger) int {
 	for {
 		select {
@@ -539,7 +541,7 @@ func stopService(svc *server.Service, servers []*http.Server, serversDone <-chan
 // Other causes, such as the engine connections still closing after the
 // 2s close bound (about 2.5s in), come well before it.
 func logUncleanStop(logger *slog.Logger, svc *server.Service, err error, grace time.Duration) {
-	msg := "stopped uncleanly; exiting without waiting for the work still running"
+	msg := "stopped uncleanly; exiting without waiting for the rest"
 	attrs := []any{"error", err}
 	if errors.Is(err, errShutdownGrace) {
 		msg = "stopped uncleanly: the shutdown's bound passed with work still running; exiting without waiting for it"
@@ -576,6 +578,10 @@ func shutdown(svc *server.Service, servers []*http.Server, serversDone <-chan st
 	cancelPaths()
 	closeCtx, cancelClose := context.WithTimeout(ctx, server.CloseEnginesTimeout)
 	var errs []error
+	// boundPassed is set where the bound is seen to cut a wait off, not from
+	// the deadline's state at the end: an earlier error, such as the engine
+	// connections still closing, isn't the bound passing.
+	boundPassed := false
 	if err := svc.CloseEnginesContext(closeCtx); err != nil {
 		errs = append(errs, err)
 	}
@@ -584,6 +590,7 @@ func shutdown(svc *server.Service, servers []*http.Server, serversDone <-chan st
 		// A request still running when ctx ends: the stop isn't clean.
 		if err := srv.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("http server %s: requests still running: %w", srv.Addr, err))
+			boundPassed = true
 		}
 	}
 	if serversDone != nil {
@@ -596,13 +603,17 @@ func shutdown(svc *server.Service, servers []*http.Server, serversDone <-chan st
 			case <-serversDone:
 			default:
 				errs = append(errs, errors.New("http servers still serving"))
+				boundPassed = true
 			}
 		}
 	}
 	if err := svc.WaitContext(ctx); err != nil {
 		errs = append(errs, err)
+		boundPassed = true
 	}
-	if len(errs) > 0 && errors.Is(context.Cause(ctx), errShutdownGrace) {
+	// WaitContext's error is the deadline's cause already; the others carry
+	// the context's error, so name the cause for logUncleanStop.
+	if boundPassed && !errors.Is(errors.Join(errs...), errShutdownGrace) {
 		errs = append(errs, errShutdownGrace)
 	}
 	return errors.Join(errs...)

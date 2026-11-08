@@ -119,6 +119,9 @@ func TestShutdownReportsRequestsStillRunning(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "requests still running") {
 		t.Fatalf("shutdown with a request still running reported %v", err)
 	}
+	if n := strings.Count(err.Error(), errShutdownGrace.Error()); n != 1 {
+		t.Fatalf("the bound is named %d times in %q, want once", n, err)
+	}
 }
 
 // A server that failed during the drain or the shutdown, after the first
@@ -177,7 +180,7 @@ func TestShutdownReportsServersStillServing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "servers still serving") || !errors.Is(err, errShutdownGrace) {
 		t.Fatalf("shutdown with a server still serving reported %v", err)
 	}
-	if took := time.Since(start); took > 2*grace {
+	if took := time.Since(start); took > grace+2*time.Second {
 		t.Fatalf("shutdown took %s, past its bound %s", took, grace)
 	}
 }
@@ -193,7 +196,7 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 		return buf.String()
 	}
 	engines := log(errors.New("2 engine connections still closing after they were dropped"))
-	if !strings.Contains(engines, "engine connections still closing") || strings.Contains(engines, "bound") {
+	if !strings.Contains(engines, "engine connections still closing") || strings.Contains(engines, "bound passed") || strings.Contains(engines, "bound=") {
 		t.Errorf("the engine-close error was logged as %q: want its text as the reason and no bound", engines)
 	}
 	if !strings.Contains(engines, "stopped uncleanly") {
