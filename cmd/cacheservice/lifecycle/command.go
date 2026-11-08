@@ -74,13 +74,17 @@ func ConfirmValue(bucket, prefix string) string {
 // prefix (apply, claim), or "" when it does.
 func confirmProblem(o Options) string {
 	want := ConfirmValue(o.Bucket, o.Prefix)
+	verb := "change" // what the action does to the bucket and prefix
+	if o.Action == "claim" {
+		verb = "claim"
+	}
 	switch {
 	case o.Confirm == want:
 		return ""
 	case o.Confirm == "":
-		return fmt.Sprintf("needs -confirm=%s, repeating the bucket and prefix it changes", want)
+		return fmt.Sprintf("needs -confirm=%s, repeating the bucket and prefix it %ss", want, verb)
 	}
-	return fmt.Sprintf("-confirm=%s doesn't match the bucket and prefix it would change, %s", o.Confirm, want)
+	return fmt.Sprintf("-confirm=%s doesn't match the bucket and prefix it would %s, %s", o.Confirm, verb, want)
 }
 
 // Opener makes the Store for an S3 configuration.
@@ -211,6 +215,14 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 	root := layout.Root(o.Prefix)
 	fmt.Fprintf(out, "bucket %s, prefix %q\n", o.Bucket, root)
+	// claim has no namespaces: they belong to the rules, not to the marker.
+	if o.Action != "claim" {
+		fmt.Fprintf(out, "namespaces, from %s (%d): %s\n", o.Source, len(o.Namespaces), strings.Join(o.Namespaces, ", "))
+		if len(o.Namespaces) == 0 {
+			fmt.Fprintln(out, "warning: no namespaces: no staging rules are wanted")
+		}
+	}
+
 	if o.Action == "apply" || o.Action == "claim" {
 		// Before anything is read: a wrong bucket or prefix is refused at
 		// once, whatever the store says.
@@ -220,10 +232,6 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 	if o.Action == "claim" {
 		return runClaim(ctx, o, st, out, fail)
-	}
-	fmt.Fprintf(out, "namespaces, from %s (%d): %s\n", o.Source, len(o.Namespaces), strings.Join(o.Namespaces, ", "))
-	if len(o.Namespaces) == 0 {
-		fmt.Fprintln(out, "warning: no namespaces: no staging rules are wanted")
 	}
 
 	marker, merr := st.ReadMarker(ctx, o.Prefix)

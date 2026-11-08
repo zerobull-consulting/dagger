@@ -809,3 +809,22 @@ func TestClaimLostRace(t *testing.T) {
 		t.Fatalf("claim that lost the race: %d, %d claims\n%s", code, st.claims, out)
 	}
 }
+
+// A refused -confirm says what the action does (apply changes, claim
+// claims), and a refused apply still prints the namespaces first, as before.
+func TestConfirmRefusalOutput(t *testing.T) {
+	for _, confirm := range []string{"", "bkt/other"} {
+		o := opts("apply", "a")
+		o.Confirm = confirm
+		code, out := run(t, o, &fakeStore{})
+		if code != ExitUsage || !strings.Contains(out, "namespaces, from test (1): a") || !strings.Contains(out, "change") || strings.Contains(out, "claim") {
+			t.Fatalf("apply -confirm=%q: %d\n%s", confirm, code, out)
+		}
+		o = opts("claim")
+		o.Confirm = confirm
+		code, out = run(t, o, &fakeStore{marker: ownership.ErrNoMarker})
+		if code != ExitUsage || strings.Contains(out, "namespaces") || !strings.Contains(out, "claim") || strings.Contains(out, "change") {
+			t.Fatalf("claim -confirm=%q: %d\n%s", confirm, code, out)
+		}
+	}
+}
