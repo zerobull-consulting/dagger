@@ -394,6 +394,8 @@ type fakeStore struct {
 	keys     bool
 	claimErr error
 	claims   int
+	// lost: another writer created the marker first (ClaimedByOther).
+	lost bool
 }
 
 func (f *fakeStore) GetLifecycle(context.Context) (Config, error) {
@@ -430,6 +432,8 @@ func (f *fakeStore) Claim(context.Context, string) (ownership.State, ownership.M
 		return 0, ownership.Marker{}, f.claimErr
 	}
 	switch {
+	case f.lost:
+		return ownership.ClaimedByOther, ownership.Marker{Layout: layout.Version, Created: time.Now()}, nil
 	case f.marker == nil:
 		return ownership.Owned, ownership.Marker{Layout: layout.Version, Created: time.Now()}, nil
 	case errors.Is(f.marker, ownership.ErrNoMarker) && f.keys:
@@ -794,5 +798,14 @@ func TestMainClaim(t *testing.T) {
 	}
 	if code, out := main("claim", "-confirm=bkt/cache"); code != ExitOK || st.claims != 1 {
 		t.Fatalf("claim: %d\n%s", code, out)
+	}
+}
+
+// A claim that lost the race to another writer wrote nothing, and says so.
+func TestClaimLostRace(t *testing.T) {
+	st := &fakeStore{marker: ownership.ErrNoMarker, lost: true}
+	code, out := run(t, opts("claim"), st)
+	if code != ExitOK || st.claims != 0 || !strings.Contains(out, "nothing written") || strings.Contains(out, "created cache/") {
+		t.Fatalf("claim that lost the race: %d, %d claims\n%s", code, st.claims, out)
 	}
 }
