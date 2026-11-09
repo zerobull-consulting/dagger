@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The accept-line-only check (zerobull-consulting/dagger#117, D5, outcome
-# A): the release check auto-merges its accept PRs, so such a PR must change
-# nothing but one added accept line. Run on every pull request by
-# .github/workflows/remote-cache-accept-line.yml, as the "accept line only"
-# check:
+# The "auto-merge: adds compatible engine only" check
+# (zerobull-consulting/dagger#117, D5, outcome A): the release check
+# auto-merges its accept PRs, so such a PR must change nothing but one added
+# accept line. Run on every pull request by
+# .github/workflows/remote-cache-auto-merge-add-compatible-engine.yml:
 #
 #   accept-line-only.sh check <base sha> <head sha> <head ref>
 #       A PR from a release-check/accept/<version> branch passes only if,
@@ -33,7 +33,7 @@ digest_re='^sha256:[0-9a-f]{64}$'
 run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[0-9]+)?$'
 
 fail() {
-	echo "::error file=$manifest::accept line only: $*"
+	echo "::error file=$manifest::auto-merge: adds compatible engine only: $*"
 	exit 1
 }
 

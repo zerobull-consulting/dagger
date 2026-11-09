@@ -825,7 +825,7 @@ sync is still to be built. Each token is an environment secret:
   accept-line PR with `GITHUB_TOKEN`, and only while the repository
   variable `RELEASE_CHECK_AUTO_MERGE` is `true`. GitHub then merges it once
   the required checks pass.
-- The `accept line only` check fails any `release-check/accept/*` PR that
+- The `auto-merge: adds compatible engine only` check fails any `release-check/accept/*` PR that
   changes more than one added accept line, and turns its auto-merge off.
   Set `RELEASE_CHECK_AUTO_MERGE` only once that check is in the ruleset's
   required checks: the five required before it don't stop a PR changing
@@ -981,13 +981,13 @@ hand. To verify a rejected release again, remove its `reject` line.
   `compat-break` issue: the failing jobs of both runs, and the diff.
 
 **The auto-merge gate.** `RELEASE_CHECK_AUTO_MERGE` (a repository
-variable) stays unset until `accept line only` is a required check. Then:
-1. `accept line only` has reported on a PR (it runs on every PR; any PR
+variable) stays unset until `auto-merge: adds compatible engine only` is a required check. Then:
+1. `auto-merge: adds compatible engine only` has reported on a PR (it runs on every PR; any PR
    that isn't from `release-check/accept/*` passes it);
 2. add it to the ruleset's required checks;
 3. set `RELEASE_CHECK_AUTO_MERGE` to `true`.
 
-The check, `.github/workflows/remote-cache-accept-line.yml`, runs on
+The check, `.github/workflows/remote-cache-auto-merge-add-compatible-engine.yml`, runs on
 `pull_request_target`, so its workflow and the scripts it runs
 (`accept-line-only.sh`, `engines.sh`) are always the default branch's
 (`feature/remote-cache`): a PR that edits any of them is still measured by
@@ -997,7 +997,7 @@ commits and parses its manifest, and requests no environment. It has no
 required check counts as passed). **A gap:** a required status check is
 matched by name, so a PR from a branch of this repository (its author has
 write access) can add a `pull_request` workflow with its own job named
-`accept line only`. Requiring this workflow through the ruleset's "Require
+`auto-merge: adds compatible engine only`. Requiring this workflow through the ruleset's "Require
 workflows to pass", rather than as a status check, closes that
 ([zerobull-consulting/dagger#164](https://github.com/zerobull-consulting/dagger/issues/164)). It fails an
 accept PR unless, from
