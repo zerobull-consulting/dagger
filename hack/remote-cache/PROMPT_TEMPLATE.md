@@ -3,10 +3,11 @@
 **Version:** [zerobull-consulting/dagger#194](https://github.com/zerobull-consulting/dagger/pull/194)
 
 Every work item's prompt for the remote cache work is generated from this
-file. It holds the template, the steps every session follows (section 12,
-copied verbatim into every prompt), the reasons behind them, and the
-conventions for the whole prompt. It is the process's source, and it changes
-by PR (see [Changing this file](#changing-this-file)).
+file, by the session's lead (see [The lead](#the-lead)). It holds the
+template, the steps every session follows (section 12, copied verbatim into
+every prompt), the reasons behind them, and the conventions for the whole
+prompt. It is the process's source, and it changes by PR (see [Changing this
+file](#changing-this-file)).
 
 **How the pieces fit:**
 
@@ -18,6 +19,68 @@ by PR (see [Changing this file](#changing-this-file)).
   block. It's the record of how that execution was instructed.
 - **The template is how prompts are generated,** and where the process
   improves.
+
+## The lead
+
+**The lead is whoever starts a session:** a human, usually generating the
+prompt from this file with an AI rather than typing it, or an orchestrator
+session the human told directly to run the work. Every session has exactly
+one lead, and the steps call it "your lead".
+
+The lead writes two things for each session:
+
+1. **The standing authorization:** who the lead is, what the session may do
+   without asking, what it may not, and how it tells the lead when it stops.
+   It goes in the session's system prompt (below).
+2. **The prompt:** what to build and how (the template, next).
+
+The lead then answers the session's questions, decides what to do with
+findings the session can't confirm, checks the "ready to merge" report, and,
+when the lead merges, merges and closes the issue.
+
+### The standing authorization
+
+An orchestrator session puts this in the new session's system prompt (the
+`append_system_prompt` field of the Claude Code Remote `create_session`
+tool), not in the prompt: a session gives a prompt another session wrote the
+weight of an automated message, and won't open a PR or merge on it. A human
+starting a session by hand puts it at the top of the first message, since
+their own words already carry that weight.
+
+Fill in the `<...>` parts. When the lead merges, drop the "merge your own
+PR" line and keep "merge any PR" in what the session may not do; when the
+session merges, the reverse.
+
+````markdown
+## Standing authorization for this session
+
+Your lead: <the requester, a human | the orchestrator session
+<session ID>, which the requester told directly to run this work>.
+<For an orchestrator: In their own words, the requester asked for <what they
+asked: e.g. a round of issues closed out, and the PRs merged without waiting
+for their approval>.>
+
+Within the task in the first message, you may, without asking first:
+- create, commit to and push your own branch `<branch>` in
+  zerobull-consulting/dagger (never force-push, and never push to any other
+  branch);
+- open your PR as a draft against `feature/remote-cache`, edit its
+  description, and mark it ready for review;
+- reply to and resolve review threads on your own PR, comment on it, and
+  re-request a Copilot review once if its runner failed;
+- file issues in zerobull-consulting/dagger, as the steps describe;
+- <merge your own PR, as the steps describe.>
+
+You may not <merge any PR,> close any issue, or change repository settings
+or rulesets. Your lead does those.
+
+**Telling your lead when you stop:** before you end any turn without having
+sent your "ready to merge" report, tell your lead why you stopped: a
+question, a blocker, or what you're waiting on and when you'll check again.
+An orchestrator gets it by the Claude Code Remote `send_message` tool
+(`session_id` `@parent`); a human, in your reply. Never end a turn waiting on
+a human without telling your lead.
+````
 
 ## The template
 
@@ -132,8 +195,8 @@ it isn't.
 - Branch name and base.
 - The closing-keyword caveat: keywords don't fire on feature branches, so
   close by hand.
-- **Who merges:** the session (the default), or its lead (the human or the
-  orchestrator session that started it). Section 12's merge step covers both.
+- **Who merges:** the session (the default), or its lead. It must match the
+  standing authorization. Section 12's merge step covers both.
 
 The rest (draft first, full references, the prompt in the PR, the squash title
 and message) is in section 12, so it isn't repeated here.
@@ -219,9 +282,15 @@ ones written here.**
   upstream repository.
 - Stop and ask, instead of deciding, on a design decision that's the
   requester's, a missing prerequisite, or anything irreversible.
+- **Never stop silently.** Before you end any turn without your "ready to
+  merge" report, tell your lead why: a question, a blocker, or what you're
+  waiting on and when you'll check again.
 
 **The steps. One at a time, top to bottom. Each one is one thing.** "Your
-lead" means whoever started you: a human, or an orchestrator session.
+lead" is whoever started you, named in your standing authorization: a human,
+or an orchestrator session. You reach an orchestrator by the Claude Code
+Remote `send_message` tool (`session_id` `@parent`), and a human in your
+reply.
 
 *Get set up*
 
@@ -461,16 +530,23 @@ that, but it was hard to explain to a session working on a single task.
 Deciding what a lead is worth, and what it belongs with, takes a view across
 tasks, which the lead has and the session doesn't.
 
-**Why the orchestrator merges.** A session reads an approval quoted in a
-prompt that another session wrote as an automated message, not the
-requester's own, and won't merge on it. That's the right call, and telling it
-again from the orchestrator carries the same weight. The
+**Why the standing authorization goes in the system prompt.** A session reads
+an approval quoted in a prompt that another session wrote as an automated
+message, not the requester's own, and won't act on it. That's the right
+call, and telling it again from the orchestrator carries the same weight. So
+the orchestrator merged instead, and the authorization moved out of the
+prompt and into the session's system prompt, where it arrives as setup. The
+zerobull-consulting/dagger#184 session pushed its fix and then stopped before
+opening its PR, asking for a go-ahead its prompt already gave. The question
+went to its own status line, where only the requester would see it, and
+nothing reached the orchestrator until a fallback check. Hence the rule to
+tell your lead whenever you stop. The
 zerobull-consulting/dagger#170 session stopped short of merging
 (zerobull-consulting/dagger#176 was then merged with GitHub's default
 `(#176)` title), and the zerobull-consulting/dagger#87 session asked for
-confirmation before its reviews. Splitting the work this way let six PRs in a
-row (zerobull-consulting/dagger#182 to zerobull-consulting/dagger#190) merge
-without the requester.
+confirmation before its reviews. Having the orchestrator merge let six PRs
+in a row (zerobull-consulting/dagger#182 to zerobull-consulting/dagger#190)
+merge without the requester.
 
 **Why "verify by running".** zerobull-consulting/dagger#127 corrected a
 code-reading claim that a real kept-volume run disproved.
@@ -494,9 +570,9 @@ each change small (zerobull-consulting/dagger#198).
   and written into the prompt as decided: credentials, engine changes,
   ruleset changes, design forks. A question that only the requester can answer
   stalls a session that hits it.
-- **Who merges** is stated in section 4: by default the session. When the
-  lead merges (a human, or the orchestrator session that wrote the prompt),
-  the merge step becomes a "ready to merge" report.
+- **Who merges** is stated in section 4 and in the standing authorization,
+  and the two agree: by default the session. When the lead merges, the merge
+  step becomes a "ready to merge" report.
 - **Before the lead merges,** it checks the report against the PR: the
   ruleset's required checks passed on the head being merged; at most two
   Copilot reviews, plus one for each push the steps allow after review 2 (a
@@ -527,9 +603,15 @@ each change small (zerobull-consulting/dagger#198).
 
 ## Starting a session
 
-Paste the full prompt, section 12 included. The agent copies the whole prompt,
-verbatim, into the draft PR it opens. A follow-up PR from the same prompt
-links to the original's instead of copying it.
+An orchestrator creates the session with the standing authorization as its
+appended system prompt and the full prompt, section 12 included, as its
+first message. A human pastes both into the first message, authorization
+first. Either way, the lead then checks in on the session about 10 minutes
+after launch, and every 20 minutes while it works.
+
+The session copies the whole prompt, verbatim, into the draft PR it opens. A
+follow-up PR from the same prompt links to the original's instead of copying
+it.
 
 ## Changing this file
 
