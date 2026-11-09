@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -788,6 +789,34 @@ func TestOTLPTraces(t *testing.T) {
 	}
 	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" {
 		t.Fatalf("unexpected cache span log: %v", s)
+	}
+}
+
+// TestOTLPTraceLogsBounded: the engine's attribute strings reach the log
+// cut, whatever their size and wherever a multi-byte rune falls.
+func TestOTLPTraceLogsBounded(t *testing.T) {
+	_, rec, srv := newTestService(t, "")
+	long := strings.Repeat("é", 100000)
+	req := &coltracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{Name: "cached", Attributes: []*commonpb.KeyValue{
+			kv(telemetryattrs.CacheResultIDAttr, long),
+			kv(telemetryattrs.CacheOutcomeAttr, long),
+			kv(telemetryattrs.CacheTypeAttr, long),
+			kv(telemetryattrs.CacheRetainedAttr, long),
+		}}}}},
+	}}}
+	if code := otlpPost(t, srv.URL+"/v1/traces", req, &coltracepb.ExportTraceServiceResponse{}, false, false); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	spans := rec.find("cache span")
+	if len(spans) != 1 {
+		t.Fatalf("%d cache spans logged", len(spans))
+	}
+	for _, field := range []string{"result", "outcome", "type", "retained"} {
+		got := spans[0][field]
+		if len(got) == 0 || len(got) > 200 || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
+			t.Errorf("%s logged as %d bytes: %.40q", field, len(got), got)
+		}
 	}
 }
 

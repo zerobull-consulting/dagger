@@ -242,26 +242,24 @@ func TestEnginesScriptMatchesParser(t *testing.T) {
 // sees a manifest it would refuse to start with
 // (zerobull-consulting/dagger#147, item 3).
 func TestEnginesCandidateGitHubOnly(t *testing.T) {
-	run := func(server string) (string, string, error) {
+	run := func(server string) (out, before, after string, err error) {
 		path := filepath.Join(t.TempDir(), "engines.txt")
-		before := "base v1.0.0-beta.25\n" + acceptLine("v1.0.0-beta.25", digestA) + "\n"
+		before = "base v1.0.0-beta.25\n" + acceptLine("v1.0.0-beta.25", digestA) + "\n"
 		require.NoError(t, os.WriteFile(path, []byte(before), 0o644))
 		cmd := exec.Command(filepath.Join(repoRoot, "hack/remote-cache/engines.sh"), "candidate", "v1.0.0-beta.26", digestB)
 		cmd.Env = append(os.Environ(), "ENGINES_FILE="+path, "GITHUB_SERVER_URL="+server, "GITHUB_REPOSITORY=o/r", "GITHUB_RUN_ID=5")
-		out, err := cmd.CombinedOutput()
-		return string(out), string(mustRead(t, path)) + "|" + before, err
+		o, err := cmd.CombinedOutput()
+		return string(o), before, string(mustRead(t, path)), err
 	}
-	out, files, err := run("https://github.com")
+	out, _, after, err := run("https://github.com")
 	require.NoError(t, err, out)
-	after, _, _ := strings.Cut(files, "|")
 	m, err := Parse([]byte(after))
 	require.NoError(t, err)
 	require.Equal(t, "v1.0.0-beta.26", m.Default().Version)
 
-	out, files, err = run("https://ghe.example.com")
+	out, before, after, err := run("https://ghe.example.com")
 	require.Error(t, err, out)
-	require.Contains(t, out, "not a GitHub Actions run URL")
-	after, before, _ := strings.Cut(files, "|")
+	require.Contains(t, out, "GITHUB_SERVER_URL is 'https://ghe.example.com'")
 	require.Equal(t, before, after, "nothing is written")
 }
 
