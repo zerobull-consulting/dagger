@@ -313,20 +313,16 @@ ones written here.**
   changes by accident.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
   upstream repository.
-- **Never stop silently.** When you stop on a question or a blocker, tell
-  your lead before you end the turn. A routine wait on CI or Copilot, with a
-  check-in scheduled, needs no message.
-- **Waiting on your lead:** schedule a check-in to yourself about 10 minutes
-  out (the Claude Code Remote `send_later` tool) before you end the turn. No
-  answer after two check-ins? Send the question once more. Silence is never
-  a no, and never a yes.
+- **Never stop silently.** Stuck on a question or a blocker? Tell your lead
+  before you end the turn, and schedule a check-in to yourself about 10
+  minutes out (the Claude Code Remote `send_later` tool). No answer after two
+  check-ins? Ask once more. Silence is never a no, and never a yes. A
+  routine wait on CI or Copilot, with a check-in scheduled, needs no message.
 
 **The steps. One at a time, top to bottom. Each one is one thing.** "Your
-lead" is whoever started you, named in your standing authorization: a human,
-or an orchestrator session. You reach an orchestrator by the Claude Code
-Remote `send_message` tool (`session_id` `@parent`), and a human in your
-reply. Your lead makes every call about findings, files every issue, and
-merges; you write the code.
+lead" is whoever started you, named in your standing authorization along
+with how to reach them. Your lead makes every call about findings, files
+every issue, and merges; you write the code.
 
 *Get set up*
 
@@ -345,12 +341,11 @@ merges; you write the code.
 4. **Test.** Run the prompt's test commands until they pass. Then prove each
    new test can fail: break what it guards, watch it go red, put it back.
    They could call you the King's Men, 'cause you can break and fix Humpty
-   all day.
-5. **Commit.**
+   all day. **Commit.**
 
 *Self-review, block 1: before anyone else sees it*
 
-6. **Review:** run exactly
+5. **Review:** run exactly
    `/code-review high origin/feature/remote-cache...HEAD`. You need somebody
    who can call you out when you're trippin' in order to be your best self.
    Then check that the files it names are yours, and that you're still on
@@ -359,16 +354,16 @@ merges; you write the code.
 
    *Go home early:* it found nothing? Skip to "The draft".
 
-7. **Sort** each finding in the scratchpad: **security or data loss** (it's
+6. **Sort** each finding in the scratchpad: **security or data loss** (it's
    real, and the code deletes data it shouldn't, publishes an unverified blob
    or bundle, or exposes a token), **real** (you can name the input, the code
    path and the wrong result), **wrong** (you followed the path it names, and
    it doesn't go wrong), or **can't tell**. A finding about how the Dagger
    engine or the bucket behaves is real or wrong only once a run shows it;
-   until then, it's can't tell.
-8. **Hand it to your lead,** the whole list in one message, security or data
-   loss first, with your read on each. Wait for their answer.
-9. **Do what they say,** finding by finding: fix the code or the tests, update
+   until then, it's can't tell. Then hand the whole list to your lead in one
+   message, security or data loss first, with your read on each, and wait
+   for their answer.
+7. **Do what they say,** finding by finding: fix the code or the tests, update
    a doc, or add a known-gap test that pins today's behaviour (name it the
    way that file names its tests, with "known gap" in the name). Run the
    tests until they pass, prove any new test can fail, and **commit** what
@@ -378,54 +373,48 @@ merges; you write the code.
 
 *The draft: CI starts here*
 
-10. **Local green.** Run the prompt's test commands one more time. All of them
-    pass.
-11. **Open the draft.** Push, and open the PR as a **draft** against
-    `feature/remote-cache`. Copilot doesn't review drafts, but every push
-    runs CI, so push when you have something to show. Follow the
-    repository's PR template, if it has one. The description says:
-    - what the PR does;
-    - **the design choices you made:** what you weighed, what you picked and
-      why, and where you'd want a reviewer to push back. Give this real
-      thought: it's the part nobody can get from the diff;
-    - at the very end, the prompt, verbatim (not your standing
-      authorization):
+8. **Open the draft.** Push, and open the PR as a **draft** against
+   `feature/remote-cache`. Copilot doesn't review drafts, but every push
+   runs CI, so push when you have something to show. Follow the
+   repository's PR template, if it has one. The description says:
+   - what the PR does;
+   - **the design choices you made:** what you weighed, what you picked and
+     why, and where you'd want a reviewer to push back. Give this real
+     thought: it's the part nobody can get from the diff;
+   - at the very end, the prompt, verbatim (not your standing
+     authorization):
 
-    ```markdown
-    ## Prompt
+   ```markdown
+   ## Prompt
 
-    <details><summary>The prompt that started this PR</summary>
+   <details><summary>The prompt that started this PR</summary>
 
-    (the prompt, verbatim)
+   (the prompt, verbatim)
 
-    </details>
-    ```
+   </details>
+   ```
 
-    Keep the blank lines around the prompt, so its Markdown renders.
-12. **Check in later.** Before you end any turn while waiting on CI or
-    Copilot, schedule a check-in to yourself about 10 minutes out (the Claude
-    Code Remote `send_later` tool), and subscribe to the PR's activity if you
-    have the `subscribe_pr_activity` tool. Never go idle without a check-in.
-    When it fires, read the PR's checks and reviews yourself: they can land
-    without waking you. This goes for every wait from here on.
-13. **Get CI green.** Red? Fix it. Test it. Repeat until green. Draft pushes
+   Keep the blank lines around the prompt, so its Markdown renders.
+9. **Check in later.** Before you end any turn while waiting on CI or
+   Copilot, schedule a check-in to yourself about 10 minutes out (the Claude
+   Code Remote `send_later` tool), and subscribe to the PR's activity if you
+   have the `subscribe_pr_activity` tool. Never go idle without a check-in.
+   When it fires, read the PR's checks and reviews yourself: they can land
+   without waking you. This goes for every wait from here on.
+10. **Get CI green.** Red? Fix it. Test it. Repeat until green. Draft pushes
     are cheap insurance. Fix the root cause: never retry, skip, loosen or
     quarantine a check.
-14. **Check in with your lead** after the first green CI. Give them the size
+11. **Check in with your lead** after the first green CI. Give them the size
     of the diff and how you're feeling about the scope, and wait for them to
     give the approval to keep going. If they split the work, do what they
     say about this PR's scope, then get CI green again before you go on. The
-    size is the lines added plus deleted, every file counted:
-
-    ```bash
-    git fetch origin feature/remote-cache &&
-      git diff --numstat origin/feature/remote-cache...HEAD |
-      awk '{n += $1 + $2} END {print n}'
-    ```
+    size is the insertions plus deletions from
+    `git diff --shortstat origin/feature/remote-cache...HEAD`, after a
+    `git fetch origin feature/remote-cache`.
 
 *Copilot, round 1*
 
-15. **Mark "ready for review".** That starts Copilot review 1. Check in
+12. **Mark "ready for review".** That starts Copilot review 1. Check in
     later. If the review fails to run, re-request it once. If the re-run
     fails too, tell your lead and wait for their answer: no review isn't a
     clean review. Never push to trigger a review.
@@ -433,11 +422,11 @@ merges; you write the code.
     *Go home early:* Copilot came back clean and CI is green? You're done
     reviewing. Skip to "Wrap it up". Nice.
 
-16. **Take Copilot's findings:** every finding from its review (red, yellow,
+13. **Take Copilot's findings:** every finding from its review (red, yellow,
     blue, and anything you can only read in its session). Sort each one, same
     four reads as before, then hand the list to your lead and ask for a
     decision on each. Wait for their answer.
-17. **Do what they say,** run the tests, prove any new test can fail, and
+14. **Do what they say,** run the tests, prove any new test can fail, and
     **commit what you changed. Do not push yet.** If CI went red on the ready
     PR, fix that too, at the root cause. Hold that push like it's the last
     slice of pizza. Reply on each of Copilot's threads with what you did, and
@@ -445,19 +434,18 @@ merges; you write the code.
 
 *Self-review, block 2: check those fixes*
 
-18. **Review:** run exactly
+15. **Review:** run exactly
     `/code-review high origin/feature/remote-cache...HEAD` again. Fresh eyes
     on fresh code. Check the files and your branch again.
 
     *Go home early:* it found nothing? Skip to "Push, once".
 
-19. **Sort** each finding, same four reads.
-20. **Hand it to your lead,** the whole list in one message, and wait for
-    their answer.
-21. **Do what they say,** run the tests, prove any new test can fail, and
+16. **Sort** each finding, same four reads, then hand the list to your lead
+    and wait for their answer.
+17. **Do what they say,** run the tests, prove any new test can fail, and
     **commit what you changed.** Still no push. If your lead says "another
     round", go back to **Review**. Otherwise, on to "Push, once".
-22. **Push, once.** Nothing committed since you marked it ready? Don't push:
+18. **Push, once.** Nothing committed since you marked it ready? Don't push:
     skip to "Wrap it up". Otherwise run the tests until they're green, then
     make one push carrying every commit since you marked it ready. It starts
     Copilot review 2. No touch-ups or rebases sneaking in alongside. Check in
@@ -466,7 +454,7 @@ merges; you write the code.
 
 *Copilot, round 2: hands off the code*
 
-23. **CI red on review 2's head?** Fix the root cause and push: no retries,
+19. **CI red on review 2's head?** Fix the root cause and push: no retries,
     skips or loosened checks. That's the one push you don't need to ask for.
     Otherwise, from here on you push only when your lead says to. Any
     Copilot review after review 2 is handled like review 2: sort, hand over,
@@ -474,24 +462,23 @@ merges; you write the code.
 
     *Go home early:* review 2 came back clean? Skip to "Wrap it up".
 
-24. **Sort** review 2's findings, same four reads.
-25. **Hand it to your lead,** the whole list in one message, and wait for
-    their answer.
-26. **Do what they say.** If that means changing code, it's block 3, and it
+20. **Sort** review 2's findings, same four reads, then hand the list to your
+    lead and wait for their answer.
+21. **Do what they say.** If that means changing code, it's block 3, and it
     happens only because your lead said so: fix, test, prove any new test can
     fail, commit, local green, push, CI green. Reply on each of Copilot's
     threads with what you did, and resolve it.
 
 *Wrap it up*
 
-27. **Hand off.** Check the prompt's "Done when" list. Then send your lead a
+22. **Hand off.** Check the prompt's "Done when" list. Then send your lead a
     **"ready to merge" report**: the head SHA, Copilot reviews used, every
     finding with what your lead decided and what you did, anything on "Done
     when" that isn't met, and a squash title and message (the PR's title plus
     `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`; the
     message is everything in the PR description above `## Prompt`). Your lead
     merges, files what they decided to file, closes the issue, and tells you.
-28. **After the merge:** unsubscribe from the PR if you subscribed. Report
+23. **After the merge:** unsubscribe from the PR if you subscribed. Report
     review rounds used and what changed. Go home. You earned it.
 
 <!-- END VERBATIM: copy to here -->
