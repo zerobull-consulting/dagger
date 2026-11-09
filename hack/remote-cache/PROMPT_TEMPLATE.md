@@ -78,7 +78,7 @@ Within the task in the first message, you may, without asking first:
 - merge your own PR, as the steps describe (session merges);
 - close the issue your PR closes, once it has merged (session merges).
 
-You may not, without asking first:
+You may not:
 - merge any PR or close any issue (lead merges);
 - change repository settings or rulesets.
 
@@ -398,9 +398,10 @@ review the same code again. Skip to "The draft".
     Keep the blank lines around the prompt, so its Markdown renders.
 13. **Check in later.** Before you end any turn while waiting on CI or
     Copilot, schedule a check-in to yourself about 10 minutes out (the Claude
-    Code Remote `send_later` tool). Never go idle without one. When it fires,
-    read the PR's checks and reviews yourself: they can land without waking
-    you. This goes for every wait from here on.
+    Code Remote `send_later` tool), and subscribe to the PR's activity if you
+    have the `subscribe_pr_activity` tool. Never go idle without a check-in.
+    When it fires, read the PR's checks and reviews yourself: they can land
+    without waking you. This goes for every wait from here on.
 14. **Get CI green.** Red? Fix it. Test it. Repeat until green. Draft pushes
     are cheap insurance. Fix the root cause: never retry, skip, loosen or
     quarantine a check.
@@ -419,8 +420,8 @@ review the same code again. Skip to "The draft".
 
 17. **Reject** the ones that don't hold up, same bar as your self-reviews.
     Reply on each thread with what you traced, and resolve it. Scratchpad it.
-    One that needs a design change goes to your lead; reply on its thread
-    once they've answered.
+    One that needs a design change goes to your lead: wait for their answer
+    before the fix push, then reply on its thread.
 18. **Fix** the real ones, each with a test that fails without the fix. If CI
     went red on the ready PR, fix that too, at the root cause, same as on the
     draft. Run the tests, then read your whole diff once more yourself: nobody
@@ -439,8 +440,8 @@ review the same code again. Skip to "The draft".
 
 20. **Record** every finding from review 2: new findings, a 🔵 "Needs a
     closer look" with or without text, findings only in its session. From
-    here on you don't push, except for the two cases below. You've done the
-    work. Let it ride.
+    here on you don't push, except in the cases below. You've done the work.
+    Let it ride.
 21. **File** each *confirmed* finding (you traced a real path to the failure)
     as an issue that references the issue your PR closes, says how to
     reproduce it, and asks for a known-gap test or the fix. The test comes
@@ -450,15 +451,17 @@ review the same code again. Skip to "The draft".
     with what you traced, resolve it, and scratchpad it.
 23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
     ask your lead what to do with that finding. Do what they say, then reply
-    on its thread and resolve it.
-24. **The only two pushes allowed after review 2:**
+    on its thread and resolve it. If it needs a code fix, file it as an issue
+    like a confirmed finding, unless your lead explicitly asks for a push now.
+24. **The only pushes allowed after review 2:**
     - CI is red on review 2's head: fix the root cause. No retries, skips or
       loosened checks here either.
     - A confirmed finding means the PR deletes data it shouldn't, publishes
       an unverified blob or bundle, or exposes a token: fix it, with a test.
+    - Your lead explicitly asked for a push to fix a finding.
 
-    Either push starts a review that's handled like review 2: nothing more is
-    pushed for it.
+    Each of these starts a review that's handled like review 2: nothing more
+    is pushed for it.
 
 *Wrap it up*
 
@@ -487,9 +490,9 @@ review the same code again. Skip to "The draft".
       (`session_id` `@parent`); a human, in your reply. They check it, merge,
       and tell you.
 27. **After the merge:** do your part of the prompt's "After the merge" list
-    (your lead does the rest if they merged), and unsubscribe from the
-    PR. Report review rounds used, what was fixed, and which issues were
-    filed. Go home. You earned it.
+    (your lead does the rest if they merged), and unsubscribe from the PR if
+    you subscribed. Report review rounds used, what was fixed, and which
+    issues were filed. Go home. You earned it.
 
 <!-- END VERBATIM: copy to here -->
 
@@ -607,11 +610,11 @@ each change small (zerobull-consulting/dagger#198).
   step becomes a "ready to merge" report.
 - **Before the lead merges,** it checks the report against the PR: the
   ruleset's required checks passed on the head being merged; at most two
-  Copilot reviews, plus one for each push the steps allow after review 2 (a
-  CI fix, or a fix for deleted data, an unverified blob or bundle, or an
-  exposed token), and nothing else pushed after review 2; and the prompt
-  verbatim in the PR. The steps don't state the cap as a number, so this is
-  where it's checked.
+  Copilot reviews, plus one for each push the steps allow after review 2 (a CI
+  fix; a fix for deleted data, an unverified blob or bundle, or an exposed
+  token; or a fix the lead asked for), and nothing else pushed after review 2;
+  and the prompt verbatim in the PR. The steps don't state the cap as a
+  number, so this is where it's checked.
 - **When a session asks about a finding it couldn't confirm,** the lead
   decides: file it on its own, add it to an issue with similar ones, or drop
   it. The session never makes that call.
