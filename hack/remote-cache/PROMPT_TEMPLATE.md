@@ -354,9 +354,9 @@ reply.
    it done until the fix is slappin' and the tests are passin'. **Commit**
    what you fixed.
 
-*Bail early:* nothing committed in round 1, because it found nothing or you
-rejected it all? Round 2 would just review the same code again. Skip to "The
-draft".
+*Bail early:* nothing committed in round 1? Maybe it found nothing, you
+rejected it all, or your lead said to leave it. Either way, round 2 would just
+review the same code again. Skip to "The draft".
 
 *Self-review, round 2: check the fixes*
 
@@ -466,8 +466,8 @@ draft".
     scratchpad: every rejection that deserves a follow-up gets its **own tiny
     issue** referencing the issue your PR closes. One idea per issue. Small
     radius, every time. Findings you already filed after review 2 are done,
-    and rejections that were plainly wrong (the tests contradict them) need
-    no issue.
+    and rejections that were plainly wrong (you traced them, or the tests
+    contradict them) need no issue.
 26. **Merge, or hand off.** Check the prompt's "Done when" list first.
     **Stop and report instead of merging** if an item on it isn't met, if CI
     stays red after a genuine fix, or if a fix after review 2 needs a design
