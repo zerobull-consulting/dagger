@@ -19,6 +19,9 @@ file](#changing-this-file)).
   block. It's the record of how that execution was instructed.
 - **The template is how prompts are generated,** and where the process
   improves.
+- **The standing authorization goes with every prompt:** in the session's
+  system prompt from an orchestrator, or at the top of the first message from
+  a human (see [The lead](#the-lead)). It never goes in the PR.
 
 ## The lead
 
@@ -105,7 +108,10 @@ An example comes first, then each section in detail.
 
 An illustration, not a real item: `<issue>`, `<other>` and `<N>` stand in
 for real numbers. Everything else is the shape a real prompt takes, down to
-how much each section says.
+how much each section says. A real launch also needs a standing
+authorization, filled in from [The standing
+authorization](#the-standing-authorization); this example's would name an
+orchestrator lead that merges.
 
 ````markdown
 # `lifecycle claim`: a `-dry-run` flag (zerobull-consulting/dagger#<issue>)
@@ -599,7 +605,8 @@ each change small (zerobull-consulting/dagger#198).
 ## Conventions for the whole prompt
 
 - Say when to **stop and ask** rather than decide: design decisions, a missing
-  prerequisite, anything irreversible.
+  prerequisite, a Dagger engine change, and anything the session can't undo
+  that its authorization doesn't cover.
 - **Measure before choosing a number,** and put the measurement in the PR.
 - **Decisions that are the requester's are settled before the session starts,**
   and written into the prompt as decided: credentials, Dagger engine changes,
