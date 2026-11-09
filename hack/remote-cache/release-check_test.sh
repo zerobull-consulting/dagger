@@ -140,8 +140,9 @@ case "$method $path" in
 		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "'"$e2e"'"}]},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
 "GET repos/o/r/actions/runs/"*)
-	# FAKE_RUN_READ_FAIL: no run can be read.
-	[[ -n "${FAKE_RUN_READ_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
+	# FAKE_RUN_READ_FAIL: no run can be read (as gh does, the error's body
+	# on stdout).
+	[[ -n "${FAKE_RUN_READ_FAIL:-}" ]] && { echo '{"message": "Server Error"}'; echo "HTTP 502" >&2; exit 1; }
 	# A run whose conclusion is "running" hasn't completed (yet).
 	c="$(cat "$FAKE/run-${path##*/}")"
 	if [[ "$c" == running ]]; then echo '{"status": "in_progress", "conclusion": null}'; else

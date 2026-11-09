@@ -241,9 +241,8 @@ fetch_tag() {
 # pending_run: a dispatched candidate run whose verdict hasn't been read
 # yet. If the script ends in failure with one pending (in verify's fetches
 # and advisory diff, or in verify's or rebuild's wait or verdict read), it is
-# cancelled (best
-# effort, with GITHUB_TOKEN), not left to run unread
-# (zerobull-consulting/dagger#163, zerobull-consulting/dagger#187).
+# cancelled, best effort and with GITHUB_TOKEN, rather than left to run
+# unread (zerobull-consulting/dagger#163, zerobull-consulting/dagger#187).
 # wait_since: when verify dispatched (SECONDS), which wait_run counts its
 # deadline from.
 pending_run=""
@@ -254,18 +253,22 @@ tree=""
 cleanup() {
 	local rc=$?
 	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
-		local url="$server/$repo/actions/runs/$pending_run" run=""
+		local url="$server/$repo/actions/runs/$pending_run" state
 		# A run that has already ended can't be cancelled (the API refuses):
 		# it is said to have ended, not to be cancelled.
 		if api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1; then
 			say "the candidate run $url is not awaited and no result is given: cancelled it"
-		elif run="$(api "repos/$repo/actions/runs/$pending_run" 2>/dev/null)" &&
-			[[ "$(jq -r .status <<<"$run" 2>/dev/null)" == completed ]]; then
-			say "the candidate run $url ended '$(jq -r '.conclusion // ""' <<<"$run")' and no result is given: nothing to cancel"
-		elif [[ -n "$run" ]]; then
-			say "the candidate run $url is not awaited and no result is given; cancelling it failed: it will finish unread"
 		else
-			say "the candidate run $url is not awaited and no result is given; cancelling it and reading its state failed: it may finish unread"
+			# "<status> <conclusion>", read once; empty when the read fails
+			# (gh prints an error's body on stdout, so its output alone
+			# doesn't say the read worked).
+			state="$(api "repos/$repo/actions/runs/$pending_run" 2>/dev/null |
+				jq -r '"\(.status) \(.conclusion // "")"' 2>/dev/null)" || state=""
+			case "$state" in
+			"completed "*) say "the candidate run $url ended '${state#completed }' and no result is given: nothing to cancel" ;;
+			"") say "the candidate run $url is not awaited and no result is given; cancelling it and reading its state failed: it may finish unread" ;;
+			*) say "the candidate run $url is not awaited and no result is given; cancelling it failed: it will finish unread" ;;
+			esac
 		fi
 	fi
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
