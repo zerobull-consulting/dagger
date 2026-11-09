@@ -491,7 +491,7 @@ every issue, and merges; you write the code.
 This section isn't copied into prompts. It's the history behind section 12,
 so changes to the steps can be weighed against what taught us each one.
 
-**The first Sonnet runs.** Three items ran on Sonnet with this section 12
+**The first Sonnet runs.** Three items ran on Sonnet
 (zerobull-consulting/dagger#207, zerobull-consulting/dagger#208,
 zerobull-consulting/dagger#210). Four slips led to four edits:
 - one opened its draft before block 1, so step 8 now says "only after
