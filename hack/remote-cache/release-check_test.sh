@@ -140,6 +140,8 @@ case "$method $path" in
 		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "'"$e2e"'"}]},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
 "GET repos/o/r/actions/runs/"*)
+	# FAKE_RUN_READ_FAIL: no run can be read.
+	[[ -n "${FAKE_RUN_READ_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
 	# A run whose conclusion is "running" hasn't completed (yet).
 	c="$(cat "$FAKE/run-${path##*/}")"
 	if [[ "$c" == running ]]; then echo '{"status": "in_progress", "conclusion": null}'; else
@@ -669,6 +671,13 @@ echo running >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0 FAKE_CANCEL_FAIL=1
 check "a cancel that fails (zerobull-consulting/dagger#187): is said to have failed" has "$tmp/out" "cancelling it failed: it will finish unread"
 check "a cancel that fails (zerobull-consulting/dagger#187): not to have cancelled" not has "$tmp/out" "cancelled it"
+# Neither the cancel nor the run's read works: its state is unknown.
+setup
+echo running >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0 FAKE_CANCEL_FAIL=1 FAKE_RUN_READ_FAIL=1
+check "a cancel and a read that fail (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a cancel and a read that fail (zerobull-consulting/dagger#187): the state is said to be unknown" has "$tmp/out" "cancelling it and reading its state failed: it may finish unread"
+check "a cancel and a read that fail (zerobull-consulting/dagger#187): not that it will finish unread" not has "$tmp/out" "it will finish unread"
 # The run ends while the jobs read keeps failing: the cancel is tried and
 # refused, and the message says the run ended rather than that it was
 # cancelled.
@@ -685,6 +694,9 @@ check "a jobs read that fails (zerobull-consulting/dagger#187): nor that the can
 setup
 echo cancelled >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
+check "a run that ended cancelled (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a run that ended cancelled (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
+check "a run that ended cancelled (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
 check "a run that ended cancelled (zerobull-consulting/dagger#187): is said to have ended" has "$tmp/out" "ended 'cancelled' and no result is given: nothing to cancel"
 check "a run that ended cancelled (zerobull-consulting/dagger#187): not to be cancelled by the check" not has "$tmp/out" "cancelled it"
 # A verdict that is read: nothing is cancelled.
@@ -693,6 +705,31 @@ echo failure >"$FAKE/conclusions"
 run verify v1.0.0-beta.26 "$d2"
 check "a verdict that is read (zerobull-consulting/dagger#187): is given" has "$tmp/out" "result=fail"
 check "a verdict that is read (zerobull-consulting/dagger#187): nothing is cancelled" not has "$FAKE/calls" "/cancel"
+# The rebuild's run too: a wait that times out, or a jobs read that fails.
+setup
+printf 'failure\nrunning\n' >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" RELEASE_CHECK_WAIT_MINUTES=0
+check "a rebuild wait that times out (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a rebuild wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
+check "a rebuild wait that times out (zerobull-consulting/dagger#187): the run is cancelled" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5002/cancel"
+check "a rebuild wait that times out (zerobull-consulting/dagger#187): and said to be" has "$tmp/out" "is not awaited and no result is given: cancelled it"
+check "a rebuild wait that times out (zerobull-consulting/dagger#187): no PR" test "$(jq length "$FAKE/pulls.json")" = 0
+setup
+printf 'failure\nsuccess\n' >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" FAKE_JOBS_FAIL=1
+check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5002/cancel"
+check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): the run is said to have ended" has "$tmp/out" "ended 'success' and no result is given: nothing to cancel"
+check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): no PR" test "$(jq length "$FAKE/pulls.json")" = 0
+# A rebuild whose verdict is read: nothing is cancelled.
+setup
+printf 'failure\nfailure\n' >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+run_bot rebuild v1.0.0-beta.26 "$d2"
+check "a rebuild verdict that is read (zerobull-consulting/dagger#187): is given" has "$tmp/out" "result=fail"
+check "a rebuild verdict that is read (zerobull-consulting/dagger#187): nothing is cancelled" not has "$FAKE/calls" "/cancel"
 setup
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
 check "a test ref that isn't a branch name is refused" test "$status" -ne 0

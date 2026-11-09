@@ -948,7 +948,8 @@ only decides when it runs and with which token.
    - **B, otherwise:** `release-check/rebuild/<version>`, as
      `CACHE_BOT_SYNC_TOKEN`: the tag merged with a merge commit, the `base`
      line moved. That branch is verified the same way: a dispatch on it, and
-     the bundle test's verdict, which is for this same merge. If green, it
+     the bundle test's verdict, which is for this same merge (a wait that
+     times out, or a verdict that can't be read, cancels its run too). If green, it
      gets the accept line, citing that run, and a PR. If the bundle or
      protocol version changed, the accept list resets to that one version.
      **A human merges it, with a merge commit.** No rebuild is tried if the

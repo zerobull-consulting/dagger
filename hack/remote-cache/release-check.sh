@@ -239,8 +239,9 @@ fetch_tag() {
 }
 
 # pending_run: a dispatched candidate run whose verdict hasn't been read
-# yet. If the script ends in failure with one pending (in the fetches, the
-# advisory diff, the wait or the verdict's read), it is cancelled (best
+# yet. If the script ends in failure with one pending (in verify's fetches
+# and advisory diff, or in verify's or rebuild's wait or verdict read), it is
+# cancelled (best
 # effort, with GITHUB_TOKEN), not left to run unread
 # (zerobull-consulting/dagger#163, zerobull-consulting/dagger#187).
 # wait_since: when verify dispatched (SECONDS), which wait_run counts its
@@ -253,7 +254,7 @@ tree=""
 cleanup() {
 	local rc=$?
 	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
-		local url="$server/$repo/actions/runs/$pending_run" run
+		local url="$server/$repo/actions/runs/$pending_run" run=""
 		# A run that has already ended can't be cancelled (the API refuses):
 		# it is said to have ended, not to be cancelled.
 		if api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1; then
@@ -261,8 +262,10 @@ cleanup() {
 		elif run="$(api "repos/$repo/actions/runs/$pending_run" 2>/dev/null)" &&
 			[[ "$(jq -r .status <<<"$run" 2>/dev/null)" == completed ]]; then
 			say "the candidate run $url ended '$(jq -r '.conclusion // ""' <<<"$run")' and no result is given: nothing to cancel"
-		else
+		elif [[ -n "$run" ]]; then
 			say "the candidate run $url is not awaited and no result is given; cancelling it failed: it will finish unread"
+		else
+			say "the candidate run $url is not awaited and no result is given; cancelling it and reading its state failed: it may finish unread"
 		fi
 	fi
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
@@ -861,7 +864,11 @@ cmd_rebuild() {
 	fi
 	local id
 	id="$(start_tests "release-check/rebuild/$v" "$v" "$d")"
+	# As in verify: a wait that times out, or a verdict that can't be read,
+	# cancels the run (zerobull-consulting/dagger#187).
+	pending_run="$id"
 	b="$(finish_tests "$id" b)"
+	pending_run=""
 	note b "$b"
 	if [[ "$b" != pass ]]; then
 		out result fail
