@@ -345,11 +345,13 @@ reply.
 
    *Go home early (a little):* found nothing? Skip the next two steps.
 
-7. **Reject** findings that are wack: ones that need a significant design
-   change, or that the test suite you can see with your own two eyes
-   contradicts. Write each one and your reasoning into the scratchpad.
+7. **Reject** findings that are wack: ones the test suite you can see with
+   your own two eyes contradicts. Write each one and your reasoning into the
+   scratchpad. A finding that needs a significant design change? Don't
+   reject it and don't fix it: ask your lead.
 8. **Fix** each finding you kept, and run the tests. You got this. Don't call
-   it done until the fix is slappin' and the tests are passin'. **Commit.**
+   it done until the fix is slappin' and the tests are passin'. **Commit**
+   what you fixed.
 
 *Bail early:* nothing committed in round 1, because it found nothing or you
 rejected it all? Round 2 would just review the same code again. Skip to "The
@@ -364,7 +366,8 @@ draft".
    *Go home early (a little more):* found nothing? Skip the next two steps.
 
 10. **Reject** what doesn't hold up. Same bar as before, new scratchpad
-    entries.
+    entries, and a finding that needs a design change still goes to your
+    lead.
 11. **Fix** what does, test it, **commit.** Look at you go.
 
 *The draft: CI starts here*
@@ -415,6 +418,8 @@ draft".
 
 17. **Reject** the ones that don't hold up, same bar as your self-reviews.
     Reply on each thread with what you traced, and resolve it. Scratchpad it.
+    One that needs a design change goes to your lead; reply on its thread
+    once they've answered.
 18. **Fix** the real ones, each with a test that fails without the fix. If CI
     went red on the ready PR, fix that too, at the root cause, same as on the
     draft. Run the tests, then read your
@@ -434,11 +439,13 @@ draft".
 
 20. **Record** every finding from review 2: new findings, a 🔵 "Needs a
     closer look" with or without text, findings only in its session. From
-    here on you don't push. You've done the work. Let it ride.
+    here on you don't push, except for the two cases below. You've done the
+    work. Let it ride.
 21. **File** each *confirmed* finding (you traced a real path to the failure)
     as an issue that references the issue your PR closes, says how to
     reproduce it, and asks for a known-gap test or the fix. The test comes
-    with that later work, not this PR.
+    with that later work, not this PR. Reply on its thread with the issue
+    link, and resolve it.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
 23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
