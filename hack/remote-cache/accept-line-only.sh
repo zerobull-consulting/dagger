@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The accept-line-only check (zerobull-consulting/dagger#117, D5, outcome
-# A): the release check auto-merges its accept PRs, so such a PR must change
-# nothing but one added accept line. Run on every pull request by
-# .github/workflows/remote-cache-auto-merge-add-compatible-engine.yml, as the "auto-merge: adds compatible engine only"
-# check:
+# The "auto-merge: adds compatible engine only" check
+# (zerobull-consulting/dagger#117, D5, outcome A): the release check
+# auto-merges its accept PRs, so such a PR must change nothing but one added
+# accept line. Run on every pull request by
+# .github/workflows/remote-cache-auto-merge-add-compatible-engine.yml:
 #
 #   accept-line-only.sh check <base sha> <head sha> <head ref>
 #       A PR from a release-check/accept/<version> branch passes only if,

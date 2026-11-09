@@ -3,7 +3,8 @@
 # upstream Dagger release against the cache service, and ends it as one of
 #
 #   A  passes as-is: a PR adding its accept line, which auto-merges once
-#      the accept-line-only check is required (RELEASE_CHECK_AUTO_MERGE);
+#      the "auto-merge: adds compatible engine only" check is required
+#      (RELEASE_CHECK_AUTO_MERGE);
 #   B  passes after rebuilding on the new tag: a PR merging the tag, moving
 #      the base line and adding the accept line, for a human to merge with
 #      a merge commit;
