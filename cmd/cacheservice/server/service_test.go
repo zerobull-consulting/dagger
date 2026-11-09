@@ -820,6 +820,25 @@ func TestOTLPTraceLogsBounded(t *testing.T) {
 	}
 }
 
+// TestOTLPEventLogsBounded: the engine's event scope name reaches the log
+// cut, on a rune boundary.
+func TestOTLPEventLogsBounded(t *testing.T) {
+	_, rec, srv := newTestService(t, "")
+	req := engineLogs()
+	req.ResourceLogs[0].ScopeLogs[0].Scope.Name = strings.Repeat("é", 100000)
+	if code := otlpPost(t, srv.URL+"/v1/logs", req, &collogspb.ExportLogsServiceResponse{}, false, false); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	events := rec.find("engine event")
+	if len(events) != 1 {
+		t.Fatalf("%d engine events logged", len(events))
+	}
+	got := events[0]["scope"]
+	if len(got) == 0 || len(got) > 200 || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
+		t.Errorf("scope logged as %d bytes: %.40q", len(got), got)
+	}
+}
+
 func TestOTLPMetrics(t *testing.T) {
 	_, rec, srv := newTestService(t, "")
 	req := &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
