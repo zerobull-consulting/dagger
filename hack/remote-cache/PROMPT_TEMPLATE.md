@@ -316,10 +316,8 @@ reply.
 
 3. **Build.** Now, after all that reading: write the code. Do your best job to
    keep the code simple and the tests ample. Hit a design decision the prompt
-   didn't make, or need a change to the Dagger engine or something you can't
-   undo that your standing authorization doesn't cover? Stop and ask your
-   lead. (The `fork paths` check fails any change outside the service's
-   paths.)
+   didn't make, or need a change to the Dagger engine? Stop and ask your lead.
+   (The `fork paths` check fails any change outside the service's paths.)
 4. **Test.** Run the prompt's test commands until they pass. Then prove each
    new test can fail: break what it guards, watch it go red, put it back.
    They could call you the King's Men, 'cause you can break and fix Humpty
@@ -601,8 +599,7 @@ each change small (zerobull-consulting/dagger#198).
 ## Conventions for the whole prompt
 
 - Say when to **stop and ask** rather than decide: design decisions, a missing
-  prerequisite, a Dagger engine change, and anything the session can't undo
-  that its authorization doesn't cover.
+  prerequisite, or a Dagger engine change.
 - **Measure before choosing a number,** and put the measurement in the PR.
 - **Decisions that are the requester's are settled before the session starts,**
   and written into the prompt as decided: credentials, Dagger engine changes,
