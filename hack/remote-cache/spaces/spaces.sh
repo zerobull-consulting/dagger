@@ -3,7 +3,15 @@
 #
 #   spaces.sh up                  create the bucket and the admin, write and read keys
 #   spaces.sh env admin|write|read  print one key's CACHESERVICE_S3_* settings as exports
+#   spaces.sh github              store the write (or read) key's settings in GitHub with gh
 #   spaces.sh down                destroy the keys and the bucket, objects included
+#
+# For a bucket per GitHub repository and environment, give each its own
+# workspace, and the same TF_WORKSPACE and -var arguments to every command:
+#
+#   export TF_WORKSPACE=dagger-ci
+#   spaces.sh up -var github_repository=owner/name -var github_environment=ci
+#   spaces.sh github
 #
 # Needs terraform (or tofu via TF=tofu) and one DigitalOcean API token in
 # DIGITALOCEAN_TOKEN (or TF_VAR_do_token). The bucket is named
@@ -33,6 +41,7 @@ up)
 	"$tf" apply -input=false -auto-approve "$@"
 	echo
 	echo "Settings for a key: ./spaces.sh env admin|write|read"
+	echo "Into GitHub: ./spaces.sh github"
 	;;
 env)
 	role="${1:-}"
@@ -46,13 +55,22 @@ env)
 for k, v in sorted(json.load(sys.stdin).items()):
     print("export %s=%s" % (k, shlex.quote(v)))'
 	;;
+github)
+	command -v gh >/dev/null || {
+		echo "spaces.sh: github needs the gh CLI, logged in (gh auth login)" >&2
+		exit 2
+	}
+	# The script pipes each value into gh from printf, a bash builtin, so no
+	# secret is on a command line, and nothing is written to disk.
+	"$tf" output -raw gh_secret_set | bash
+	;;
 down)
 	need
 	"$tf" init -input=false
 	"$tf" destroy -input=false -auto-approve "$@"
 	;;
 *)
-	echo "usage: spaces.sh up|env <role>|down" >&2
+	echo "usage: spaces.sh up|env <role>|github|down" >&2
 	exit 2
 	;;
 esac
