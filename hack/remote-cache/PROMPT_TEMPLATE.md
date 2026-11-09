@@ -71,8 +71,8 @@ it isn't.
 - Branch name and base.
 - The closing-keyword caveat: keywords don't fire on feature branches, so
   close by hand.
-- **Who merges:** the session (the default), the user, or the orchestrating
-  session. Section 12's merge step covers each case.
+- **Who merges:** the session (the default), or its lead (the human or the
+  orchestrator session that started it). Section 12's merge step covers both.
 
 The rest (draft first, full references, the prompt in the PR, the squash title
 and message) is in section 12, so it isn't repeated here.
@@ -116,7 +116,7 @@ Observable outcomes, each shown by a test or a run.
 ### 10. After the merge
 
 Issues to close by hand, comments to post and where, and follow-up issues to
-file. Say who does each (the orchestrator, when it merges).
+file. Say who does each (the lead, when it merges).
 
 *Why:* keeps the tracking issue and the issues that depend on this one current
 without the requester doing it.
@@ -162,7 +162,8 @@ ones written here.**
 - Stop and ask, instead of deciding, on a design decision that's the
   requester's, a missing prerequisite, or anything irreversible.
 
-**The steps. One at a time, top to bottom. Each one is one thing.**
+**The steps. One at a time, top to bottom. Each one is one thing.** "Your
+lead" means whoever started you: a human, or an orchestrator session.
 
 *Get set up*
 
@@ -188,8 +189,8 @@ ones written here.**
    ```
 
    Over about 2,500 lines: stop and split it into issues, now, before
-   anybody reviews it. Ask your orchestrator for help. This number decides
-   it once, and nothing later reopens it.
+   anybody reviews it. Ask your lead for help. This number decides it once,
+   and nothing later reopens it.
 
 *Self-review, round 1: before anyone else sees it*
 
@@ -318,15 +319,15 @@ ones written here.**
     `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`; the
     message is the PR's summary, without the prompt. Then, depending on who
     merges (the prompt's "Branch and PR" says):
-    - **You:** merge it.
-    - **The user:** stop here and report.
-    - **The orchestrating session:** send it a **"ready to merge" report**
-      (the Claude Code Remote `send_message` tool, `session_id` `@parent`):
-      the head SHA, Copilot reviews used, what the self-reviews and Copilot
-      found, what you fixed, the issues and leads you filed, and the exact
-      squash title and message. It checks and merges, and tells you.
+    - **You** (the default): merge it.
+    - **Your lead:** send them a **"ready to merge" report**: the head SHA,
+      Copilot reviews used, what the self-reviews and Copilot found, what you
+      fixed, the issues and leads you filed, and the exact squash title and
+      message. A session gets it by the Claude Code Remote `send_message`
+      tool (`session_id` `@parent`); a human, in your reply. They check it,
+      merge, and tell you.
 27. **After the merge:** do your part of the prompt's "After the merge" list
-    (the orchestrator does the rest when it merged), and unsubscribe from the
+    (your lead does the rest if they merged), and unsubscribe from the
     PR. Report review rounds used, what was fixed, and which issues were
     filed. Go home. You earned it.
 
@@ -429,9 +430,9 @@ small (zerobull-consulting/dagger#198).
   and written into the prompt as decided: credentials, engine changes,
   ruleset changes, design forks. A question that only the requester can answer
   stalls a session that hits it.
-- **Who merges** is stated in section 4: by default the session. A prompt
-  written by an orchestrating session says the orchestrator merges, which
-  makes the merge step a "ready to merge" report.
+- **Who merges** is stated in section 4: by default the session. When the
+  lead merges (a human, or the orchestrator session that wrote the prompt),
+  the merge step becomes a "ready to merge" report.
 - When picking several items to run in parallel: refresh the state first
   (commits, open PRs, issues filed since the last round, and running sessions,
   not just PRs); map which files each item touches and avoid two items in the
