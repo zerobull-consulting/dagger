@@ -37,8 +37,9 @@ The lead writes two things for each session:
 2. **The prompt:** what to build and how (the template, next).
 
 The lead then answers the session's questions, decides what to do with
-findings the session can't confirm, checks the "ready to merge" report, and,
-when the lead merges, merges and closes the issue.
+findings that need a design change and with all of Copilot review 2's
+findings, checks the "ready to merge" report, and, when the lead merges,
+merges and closes the issue.
 
 ### The standing authorization
 
@@ -372,7 +373,7 @@ review the same code again. Skip to "The draft".
 
 10. **Reject** what doesn't hold up. Same bar as before, new scratchpad
     entries, and a finding that needs a design change still goes to your
-    lead.
+    lead: wait for their answer before you fix anything.
 11. **Fix** what does, test it, **commit.** Look at you go.
 
 *The draft: CI starts here*
@@ -445,32 +446,26 @@ review the same code again. Skip to "The draft".
 
 20. **Record** every finding from review 2: new findings, a 🔵 "Needs a
     closer look" with or without text, findings only in its session. From
-    here on you don't push, except in the cases below. You've done the work.
-    Let it ride.
-21. **File** confirmed findings. First, the exception: a finding that the PR
-    deletes data it shouldn't, publishes an unverified blob or bundle, or
-    exposes a token is never filed. It gets a fix push (below) and a reply on
-    its thread saying so. File every other *confirmed* finding (you traced a
-    real path to the failure, or, for how the Dagger engine or the bucket
-    behaves, saw it in a run) as an issue that references the issue your PR
-    closes, says how to reproduce it, and asks for a known-gap test or the
-    fix. The test comes with that later work, not this PR. Reply on its
-    thread with the issue link, and resolve it.
-22. **Answer** each finding you traced and found wrong: reply on its thread
-    with what you traced, resolve it, and scratchpad it.
-23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
-    ask your lead what to do with that finding. Do what they say, then reply
-    on its thread and resolve it. If it needs a code fix, file it as an issue
-    like a confirmed finding, unless your lead explicitly asks for a push now.
-24. **The only pushes allowed after review 2:**
-    - CI is red on review 2's head: fix the root cause. No retries, skips or
-      loosened checks here either.
-    - A confirmed finding means the PR deletes data it shouldn't, publishes
-      an unverified blob or bundle, or exposes a token: fix it, with a test.
-    - Your lead explicitly asked for a push to fix a finding.
+    here on you push only to fix red CI, or when your lead says to. You've
+    done the work. Let it ride.
+21. **CI red on review 2's head?** Fix the root cause and push: no retries,
+    skips or loosened checks. That's the one push you don't need to ask for,
+    and its review is handled like review 2.
 
-    Each of these starts a review that's handled like review 2: nothing more
-    is pushed for it.
+    *Go home early:* review 2 came back clean? Skip to "Wrap it up".
+
+22. **Sort** each finding in the scratchpad: **security or data loss** (it's
+    real, and the PR deletes data it shouldn't, publishes an unverified blob
+    or bundle, or exposes a token), **real** (you traced it, or saw it in a
+    run if it's about the Dagger engine or the bucket), **wrong** (you traced
+    it and it doesn't hold), or **can't tell**.
+23. **Hand it to your lead,** all of it in one message, security or data loss
+    first, with your read on each, and wait for their answer. They decide
+    what gets filed, fixed with a push, or dropped.
+24. **Do what they said.** File, fix or answer, then reply on each thread and
+    resolve it. A filed issue references the issue your PR closes, says how
+    to reproduce the problem, and asks for a known-gap test or the fix. A
+    push starts a review that's handled like review 2.
 
 *Wrap it up*
 
@@ -562,11 +557,14 @@ sessions in that round went idle beside a review that had already arrived
 (zerobull-consulting/dagger#180, zerobull-consulting/dagger#182,
 zerobull-consulting/dagger#188) and sat until someone nudged them.
 
-**Why the session asks its lead about unverified findings.** One leads issue
-per PR meant twelve of them piled up untriaged. One rolling leads issue fixed
-that, but it was hard to explain to a session working on a single task.
-Deciding what an unverified finding is worth, and what it belongs with, takes
-a view across tasks, which the lead has and the session doesn't.
+**Why the session hands findings to its lead.** One leads issue per PR meant
+twelve of them piled up untriaged. One rolling leads issue fixed that, but it
+was hard to explain to a session working on a single task. Deciding what an
+unverified finding is worth, and what it belongs with, takes a view across
+tasks, which the lead has and the session doesn't. The same goes for all of
+review 2's findings: the session used to file some, fix others under a list of
+exceptions, and ask about the rest, and that list was more than a session
+could reliably work through. Now it sorts them and hands the lot to its lead.
 
 **Why the standing authorization goes in the system prompt.** A session reads
 an approval quoted in a prompt that another session wrote as an automated
@@ -616,14 +614,13 @@ each change small (zerobull-consulting/dagger#198).
 - **Before the lead merges,** it checks the report against the PR: the
   ruleset's required checks passed on the head being merged; at most two
   Copilot reviews that ran (a re-requested run that failed doesn't count),
-  plus one for each push the steps allow after review 2 (a CI fix; a fix for
-  deleted data, an unverified blob or bundle, or an exposed token; or a fix
-  the lead asked for), and nothing else pushed after review 2; and the prompt
-  verbatim in the PR. The steps don't state the cap as a number, so this is
-  where it's checked.
-- **When a session asks about a finding it couldn't confirm,** the lead
-  decides: file it on its own, add it to an issue with similar ones, or drop
-  it. The session never makes that call.
+  plus one for each push after review 2 that was a CI fix or one the lead
+  asked for, and nothing else pushed after review 2; and the prompt verbatim
+  in the PR. The steps don't state the cap as a number, so this is where it's
+  checked.
+- **When a session hands over review 2's findings,** or asks about one that
+  needs a design change, the lead decides what gets filed (on its own, or
+  with similar ones), fixed, or dropped. The session never makes that call.
 - **Run items one at a time,** in the order the requester set. Before each
   launch, refresh `feature/remote-cache`, and carry what the last session hit
   into the next prompt's "Heads up" (section 11). Running items in parallel
