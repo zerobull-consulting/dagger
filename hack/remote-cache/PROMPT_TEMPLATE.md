@@ -226,8 +226,8 @@ lead" means whoever started you: a human, or an orchestrator session.
 *The draft: CI starts here*
 
 12. **Open the draft.** Push, and open the PR as a **draft** against
-    `feature/remote-cache`. Copilot doesn't review drafts, so draft pushes are
-    free. Follow the repository's PR template, if it has one. The description
+    `feature/remote-cache`. Copilot doesn't review drafts, but every push
+    runs CI, so push when you have something to show. Follow the repository's PR template, if it has one. The description
     says:
     - what the PR does;
     - the size you measured (and why, if it's over 2,500 and not split);
@@ -257,8 +257,8 @@ lead" means whoever started you: a human, or an orchestrator session.
 
 *Copilot, round 1*
 
-15. **Mark "ready for review",** now that CI is green. That starts Copilot review 1. Check
-    in later.
+15. **Mark "ready for review",** now that CI is green. That starts Copilot
+    review 1. Check in later.
 16. **Record** every finding from review 1 in the scratchpad: red, yellow,
     blue, and anything you can only read in its session.
 
