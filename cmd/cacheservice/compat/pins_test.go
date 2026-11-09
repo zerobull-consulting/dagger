@@ -242,25 +242,37 @@ func TestEnginesScriptMatchesParser(t *testing.T) {
 // sees a manifest it would refuse to start with
 // (zerobull-consulting/dagger#147, item 3).
 func TestEnginesCandidateGitHubOnly(t *testing.T) {
-	run := func(server string) (out, before, after string, err error) {
+	run := func(server, repo, runID string) (out, before, after string, err error) {
 		path := filepath.Join(t.TempDir(), "engines.txt")
 		before = "base v1.0.0-beta.25\n" + acceptLine("v1.0.0-beta.25", digestA) + "\n"
 		require.NoError(t, os.WriteFile(path, []byte(before), 0o644))
 		cmd := exec.Command(filepath.Join(repoRoot, "hack/remote-cache/engines.sh"), "candidate", "v1.0.0-beta.26", digestB)
-		cmd.Env = append(os.Environ(), "ENGINES_FILE="+path, "GITHUB_SERVER_URL="+server, "GITHUB_REPOSITORY=o/r", "GITHUB_RUN_ID=5")
+		cmd.Env = append(os.Environ(), "ENGINES_FILE="+path, "GITHUB_SERVER_URL="+server, "GITHUB_REPOSITORY="+repo, "GITHUB_RUN_ID="+runID)
 		o, err := cmd.CombinedOutput()
 		return string(o), before, string(mustRead(t, path)), err
 	}
-	out, _, after, err := run("https://github.com")
+	out, _, after, err := run("https://github.com", "o/r", "5")
 	require.NoError(t, err, out)
 	m, err := Parse([]byte(after))
 	require.NoError(t, err)
 	require.Equal(t, "v1.0.0-beta.26", m.Default().Version)
 
-	out, before, after, err := run("https://ghe.example.com")
-	require.Error(t, err, out)
-	require.Contains(t, out, "GITHUB_SERVER_URL is 'https://ghe.example.com'")
-	require.Equal(t, before, after, "nothing is written")
+	// Whatever would make the verified: URL one the parser refuses is
+	// refused, and the manifest is left as it was.
+	for _, tc := range []struct{ name, server, repo, runID, want string }{
+		{"another server", "https://ghe.example.com", "o/r", "5", "GITHUB_SERVER_URL is 'https://ghe.example.com'"},
+		{"trailing slash", "https://github.com/", "o/r", "5", "GITHUB_SERVER_URL is 'https://github.com/'"},
+		{"run ID not a number", "https://github.com", "o/r", "abc", "is not a GitHub Actions run URL"},
+		{"repository without an owner", "https://github.com", "r", "5", "is not a GitHub Actions run URL"},
+		{"repository with a third part", "https://github.com", "o/r/x", "5", "is not a GitHub Actions run URL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, before, after, err := run(tc.server, tc.repo, tc.runID)
+			require.Error(t, err, out)
+			require.Contains(t, out, tc.want)
+			require.Equal(t, before, after, "nothing is written")
+		})
+	}
 }
 
 // TestEnginesScriptSelects: pin <version> gives that accept line, as the
