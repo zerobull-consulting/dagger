@@ -248,12 +248,12 @@ ones written here.**
     Code Remote `send_later` tool). Never go idle without one. When it fires,
     read the PR's checks and reviews yourself: they can land without waking
     you. This goes for every wait from here on.
-14. **Get CI green.** Red? Root cause, commit, push to the draft, check in
-    later, look again. Repeat until green. Draft pushes are still free.
+14. **Get CI green.** Red? Fix it. Test it. Repeat until green. Draft pushes
+    are cheap insurance.
 
 *Copilot, round 1*
 
-15. **Mark ready,** now that CI is green. That starts Copilot review 1. Check
+15. **Mark "ready for review",** now that CI is green. That starts Copilot review 1. Check
     in later.
 16. **Record** every finding from review 1 in the scratchpad: red, yellow,
     blue, and anything you can only read in its session.
