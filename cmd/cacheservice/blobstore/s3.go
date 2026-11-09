@@ -240,8 +240,8 @@ func (s *S3Store) Client() *s3.Client { return s.client }
 
 // NewS3Client returns an S3 client for cfg's endpoint, region, addressing,
 // credentials and HTTP client. It ignores the bucket, prefix and expiries, and
-// makes no requests. The metadata store shares it, so both stores reach S3 the
-// same way.
+// makes no requests. NewS3 builds the blob store's with it; the metadata store
+// and GC share that one (S3Store.Client), so all three reach S3 the same way.
 func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 	if cfg.Region == "" {
 		return nil, errors.New("no region")
