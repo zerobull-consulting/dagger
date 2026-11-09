@@ -424,64 +424,68 @@ merges; you write the code.
     fails too, tell your lead and wait for their answer: no review isn't a
     clean review. Never push to trigger a review.
 
-*Self-review, block 2: Copilot's findings plus your own*
+    *Go home early:* Copilot came back clean and CI is green? You're done
+    reviewing. Skip to "Wrap it up". Nice.
 
-16. **Review:** on this block's first round, take every finding from
-    Copilot's review (red, yellow, blue, and anything you can only read in
-    its session). Every round, run exactly
+16. **Take Copilot's findings:** every finding from its review (red, yellow,
+    blue, and anything you can only read in its session). Sort each one, same
+    four reads as before, then hand the list to your lead and ask for a
+    decision on each. Wait for their answer.
+17. **Do what they say,** run the tests, prove any new test can fail, and
+    **commit what you changed. Do not push yet.** If CI went red on the ready
+    PR, fix that too, at the root cause. Hold that push like it's the last
+    slice of pizza. Reply on each of Copilot's threads with what you did, and
+    resolve it.
+
+*Self-review, block 2: check those fixes*
+
+18. **Review:** run exactly
     `/code-review high origin/feature/remote-cache...HEAD` again. Fresh eyes
     on fresh code. Check the files and your branch again.
 
-    *Go home early:* both came back with nothing, and CI is green? Skip to
-    "Wrap it up". Nice.
+    *Go home early:* it found nothing? Skip to "Push, once".
 
-17. **Sort** each finding, same four reads as before.
-18. **Hand it to your lead,** the whole list in one message, and wait for
+19. **Sort** each finding, same four reads.
+20. **Hand it to your lead,** the whole list in one message, and wait for
     their answer.
-19. **Do what they say,** run the tests, prove any new test can fail, and
-    **commit what you changed. Do not push yet.** Hold that push like it's
-    the last slice of pizza. Reply on each of Copilot's threads you handled
-    this round with what you did, and resolve it. Then go back to
-    **Review**, unless your lead said to change nothing this round: then the
-    block's done. Five rounds in this block, then ask your lead before any
-    more.
-
-    *Go home early:* nothing committed in this whole block? There's nothing
-    to push. Skip to "Wrap it up".
-
-20. **Local green,** then **push, once.** One push carrying every commit
-    since you marked it ready. It starts Copilot review 2. No touch-ups or
-    rebases sneaking in alongside. Check in later. Review 2 fails to run?
-    Same deal: re-request it once, then tell your lead and wait for their
-    answer.
+21. **Do what they say,** run the tests, prove any new test can fail, and
+    **commit what you changed.** Still no push. Then go back to **Review**,
+    unless your lead said to change nothing this round: then the block's
+    done. Five rounds in this block, then ask your lead before any more.
+22. **Push, once.** Nothing committed since you marked it ready? Don't push:
+    skip to "Wrap it up". Otherwise run the tests until they're green, then
+    make one push carrying every commit since you marked it ready. It starts
+    Copilot review 2. No touch-ups or rebases sneaking in alongside. Check in
+    later. Review 2 fails to run? Same deal: re-request it once, then tell
+    your lead and wait for their answer.
 
 *Copilot, round 2: hands off the code*
 
-21. **CI red on review 2's head?** Fix the root cause and push: no retries,
+23. **CI red on review 2's head?** Fix the root cause and push: no retries,
     skips or loosened checks. That's the one push you don't need to ask for,
     and its review is handled like review 2. Otherwise, from here on you
     push only when your lead says to.
 
     *Go home early:* review 2 came back clean? Skip to "Wrap it up".
 
-22. **Sort** review 2's findings, same four reads.
-23. **Hand it to your lead,** the whole list in one message, and wait for
+24. **Sort** review 2's findings, same four reads.
+25. **Hand it to your lead,** the whole list in one message, and wait for
     their answer.
-24. **Do what they say.** If that means changing code, it's block 3, and it
+26. **Do what they say.** If that means changing code, it's block 3, and it
     happens only because your lead said so: fix, test, commit, local green,
     push, CI green. Reply on each of Copilot's threads with what you did, and
     resolve it.
 
 *Wrap it up*
 
-25. **Hand off.** Check the prompt's "Done when" list. Then send your lead a
+27. **Hand off.** Check the prompt's "Done when" list. Then send your lead a
     **"ready to merge" report**: the head SHA, Copilot reviews used, every
     finding with what your lead decided and what you did, anything on "Done
     when" that isn't met, and a squash title and message (the PR's title plus
     `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`;
     the message is the PR's summary, without the prompt). Your lead merges,
     files what they decided to file, closes the issue, and tells you.
-26. **After the merge:** unsubscribe from the PR if you subscribed. Report
+28. **After the merge:** unsubscribe from the PR if you subscribed. Report
     review rounds used and what changed. Go home. You earned it.
 
 <!-- END VERBATIM: copy to here -->
