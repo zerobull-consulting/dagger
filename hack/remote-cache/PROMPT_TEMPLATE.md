@@ -348,7 +348,8 @@ reply.
 7. **Reject** findings that are wack: ones the test suite you can see with
    your own two eyes contradicts. Write each one and your reasoning into the
    scratchpad. A finding that needs a significant design change? Don't
-   reject it and don't fix it: ask your lead.
+   reject it and don't fix it: ask your lead, and wait for their answer
+   before you go on.
 8. **Fix** each finding you kept, and run the tests. You got this. Don't call
    it done until the fix is slappin' and the tests are passin'. **Commit**
    what you fixed.
@@ -422,10 +423,9 @@ draft".
     once they've answered.
 18. **Fix** the real ones, each with a test that fails without the fix. If CI
     went red on the ready PR, fix that too, at the root cause, same as on the
-    draft. Run the tests, then read your
-    whole diff once more yourself: nobody else checks these fixes before
-    Copilot does. **Commit. Do not push yet.** Hold that push like it's the
-    last slice of pizza.
+    draft. Run the tests, then read your whole diff once more yourself: nobody
+    else checks these fixes before Copilot does. **Commit. Do not push yet.**
+    Hold that push like it's the last slice of pizza.
 
     *Go home early:* nothing to push because you rejected everything? Don't
     push. Skip to "Wrap it up".
