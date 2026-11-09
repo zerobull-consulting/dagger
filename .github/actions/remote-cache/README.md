@@ -285,7 +285,9 @@ inspect` that fails during a wait is never taken for the service's exit:
 the engine isn't stopped before the drain is done. Every wait is bounded,
 and a wait that runs out doesn't skip the rest: the stop keeps both
 logs (with presigned URLs' credentials and signatures redacted), and
-removes the containers, the engine's state volume and the network. With
+removes the containers, the engine's state volume and the network. A
+removal that fails is named in the stop's output and step summary (its kind
+and name, as `left behind: volume <name>`); it doesn't fail the step. With
 nothing to drain, the stop takes about 10s, most of it the engine's.
 
 The steps run one after another, so the whole stop takes at most its probe
