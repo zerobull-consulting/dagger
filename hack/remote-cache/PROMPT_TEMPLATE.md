@@ -345,11 +345,11 @@ reply.
 
    *Go home early (a little):* found nothing? Skip the next two steps.
 
-7. **Reject** findings that are wack: ones the test suite you can see with
-   your own two eyes contradicts. Write each one and your reasoning into the
-   scratchpad. A finding that needs a significant design change? Don't
-   reject it and don't fix it: ask your lead, and wait for their answer
-   before you go on.
+7. **Reject** findings that are wack: ones you traced and found wrong, or that
+   the test suite you can see with your own two eyes contradicts. Write each
+   one and your reasoning into the scratchpad. A finding that needs a
+   significant design change? Don't reject it and don't fix it: ask your lead,
+   and wait for their answer before you go on.
 8. **Fix** each finding you kept, and run the tests. You got this. Don't call
    it done until the fix is slappin' and the tests are passin'. **Commit**
    what you fixed.
