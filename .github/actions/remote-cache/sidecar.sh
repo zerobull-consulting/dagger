@@ -4,6 +4,9 @@
 # the dagger CLI set up to use them. See README.md in this directory.
 #
 #   sidecar.sh start   start the service, then the engine; set up the CLI
+#   sidecar.sh version print the engine version SIDECAR_VERSION selects (the
+#                      manifest's first accept line for none), or fail: the
+#                      check the start action runs before it installs the CLI
 #   sidecar.sh stop    stop the service (it drains), then, once its drain
 #                      is done, the engine, then wait for the service to
 #                      exit; keep their logs; remove the containers, the
@@ -845,14 +848,24 @@ stop() {
 	echo "remote-cache-sidecar: stopped cleanly (exit 0). Logs: $st_logs"
 }
 
+# version: the engine version SIDECAR_VERSION selects, on one line; the same
+# check start runs (select_images), so that the start action's early check and
+# the start have one rule and one error message.
+version() {
+	local version service_image engine_image service_floating
+	SIDECAR_SERVICE_IMAGE="" SIDECAR_ENGINE_IMAGE="" select_images
+	echo "$version"
+}
+
 # Sourced (by sidecar_test.sh), it only defines the functions.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case "${1:-}" in
 start) start ;;
+version) version ;;
 stop) stop ;;
 *)
-	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

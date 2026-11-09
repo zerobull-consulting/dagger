@@ -103,6 +103,15 @@ check "... and says which versions are accepted" grep -qF "it accepts only ${acc
 check "a prefix of an accepted version is refused" not selected SIDECAR_VERSION="${first_version%?}"
 check "a version that isn't one is refused" not selected SIDECAR_VERSION=--privileged
 check "... without repeating it" not grep -qF -- --privileged "$tmp/selected.err"
+# zerobull-consulting/dagger#174: the start action checks the version with
+# `sidecar.sh version`, the rule start runs (before, it ran engines.sh itself).
+version_cmd() { (unset SIDECAR_VERSION SIDECAR_ENGINE_IMAGE SIDECAR_SERVICE_IMAGE; (($#)) && export "$@"; "$here/sidecar.sh" version 2>"$tmp/version.err"); }
+check "sidecar.sh version: none is the manifest's first accept line" [ "$(version_cmd)" = "$first_version" ]
+check "... an accepted version is itself" [ "$(version_cmd SIDECAR_VERSION="${accepted[-1]}")" = "${accepted[-1]}" ]
+check "... an unknown version is refused, with the error start gives" not version_cmd SIDECAR_VERSION=v0.0.1
+check "... which says what is accepted" grep -qF "it accepts only ${accepted[*]}" "$tmp/version.err"
+check "... a service-image or engine-image in the environment changes nothing" \
+	[ "$(version_cmd SIDECAR_ENGINE_IMAGE=e:1 SIDECAR_SERVICE_IMAGE=s:1)" = "$first_version" ]
 check "the deprecated engine-image with service-image: both as given" \
 	[ "$(selected SIDECAR_ENGINE_IMAGE=e:1 SIDECAR_SERVICE_IMAGE=s:1)" = "|s:1|e:1" ]
 check "... with a warning" grep -q "warning: engine-image is deprecated" "$tmp/selected.err"
@@ -751,6 +760,21 @@ stop_secrets created=debug-token other
 check "... but not another file next to it" [ ! -e "$tmp/st/sc/t/secrets/debug-token" -a -e "$tmp/st/sc/t/secrets/other" ]
 stop_secrets "" none
 check "a start that wrote no token: the stop leaves the file" [ -e "$tmp/st/sc/t/secrets/debug-token" ]
+
+# zerobull-consulting/dagger#174: a second start with a name in use fails
+# before it writes or creates anything, so the first sidecar's state is as it
+# was. The second start's post step then runs the stop for that name, which
+# is the first sidecar's: both stops come at the job's end, after every step
+# that uses the first, so the first is stopped when it would have been.
+second_start_refused() {
+	hello_start welcome >/dev/null || return 1
+	local state="$tmp/okbin.sc/remote-cache/state" before after calls_before out
+	before="$(cat "$state")" calls_before="$(cat "$tmp/okbin.fake/calls")"
+	out="$(fake_start okbin SIDECAR_SERVICE_IMAGE= 2>&1)" && return 1
+	after="$(cat "$state")"
+	grep -q "already set up" <<<"$out" && [ "$before" = "$after" ] && [ "$calls_before" = "$(cat "$tmp/okbin.fake/calls")" ]
+}
+check "a second start with a name in use is refused, and touches nothing of the first" second_start_refused
 
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="drain: done" outcome=complete' >"$tmp/no-exports.log"
