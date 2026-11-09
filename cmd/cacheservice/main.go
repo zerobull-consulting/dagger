@@ -72,15 +72,19 @@
 //     engine.stop, and stops at once. It ends once each connected engine
 //     whose events come here sent engine.stop (at once when there is
 //     none). A shutdown follows, bounded at 5s: it closes the engine
-//     connections (within 2s), shuts the HTTP servers down and waits for
+//     connections (dropping those not closed within 2s), shuts the HTTP
+//     servers down and waits for
 //     what is still running. So the whole stop takes at most -drain-timeout
 //     plus -drain-linger plus 5s: give the process manager a stop timeout
 //     longer than that. A second signal ends the drain, or the linger, at
 //     once, and skips the linger; a signal during the shutdown exits at
 //     once.
-//     The process exits 0 only when everything ended within the bound, and
-//     1 when a signal or the bound cut the shutdown off, or an HTTP server
-//     failed, logging the reason and what was still running. GET /debug/drain
+//     The process exits 0 only when everything ended within the bound
+//     without an error, and 1 when the shutdown ended in any error (such
+//     as engine connections still closing after they were dropped, an
+//     error that comes about 2.5s in, or the bound cutting it off), a
+//     signal cut it off, or an HTTP server failed,
+//     logging the reason and what was still running. GET /debug/drain
 //     shows the drain. See README.md, "Stopping and draining".
 //
 //   - with -export=false, a read-only instance: the import path alone. It
@@ -567,8 +571,10 @@ const shutdownMargin = 500 * time.Millisecond
 // It also waits, within the same bound, for the servers' goroutines
 // (serversDone, nil when there are none), so that the error one sent as it
 // stopped is in errs when exitCode reads it.
-// It returns an error when that bound cut the wait off, with work still
-// running: the service's paths, an HTTP request or a server's goroutine.
+// It returns an error when engine connections it dropped at the close bound
+// were still closing a moment later (CloseEnginesContext's error), or when
+// grace cut the wait off, with work still running: the service's paths, an
+// HTTP request or a server's goroutine.
 // The cancel comes first, as when the signal itself canceled that
 // context: a request tied to it, such as POST /debug/gc, then ends at once
 // rather than holding the shutdown for grace.
