@@ -66,7 +66,7 @@ func (h *logRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 	return &logRecorder{root: root, attrs: append(append([]slog.Attr(nil), h.attrs...), attrs...)}
 }
-func (h *logRecorder) WithGroup(string) slog.Handler      { return h }
+func (h *logRecorder) WithGroup(string) slog.Handler { return h }
 
 // find returns the attributes of every record with the message msg.
 func (h *logRecorder) find(msg string) []map[string]string {
