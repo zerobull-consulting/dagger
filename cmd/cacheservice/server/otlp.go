@@ -112,7 +112,7 @@ func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportL
 				}
 				body := rec.GetBody().GetStringValue()
 				cache := stringAttr(rec.Attributes, telemetryattrs.EngineCacheAttr)
-				s.logger.Info("engine event", "namespace", ns.name, "kind", truncate(kind, 200), "cache", truncate(cache, 200), "instance", instance,
+				s.logger.Info("engine event", "namespace", ns.name, "kind", truncate(kind, 200), "cache", truncate(cache, 200), "instance", truncate(instance, 200),
 					"scope", sl.GetScope().GetName(), "bodyBytes", len(body), "body", truncate(body, 512))
 				if s.dumpDir != "" {
 					s.dump(fmt.Sprintf("%06d-event-%s.json", s.dumpSeq.Add(1), kind), []byte(body))

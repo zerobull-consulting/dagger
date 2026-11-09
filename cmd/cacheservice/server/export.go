@@ -348,7 +348,9 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 		if !ok || (session != "" && !validEngineID(session)) {
 			// Their IDs would key the tracker's state: none of these
 			// spans is taken.
-			s.refusedEngineIDs(metrics.EngineIDSourceSpan, resourceSpanCount(rs), len(cache), len(session))
+			if n := cacheSpanCount(rs); n > 0 {
+				s.refusedEngineIDs(metrics.EngineIDSourceSpan, n, len(cache), len(session))
+			}
 			continue
 		}
 		for _, ss := range rs.ScopeSpans {
@@ -483,11 +485,18 @@ func parseEngineCache(v string) (string, uint64, bool) {
 	return v[:i], gen, true
 }
 
-// resourceSpanCount is how many spans rs holds.
-func resourceSpanCount(rs *tracepb.ResourceSpans) int {
+// cacheSpanCount is how many of rs's spans the tracker would take: cache
+// spans and session carriers.
+func cacheSpanCount(rs *tracepb.ResourceSpans) int {
 	n := 0
 	for _, ss := range rs.ScopeSpans {
-		n += len(ss.Spans)
+		for _, span := range ss.Spans {
+			if _, ok := attrValue(span.Attributes, telemetryattrs.CacheResultIDAttr); ok {
+				n++
+			} else if _, ok := attrValue(span.Attributes, telemetryattrs.CacheSessionSpansAttr); ok {
+				n++
+			}
+		}
 	}
 	return n
 }

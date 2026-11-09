@@ -129,14 +129,14 @@ func engineIDs(t *testing.T, logs []*LogRecorder) {
 				cache = cache[:i]
 			}
 			caches[cache] = true
-			if session := rec.Attr("session"); session != "" {
-				sessions[session] = true
-			}
 			if len(cache) > len(longestCache) {
 				longestCache = cache
 			}
-			if len(rec.Attr("session")) > len(longestSession) {
-				longestSession = rec.Attr("session")
+			if session := rec.Attr("session"); session != "" {
+				sessions[session] = true
+				if len(session) > len(longestSession) {
+					longestSession = session
+				}
 			}
 		}
 	}
