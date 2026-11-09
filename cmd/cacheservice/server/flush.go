@@ -28,8 +28,6 @@ const (
 	// (zerobull-consulting/dagger#137) runs its service with
 	// -drain-timeout 0, and flushes before it stops the engine.
 	MaxFlushTimeout = 10 * time.Minute
-	// maxCacheIDLen bounds a cache ID taken from a request's path.
-	maxCacheIDLen = 128
 )
 
 // errAmbiguousFlush is the token form's refusal when the token's
@@ -300,23 +298,6 @@ func (s *Service) notConnectedReport(ns *namespace, start time.Time) FlushReport
 	return FlushReport{Outcome: metrics.FlushNotConnected, Took: took.Round(time.Millisecond).String()}
 }
 
-// validCacheID reports whether a cache ID from a request's path is one the
-// service may log and look up: 1 to maxCacheIDLen letters, digits, '.',
-// '_' or '-'. Engines name their caches with random IDs of these.
-func validCacheID(id string) bool {
-	if id == "" || len(id) > maxCacheIDLen {
-		return false
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // flushTimeout reads a flush request's timeout: DefaultFlushTimeout when
 // it names none, and a Go duration from 0 to MaxFlushTimeout otherwise.
 func flushTimeout(r *http.Request) (time.Duration, error) {
@@ -361,7 +342,7 @@ func (s *Service) serveFlush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cacheID := r.PathValue("cacheID")
-	if !validCacheID(cacheID) {
+	if !validEngineID(cacheID) {
 		http.Error(w, "bad cache ID", http.StatusBadRequest)
 		return
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -336,11 +338,19 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 	}
 	for _, rs := range req.ResourceSpans {
 		res := rs.GetResource().GetAttributes()
-		cacheID, generation, ok := parseEngineCache(stringAttr(res, telemetryattrs.EngineCacheAttr))
-		if !ok {
+		cache := stringAttr(res, telemetryattrs.EngineCacheAttr)
+		if cache == "" {
+			// Not an engine session's spans.
 			continue
 		}
+		cacheID, generation, ok := parseEngineCache(cache)
 		session := stringAttr(res, telemetryattrs.EngineSessionAttr)
+		if !ok || (session != "" && !validEngineID(session)) {
+			// Their IDs would key the tracker's state: none of these
+			// spans is taken.
+			s.refusedEngineIDs(metrics.EngineIDSourceSpan, resourceSpanCount(rs), len(cache), len(session))
+			continue
+		}
 		for _, ss := range rs.ScopeSpans {
 			for _, span := range ss.Spans {
 				attrs := span.Attributes
@@ -401,6 +411,7 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 	}
 	cacheID, generation, ok := parseEngineCache(cache)
 	if !ok {
+		s.refusedEngineIDs(metrics.EngineIDSourceEvent, 1, len(cache), 0)
 		return
 	}
 	authenticated := s.authenticated()
@@ -416,6 +427,12 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 			return
 		}
 		wiped := ev.WipedCache
+		if wiped != "" && !validEngineID(wiped) {
+			// The start is taken; the wiped cache, which no cache can
+			// be named, isn't.
+			s.refusedEngineIDs(metrics.EngineIDSourceEvent, 1, len(wiped), 0)
+			wiped = ""
+		}
 		if wiped != "" && authenticated && !ns.ownerAccepts(wiped, key) {
 			s.ignoredEvent(ns, kind+" (wiped cache)", wiped)
 			wiped = ""
@@ -451,9 +468,11 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 }
 
 // parseEngineCache splits dagger.io/engine.cache, "<cacheID>/<generation>".
+// A cache ID that isn't a valid engine ID (validEngineID) is refused: it
+// would key the tracker's, importer's and linger's state.
 func parseEngineCache(v string) (string, uint64, bool) {
 	i := strings.LastIndexByte(v, '/')
-	if i <= 0 {
+	if i <= 0 || !validEngineID(v[:i]) {
 		return "", 0, false
 	}
 	gen, err := strconv.ParseUint(v[i+1:], 10, 64)
@@ -461,6 +480,30 @@ func parseEngineCache(v string) (string, uint64, bool) {
 		return "", 0, false
 	}
 	return v[:i], gen, true
+}
+
+// resourceSpanCount is how many spans rs holds.
+func resourceSpanCount(rs *tracepb.ResourceSpans) int {
+	n := 0
+	for _, ss := range rs.ScopeSpans {
+		n += len(ss.Spans)
+	}
+	return n
+}
+
+// refusedEngineIDs counts n spans, events or hellos (source, a
+// metrics.EngineIDSource constant) dropped because an engine cache ID or
+// session in them isn't a valid engine ID, and logs it: at warning level at
+// most once a minute per source (rejectionLog), the rest at debug level. The
+// IDs themselves aren't logged, only their lengths.
+func (s *Service) refusedEngineIDs(source string, n, cacheLen, sessionLen int) {
+	s.metrics.EngineIDsRefused(source, n)
+	level := slog.LevelDebug
+	if s.engineIDRefusals.allow(source, time.Now()) {
+		level = slog.LevelWarn
+	}
+	s.logger.Log(context.Background(), level, LogEngineIDsRefused, "source", source, "count", n,
+		"cacheLength", cacheLen, "sessionLength", sessionLen, "maxLength", MaxEngineIDLen)
 }
 
 func attrValue(kvs []*commonpb.KeyValue, key string) (*commonpb.AnyValue, bool) {

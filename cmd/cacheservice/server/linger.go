@@ -34,9 +34,6 @@ const maxLingerPoll = 100 * time.Millisecond
 // draining, none is replaced, and a new one isn't remembered.
 const maxEventCaches = 4096
 
-// maxEventCacheID bounds the cache IDs remembered; an engine's is a UUID.
-const maxEventCacheID = 128
-
 // LingerCache is one engine cache a linger waits for.
 type LingerCache struct {
 	Namespace string `json:"namespace"`
@@ -212,7 +209,7 @@ func (s *Service) endLinger(start time.Time, outcome string, caches []LingerCach
 // takes it.
 func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache string) {
 	cacheID, generation, ok := parseEngineCache(cache)
-	if !ok || len(cacheID) > maxEventCacheID {
+	if !ok {
 		return
 	}
 	if s.authenticated() && !ns.ownerAccepts(cacheID, key) {

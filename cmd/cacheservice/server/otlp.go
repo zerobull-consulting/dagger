@@ -131,6 +131,7 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 	spans, cacheSpans := 0, 0
 	for _, rs := range req.ResourceSpans {
 		cache := stringAttr(rs.GetResource().GetAttributes(), telemetryattrs.EngineCacheAttr)
+		session := stringAttr(rs.GetResource().GetAttributes(), telemetryattrs.EngineSessionAttr)
 		for _, ss := range rs.ScopeSpans {
 			for _, span := range ss.Spans {
 				spans++
@@ -139,7 +140,7 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 					continue
 				}
 				cacheSpans++
-				s.logger.Debug("cache span", "cache", cache, "name", truncate(span.Name, 120),
+				s.logger.Debug("cache span", "cache", truncate(cache, 200), "session", truncate(session, 200), "name", truncate(span.Name, 120),
 					"result", result,
 					"outcome", stringAttr(span.Attributes, telemetryattrs.CacheOutcomeAttr),
 					"type", stringAttr(span.Attributes, telemetryattrs.CacheTypeAttr),

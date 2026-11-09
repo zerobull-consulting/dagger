@@ -3,6 +3,7 @@ package e2e
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -109,6 +110,41 @@ func (s *state) otlpSizes(t *testing.T) {
 	}
 	Check(t, sizes.budgetPeak*otlpMargin <= server.OTLPDecodeBudget,
 		"decode budget: at most %d bytes in use at once; budget %d", sizes.budgetPeak, int64(server.OTLPDecodeBudget))
+	engineIDs(t, logs)
+}
+
+// engineIDs checks the engine cache IDs and sessions real engines sent
+// against the service's bound on them (zerobull-consulting/dagger#88): no
+// span, event or hello was dropped for its IDs, and the longest of each seen
+// is logged, to measure the bound against.
+func engineIDs(t *testing.T, logs []*LogRecorder) {
+	var refused []LogRecord
+	caches, sessions := map[string]bool{}, map[string]bool{}
+	longestCache, longestSession := "", ""
+	for _, l := range logs {
+		refused = append(refused, l.Since(0, server.LogEngineIDsRefused, nil)...)
+		for _, rec := range l.Since(0, "cache span", nil) {
+			cache := rec.Attr("cache")
+			if i := strings.LastIndexByte(cache, '/'); i > 0 {
+				cache = cache[:i]
+			}
+			caches[cache] = true
+			sessions[rec.Attr("session")] = true
+			if len(cache) > len(longestCache) {
+				longestCache = cache
+			}
+			if len(rec.Attr("session")) > len(longestSession) {
+				longestSession = rec.Attr("session")
+			}
+		}
+	}
+	for _, rec := range refused {
+		t.Logf("refused: %s %v", rec.Msg, rec.Attrs)
+	}
+	Check(t, len(refused) == 0, "no real-engine span, event or hello dropped for its cache ID or session (%d dropped)", len(refused))
+	Check(t, len(caches) > 0 && len(sessions) > 0, "cache spans seen: %d caches, %d sessions", len(caches), len(sessions))
+	t.Logf("engine IDs: %d cache IDs, longest %d characters (%q); %d sessions, longest %d characters (%q); bound %d",
+		len(caches), len(longestCache), longestCache, len(sessions), len(longestSession), longestSession, server.MaxEngineIDLen)
 }
 
 // attrInt is a record's integer attribute; a missing or malformed one is an

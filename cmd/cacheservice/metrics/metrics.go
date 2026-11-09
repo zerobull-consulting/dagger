@@ -100,6 +100,7 @@ type Metrics struct {
 	tokensRevoked       *prometheus.CounterVec
 	versionMismatch     *prometheus.CounterVec
 	eventsIgnored       *prometheus.CounterVec
+	engineIDsRefused    *prometheus.CounterVec
 	blobPromotions      *prometheus.CounterVec
 	blobHashedBytes     *prometheus.CounterVec
 	blobPromoteDuration *prometheus.HistogramVec
@@ -278,6 +279,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "engine_events_ignored_total",
 			Help: "Engine events dropped because they came with a token other than the engine's, by scope and kind.",
 		}, []string{"scope", "kind"}),
+		engineIDsRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "engine_ids_refused_total",
+			Help: "Spans, engine events and engine hellos dropped because an engine cache ID or session in them isn't 1 to 128 letters, digits, '.', '_' or '-', by source (span, event, hello). Nothing of them keys the service's state.",
+		}, []string{"source"}),
 		blobPromotions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "blob_promotions_total",
 			Help: "Uploaded blobs verified and promoted to their digest keys, by scope and outcome: promoted, existing (already stored), mismatch (content not the digest's), missing (nothing uploaded) or error.",
@@ -398,7 +403,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.importBundleCache, m.importResCache, m.importSyncs, m.importSyncDuration,
 		m.exportBatches, m.exportBatchDuration, m.exportBatchRoots,
 		m.exportRoots, m.exportBlobs, m.exportBundles,
-		m.authRejected, m.tokensRevoked, m.versionMismatch, m.eventsIgnored,
+		m.authRejected, m.tokensRevoked, m.versionMismatch, m.eventsIgnored, m.engineIDsRefused,
 		m.blobPromotions, m.blobHashedBytes, m.blobPromoteDuration,
 		m.gcStoredBytes, m.gcStoredObjects, m.gcDeletedObjects, m.gcDeletedBytes,
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule, m.gcUnexpectedKeys, m.gcRefused,
@@ -657,6 +662,25 @@ func (m *Metrics) IgnoredEvent(scope, kind string) {
 		return
 	}
 	m.eventsIgnored.WithLabelValues(scope, kind).Inc()
+}
+
+// Sources of what is dropped for an invalid engine cache ID or session, the
+// source label of EngineIDsRefused: a fixed set, never taken from the
+// request.
+const (
+	EngineIDSourceSpan  = "span"
+	EngineIDSourceEvent = "event"
+	EngineIDSourceHello = "hello"
+)
+
+// EngineIDsRefused records n spans, events or hellos, of source (an
+// EngineIDSource constant), dropped for an invalid engine cache ID or
+// session.
+func (m *Metrics) EngineIDsRefused(source string, n int) {
+	if m == nil {
+		return
+	}
+	m.engineIDsRefused.WithLabelValues(source).Add(float64(n))
 }
 
 // BlobPromotion records one uploaded blob's verification and promotion in a
