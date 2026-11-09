@@ -11,7 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 // S3Bucket is a Bucket in S3. The service's credentials need, besides what
@@ -158,7 +159,7 @@ func (b *S3Bucket) listUploads(ctx context.Context, prefix string) ([]Upload, er
 // AbortUpload aborts an upload; one already gone (404) is not an error.
 func (b *S3Bucket) AbortUpload(ctx context.Context, u Upload) error {
 	_, err := b.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &b.Bucket, Key: &u.Key, UploadId: &u.ID})
-	if err != nil && status(err) != http.StatusNotFound {
+	if err != nil && s3util.HTTPStatus(err) != http.StatusNotFound {
 		return fmt.Errorf("abort upload of %s: %w", u.Key, err)
 	}
 	return nil
@@ -218,12 +219,4 @@ func rulePrefix(r types.LifecycleRule) (string, bool) {
 		return aws.ToString(a.Prefix), true
 	}
 	return aws.ToString(f.Prefix), true
-}
-
-func status(err error) int {
-	var re *smithyhttp.ResponseError
-	if errors.As(err, &re) {
-		return re.HTTPStatusCode()
-	}
-	return 0
 }

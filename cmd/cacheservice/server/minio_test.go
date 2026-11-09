@@ -12,7 +12,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -23,9 +22,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 type minioTestEnv struct {
@@ -76,21 +75,13 @@ func (e *minioTestEnv) key(rest string) string { return e.prefix + "/" + rest }
 func (e *minioTestEnv) exists(ctx context.Context, t *testing.T, key string) (bool, int64) {
 	t.Helper()
 	out, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &e.bucket, Key: &key})
-	if httpStatus(err) == http.StatusNotFound {
+	if s3util.HTTPStatus(err) == http.StatusNotFound {
 		return false, 0
 	}
 	if err != nil {
 		t.Fatalf("HeadObject %s: %v", key, err)
 	}
 	return true, aws.ToInt64(out.ContentLength)
-}
-
-func httpStatus(err error) int {
-	var re *smithyhttp.ResponseError
-	if errors.As(err, &re) {
-		return re.HTTPStatusCode()
-	}
-	return 0
 }
 
 // enginePut uploads body the way the engine does (engine/remotecache's
@@ -286,7 +277,7 @@ func TestMinIOConditionalWrites(t *testing.T) {
 		Bucket: &e.bucket, Key: &key, Body: strings.NewReader(`{"v":"other"}`),
 		IfNoneMatch: aws.String("*"),
 	})
-	if httpStatus(err) != http.StatusPreconditionFailed {
+	if s3util.HTTPStatus(err) != http.StatusPreconditionFailed {
 		t.Fatalf("second create with If-None-Match: %v, want 412", err)
 	}
 
@@ -302,7 +293,7 @@ func TestMinIOConditionalWrites(t *testing.T) {
 		Bucket: &e.bucket, Key: &key, Body: strings.NewReader(`{"v":"stale"}`),
 		IfMatch: unquoted,
 	})
-	if httpStatus(err) != http.StatusPreconditionFailed {
+	if s3util.HTTPStatus(err) != http.StatusPreconditionFailed {
 		t.Fatalf("update with stale If-Match: %v, want 412", err)
 	}
 
@@ -326,7 +317,7 @@ func TestMinIOConditionalWrites(t *testing.T) {
 	_, err = e.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &e.bucket, Key: &quotedKey, Body: strings.NewReader("2"), IfMatch: created.ETag})
 	if takes := s3test.StoreBehavior(t).QuotedIfMatch; takes && err != nil {
 		t.Fatalf("If-Match with the quoted current ETag: %v", err)
-	} else if !takes && httpStatus(err) != http.StatusPreconditionFailed {
+	} else if !takes && s3util.HTTPStatus(err) != http.StatusPreconditionFailed {
 		t.Fatalf("If-Match with the quoted current ETag: %v, want 412; the store changed (update its behavior and the README)", err)
 	}
 }

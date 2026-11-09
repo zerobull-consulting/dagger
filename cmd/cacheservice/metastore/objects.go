@@ -15,9 +15,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 // Objects is the small part of an object store the metadata store needs:
@@ -67,7 +67,7 @@ var _ Objects = (*S3Objects)(nil)
 func (o *S3Objects) Get(ctx context.Context, key string) ([]byte, string, error) {
 	out, err := o.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: &o.Bucket, Key: &key})
 	if err != nil {
-		if httpStatus(err) == http.StatusNotFound {
+		if s3util.HTTPStatus(err) == http.StatusNotFound {
 			return nil, "", fmt.Errorf("get %s: %w", key, ErrNotFound)
 		}
 		return nil, "", fmt.Errorf("get %s: %w", key, err)
@@ -104,7 +104,7 @@ func (o *S3Objects) Put(ctx context.Context, key string, body []byte, cond Condi
 	}
 	out, err := o.Client.PutObject(ctx, in)
 	if err != nil {
-		switch httpStatus(err) {
+		switch s3util.HTTPStatus(err) {
 		case http.StatusPreconditionFailed, http.StatusConflict:
 			return "", fmt.Errorf("put %s: %w", key, ErrPreconditionFailed)
 		}
@@ -172,14 +172,6 @@ func (o *S3Objects) ListUploadKeys(ctx context.Context, prefix string, max int) 
 		return keys, err
 	}
 	return list("")
-}
-
-func httpStatus(err error) int {
-	var re *smithyhttp.ResponseError
-	if errors.As(err, &re) {
-		return re.HTTPStatusCode()
-	}
-	return 0
 }
 
 // MemObjects is Objects in memory, with the same conditional writes as S3.
@@ -324,12 +316,18 @@ func (m *MemObjects) Keys() []string {
 // blob store does. It ignores cfg's prefix and expiries, and makes no
 // requests.
 func NewS3Objects(ctx context.Context, cfg blobstore.S3Config) (*S3Objects, error) {
+	return newS3Objects(ctx, cfg, nil)
+}
+
+func newS3Objects(ctx context.Context, cfg blobstore.S3Config, client *s3.Client) (*S3Objects, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3 metadata store: no bucket")
 	}
-	client, err := blobstore.NewS3Client(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("s3 metadata store: %w", err)
+	if client == nil {
+		var err error
+		if client, err = blobstore.NewS3Client(ctx, cfg); err != nil {
+			return nil, fmt.Errorf("s3 metadata store: %w", err)
+		}
 	}
 	// A custom endpoint is an S3-compatible store, which may list multipart
 	// uploads only by exact key (MinIO), as for GC (server.EnableS3).
@@ -340,7 +338,13 @@ func NewS3Objects(ctx context.Context, cfg blobstore.S3Config) (*S3Objects, erro
 // and prefix as the blob store's, so a scope's metadata sits next to its
 // blobs, under <prefix>/ns/<scope>/ (see package layout).
 func NewS3(ctx context.Context, cfg blobstore.S3Config) (*Store, error) {
-	objects, err := NewS3Objects(ctx, cfg)
+	return NewS3WithClient(ctx, cfg, nil)
+}
+
+// NewS3WithClient is NewS3 with client, which blobstore.NewS3Client built for
+// cfg, instead of a client of its own. A nil client builds one.
+func NewS3WithClient(ctx context.Context, cfg blobstore.S3Config, client *s3.Client) (*Store, error) {
+	objects, err := newS3Objects(ctx, cfg, client)
 	if err != nil {
 		return nil, err
 	}

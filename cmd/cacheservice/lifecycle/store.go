@@ -10,8 +10,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
@@ -132,18 +132,9 @@ func errorCode(err error) string {
 	return ""
 }
 
-// httpStatus is an S3 error's HTTP status, or 0.
-func httpStatus(err error) int {
-	var re *smithyhttp.ResponseError
-	if errors.As(err, &re) {
-		return re.HTTPStatusCode()
-	}
-	return 0
-}
-
 // denied reports an error of a key that isn't allowed the request.
 func denied(err error) bool {
-	return httpStatus(err) == http.StatusForbidden || errorCode(err) == "AccessDenied"
+	return s3util.HTTPStatus(err) == http.StatusForbidden || errorCode(err) == "AccessDenied"
 }
 
 // explainRead is an error reading the configuration, with what to do.
@@ -162,7 +153,7 @@ func explainWrite(err error, abortRule bool) error {
 		return fmt.Errorf("the store refused to set the lifecycle configuration (%w). "+
 			"Setting it takes the admin key (on DigitalOcean Spaces, a full-access key): a Read or Read/Write/Delete key gets 403. "+
 			"Run apply with it, interactively; never put it in the service's or a job's secrets", err)
-	case abortRule && httpStatus(err) == http.StatusBadRequest:
+	case abortRule && s3util.HTTPStatus(err) == http.StatusBadRequest:
 		// MinIO answers 400 InvalidArgument; other causes give 400 too,
 		// so the message names the likely one, not a certain one.
 		return fmt.Errorf("the store refused the configuration (%w). "+

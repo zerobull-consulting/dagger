@@ -15,9 +15,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/opencontainers/go-digest"
 
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 )
 
@@ -234,10 +234,14 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	}, nil
 }
 
+// Client is the store's S3 client. Other stores of the same bucket can share
+// it (metastore.NewS3WithClient).
+func (s *S3Store) Client() *s3.Client { return s.client }
+
 // NewS3Client returns an S3 client for cfg's endpoint, region, addressing,
 // credentials and HTTP client. It ignores the bucket, prefix and expiries, and
-// makes no requests. The metadata store shares it, so both stores reach S3 the
-// same way.
+// makes no requests. NewS3 builds the blob store's with it; the metadata store
+// and GC share that one (S3Store.Client), so all three reach S3 the same way.
 func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 	if cfg.Region == "" {
 		return nil, errors.New("no region")
@@ -348,18 +352,13 @@ func (s *S3Store) Has(ctx context.Context, dgst digest.Digest) (bool, error) {
 // isNotFound reports a 404 and nothing else: a HEAD response has no body, so
 // the status is all S3 says.
 func isNotFound(err error) bool {
-	return hasStatus(err, http.StatusNotFound)
+	return s3util.HasStatus(err, http.StatusNotFound)
 }
 
 // isConditionFailed reports a conditional write that lost: 412, or 409 for
 // one that raced another write of the same key.
 func isConditionFailed(err error) bool {
-	return hasStatus(err, http.StatusPreconditionFailed) || hasStatus(err, http.StatusConflict)
-}
-
-func hasStatus(err error, status int) bool {
-	var re *smithyhttp.ResponseError
-	return errors.As(err, &re) && re.HTTPStatusCode() == status
+	return s3util.HasStatus(err, http.StatusPreconditionFailed) || s3util.HasStatus(err, http.StatusConflict)
 }
 
 // PresignPut returns a presigned PUT of exactly size bytes to the blob's
