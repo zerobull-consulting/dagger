@@ -55,3 +55,17 @@ func TestSleepCtx(t *testing.T) {
 		t.Fatalf("SleepCtx on a cancelled context = %v, want %v", err, ctx.Err())
 	}
 }
+
+// TestSleepCtxCanceled checks that a context that has already ended wins
+// over a timer that has fired, every time.
+func TestSleepCtxCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, d := range []time.Duration{0, 1} {
+		for range 1000 {
+			if err := SleepCtx(ctx, d); !errors.Is(err, context.Canceled) {
+				t.Fatalf("SleepCtx(canceled, %v) = %v, want context.Canceled", d, err)
+			}
+		}
+	}
+}
