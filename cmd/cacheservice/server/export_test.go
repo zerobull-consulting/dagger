@@ -516,7 +516,10 @@ func TestParseEngineCache(t *testing.T) {
 		ok  bool
 	}{
 		{"abc/3", "abc", 3, true},
-		{"a/b/7", "a/b", 7, true},
+		{"a/b/7", "", 0, false},
+		{strings.Repeat("a", MaxEngineIDLen) + "/1", strings.Repeat("a", MaxEngineIDLen), 1, true},
+		{strings.Repeat("a", MaxEngineIDLen+1) + "/1", "", 0, false},
+		{"bad id/1", "", 0, false},
 		{"abc", "", 0, false},
 		{"/3", "", 0, false},
 		{"abc/x", "", 0, false},

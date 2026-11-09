@@ -112,7 +112,7 @@ func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportL
 				}
 				body := rec.GetBody().GetStringValue()
 				cache := stringAttr(rec.Attributes, telemetryattrs.EngineCacheAttr)
-				s.logger.Info("engine event", "namespace", ns.name, "kind", kind, "cache", cache, "instance", instance,
+				s.logger.Info("engine event", "namespace", ns.name, "kind", truncate(kind, 200), "cache", truncate(cache, 200), "instance", truncate(instance, 200),
 					"scope", sl.GetScope().GetName(), "bodyBytes", len(body), "body", truncate(body, 512))
 				if s.dumpDir != "" {
 					s.dump(fmt.Sprintf("%06d-event-%s.json", s.dumpSeq.Add(1), kind), []byte(body))
@@ -131,6 +131,7 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 	spans, cacheSpans := 0, 0
 	for _, rs := range req.ResourceSpans {
 		cache := stringAttr(rs.GetResource().GetAttributes(), telemetryattrs.EngineCacheAttr)
+		session := stringAttr(rs.GetResource().GetAttributes(), telemetryattrs.EngineSessionAttr)
 		for _, ss := range rs.ScopeSpans {
 			for _, span := range ss.Spans {
 				spans++
@@ -139,7 +140,7 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 					continue
 				}
 				cacheSpans++
-				s.logger.Debug("cache span", "cache", cache, "name", truncate(span.Name, 120),
+				s.logger.Debug("cache span", "cache", truncate(cache, 200), "session", truncate(session, 200), "name", truncate(span.Name, 120),
 					"result", result,
 					"outcome", stringAttr(span.Attributes, telemetryattrs.CacheOutcomeAttr),
 					"type", stringAttr(span.Attributes, telemetryattrs.CacheTypeAttr),

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
@@ -336,22 +338,31 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 	}
 	for _, rs := range req.ResourceSpans {
 		res := rs.GetResource().GetAttributes()
-		cacheID, generation, ok := parseEngineCache(stringAttr(res, telemetryattrs.EngineCacheAttr))
-		if !ok {
+		cache := stringAttr(res, telemetryattrs.EngineCacheAttr)
+		if cache == "" {
+			// Not an engine session's spans.
 			continue
 		}
+		cacheID, generation, ok := parseEngineCache(cache)
 		session := stringAttr(res, telemetryattrs.EngineSessionAttr)
+		if !ok || (session != "" && !validEngineID(session)) {
+			// Their IDs would key the tracker's state: none of these
+			// spans is taken.
+			if n := cacheSpanCount(rs); n > 0 {
+				s.refusedEngineIDs(metrics.EngineIDSourceSpan, n, len(cache), len(session))
+			}
+			continue
+		}
 		for _, ss := range rs.ScopeSpans {
 			for _, span := range ss.Spans {
 				attrs := span.Attributes
-				if n, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr); ok {
-					count, err := strconv.Atoi(n.GetStringValue())
-					if err == nil && !tracker.SessionEnded(cacheID, generation, session, count, now) && draining {
+				if count, ok := carrierCount(attrs); ok {
+					if !tracker.SessionEnded(cacheID, generation, session, count, now) && draining {
 						s.refusedSpan()
 					}
 				}
-				number, err := strconv.ParseUint(stringAttr(attrs, telemetryattrs.CacheResultIDAttr), 10, 64)
-				if err != nil || number == 0 {
+				number, ok := cacheResultNumber(attrs)
+				if !ok {
 					continue
 				}
 				o := exporter.Observation{
@@ -399,6 +410,8 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 	if kind != telemetryattrs.EngineEventStart && kind != telemetryattrs.EngineEventPrune {
 		return
 	}
+	// noteEngineEvent, which every event goes through, counts one whose
+	// cache attribute is refused.
 	cacheID, generation, ok := parseEngineCache(cache)
 	if !ok {
 		return
@@ -416,6 +429,12 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 			return
 		}
 		wiped := ev.WipedCache
+		if wiped != "" && !validEngineID(wiped) {
+			// The start is taken; the wiped cache, which no cache can
+			// be named, isn't.
+			s.refusedEngineIDs(metrics.EngineIDSourceWipedCache, 1, len(wiped), 0)
+			wiped = ""
+		}
 		if wiped != "" && authenticated && !ns.ownerAccepts(wiped, key) {
 			s.ignoredEvent(ns, kind+" (wiped cache)", wiped)
 			wiped = ""
@@ -451,9 +470,11 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 }
 
 // parseEngineCache splits dagger.io/engine.cache, "<cacheID>/<generation>".
+// A cache ID that isn't a valid engine ID (validEngineID) is refused: it
+// would key the tracker's, importer's and linger's state.
 func parseEngineCache(v string) (string, uint64, bool) {
 	i := strings.LastIndexByte(v, '/')
-	if i <= 0 {
+	if i <= 0 || !validEngineID(v[:i]) {
 		return "", 0, false
 	}
 	gen, err := strconv.ParseUint(v[i+1:], 10, 64)
@@ -461,6 +482,54 @@ func parseEngineCache(v string) (string, uint64, bool) {
 		return "", 0, false
 	}
 	return v[:i], gen, true
+}
+
+// cacheResultNumber is a cache span's engine number: set, and not 0.
+func cacheResultNumber(attrs []*commonpb.KeyValue) (uint64, bool) {
+	n, err := strconv.ParseUint(stringAttr(attrs, telemetryattrs.CacheResultIDAttr), 10, 64)
+	return n, err == nil && n != 0
+}
+
+// carrierCount is a session carrier's count of the session's cache spans.
+func carrierCount(attrs []*commonpb.KeyValue) (int, bool) {
+	v, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v.GetStringValue())
+	return n, err == nil
+}
+
+// cacheSpanCount is how many of rs's spans trackSpans would take, by the
+// same checks: cache spans and session carriers.
+func cacheSpanCount(rs *tracepb.ResourceSpans) int {
+	n := 0
+	for _, ss := range rs.ScopeSpans {
+		for _, span := range ss.Spans {
+			_, isCache := cacheResultNumber(span.Attributes)
+			_, isCarrier := carrierCount(span.Attributes)
+			if isCache || isCarrier {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// refusedEngineIDs counts n spans, events, wiped caches or hellos (source, a
+// metrics.EngineIDSource constant) refused because their engine cache
+// attribute isn't "<cacheID>/<generation>" with a valid engine ID, or their
+// cache ID or session isn't one (validEngineID), and logs it: at warning
+// level at most once a minute per source (rejectionLog), the rest at debug
+// level. The values themselves aren't logged, only their lengths.
+func (s *Service) refusedEngineIDs(source string, n, cacheLen, sessionLen int) {
+	s.metrics.EngineIDsRefused(source, n)
+	level := slog.LevelDebug
+	if s.engineIDRefusals.allow(source, time.Now()) {
+		level = slog.LevelWarn
+	}
+	s.logger.Log(context.Background(), level, LogEngineIDsRefused, "source", source, "count", n,
+		"cacheLength", cacheLen, "sessionLength", sessionLen, "maxLength", MaxEngineIDLen)
 }
 
 func attrValue(kvs []*commonpb.KeyValue, key string) (*commonpb.AnyValue, bool) {

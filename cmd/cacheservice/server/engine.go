@@ -108,6 +108,9 @@ type Service struct {
 	// the warnings of the requests it refuses, by route and reason.
 	otlp         otlpLimits
 	otlpRefusals rejectionLog
+	// engineIDRefusals rate-limits the warnings of what is dropped for an
+	// invalid engine cache ID or session (refusedEngineIDs), by source.
+	engineIDRefusals rejectionLog
 }
 
 // New returns a service with no engines, and with the export and import
@@ -297,6 +300,13 @@ func (c *engineConn) serve(ctx context.Context) error {
 	if err := env.Decode(&c.hello); err != nil {
 		_ = c.replyError(ctx, env, err.Error())
 		return err
+	}
+	// The cache ID keys the tracker's, the importer's and the namespace's
+	// state, as a span's does (parseEngineCache).
+	if !validEngineID(c.hello.CacheID) {
+		c.svc.refusedEngineIDs(metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
+		_ = c.replyError(ctx, env, "invalid cache ID")
+		return errors.New("hello: invalid cache ID")
 	}
 	if h := c.svc.testHookHello; h != nil {
 		h()
