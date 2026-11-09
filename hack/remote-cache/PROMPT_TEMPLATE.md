@@ -52,9 +52,9 @@ Fill it in like this:
 - **Your lead:** keep one of the two lines. For an orchestrator, replace
   SESSION_ID with its session ID and WHAT_THEY_ASKED with what the requester
   asked for, in their words.
-- **Who merges:** when the session merges, keep the two lines marked
-  "(session merges)" and delete "merge any PR, close any issue,". When the
-  lead merges, delete the two marked lines instead.
+- **Who merges:** when the session merges, keep the lines marked "(session
+  merges)" and delete the one marked "(lead merges)". When the lead merges,
+  do the reverse.
 - **Branch:** replace BRANCH with the branch name from the prompt's "Branch
   and PR".
 
@@ -78,8 +78,11 @@ Within the task in the first message, you may, without asking first:
 - merge your own PR, as the steps describe (session merges);
 - close the issue your PR closes, once it has merged (session merges).
 
-You may not merge any PR, close any issue, or change repository settings or
-rulesets. Your lead does those.
+You may not, without asking first:
+- merge any PR or close any issue (lead merges);
+- change repository settings or rulesets.
+
+Your lead does those.
 
 **Telling your lead when you stop:** when you stop on a question or a
 blocker, tell your lead before you end the turn. An orchestrator gets it by
@@ -401,8 +404,9 @@ draft".
 *Copilot, round 1*
 
 15. **Mark "ready for review",** now that CI is green. That starts Copilot
-    review 1. Check in later. If the review fails to run, re-request it once;
-    if the re-run fails too, tell your lead. Never push to trigger a review.
+    review 1. Check in later. If the review fails to run, re-request it once.
+    If the re-run fails too, tell your lead and wait for their answer: no
+    review isn't a clean review. Never push to trigger a review.
 16. **Record** every finding from review 1 in the scratchpad: red, yellow,
     blue, and anything you can only read in its session.
 
@@ -424,7 +428,7 @@ draft".
 19. **Push, once.** One push carrying every commit since you marked it ready.
     It's your one fix push, and it starts Copilot review 2. No touch-ups or
     rebases sneaking in alongside. Check in later. Review 2 fails to run? Same
-    deal: re-request it once, then tell your lead.
+    deal: re-request it once, then tell your lead and wait for their answer.
 
 *Copilot, round 2: hands off the code*
 
