@@ -134,6 +134,9 @@ type Exporter struct {
 	// epoch is the last fence read, when epochOK (see fence).
 	epoch   metastore.Fence
 	epochOK bool
+	// epochGen counts forgetEpoch calls: a fence read keeps its epoch only
+	// if none happened since the read began.
+	epochGen uint64
 }
 
 const (
@@ -618,10 +621,11 @@ func (x *Exporter) checkOffered(ctx context.Context, bundle *dagql.ValueBundle, 
 // The fence is read at most once per epochTTL, and kept: a fence read
 // earlier is still read before this try's checks, so it is as safe, and at
 // worst older, which only refuses more. A refused export forgets it
-// (forgetEpoch), so its next try reads a fresh one.
+// (forgetEpoch), so its next try reads a fresh one; a read that began before
+// the forgetting isn't kept, or it would hand that try the older epoch.
 func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 	x.mu.Lock()
-	f, ok := x.epoch, x.epochOK
+	f, ok, gen := x.epoch, x.epochOK, x.epochGen
 	x.mu.Unlock()
 	if ok && x.cfg.Meta.Now().Sub(f.Started) < epochTTL {
 		return f
@@ -634,7 +638,9 @@ func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 	}
 	f = metastore.Fence{Epoch: epoch, Started: started}
 	x.mu.Lock()
-	x.epoch, x.epochOK = f, true
+	if x.epochGen == gen {
+		x.epoch, x.epochOK = f, true
+	}
 	x.mu.Unlock()
 	return f
 }
@@ -643,6 +649,7 @@ func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 func (x *Exporter) forgetEpoch() {
 	x.mu.Lock()
 	x.epochOK = false
+	x.epochGen++
 	x.mu.Unlock()
 }
 
