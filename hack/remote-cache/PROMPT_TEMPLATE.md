@@ -62,7 +62,8 @@ first of these that fits:
    fix that names the test. A pinned gap can't drift unnoticed, and the fix
    flips the test.
 4. **File it:** you file an issue, with no test.
-5. **Reject it:** the session replies on the thread with why.
+5. **Reject it:** the session notes why, and replies on the thread if it
+   came from Copilot.
 
 Security or data loss findings are fixed in this PR, or the PR doesn't merge.
 Never describe a token leak in a public issue.
@@ -350,7 +351,7 @@ merges; you write the code.
    your branch (`git status`): it has wandered off to other commits before.
    Not on it? Check your branch out again before you commit.
 
-   *Go home early:* nothing in it you'd change? Skip to "The draft".
+   *Go home early:* it found nothing? Skip to "The draft".
 
 7. **Sort** each finding in the scratchpad: **security or data loss** (it's
    real, and the code deletes data it shouldn't, publishes an unverified blob
@@ -359,13 +360,15 @@ merges; you write the code.
    and it doesn't hold), or **can't tell**.
 8. **Hand it to your lead,** the whole list in one message, security or data
    loss first, with your read on each. Wait for their answer.
-9. **Do what they say,** finding by finding: fix the code or the tests,
-   update a doc, or add a known-gap test that pins today's behaviour (name it
+9. **Do what they say,** finding by finding: fix the code or the tests, update
+   a doc, or add a known-gap test that pins today's behaviour (name it
    `TestKnownGap…`). Run the tests until they pass, prove any new test can
-   fail, and **commit**. You got this. Don't call it done until the fix is
-   slappin' and the tests are passin'. Then go back to **Review**. Five rounds
-   in this block and still finding things? Ask your lead whether to keep
-   going, and wait for their answer.
+   fail, and **commit** what you changed. You got this. Don't call it done
+   until the fix is slappin' and the tests are passin'. Then go back to
+   **Review**, unless your lead said to change nothing this round: then the
+   block's done, on to "The draft". Five rounds in this block and still
+   finding things? Ask your lead whether to keep going, and wait for their
+   answer.
 
 *The draft: CI starts here*
 
@@ -404,7 +407,8 @@ merges; you write the code.
     quarantine a check.
 14. **Check in with your lead** after the first green CI. Give them the size
     of the diff and how you're feeling about the scope, and wait for them to
-    give the approval to keep going. The size is the lines added plus
+    give the approval to keep going. If they split the work, do what they
+    say about this PR's scope before you go on. The size is the lines added plus
     deleted, every file counted:
 
     ```bash
@@ -422,30 +426,34 @@ merges; you write the code.
 
 *Self-review, block 2: Copilot's findings plus your own*
 
-16. **Review:** take every finding from Copilot's review (red, yellow, blue,
-    and anything you can only read in its session), then run exactly
+16. **Review:** on this block's first round, take every finding from
+    Copilot's review (red, yellow, blue, and anything you can only read in
+    its session). Every round, run exactly
     `/code-review high origin/feature/remote-cache...HEAD` again. Fresh eyes
     on fresh code. Check the files and your branch again.
 
-    *Go home early:* nothing from either that you'd change, and CI is green?
-    Skip to "Wrap it up". Nice.
+    *Go home early:* both came back with nothing, and CI is green? Skip to
+    "Wrap it up". Nice.
 
 17. **Sort** each finding, same four reads as before.
 18. **Hand it to your lead,** the whole list in one message, and wait for
     their answer.
 19. **Do what they say,** run the tests, prove any new test can fail, and
-    **commit. Do not push yet.** Hold that push like it's the last slice of
-    pizza. Reply on each of Copilot's threads with what you did, and resolve
-    it. Then go back to **Review**: five rounds in this block, then ask your
-    lead before any more.
+    **commit what you changed. Do not push yet.** Hold that push like it's
+    the last slice of pizza. Reply on each of Copilot's threads you handled
+    this round with what you did, and resolve it. Then go back to
+    **Review**, unless your lead said to change nothing this round: then the
+    block's done. Five rounds in this block, then ask your lead before any
+    more.
+
+    *Go home early:* nothing committed in this whole block? There's nothing
+    to push. Skip to "Wrap it up".
+
 20. **Local green,** then **push, once.** One push carrying every commit
     since you marked it ready. It starts Copilot review 2. No touch-ups or
     rebases sneaking in alongside. Check in later. Review 2 fails to run?
     Same deal: re-request it once, then tell your lead and wait for their
     answer.
-
-    *Go home early:* nothing to push because your lead said to change
-    nothing? Don't push. Skip to "Wrap it up".
 
 *Copilot, round 2: hands off the code*
 
