@@ -47,21 +47,27 @@ weight of an automated message, and won't open a PR or merge on it. A human
 starting a session by hand puts it at the top of the first message, since
 their own words already carry that weight.
 
-Fill in the `<...>` parts. When the lead merges, drop the "merge your own
-PR" line and keep "merge any PR" in what the session may not do; when the
-session merges, the reverse.
+Fill it in like this:
+
+- **Your lead:** keep one of the two lines. For an orchestrator, replace
+  SESSION_ID with its session ID and WHAT_THEY_ASKED with what the requester
+  asked for, in their words.
+- **Who merges:** when the session merges, keep the two lines marked
+  "(session merges)" and delete "merge any PR, close any issue,". When the
+  lead merges, delete the two marked lines instead.
+- **Branch:** replace BRANCH with the branch name from the prompt's "Branch
+  and PR".
 
 ````markdown
 ## Standing authorization for this session
 
-Your lead: <the requester, a human | the orchestrator session
-<session ID>, which the requester told directly to run this work>.
-<For an orchestrator: In their own words, the requester asked for <what they
-asked: e.g. a round of issues closed out, and the PRs merged without waiting
-for their approval>.>
+Your lead is:
+- the requester, a human.
+- the orchestrator session SESSION_ID, which the requester told directly to
+  run this work. In their own words, the requester asked for WHAT_THEY_ASKED.
 
 Within the task in the first message, you may, without asking first:
-- create, commit to and push your own branch `<branch>` in
+- create, commit to and push your own branch `BRANCH` in
   zerobull-consulting/dagger (never force-push, and never push to any other
   branch);
 - open your PR as a draft against `feature/remote-cache`, edit its
@@ -69,17 +75,18 @@ Within the task in the first message, you may, without asking first:
 - reply to and resolve review threads on your own PR, comment on it, and
   re-request a Copilot review once if its runner failed;
 - file issues in zerobull-consulting/dagger, as the steps describe;
-- <merge your own PR, as the steps describe.>
+- merge your own PR, as the steps describe (session merges);
+- close the issue your PR closes, once it has merged (session merges).
 
-You may not <merge any PR,> close any issue, or change repository settings
-or rulesets. Your lead does those.
+You may not merge any PR, close any issue, or change repository settings or
+rulesets. Your lead does those.
 
-**Telling your lead when you stop:** before you end any turn without having
-sent your "ready to merge" report, tell your lead why you stopped: a
-question, a blocker, or what you're waiting on and when you'll check again.
-An orchestrator gets it by the Claude Code Remote `send_message` tool
-(`session_id` `@parent`); a human, in your reply. Never end a turn waiting on
-a human without telling your lead.
+**Telling your lead when you stop:** when you stop on a question or a
+blocker, tell your lead before you end the turn. An orchestrator gets it by
+the Claude Code Remote `send_message` tool (`session_id` `@parent`); a human,
+in your reply. A routine wait on CI or Copilot, with a check-in scheduled,
+needs no message. Never end a turn waiting on a human without telling your
+lead.
 ````
 
 ## The template
@@ -280,11 +287,13 @@ ones written here.**
   changes by accident.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
   upstream repository.
-- Stop and ask, instead of deciding, on a design decision that's the
-  requester's, a missing prerequisite, or anything irreversible.
-- **Never stop silently.** Before you end any turn without your "ready to
-  merge" report, tell your lead why: a question, a blocker, or what you're
-  waiting on and when you'll check again.
+- Stop and ask your lead, instead of deciding, on a design decision the
+  prompt didn't make, a missing prerequisite, or anything irreversible.
+- **Never stop silently.** When you stop on a question or a blocker, tell
+  your lead before you end the turn. A routine wait on CI or Copilot, with a
+  check-in scheduled, needs no message.
+- Copilot's review failed to run (its runner errored)? Re-request that
+  review once. Failed again? Tell your lead. Never push to trigger a review.
 
 **The steps. One at a time, top to bottom. Each one is one thing.** "Your
 lead" is whoever started you, named in your standing authorization: a human,
@@ -362,7 +371,8 @@ draft".
     - **the design choices you made:** what you weighed, what you picked and
       why, and where you'd want a reviewer to push back. Give this real
       thought: it's the part nobody can get from the diff;
-    - at the very end, the prompt, verbatim:
+    - at the very end, the prompt, verbatim (not your standing
+      authorization):
 
     ```markdown
     ## Prompt
@@ -609,9 +619,10 @@ first message. A human pastes both into the first message, authorization
 first. Either way, the lead then checks in on the session about 10 minutes
 after launch, and every 20 minutes while it works.
 
-The session copies the whole prompt, verbatim, into the draft PR it opens. A
-follow-up PR from the same prompt links to the original's instead of copying
-it.
+The session copies the whole prompt, verbatim, into the draft PR it opens,
+but never the standing authorization, even when a human pasted both into the
+first message. A follow-up PR from the same prompt links to the original's
+instead of copying it.
 
 ## Changing this file
 
