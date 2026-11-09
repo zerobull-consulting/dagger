@@ -598,8 +598,8 @@ a writer already started on needs no `claim`; running it anyway is harmless.
 **Run `apply` with the admin key, interactively.** Setting lifecycle rules
 takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
 key), since a rule can expire anything in the bucket. `claim` doesn't need
-that power, only a key that can list the prefix and read and write the
-marker; on a fresh bucket the admin
+that power, only a key that can list the prefix and its multipart uploads,
+and read and write the marker; on a fresh bucket the admin
 key is the only key there is, so that is the one to use. Run `apply` once when a
 bucket is set up, and again when the tokens file's namespaces change, from
 your own shell, with the key in your environment for that one command. Never
@@ -2432,7 +2432,7 @@ Keep three credentials, each with only what it needs
 | --- | --- | --- |
 | **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
 | **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
-| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs less: only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else), so the Read/Write/Delete key can claim a prefix, and the Admin key can too. |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs less: only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor), so the Read/Write/Delete key can claim a prefix, and the Admin key can too. |
 
 The admin key is the most powerful: a lifecycle rule can expire anything in
 the bucket. Use it for `lifecycle apply`, and for `plan` and `check` where the writer's
@@ -2531,10 +2531,12 @@ answer).
   1 when the shutdown ended in any error: engine connections still closing
   after they were dropped (about 2.5s in, well before the bound), or the
   bound cutting the shutdown off with work still running (such as an HTTP
-  request); or when a signal cut it off: it logs what was still running (`exports`, `imports`, `gc`,
-  `engines`), and exits without waiting for it. A shutdown that ends in
-  error logs `stopped uncleanly` with the reason in `error=`, and says the
-  shutdown's bound passed only when it did. 1 also when an HTTP server
+  request). It logs `stopped uncleanly` with the reason in `error=` and what
+  was still running (`exports`, `imports`, `gc`, `engines`), says the
+  shutdown's bound passed only when it did, and exits without waiting for
+  the rest. 1 too when a signal, or the backstop for a step that overran its
+  own bound (`stopped: the shutdown overran its bound`), cut the shutdown
+  off: it logs what was still running, and exits without waiting for it. 1 also when an HTTP server
   failed (such as its address in use), which stops the service too, or
   failed during the drain or the shutdown, including as the shutdown ended:
   the shutdown waits, within its bound, for the servers to return before

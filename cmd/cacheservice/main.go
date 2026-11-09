@@ -569,9 +569,10 @@ const shutdownMargin = 500 * time.Millisecond
 // It also waits, within the same bound, for the servers' goroutines
 // (serversDone, nil when there are none), so that the error one sent as it
 // stopped is in errs when exitCode reads it.
-// It returns an error when the engine connections were still closing after
-// the close bound, or when grace cut the wait off, with work still running:
-// the service's paths, an HTTP request or a server's goroutine.
+// It returns an error when engine connections it dropped at the close bound
+// were still closing a moment later (CloseEnginesContext's error), or when
+// grace cut the wait off, with work still running: the service's paths, an
+// HTTP request or a server's goroutine.
 // The cancel comes first, as when the signal itself canceled that
 // context: a request tied to it, such as POST /debug/gc, then ends at once
 // rather than holding the shutdown for grace.
