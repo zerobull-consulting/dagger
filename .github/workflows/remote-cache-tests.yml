@@ -455,6 +455,8 @@ jobs:
       - name: "Read-only: a step that fails before the job's end"
         continue-on-error: true
         run: exit 1
+      - name: PROOF-ONLY failing step
+        run: exit 1
       # The reader's logs are written by its stop, which the start's post
       # step does only after every step here, this upload included: a job that
       # failed would upload no reader logs (zerobull-consulting/dagger#174).
