@@ -140,8 +140,10 @@ case "$method $path" in
 		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "'"$e2e"'"}]},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
 "GET repos/o/r/actions/runs/"*)
+	# A run whose conclusion is "running" hasn't completed (yet).
 	c="$(cat "$FAKE/run-${path##*/}")"
-	echo "{\"status\": \"completed\", \"conclusion\": \"$c\"}" ;;
+	if [[ "$c" == running ]]; then echo '{"status": "in_progress", "conclusion": null}'; else
+		echo "{\"status\": \"completed\", \"conclusion\": \"$c\"}"; fi ;;
 "GET repos/o/r/branches/feature/remote-cache")
 	sha="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
 	echo "{\"commit\": {\"sha\": \"$sha\", \"commit\": {\"committer\": {\"date\": \"${FAKE_HEAD_DATE:-2020-01-01T00:00:00Z}\"}}}}" ;;
@@ -643,6 +645,14 @@ check "dispatch first: after the dispatch" test -f "$FAKE/dispatch-remote-cache-
 check "dispatch first: so no result is given" not has "$tmp/out" "result="
 check "dispatch first: saying the run isn't awaited" has "$tmp/out" "is not awaited"
 check "dispatch first: and cancelling it" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+# zerobull-consulting/dagger#187: a wait that times out. Known gap: the
+# run is left going, uncancelled.
+setup
+echo running >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0
+check "a wait that times out (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
+check "a wait that times out (zerobull-consulting/dagger#187): known gap, the run is not cancelled" not has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
 setup
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
 check "a test ref that isn't a branch name is refused" test "$status" -ne 0
