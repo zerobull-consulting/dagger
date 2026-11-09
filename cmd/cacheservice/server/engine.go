@@ -116,6 +116,13 @@ type Service struct {
 // New returns a service with no engines, and with the export and import
 // paths off. dumpDir, when set, receives every envelope and engine event
 // body; it must exist.
+//
+// The service's identity comes from the embedded manifest, and a build
+// stamped as another release than the manifest's base reports base "dev"
+// here, without an error: only main refuses such a build
+// (compat.BuildBase). No program outside tests embeds this package; one that
+// did would have to make that check itself (zerobull-consulting/dagger#147,
+// item 4).
 func New(logger *slog.Logger, dumpDir string) *Service {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))

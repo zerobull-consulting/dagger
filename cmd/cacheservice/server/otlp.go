@@ -112,8 +112,8 @@ func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportL
 				}
 				body := rec.GetBody().GetStringValue()
 				cache := stringAttr(rec.Attributes, telemetryattrs.EngineCacheAttr)
-				s.logger.Info("engine event", "namespace", ns.name, "kind", truncate(kind, 200), "cache", truncate(cache, 200), "instance", truncate(instance, 200),
-					"scope", sl.GetScope().GetName(), "bodyBytes", len(body), "body", truncate(body, 512))
+				s.logger.Info("engine event", "namespace", ns.name, "kind", cutString(kind, 200), "cache", cutString(cache, 200), "instance", cutString(instance, 200),
+					"scope", sl.GetScope().GetName(), "bodyBytes", len(body), "body", cutString(body, 512))
 				if s.dumpDir != "" {
 					s.dump(fmt.Sprintf("%06d-event-%s.json", s.dumpSeq.Add(1), kind), []byte(body))
 				}
@@ -140,7 +140,7 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 					continue
 				}
 				cacheSpans++
-				s.logger.Debug("cache span", "cache", truncate(cache, 200), "session", truncate(session, 200), "name", truncate(span.Name, 120),
+				s.logger.Debug("cache span", "cache", cutString(cache, 200), "session", cutString(session, 200), "name", cutString(span.Name, 120),
 					"result", result,
 					"outcome", stringAttr(span.Attributes, telemetryattrs.CacheOutcomeAttr),
 					"type", stringAttr(span.Attributes, telemetryattrs.CacheTypeAttr),
@@ -284,11 +284,4 @@ func arrayLen(kvs []*commonpb.KeyValue, key string) int {
 		}
 	}
 	return 0
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }

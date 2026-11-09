@@ -847,12 +847,6 @@ func TestUnhandledRequest(t *testing.T) {
 }
 
 func TestHelpers(t *testing.T) {
-	if got := truncate("abc", 3); got != "abc" {
-		t.Errorf("truncate kept %q", got)
-	}
-	if got := truncate("abcdef", 3); got != "abc…" {
-		t.Errorf("truncate made %q", got)
-	}
 	attrs := []*commonpb.KeyValue{kv("a", "1"), arrayKV("list", 4)}
 	if stringAttr(attrs, "a") != "1" || stringAttr(attrs, "missing") != "" || stringAttr(attrs, "list") != "" {
 		t.Error("stringAttr")

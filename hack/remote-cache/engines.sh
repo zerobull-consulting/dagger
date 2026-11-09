@@ -26,7 +26,10 @@
 #       it. The edit is the run's own and is never committed by this
 #       script: a green run is what a commit of that line then cites. An
 #       accepted version with the same digest is verified again: its line
-#       moves first.
+#       moves first. Only a github.com server works: the service's parser
+#       takes only https://github.com/... run URLs, so on another server
+#       (GitHub Enterprise Server) candidate refuses and writes nothing
+#       (zerobull-consulting/dagger#147, item 3).
 #
 # The release check (release-check.sh, zerobull-consulting/dagger#117, D5)
 # reads and edits the manifest only through these:
