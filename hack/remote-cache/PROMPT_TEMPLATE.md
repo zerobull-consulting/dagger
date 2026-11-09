@@ -224,8 +224,8 @@ lead" means whoever started you: a human, or an orchestrator session.
 
 12. **Open the draft.** Push, and open the PR as a **draft** against
     `feature/remote-cache`. Copilot doesn't review drafts, but every push
-    runs CI, so push when you have something to show. Follow the repository's PR template, if it has one. The description
-    says:
+    runs CI, so push when you have something to show. Follow the
+    repository's PR template, if it has one. The description says:
     - what the PR does;
     - the size you measured (and why, if it's over 2,500 and not split);
     - **the design choices you made:** what you weighed, what you picked and
@@ -417,9 +417,9 @@ bullets and loops ("fix, then review again, then gather it into one push").
 Sessions got lost in the middle, and zerobull-consulting/dagger#193 was one
 result. One step per action, written out again instead of "repeat", with
 different wording each time, makes the second round visibly not the first.
-The rules stay plain so the limits are never ambiguous. The "go home early" exits and the
-tiny follow-up issues reward a PR that's going well and keep each change
-small (zerobull-consulting/dagger#198).
+The rules stay plain so the limits are never ambiguous. The "go home early"
+exits and the tiny follow-up issues reward a PR that's going well and keep
+each change small (zerobull-consulting/dagger#198).
 
 ## Conventions for the whole prompt
 
@@ -433,6 +433,13 @@ small (zerobull-consulting/dagger#198).
 - **Who merges** is stated in section 4: by default the session. When the
   lead merges (a human, or the orchestrator session that wrote the prompt),
   the merge step becomes a "ready to merge" report.
+- **Before the lead merges,** it checks the report against the PR: the
+  ruleset's required checks passed on the head being merged; at most two
+  Copilot reviews, plus one for each push the steps allow after review 2 (a
+  CI fix, or a fix for deleted data, an unverified blob or bundle, or an
+  exposed token), and nothing else pushed after review 2; and the prompt
+  verbatim in the PR. The steps don't state the cap as a number, so this is
+  where it's checked.
 - When picking several items to run in parallel: refresh the state first
   (commits, open PRs, issues filed since the last round, and running sessions,
   not just PRs); map which files each item touches and avoid two items in the
