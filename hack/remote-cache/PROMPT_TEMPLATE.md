@@ -168,8 +168,8 @@ agreement's full text below:
   real findings, then mark the PR ready;
 - at most **two** Copilot reviews in all, counting every push's: review 1,
   one fix push, review 2, and **no push after review 2**;
-- commit review 1's fixes locally (no push), then a second `/code-review high`,
-  its fixes committed too, and all of it in that one fix push;
+- commit review 1's fixes locally (no push), run a second `/code-review high`,
+  commit the fixes for its findings too, then make that one fix push;
 - never end a turn waiting on Copilot or CI without a check-in scheduled;
 - review 2's confirmed findings become issues, the rest go to the tracking
   issue's rolling leads issue, then the squash merge of review 2's head, or
@@ -218,12 +218,12 @@ keeps the rounds productive.
   is exactly one fix push, and nothing is pushed after review 2.
   - *Why the final push counts:* the earlier text capped "rounds" but required
     a final push after the last one, so a cap of four meant five reviews
-    (zerobull-consulting/dagger#121 and zerobull-consulting/dagger#141 had five). Counting every
-    review makes the cap what it says.
+    (zerobull-consulting/dagger#121 and zerobull-consulting/dagger#141 had
+    five). Counting every review makes the cap what it says.
   - *Why two:* under the earlier cap of four, most PRs from
-    zerobull-consulting/dagger#107 to zerobull-consulting/dagger#168 already finished in two, thanks to
-    the self-review before marking ready. zerobull-consulting/dagger#168 met
-    every target under a cap of two.
+    zerobull-consulting/dagger#107 to zerobull-consulting/dagger#168 already
+    finished in two, thanks to the self-review before marking ready.
+    zerobull-consulting/dagger#168 met every target under a cap of two.
 - **Decide on splitting once, from the first diff:** when the draft first does
   what the prompt asks, before `/code-review` or any other review. Its size is
   the lines added plus the lines deleted, counting every file (tests, docs and
@@ -288,7 +288,8 @@ keeps the rounds productive.
      Remote `send_later` tool, where you have it), and then read the PR's
      reviews and checks yourself. Three sessions in that round went idle
      beside a review that had already arrived (zerobull-consulting/dagger#180,
-     zerobull-consulting/dagger#182, zerobull-consulting/dagger#188) and sat until someone nudged them.
+     zerobull-consulting/dagger#182, zerobull-consulting/dagger#188) and sat
+     until someone nudged them.
 4. **After review 2, push nothing more.** Handle whatever it reports (new
    findings, a 🔵 "Needs a closer look" with or without text, findings only in
    its session) without changing the PR:
@@ -331,12 +332,13 @@ keeps the rounds productive.
    - *Why the orchestrator merges:* a session reads an approval quoted in a
      prompt that another session wrote as an automated message, not the
      requester's own, and won't merge on it. That's the right call, and
-     telling it again from the orchestrator carries the same weight. The zerobull-consulting/dagger#170
-     session stopped short of merging (zerobull-consulting/dagger#176 was then
-     merged with GitHub's default `(#176)` title), and the zerobull-consulting/dagger#87 session
-     asked for confirmation before its reviews. Splitting the work this way let
-     six PRs in a row (zerobull-consulting/dagger#182 to zerobull-consulting/dagger#190) merge without
-     the requester.
+     telling it again from the orchestrator carries the same weight. The
+     zerobull-consulting/dagger#170 session stopped short of merging
+     (zerobull-consulting/dagger#176 was then merged with GitHub's default
+     `(#176)` title), and the zerobull-consulting/dagger#87 session asked for
+     confirmation before its reviews. Splitting the work this way let six PRs
+     in a row (zerobull-consulting/dagger#182 to
+     zerobull-consulting/dagger#190) merge without the requester.
 6. **CI red at any point:** fix it at the root cause; never retry or loosen a
    check. A fix push after review 2 is allowed only for CI that is red on
    review 2's head, and its review is handled like review 2's.
