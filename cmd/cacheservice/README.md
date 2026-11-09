@@ -1418,7 +1418,10 @@ What it does, and doesn't:
   it stores copies of what it imported, under new numbers, rather than
   reusing them. Nothing is lost; a fresh engine per job never hits it.
 - **The drain has nothing to flush,** and returns at once
-  (`drain: nothing to export (read-only: -export=false)`).
+  (`drain: nothing to export (read-only: -export=false)`), unless an
+  explicit import admitted before it still runs: it waits for that, up to
+  its deadline (`drain: waiting for explicit requests`; see
+  [Stopping and draining](#stopping-and-draining)).
 
 Three combinations are refused at startup, with exit code 2 and an error
 naming both settings, before anything connects to the bucket:
@@ -1607,6 +1610,34 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   they hold no part of the budget
   ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
   `TestIdleKeepAliveConnectionsUnbounded`).
+- **Engine IDs are validated before they key anything.** An engine cache ID
+  (the `<cacheID>` of a span's or event's `dagger.io/engine.cache`, an
+  engine start's wiped cache, an engine's hello) and a span's session
+  (`dagger.io/engine.session`), when it has one, must be 1 to 128 letters,
+  digits, `.`, `_` or `-` (`server.MaxEngineIDLen`), as a flush's cache ID
+  already had to be; and `dagger.io/engine.cache` must be
+  `<cacheID>/<generation>`
+  ([zerobull-consulting/dagger#88](https://github.com/zerobull-consulting/dagger/issues/88)).
+  Real engines send far less: a cache ID is a UUID, 36 characters
+  (`uuid.NewString` in dagql's `Cache.openIdentity`), and a session ID 26
+  (`crypto/rand.Text` in the engine client); the e2e's `otlp-sizes` scenario
+  logs the longest of each the run's engines sent, and fails if any was
+  dropped. Before, a cache ID or session of any length or content (with a
+  numeric generation) became a key of the tracker's state, which the
+  tracker keeps for a cache no engine connects under. That
+  bounds what each cache ID costs, but not how many the tracker keeps: it
+  never forgets a cache no engine connects under
+  ([zerobull-consulting/dagger#203](https://github.com/zerobull-consulting/dagger/issues/203)). Now
+  a request's spans under an invalid one are dropped, not tracked; an event
+  of any kind with one is dropped; a start naming an invalid wiped cache is
+  taken without it; a hello with one is answered with an error and the
+  connection closed. Each is counted in
+  `cacheservice_engine_ids_refused_total`, by source (`span`, `event`,
+  `wiped_cache`, `hello`), and logged, at warning level at most once a
+  minute per source; the refusal's record gives the values' lengths, not
+  the values
+  (`TestTrackSpansValidatesEngineIDs`, `TestTrackEventValidatesEngineIDs`,
+  `TestHelloValidatesCacheID`).
 - **Every refusal is counted**, by route and reason, in
   `cacheservice_otlp_refused_total`, and logged: at warning level at most
   once a minute per route and reason, as refused tokens are, the rest at
@@ -2472,8 +2503,10 @@ job is its only chance to store what the job built
 ([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
 SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops.
 A read-only instance (`-export=false`) has nothing to flush: its drain
-returns at once, and logs `drain: nothing to export (read-only:
--export=false)`.
+logs `drain: nothing to export (read-only: -export=false)`, and returns at
+once, unless an explicit import admitted before it still runs, which it
+waits for, up to its deadline (logged as `drain: waiting for explicit
+requests`).
 
 1. **It takes no new work.** A new engine WebSocket gets 503 with
    `Retry-After: 10` before the upgrade, and one upgraded but not yet
@@ -2491,7 +2524,8 @@ returns at once, and logs `drain: nothing to export (read-only:
    scheduled GC stop; a GC run under way is canceled (GC is idempotent, and
    the next run finishes it), whether scheduled or asked for. `POST
    /debug/gc`, and the explicit export and import hooks, answer 503: the
-   drain runs what is pending itself. Engine events
+   drain runs what is pending itself. An explicit export or import admitted
+   before the drain started is waited for (see below). Engine events
    (`engine.start`, `engine.prune`) are still taken: a prune makes an entry
    no longer worth exporting.
 2. **It flushes.** Every dirty entry is due now, without waiting for it to
@@ -2783,12 +2817,23 @@ doesn't wait for it, and logs its roots as left (`connected=false`). Known
 gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
 ([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
 
-**An explicit export or import admitted just before the drain.** One that
-passed the 503 check as the drain started runs on, and the drain doesn't wait
-for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
-`TestKnownGapDrainDoesNotWaitForExplicitExport` and
-`TestKnownGapDrainDoesNotWaitForExplicitImport`
-([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
+**An explicit export or import admitted just before the drain.** The hooks
+are admitted under the drain's lock, so each one is either admitted before
+the drain starts, and waited for, or refused with 503. The drain waits for
+those admitted, up to its deadline, as for the exports it runs; it doesn't
+cancel them. An explicit export admitted while it still waited for its
+cache's export slot runs once it has it. While the drain waits, `GET
+/debug/drain` counts them in `explicit`. Roots such an export stores while
+draining are counted in the report's `stored`. One still running when the
+drain ends (at its deadline, or canceled) is counted in the report's
+`explicit`, logged as `explicitLeft`, and runs on until it ends or the stop
+that follows cuts it off (an export cut off publishes nothing); what it
+stores after the drain ended isn't in the report. Pinned by
+`TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
+`TestDrainRunsExplicitExportWaitingForSlot`, the
+`TestDrainEndsAtDeadlineWith…` tests and
+`TestReadOnlyDrainWaitsForExplicitImport`
+([#72](https://github.com/zerobull-consulting/dagger/issues/72), fixed).
 
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
@@ -2799,7 +2844,8 @@ by an export cut off are named by nothing, and GC deletes them.
 
 **A service that doesn't export** (no `CACHESERVICE_S3_BUCKET`) has nothing
 to drain: it refuses new engines, and stops at once
-(`TestDrainExportOff`).
+(`TestDrainExportOff`), but for an explicit import admitted before the
+drain, which it waits for, up to its deadline.
 
 Tests: `TestDrain*`, `TestDrainedRestartStoresPendingExport`,
 `TestCloseEnginesBoundedAndOffTheLock` and `TestWaitWaitsForGCRunAskedFor` in
@@ -2843,6 +2889,7 @@ paths record into them through their metadata store. All are prefixed
 | `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, `flush` (see [Flushing one engine cache](#flushing-one-engine-cache)), or `debug` (the debug API; see [The debug API](#the-debug-api)) |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
+| `engine_ids_refused_total` | `source` | What was refused because its `dagger.io/engine.cache` isn't `<cacheID>/<generation>` with a valid cache ID, or its cache ID or session isn't 1 to 128 letters, digits, `.`, `_` or `-` (see [OTLP limits](#otlp-limits)), by source: `span` (dropped), `event` (dropped), `wiped_cache` (an engine start's wiped cache, ignored; the start is taken) or `hello` (refused) |
 | `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
 | `blob_hashed_bytes_total` | `scope`, `by` | Bytes hashed to verify uploads: `store` (as it copied them) or `service` (read through the service) |
 | `blob_promotion_duration_seconds` | `scope` | Time to verify and promote one blob, slot wait included: it grows with the blob's size (see [Verification and promotion](#verification-and-promotion)) |
@@ -3676,12 +3723,13 @@ later session names its entries
 stop drains first and stores it (see
 [Stopping and draining](#stopping-and-draining)); an engine that disconnects
 during the drain can't reconnect, and its exports are left
-([#70](https://github.com/zerobull-consulting/dagger/issues/70)); and the
-drain doesn't wait for an explicit export or import admitted just before it
-([#72](https://github.com/zerobull-consulting/dagger/issues/72)). The drain
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)). The drain
 starting an export past its deadline
 ([#73](https://github.com/zerobull-consulting/dagger/issues/73)) is fixed:
-it starts nothing past it.
+it starts nothing past it. So is the drain not waiting for an explicit
+export or import admitted just before it
+([#72](https://github.com/zerobull-consulting/dagger/issues/72)): it waits
+for it, up to its deadline.
 
 **Fixed since: bundles of moved imports.** The first run of
 `service-restart` found that a bundle holding imports could no longer be

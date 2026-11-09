@@ -566,7 +566,7 @@ func TestFlushBadRequests(t *testing.T) {
 	}{
 		{flushURL(h.srv.URL, h.cache.ID, ""), "", http.StatusUnauthorized},
 		{flushURL(h.srv.URL, "bad%20id", ""), "engine-token", http.StatusBadRequest},
-		{flushURL(h.srv.URL, strings.Repeat("a", maxCacheIDLen+1), ""), "engine-token", http.StatusBadRequest},
+		{flushURL(h.srv.URL, strings.Repeat("a", MaxEngineIDLen+1), ""), "engine-token", http.StatusBadRequest},
 		{flushURL(h.srv.URL, h.cache.ID, "soon"), "engine-token", http.StatusBadRequest},
 		{flushURL(h.srv.URL, h.cache.ID, "-1s"), "engine-token", http.StatusBadRequest},
 		{flushURL(h.srv.URL, h.cache.ID, "11m"), "engine-token", http.StatusBadRequest},

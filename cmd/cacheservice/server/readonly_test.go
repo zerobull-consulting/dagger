@@ -151,8 +151,19 @@ func readOnlyOptions() S3Options {
 
 func newReadOnlyHarness(t *testing.T, stores sharedStores, opts S3Options) *readOnlyHarness {
 	t.Helper()
+	return newReadOnlyHarnessWrapped(t, stores, opts, nil)
+}
+
+// newReadOnlyHarnessWrapped is newReadOnlyHarness, with the service's index
+// reads going through wrap, when set.
+func newReadOnlyHarnessWrapped(t *testing.T, stores sharedStores, opts S3Options, wrap func(metastore.Objects) metastore.Objects) *readOnlyHarness {
+	t.Helper()
 	objs := &refuseWrites{Objects: stores.objs}
-	meta, err := metastore.New(metastore.Config{Objects: objs})
+	var read metastore.Objects = objs
+	if wrap != nil {
+		read = wrap(objs)
+	}
+	meta, err := metastore.New(metastore.Config{Objects: read})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +421,83 @@ func debugGet(t *testing.T, url string) (int, string) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(body)
+}
+
+// heldListing is holdReads over refuseWrites, still listable, as the
+// ownership check needs.
+type heldListing struct {
+	*holdReads
+	refuseWrites *refuseWrites
+}
+
+func (h heldListing) ListKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	return h.refuseWrites.ListKeys(ctx, prefix, max)
+}
+
+func (h heldListing) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	return h.refuseWrites.ListUploadKeys(ctx, prefix, max)
+}
+
+// The drain of a read-only service, which has no export path, still waits
+// for an explicit import admitted before it, up to its deadline
+// (zerobull-consulting/dagger#72).
+func TestReadOnlyDrainWaitsForExplicitImport(t *testing.T) {
+	for _, hang := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ends", true: "hangs"}[hang], func(t *testing.T) {
+			hold := &holdReads{held: make(chan struct{}), released: make(chan struct{})}
+			h := newReadOnlyHarnessWrapped(t, newSharedStores(t), readOnlyOptions(), func(o metastore.Objects) metastore.Objects {
+				hold.Objects = o
+				return heldListing{holdReads: hold, refuseWrites: o.(*refuseWrites)}
+			})
+			var once sync.Once
+			release := func() { once.Do(func() { close(hold.released) }) }
+			defer release()
+			conn := h.connect(fakeengine.New("cache-b", 1))
+			done := make(chan error, 1)
+			go func() {
+				_, err := h.svc.Import(context.WithValue(context.Background(), holdKey{}, true), conn)
+				done <- err
+			}()
+			select {
+			case <-hold.held:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the explicit import didn't reach its index read")
+			}
+			d := time.Minute
+			if hang {
+				d = 300 * time.Millisecond
+			}
+			drained := startDrain(t, h.svc, d)
+			if hang {
+				rep := waitDrain(t, drained, 5*time.Second)
+				if rep.Outcome != metrics.DrainDeadline || rep.Explicit != 1 {
+					t.Fatalf("drain report %+v", rep)
+				}
+				if len(h.logs.find("drain: waiting for explicit requests")) != 1 {
+					t.Error("the drain didn't log that it waits for the explicit import")
+				}
+				release()
+				<-done
+				return
+			}
+			select {
+			case rep := <-drained:
+				t.Fatalf("the drain didn't wait for the explicit import: %+v", rep)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if _, err := h.svc.Import(context.Background(), conn); !errors.Is(err, ErrDraining) {
+				t.Fatalf("an explicit import during the drain: %v", err)
+			}
+			release()
+			if err := <-done; err != nil {
+				t.Fatalf("the explicit import: %v", err)
+			}
+			rep := waitDrain(t, drained, 5*time.Second)
+			if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 {
+				t.Fatalf("drain report %+v", rep)
+			}
+		})
+	}
 }
 
 // The drain of a read-only service has nothing to flush: it returns at
