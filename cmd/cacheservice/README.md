@@ -587,9 +587,9 @@ shell, in this order:
    claim a writer makes at startup. It doesn't need the admin key (a
    Read/Write/Delete key can claim), only a key that can list the prefix and
    its multipart uploads, and `s3:GetObject` and `s3:PutObject` on the marker
-   (`<prefix>/cacheservice.json`), plus `s3:GetObject` on each ancestor
-   prefix's marker for the nested-prefix check (see the keys table); on a
-   fresh bucket, that is the admin key.
+   (`<prefix>/cacheservice.json`); on a fresh bucket, that is the admin key.
+   `s3:GetObject` on each ancestor prefix's marker is optional (see the keys
+   table): without it, the nested-prefix check skips that ancestor.
 2. `lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>` (on
    MinIO, with `-abort-rule=false`).
 3. `lifecycle check -tokens-file tokens`: exit 0.
@@ -624,7 +624,8 @@ What it does:
   nothing and exits 0. It exits 1, writing nothing, on a prefix that holds keys
   and no marker, one with a marker of another layout, a prefix inside another
   service's, an upload in progress under it, or a store error (a 403 is
-  explained as needing a key that can write there). There is no
+  explained as needing a key that can list the prefix and its uploads and read
+  and write the marker). There is no
   `apply -claim`: keeping the steps apart keeps `apply`'s refusal of an
   unowned prefix a real check.
 - **`plan`** prints the bucket and prefix, the namespaces and where they came

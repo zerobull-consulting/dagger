@@ -323,7 +323,7 @@ func runClaim(ctx context.Context, o Options, st Store, out io.Writer, fail func
 	state, m, err := st.Claim(ctx, o.Prefix)
 	if err != nil {
 		if denied(err) {
-			err = fmt.Errorf("%w (the key isn't allowed to list the prefix and its multipart uploads and to write the marker there: a limited Read/Write/Delete key is, a Read key is not)", err)
+			err = fmt.Errorf("%w (the key isn't allowed to list the prefix and its multipart uploads and to read and write the marker there: a limited Read/Write/Delete key is, a Read key is not)", err)
 		}
 		return fail(ExitError, "%v; nothing claimed", err)
 	}

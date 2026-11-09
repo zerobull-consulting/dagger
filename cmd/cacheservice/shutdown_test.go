@@ -202,6 +202,10 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 	if !strings.Contains(engines, "stopped uncleanly") {
 		t.Errorf("the engine-close error was logged as %q: want \"stopped uncleanly\"", engines)
 	}
+	// Everything else was waited for, so the line must not say it wasn't.
+	if strings.Contains(engines, "without waiting") {
+		t.Errorf("the engine-close error was logged as %q: it claims not to have waited", engines)
+	}
 	// The bound passing, from a real shutdown with a request held past it.
 	srv := &http.Server{Handler: http.NotFoundHandler()}
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -229,7 +233,7 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 		t.Fatal("shutdown with a request held past the bound reported nothing")
 	}
 	bound := log(err)
-	if !strings.Contains(bound, "the shutdown's bound passed") || !strings.Contains(bound, "requests still running") {
+	if !strings.Contains(bound, "the shutdown's bound passed") || !strings.Contains(bound, "requests still running") || !strings.Contains(bound, "without waiting") {
 		t.Errorf("the bound passing was logged as %q", bound)
 	}
 }

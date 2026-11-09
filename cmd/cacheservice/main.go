@@ -540,12 +540,13 @@ func stopService(svc *server.Service, servers []*http.Server, serversDone <-chan
 }
 
 // logUncleanStop logs why shutdown reported an unclean stop: err's text is the
-// reason, and the message names the bound only when it passed
-// (errShutdownGrace), as the wait on requests or the service's paths does.
-// Other causes, such as the engine connections still closing after the
-// 2s close bound (about 2.5s in), come well before it.
+// reason, and the message says it exits without waiting only when the bound
+// passed (errShutdownGrace), as the wait on requests or the service's paths
+// does. Other causes, such as the engine connections still closing after the
+// 2s close bound (about 2.5s in), come well before it, with everything else
+// waited for.
 func logUncleanStop(logger *slog.Logger, svc *server.Service, err error, grace time.Duration) {
-	msg := "stopped uncleanly; exiting without waiting for the rest"
+	msg := "stopped uncleanly"
 	attrs := []any{"error", err}
 	if errors.Is(err, errShutdownGrace) {
 		msg = "stopped uncleanly: the shutdown's bound passed with work still running; exiting without waiting for it"
