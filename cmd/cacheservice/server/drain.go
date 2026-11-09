@@ -167,6 +167,11 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	s.drain.started, s.drain.deadline = start, deadline
 	s.drain.stored = map[string]int{}
 	explicitEnded := s.drain.explicitEnded
+	// A request that ended before the drain may have left a wake.
+	select {
+	case <-explicitEnded:
+	default:
+	}
 	if s.drain.refused == nil {
 		s.drain.refused = map[string]int{}
 	}
@@ -198,6 +203,9 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 			why = "read-only: -export=false"
 		}
 		s.logger.Info("drain: nothing to export (" + why + ")")
+		if n := s.explicitRunning(); n > 0 {
+			s.logger.Info("drain: waiting for explicit requests", "running", n, "deadline", deadline)
+		}
 		paths := context.Background()
 		if p != nil {
 			paths = p.ctx
@@ -468,6 +476,7 @@ func (s *Service) DrainStatus() DrainStatus {
 	}
 	s.drain.mu.Lock()
 	started, deadline, ended := s.drain.started, s.drain.deadline, s.drain.ended
+	explicit := s.drain.explicit
 	if l := s.drain.linger; l != nil {
 		cp := *l
 		cp.Caches = slices.Clone(l.Caches)
@@ -484,7 +493,7 @@ func (s *Service) DrainStatus() DrainStatus {
 		st.Report = ended
 		return st
 	}
-	st.Explicit = s.explicitRunning()
+	st.Explicit = explicit
 	if p := s.export; p != nil {
 		st.Left = s.drainLeft(p.now(), deadline)
 	}

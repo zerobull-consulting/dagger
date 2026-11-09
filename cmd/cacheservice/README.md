@@ -1418,7 +1418,10 @@ What it does, and doesn't:
   it stores copies of what it imported, under new numbers, rather than
   reusing them. Nothing is lost; a fresh engine per job never hits it.
 - **The drain has nothing to flush,** and returns at once
-  (`drain: nothing to export (read-only: -export=false)`).
+  (`drain: nothing to export (read-only: -export=false)`), unless an
+  explicit import admitted before it still runs: it waits for that, up to
+  its deadline (`drain: waiting for explicit requests`; see
+  [Stopping and draining](#stopping-and-draining)).
 
 Three combinations are refused at startup, with exit code 2 and an error
 naming both settings, before anything connects to the bucket:
@@ -2472,8 +2475,10 @@ job is its only chance to store what the job built
 ([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
 SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops.
 A read-only instance (`-export=false`) has nothing to flush: its drain
-returns at once, and logs `drain: nothing to export (read-only:
--export=false)`.
+logs `drain: nothing to export (read-only: -export=false)`, and returns at
+once, unless an explicit import admitted before it still runs, which it
+waits for, up to its deadline (logged as `drain: waiting for explicit
+requests`).
 
 1. **It takes no new work.** A new engine WebSocket gets 503 with
    `Retry-After: 10` before the upgrade, and one upgraded but not yet
@@ -2811,7 +2816,8 @@ by an export cut off are named by nothing, and GC deletes them.
 
 **A service that doesn't export** (no `CACHESERVICE_S3_BUCKET`) has nothing
 to drain: it refuses new engines, and stops at once
-(`TestDrainExportOff`).
+(`TestDrainExportOff`), but for an explicit import admitted before the
+drain, which it waits for, up to its deadline.
 
 Tests: `TestDrain*`, `TestDrainedRestartStoresPendingExport`,
 `TestCloseEnginesBoundedAndOffTheLock` and `TestWaitWaitsForGCRunAskedFor` in

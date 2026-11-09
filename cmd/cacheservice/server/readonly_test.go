@@ -473,6 +473,9 @@ func TestReadOnlyDrainWaitsForExplicitImport(t *testing.T) {
 				if rep.Outcome != metrics.DrainDeadline || rep.Explicit != 1 {
 					t.Fatalf("drain report %+v", rep)
 				}
+				if len(h.logs.find("drain: waiting for explicit requests")) != 1 {
+					t.Error("the drain didn't log that it waits for the explicit import")
+				}
 				release()
 				<-done
 				return
