@@ -181,7 +181,7 @@ the merged PR.
 ### 1. Header
 
 Repository; "You're opening a PR that closes <full reference>", with the
-issue in a sentence; where it sits in the plan; and *why it matters now*.
+issue in a sentence; what it builds on or unblocks; and *why it matters now*.
 
 *Why:* the agent weighs trade-offs better when it knows what the work is for.
 
@@ -348,9 +348,11 @@ reply.
 
 7. **Reject** findings that are wack: ones you traced and found wrong, or that
    the test suite you can see with your own two eyes contradicts. Write each
-   one and your reasoning into the scratchpad. A finding that needs a
-   significant design change? Don't reject it and don't fix it: ask your lead,
-   and wait for their answer before you go on.
+   one and your reasoning into the scratchpad. A finding about how the Dagger
+   engine or the bucket behaves needs a run, not just a trace, before you call
+   it wrong. A finding that needs a significant design change? Don't reject it
+   and don't fix it: ask your lead, and wait for their answer before you go
+   on.
 8. **Fix** each finding you kept, and run the tests. You got this. Don't call
    it done until the fix is slappin' and the tests are passin'. **Commit**
    what you fixed.
@@ -620,10 +622,10 @@ each change small (zerobull-consulting/dagger#198).
 - **When a session asks about a finding it couldn't confirm,** the lead
   decides: file it on its own, add it to an issue with similar ones, or drop
   it. The session never makes that call.
-- **Run items one at a time,** in the plan's order. Before each launch,
-  refresh `feature/remote-cache`, and carry what the last session hit into the
-  next prompt's "Heads up" (section 11). Running items in parallel turned out
-  to be hard.
+- **Run items one at a time,** in the order the requester set. Before each
+  launch, refresh `feature/remote-cache`, and carry what the last session hit
+  into the next prompt's "Heads up" (section 11). Running items in parallel
+  turned out to be hard.
 
 ## Starting a session
 
