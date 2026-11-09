@@ -1,7 +1,5 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#194](https://github.com/zerobull-consulting/dagger/pull/194)
-
 Every work item's prompt for the remote cache work is generated from this
 file, by the session's lead (see [The lead](#the-lead)). It holds the
 template, the steps every session follows (section 12, copied verbatim into
@@ -57,7 +55,7 @@ Fill it in like this:
   asked for, in their words.
 - **Who merges:** when the session merges, keep the lines marked "(session
   merges)" and delete the one marked "(lead merges)". When the lead merges,
-  do the reverse.
+  do the reverse. Then remove the markers themselves.
 - **Branch:** replace BRANCH with the branch name from the prompt's "Branch
   and PR".
 
@@ -106,12 +104,11 @@ An example comes first, then each section in detail.
 
 ### Example
 
-An illustration, not a real item: `<issue>`, `<other>` and `<N>` stand in
-for real numbers. Everything else is the shape a real prompt takes, down to
-how much each section says. A real launch also needs a standing
-authorization, filled in from [The standing
-authorization](#the-standing-authorization); this example's would name an
-orchestrator lead that merges.
+An illustration, not a real item: `<issue>` and `<other>` stand in for real
+numbers. Everything else is the shape a real prompt takes, down to how much
+each section says. A real launch also needs a standing authorization, filled
+in from [The standing authorization](#the-standing-authorization); this
+example's would name an orchestrator lead that merges.
 
 ````markdown
 # `lifecycle claim`: a `-dry-run` flag (zerobull-consulting/dagger#<issue>)
@@ -178,9 +175,6 @@ the merged PR.
 
 ## 12. The rules and the steps
 (section 12 of `hack/remote-cache/PROMPT_TEMPLATE.md`, copied verbatim)
-
-Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
-`zerobull-consulting/dagger#<N>`
 ````
 
 ### 1. Header
@@ -227,7 +221,7 @@ judge). Section 12 has the session write its design choices into the PR
 description.
 
 *Why:* separates what was settled before launch from what the session
-decides, and puts the reasoning on the record before code.
+decides, and puts the reasoning on the record where reviewers will see it.
 
 ### 6. What to build
 
@@ -292,7 +286,7 @@ ones written here.**
   enough.
 - **The Dagger engine never makes the service delete.** A Dagger engine
   event such as `engine.prune` or a cache wipe can make the service forget
-  entries, but objects leave the bucket only through GC.
+  entries, but never makes it remove their objects from the bucket.
 - Bound every loop, retry, wait and buffer.
 - Validate any string that came from the Dagger engine or the bucket before
   it goes into a metric label, an object key or a file name.
@@ -323,8 +317,9 @@ reply.
 3. **Build.** Now, after all that reading: write the code. Do your best job to
    keep the code simple and the tests ample. Hit a design decision the prompt
    didn't make, or need a change to the Dagger engine or something you can't
-   undo? Stop and ask your lead. (The `fork paths` check fails any change
-   outside the service's paths.)
+   undo that your standing authorization doesn't cover? Stop and ask your
+   lead. (The `fork paths` check fails any change outside the service's
+   paths.)
 4. **Test.** Run the prompt's test commands until they pass. Then prove each
    new test can fail: break what it guards, watch it go red, put it back.
    They could call you the King's Men, 'cause you can break and fix Humpty
@@ -348,6 +343,7 @@ reply.
    who can call you out when you're trippin' in order to be your best self.
    Then check that the files it names are yours, and that you're still on
    your branch (`git status`): it has wandered off to other commits before.
+   Not on it? Check your branch out again before you commit.
 
    *Go home early (a little):* found nothing? Skip the next two steps.
 
@@ -368,7 +364,8 @@ review the same code again. Skip to "The draft".
 
 9. **Review again,** same exact command. It reads commits, not your working
    tree, which is why you committed. Fresh eyes on fresh code. Check the
-   files and your branch again.
+   files and your branch again, and check your branch out if you're not on
+   it.
 
    *Go home early (a little more):* found nothing? Skip the next two steps.
 
@@ -384,7 +381,8 @@ review the same code again. Skip to "The draft".
     runs CI, so push when you have something to show. Follow the
     repository's PR template, if it has one. The description says:
     - what the PR does;
-    - the size you measured (and why, if it's over 2,500 and not split);
+    - the size you measured (and, if it's over 2,500, what your lead
+      decided);
     - **the design choices you made:** what you weighed, what you picked and
       why, and where you'd want a reviewer to push back. Give this real
       thought: it's the part nobody can get from the diff;
@@ -448,11 +446,13 @@ review the same code again. Skip to "The draft".
     closer look" with or without text, findings only in its session. From
     here on you don't push, except in the cases below. You've done the work.
     Let it ride.
-21. **File** each *confirmed* finding (you traced a real path to the failure)
-    as an issue that references the issue your PR closes, says how to
-    reproduce it, and asks for a known-gap test or the fix. The test comes
-    with that later work, not this PR. Reply on its thread with the issue
-    link, and resolve it.
+21. **File** each *confirmed* finding (you traced a real path to the failure),
+    except one that deletes data it shouldn't, publishes an unverified blob or
+    bundle, or exposes a token: never file those: they get a fix push (below),
+    and a reply on their thread saying so. File the rest as an issue that
+    references the issue your PR closes, says how to reproduce it, and asks
+    for a known-gap test or the fix. The test comes with that later work, not
+    this PR. Reply on its thread with the issue link, and resolve it.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
 23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
@@ -474,9 +474,7 @@ review the same code again. Skip to "The draft".
 25. **File little issues.** Your value here is your thought. Go through the
     scratchpad: every rejection that deserves a follow-up gets its **own tiny
     issue** referencing the issue your PR closes. One idea per issue. Small
-    radius, every time. Findings you already filed after review 2 are done,
-    and rejections that were plainly wrong (you traced them, or the tests
-    contradict them) need no issue.
+    radius, every time. Findings you already filed after review 2 are done.
 26. **Merge, or hand off.** Check the prompt's "Done when" list first.
     **Stop and report instead of merging** if an item on it isn't met, if CI
     stays red after a genuine fix, or if a fix after review 2 needs a design
@@ -491,10 +489,8 @@ review the same code again. Skip to "The draft".
     - **You** (the default): merge it.
     - **Your lead:** send them a **"ready to merge" report**: the head SHA,
       Copilot reviews used, what the self-reviews and Copilot found, what you
-      fixed, the issues you filed, and the exact squash title and message. A
-      session gets it by the Claude Code Remote `send_message` tool
-      (`session_id` `@parent`); a human, in your reply. They check it, merge,
-      and tell you.
+      fixed, the issues you filed, and the exact squash title and message.
+      They check it, merge, and tell you.
 27. **After the merge:** do your part of the prompt's "After the merge" list
     (your lead does the rest if they merged), and unsubscribe from the PR if
     you subscribed. Report review rounds used, what was fixed, and which
@@ -617,31 +613,19 @@ each change small (zerobull-consulting/dagger#198).
   step becomes a "ready to merge" report.
 - **Before the lead merges,** it checks the report against the PR: the
   ruleset's required checks passed on the head being merged; at most two
-  Copilot reviews, plus one for each push the steps allow after review 2 (a CI
-  fix; a fix for deleted data, an unverified blob or bundle, or an exposed
-  token; or a fix the lead asked for), and nothing else pushed after review 2;
-  and the prompt verbatim in the PR. The steps don't state the cap as a
-  number, so this is where it's checked.
+  Copilot reviews that ran (a re-requested run that failed doesn't count),
+  plus one for each push the steps allow after review 2 (a CI fix; a fix for
+  deleted data, an unverified blob or bundle, or an exposed token; or a fix
+  the lead asked for), and nothing else pushed after review 2; and the prompt
+  verbatim in the PR. The steps don't state the cap as a number, so this is
+  where it's checked.
 - **When a session asks about a finding it couldn't confirm,** the lead
   decides: file it on its own, add it to an issue with similar ones, or drop
   it. The session never makes that call.
-- **Run items one at a time,** in the plan's order. Before
-  each launch, refresh `feature/remote-cache` and the **Version** line, and
-  carry what the last session hit into the next prompt's "Heads up"
-  (section 11). Running items in parallel turned out to be hard.
-- End the prompt with a line naming the template version it was generated
-  from:
-
-  > Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
-  > `zerobull-consulting/dagger#<N>`
-
-  where `<N>` is the PR in the file's **Version** line, at the top, as the file
-  is on `feature/remote-cache`.
-
-  The version is a PR, not a commit: before the branch's own review into
-  `main`, `feature/remote-cache` will be flattened into new commits, so its
-  commit hashes don't last. A PR number does, and the PR says why the process
-  changed.
+- **Run items one at a time,** in the plan's order. Before each launch,
+  refresh `feature/remote-cache`, and carry what the last session hit into the
+  next prompt's "Heads up" (section 11). Running items in parallel turned out
+  to be hard.
 
 ## Starting a session
 
@@ -659,12 +643,9 @@ instead of copying it.
 ## Changing this file
 
 - The template changes by PR, like any other file, into `feature/remote-cache`.
-- The PR says what changed in the process and why, and sets the **Version**
-  line to its own number.
+- The PR says what changed in the process and why.
 - A change to section 12 changes every prompt from then on. Put the reason in
   "Why the steps look like this".
-- The next prompt generated names that PR (see the last convention above),
-  so every prompt shows which version of the process it followed.
 - The draft in zerobull-consulting/dagger#95's body and the working
   agreement's comments on zerobull-consulting/dagger#1 are history; this file
   supersedes them.
