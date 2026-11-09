@@ -20,6 +20,7 @@ start)
   printf 'service=x\\nstop_seconds=14\\n' >"$SIDECAR_DIR/$SIDECAR_NAME/state"
   exit "\${FAKE_START_EXIT:-0}" ;;
 stop)
+  [ -f "$SIDECAR_DIR/$SIDECAR_NAME/state" ] || echo "remote-cache-sidecar: nothing to stop"
   rm -f "$SIDECAR_DIR/$SIDECAR_NAME/state"
   exit "\${FAKE_STOP_EXIT:-0}" ;;
 esac
@@ -84,7 +85,7 @@ test('the post step stops the sidecar after a job that failed, with no stop step
   assert.ok(!fs.existsSync(path.join(env.SIDECAR_DIR, 't', 'state')));
 });
 
-test('after an explicit stop the post step does nothing', (t) => {
+test('after an explicit stop the post step still runs stop, which finds nothing to stop', (t) => {
   const { env, log } = setup(t);
   assert.strictEqual(main(env).status, 0);
   // remote-cache/stop ran sidecar.sh stop: the state file is gone.
@@ -92,15 +93,47 @@ test('after an explicit stop the post step does nothing', (t) => {
   const p = post(env);
   assert.strictEqual(p.status, 0);
   assert.match(p.stdout, /nothing to stop/);
-  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start']);
+  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start', 'stop']);
 });
 
-test('stopping twice is safe: a second post step after a first one does nothing', (t) => {
+// zerobull-consulting/dagger#174: the shim used to look for the state itself
+// and skip the stop if it found none, so a script whose state is elsewhere
+// (the script is the caller's commit's, the shim is pinned) was never stopped.
+test('the post step stops a sidecar whose state is not where the shim looks', (t) => {
+  const { env, log } = setup(t);
+  assert.strictEqual(main(env).status, 0);
+  fs.rmSync(path.join(env.SIDECAR_DIR, 't', 'state'));
+  const p = post(env);
+  assert.strictEqual(p.status, 0);
+  assert.ok(/^stop /m.test(log()), log());
+});
+
+// zerobull-consulting/dagger#174: a bound that passed killed only bash, and
+// left the docker, timeout and pull processes it had spawned running.
+test('a run that passes its bound is killed with the processes it spawned', (t) => {
+  const { dir, env } = setup(t);
+  const pidFile = path.join(dir, 'child.pid');
+  fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\nsleep 300 &\necho $! >"$CHILD_PID"\nwait\n', { mode: 0o755 });
+  const code = require(shim).run('stop', { ...env, CHILD_PID: pidFile }, 1000);
+  assert.strictEqual(code, 1);
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  // A killed process may stay a zombie until its parent reaps it.
+  let state = '';
+  try {
+    state = /^State:\s*(\S)/m.exec(fs.readFileSync(`/proc/${pid}/status`, 'utf8'))[1];
+  } catch (_) {
+    state = 'gone';
+  }
+  if (state !== 'gone' && state !== 'Z') process.kill(pid, 'SIGKILL');
+  assert.ok(state === 'gone' || state === 'Z', `the spawned sleep ${pid} is still alive (state ${state})`);
+});
+
+test('stopping twice is safe: a second post step after a first one finds nothing to stop', (t) => {
   const { env, log } = setup(t);
   main(env);
   assert.strictEqual(post(env).status, 0);
   assert.strictEqual(post(env).status, 0);
-  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start', 'stop']);
+  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start', 'stop', 'stop']);
 });
 
 test('a stop that fails fails the post step', (t) => {

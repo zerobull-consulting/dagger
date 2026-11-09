@@ -56,14 +56,24 @@ function stopTimeoutMs(file) {
   return stopSeconds(file) * 1000 + stopSlackMs;
 }
 
+// Runs `sidecar.sh <command>`, bounded. The script runs in a session of its
+// own (setsid), so that when the bound passes, the kill reaches the docker,
+// timeout and pull processes it spawned too: killing only bash would orphan
+// them. Without setsid, bash is run directly (and only it is killed).
 function run(command, env, timeoutMs) {
-  const r = spawnSync('bash', [scriptOf(env), command], {
-    env,
-    stdio: 'inherit',
-    timeout: timeoutMs,
-    killSignal: 'SIGKILL',
-  });
+  const args = [scriptOf(env), command];
+  const opts = { env, stdio: 'inherit', timeout: timeoutMs, killSignal: 'SIGKILL' };
+  let r = spawnSync('setsid', ['bash', ...args], opts);
+  if (r.error && r.error.code === 'ENOENT') r = spawnSync('bash', args, opts);
   if (r.error) {
+    if (r.pid) {
+      try {
+        // The session's leader is the pid; its group is whatever it left.
+        process.kill(-r.pid, 'SIGKILL');
+      } catch (_) {
+        // Nothing left in the group.
+      }
+    }
     console.log(`::error::remote-cache-sidecar: ${command} did not finish: ${r.error.message}`);
     return 1;
   }
@@ -89,19 +99,18 @@ function main(env) {
 function post(env) {
   const name = env.STATE_name || env.SIDECAR_NAME || 'remote-cache';
   const dir = env.STATE_dir || sidecarDir(env);
+  // Always `sidecar.sh stop`, which knows where its state is and says
+  // "nothing to stop" itself: this shim holds a copy of the state's place and
+  // format only to bound the stop, and a drift between the two (the script
+  // comes from the caller's commit, the shim is pinned) shortens or lengthens
+  // that bound, but never leaves a sidecar running.
   const file = path.join(dir, name, 'state');
-  if (!fs.existsSync(file)) {
-    // Stopped already (remote-cache/stop), or the start never got as far as
-    // its state: nothing to do. The script says the same.
-    console.log(`remote-cache-sidecar: nothing to stop for ${name} (no state at ${file}): stopped already, or never started`);
-    return 0;
-  }
-  console.log(`remote-cache-sidecar: stopping ${name} at the end of the job`);
+  console.log(`remote-cache-sidecar: stopping ${name} at the end of the job (if it isn't stopped already)`);
   const childEnv = { ...env, SIDECAR_NAME: name, SIDECAR_DIR: dir };
   return run('stop', childEnv, stopTimeoutMs(file));
 }
 
-module.exports = { main, post, stopSeconds, stopTimeoutMs, sidecarDir };
+module.exports = { main, post, run, stopSeconds, stopTimeoutMs, sidecarDir };
 
 if (require.main === module) {
   // The runner hands the values main saved to the post step as STATE_<key>.
