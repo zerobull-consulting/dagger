@@ -6,9 +6,10 @@ package server
 // crypto/rand.Text (26).
 const MaxEngineIDLen = 128
 
-// LogEngineIDsRefused is the message of the log record of what is dropped
-// for an invalid engine cache ID or session (refusedEngineIDs).
-const LogEngineIDsRefused = "invalid engine cache ID or session: dropped"
+// LogEngineIDsRefused is the message of the log record of what is refused
+// for an invalid engine cache attribute, cache ID or session
+// (refusedEngineIDs).
+const LogEngineIDsRefused = "invalid engine cache attribute or session: refused"
 
 // validEngineID reports whether an engine cache ID or session ID is one the
 // service may key its state on, log and look up: 1 to MaxEngineIDLen

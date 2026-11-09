@@ -409,9 +409,10 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 	if kind != telemetryattrs.EngineEventStart && kind != telemetryattrs.EngineEventPrune {
 		return
 	}
+	// noteEngineEvent, which every event goes through, counts one whose
+	// cache attribute is refused.
 	cacheID, generation, ok := parseEngineCache(cache)
 	if !ok {
-		s.refusedEngineIDs(metrics.EngineIDSourceEvent, 1, len(cache), 0)
 		return
 	}
 	authenticated := s.authenticated()
@@ -430,7 +431,7 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 		if wiped != "" && !validEngineID(wiped) {
 			// The start is taken; the wiped cache, which no cache can
 			// be named, isn't.
-			s.refusedEngineIDs(metrics.EngineIDSourceEvent, 1, len(wiped), 0)
+			s.refusedEngineIDs(metrics.EngineIDSourceWipedCache, 1, len(wiped), 0)
 			wiped = ""
 		}
 		if wiped != "" && authenticated && !ns.ownerAccepts(wiped, key) {
@@ -491,11 +492,12 @@ func resourceSpanCount(rs *tracepb.ResourceSpans) int {
 	return n
 }
 
-// refusedEngineIDs counts n spans, events or hellos (source, a
-// metrics.EngineIDSource constant) dropped because an engine cache ID or
-// session in them isn't a valid engine ID, and logs it: at warning level at
-// most once a minute per source (rejectionLog), the rest at debug level. The
-// IDs themselves aren't logged, only their lengths.
+// refusedEngineIDs counts n spans, events, wiped caches or hellos (source, a
+// metrics.EngineIDSource constant) refused because their engine cache
+// attribute isn't "<cacheID>/<generation>" with a valid engine ID, or their
+// cache ID or session isn't one (validEngineID), and logs it: at warning
+// level at most once a minute per source (rejectionLog), the rest at debug
+// level. The values themselves aren't logged, only their lengths.
 func (s *Service) refusedEngineIDs(source string, n, cacheLen, sessionLen int) {
 	s.metrics.EngineIDsRefused(source, n)
 	level := slog.LevelDebug

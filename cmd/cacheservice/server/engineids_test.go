@@ -115,8 +115,9 @@ func TestTrackSpansWithoutCacheNotCounted(t *testing.T) {
 	require.Zero(t, engineIDsRefused(t, h.svc, "span"))
 }
 
-// An engine event whose cache ID isn't a valid engine ID is dropped and
-// counted; a start naming an invalid wiped cache is taken without it.
+// An engine event, of any kind, whose cache attribute isn't
+// "<cacheID>/<generation>" with a valid engine ID is dropped and counted
+// once; a start naming an invalid wiped cache is taken without it.
 func TestTrackEventValidatesEngineIDs(t *testing.T) {
 	h, _ := newMemExportHarness(t, nil)
 	sawEvent := func(cacheID string) bool {
@@ -131,10 +132,16 @@ func TestTrackEventValidatesEngineIDs(t *testing.T) {
 		require.False(t, sawEvent(bad))
 	}
 	require.Equal(t, 2.0, engineIDsRefused(t, h.svc, "event"))
+	// A kind the tracker doesn't act on is counted too, and a malformed
+	// generation as well as a malformed ID.
+	require.Equal(t, http.StatusOK, postEngineEvent(t, h.srv, "", "bad cache!", telemetryattrs.EngineEventStop, `{}`))
+	require.Equal(t, http.StatusOK, postEngineEventGen(t, h.srv, "", realCacheID+"/x", telemetryattrs.EngineEventPrune, `{"drops":[]}`))
+	require.Equal(t, 4.0, engineIDsRefused(t, h.svc, "event"))
 
 	require.Equal(t, http.StatusOK, postEngineEvent(t, h.srv, "", realCacheID, telemetryattrs.EngineEventStart, `{"wipedCache":"`+long+`"}`))
 	require.True(t, sawEvent(realCacheID), "the start is taken")
-	require.Equal(t, 3.0, engineIDsRefused(t, h.svc, "event"), "its wiped cache is counted")
+	require.Equal(t, 4.0, engineIDsRefused(t, h.svc, "event"), "the start isn't counted as dropped")
+	require.Equal(t, 1.0, engineIDsRefused(t, h.svc, "wiped_cache"), "its wiped cache is counted")
 }
 
 // A hello whose cache ID isn't a valid engine ID is answered with an error

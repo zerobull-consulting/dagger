@@ -1613,8 +1613,10 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
 - **Engine IDs are validated before they key anything.** An engine cache ID
   (the `<cacheID>` of a span's or event's `dagger.io/engine.cache`, an
   engine start's wiped cache, an engine's hello) and a span's session
-  (`dagger.io/engine.session`) must be 1 to 128 letters, digits, `.`, `_` or
-  `-` (`server.MaxEngineIDLen`), as a flush's cache ID already had to be
+  (`dagger.io/engine.session`), when it has one, must be 1 to 128 letters,
+  digits, `.`, `_` or `-` (`server.MaxEngineIDLen`), as a flush's cache ID
+  already had to be; and `dagger.io/engine.cache` must be
+  `<cacheID>/<generation>`
   ([zerobull-consulting/dagger#88](https://github.com/zerobull-consulting/dagger/issues/88)).
   Real engines send far less: a cache ID is a UUID, 36 characters
   (`uuid.NewString` in dagql's `Cache.openIdentity`), and a session ID 26
@@ -1625,13 +1627,14 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   bounds what each cache ID costs, but not how many the tracker keeps: it
   never forgets a cache no engine connects under
   ([zerobull-consulting/dagger#203](https://github.com/zerobull-consulting/dagger/issues/203)). Now
-  a request's spans under an invalid ID are dropped, not tracked; an event
-  with one is dropped, and a start naming an invalid wiped cache is taken
-  without it; a hello with one is answered with an error and the
+  a request's spans under an invalid one are dropped, not tracked; an event
+  of any kind with one is dropped; a start naming an invalid wiped cache is
+  taken without it; a hello with one is answered with an error and the
   connection closed. Each is counted in
   `cacheservice_engine_ids_refused_total`, by source (`span`, `event`,
-  `hello`), and logged, at warning level at most once a minute per source;
-  the IDs themselves aren't logged, only their lengths
+  `wiped_cache`, `hello`), and logged, at warning level at most once a
+  minute per source; the refusal's record gives the values' lengths, not
+  the values
   (`TestTrackSpansValidatesEngineIDs`, `TestTrackEventValidatesEngineIDs`,
   `TestHelloValidatesCacheID`).
 - **Every refusal is counted**, by route and reason, in
@@ -2885,7 +2888,7 @@ paths record into them through their metadata store. All are prefixed
 | `auth_rejected_total` | `endpoint` | Requests refused for a missing or unknown token: `engine` (the WebSocket), `otlp`, `flush` (see [Flushing one engine cache](#flushing-one-engine-cache)), or `debug` (the debug API; see [The debug API](#the-debug-api)) |
 | `connections_revoked_total` | `scope` | Connections closed with 4001 because their token left the namespace |
 | `engine_events_ignored_total` | `scope`, `kind` | Engine events dropped because they came with a token other than the engine's |
-| `engine_ids_refused_total` | `source` | Spans, engine events and engine hellos dropped because an engine cache ID or session in them isn't 1 to 128 letters, digits, `.`, `_` or `-` (see [OTLP limits](#otlp-limits)), by source: `span`, `event` or `hello` |
+| `engine_ids_refused_total` | `source` | What was refused because its `dagger.io/engine.cache` isn't `<cacheID>/<generation>` with a valid cache ID, or its cache ID or session isn't 1 to 128 letters, digits, `.`, `_` or `-` (see [OTLP limits](#otlp-limits)), by source: `span` (dropped), `event` (dropped), `wiped_cache` (an engine start's wiped cache, ignored; the start is taken) or `hello` (refused) |
 | `blob_promotions_total` | `scope`, `outcome` | Uploaded blobs verified and promoted: `promoted`, `existing` (already stored, or another export's copy won), `mismatch` (content not the digest's, or not the declared size), `missing` (reported uploaded, nothing staged) or `error` (the store failed) |
 | `blob_hashed_bytes_total` | `scope`, `by` | Bytes hashed to verify uploads: `store` (as it copied them) or `service` (read through the service) |
 | `blob_promotion_duration_seconds` | `scope` | Time to verify and promote one blob, slot wait included: it grows with the blob's size (see [Verification and promotion](#verification-and-promotion)) |

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
 
@@ -210,6 +211,11 @@ func (s *Service) endLinger(start time.Time, outcome string, caches []LingerCach
 func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache string) {
 	cacheID, generation, ok := parseEngineCache(cache)
 	if !ok {
+		// Every event comes here, whatever its kind: the one place an
+		// event refused for its cache attribute is counted.
+		if cache != "" {
+			s.refusedEngineIDs(metrics.EngineIDSourceEvent, 1, len(cache), 0)
+		}
 		return
 	}
 	if s.authenticated() && !ns.ownerAccepts(cacheID, key) {

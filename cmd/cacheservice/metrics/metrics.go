@@ -281,7 +281,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"scope", "kind"}),
 		engineIDsRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "engine_ids_refused_total",
-			Help: "Spans, engine events and engine hellos dropped because an engine cache ID or session in them isn't 1 to 128 letters, digits, '.', '_' or '-', by source (span, event, hello). Nothing of them keys the service's state.",
+			Help: "What was refused because its engine cache attribute isn't \"<cacheID>/<generation>\" with a valid cache ID, or its cache ID or session isn't valid (1 to 128 letters, digits, '.', '_' or '-'), by source: span (dropped), event (dropped), wiped_cache (an engine start's wiped cache, ignored; the start is taken) or hello (refused). Nothing refused keys the service's state.",
 		}, []string{"source"}),
 		blobPromotions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "blob_promotions_total",
@@ -668,14 +668,15 @@ func (m *Metrics) IgnoredEvent(scope, kind string) {
 // source label of EngineIDsRefused: a fixed set, never taken from the
 // request.
 const (
-	EngineIDSourceSpan  = "span"
-	EngineIDSourceEvent = "event"
-	EngineIDSourceHello = "hello"
+	EngineIDSourceSpan       = "span"
+	EngineIDSourceEvent      = "event"
+	EngineIDSourceWipedCache = "wiped_cache"
+	EngineIDSourceHello      = "hello"
 )
 
-// EngineIDsRefused records n spans, events or hellos, of source (an
-// EngineIDSource constant), dropped for an invalid engine cache ID or
-// session.
+// EngineIDsRefused records n spans, events, wiped caches or hellos, of
+// source (an EngineIDSource constant), refused for an invalid engine cache
+// attribute, cache ID or session.
 func (m *Metrics) EngineIDsRefused(source string, n int) {
 	if m == nil {
 		return
