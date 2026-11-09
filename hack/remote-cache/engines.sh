@@ -26,7 +26,10 @@
 #       it. The edit is the run's own and is never committed by this
 #       script: a green run is what a commit of that line then cites. An
 #       accepted version with the same digest is verified again: its line
-#       moves first.
+#       moves first. Only a github.com server works: the service's parser
+#       takes only https://github.com/... run URLs, so on another server
+#       (GitHub Enterprise Server) candidate refuses up front, naming GITHUB_SERVER_URL, and writes nothing
+#       (zerobull-consulting/dagger#147, item 3).
 #
 # The release check (release-check.sh, zerobull-consulting/dagger#117, D5)
 # reads and edits the manifest only through these:
@@ -230,6 +233,9 @@ candidate)
 	for var in GITHUB_SERVER_URL GITHUB_REPOSITORY GITHUB_RUN_ID; do
 		[[ -n "${!var:-}" ]] || die "$var is not set: a candidate is verified by a CI run"
 	done
+	# The parser takes only github.com run URLs (zerobull-consulting/dagger#147, item 3).
+	[[ "$GITHUB_SERVER_URL" == https://github.com ]] ||
+		die "GITHUB_SERVER_URL is '$GITHUB_SERVER_URL': a candidate is verified by a github.com CI run, the only run URLs the service's manifest parser takes"
 	# The whole manifest is checked first, and the candidate must fit: a
 	# full list is refused before anything is written.
 	list="$(accepts)"

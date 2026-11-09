@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -791,6 +792,62 @@ func TestOTLPTraces(t *testing.T) {
 	}
 }
 
+// TestOTLPTraceLogsBounded: the engine's attribute strings reach the log
+// cut, whatever their size and wherever a multi-byte rune falls.
+func TestOTLPTraceLogsBounded(t *testing.T) {
+	_, rec, srv := newTestService(t, "")
+	long := strings.Repeat("é", 100000)
+	req := &coltracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			kv(telemetryattrs.EngineCacheAttr, long), kv(telemetryattrs.EngineSessionAttr, long),
+		}},
+		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{Name: long, Attributes: []*commonpb.KeyValue{
+			kv(telemetryattrs.CacheResultIDAttr, long),
+			kv(telemetryattrs.CacheOutcomeAttr, long),
+			kv(telemetryattrs.CacheTypeAttr, long),
+			kv(telemetryattrs.CacheRetainedAttr, long),
+		}}}}},
+	}}}
+	if code := otlpPost(t, srv.URL+"/v1/traces", req, &coltracepb.ExportTraceServiceResponse{}, false, false); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	spans := rec.find("cache span")
+	if len(spans) != 1 {
+		t.Fatalf("%d cache spans logged", len(spans))
+	}
+	for field, limit := range map[string]int{"result": 200, "outcome": 200, "type": 200, "retained": 200, "cache": 200, "session": 200, "name": 120} {
+		got := spans[0][field]
+		if len(got) == 0 || len(got) > limit || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
+			t.Errorf("%s logged as %d bytes: %.40q", field, len(got), got)
+		}
+	}
+}
+
+// TestOTLPEventLogsBounded: the engine's event strings reach the log cut,
+// on a rune boundary.
+func TestOTLPEventLogsBounded(t *testing.T) {
+	_, rec, srv := newTestService(t, "")
+	long := strings.Repeat("é", 1000)
+	req := engineLogs()
+	req.ResourceLogs[0].Resource.Attributes = []*commonpb.KeyValue{kv("service.instance.id", long)}
+	sl := req.ResourceLogs[0].ScopeLogs[0]
+	sl.Scope.Name = long
+	sl.LogRecords[0].Attributes = []*commonpb.KeyValue{kv(telemetryattrs.EngineEventAttr, long), kv(telemetryattrs.EngineCacheAttr, long)}
+	if code := otlpPost(t, srv.URL+"/v1/logs", req, &collogspb.ExportLogsServiceResponse{}, false, false); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	events := rec.find("engine event")
+	if len(events) != 1 {
+		t.Fatalf("%d engine events logged", len(events))
+	}
+	for _, field := range []string{"scope", "kind", "cache", "instance"} {
+		got := events[0][field]
+		if len(got) == 0 || len(got) > 200 || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
+			t.Errorf("%s logged as %d bytes: %.40q", field, len(got), got)
+		}
+	}
+}
+
 func TestOTLPMetrics(t *testing.T) {
 	_, rec, srv := newTestService(t, "")
 	req := &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
@@ -847,12 +904,6 @@ func TestUnhandledRequest(t *testing.T) {
 }
 
 func TestHelpers(t *testing.T) {
-	if got := truncate("abc", 3); got != "abc" {
-		t.Errorf("truncate kept %q", got)
-	}
-	if got := truncate("abcdef", 3); got != "abc…" {
-		t.Errorf("truncate made %q", got)
-	}
 	attrs := []*commonpb.KeyValue{kv("a", "1"), arrayKV("list", 4)}
 	if stringAttr(attrs, "a") != "1" || stringAttr(attrs, "missing") != "" || stringAttr(attrs, "list") != "" {
 		t.Error("stringAttr")

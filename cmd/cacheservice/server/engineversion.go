@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
@@ -161,24 +160,11 @@ func refusalMessage(v string, id compat.Identity, m *compat.Manifest) string {
 // closeReason is the refusal in at most a close frame's 123 bytes.
 func closeReason(v string, id compat.Identity) string {
 	r := fmt.Sprintf("engine version %q not accepted; accepts %s", boundVersion(v), strings.Join(id.Accept, " "))
-	return cutBytes(r, maxCloseReason)
+	return cutString(r, maxCloseReason)
 }
 
 // boundVersion is an engine-supplied version cut to maxQuotedVersion bytes.
-func boundVersion(v string) string { return cutBytes(v, maxQuotedVersion) }
-
-// cutBytes cuts s to at most n bytes, on a rune boundary, marking the cut
-// with "...".
-func cutBytes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	cut := n - len("...")
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + "..."
-}
+func boundVersion(v string) string { return cutString(v, maxQuotedVersion) }
 
 // welcome is the welcome's body: protocol.Welcome, which has no fields,
 // and the service's identity. The engine's client doesn't decode the
