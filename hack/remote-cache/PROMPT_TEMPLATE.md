@@ -414,8 +414,8 @@ merges; you write the code.
 14. **Check in with your lead** after the first green CI. Give them the size
     of the diff and how you're feeling about the scope, and wait for them to
     give the approval to keep going. If they split the work, do what they
-    say about this PR's scope before you go on. The size is the lines added plus
-    deleted, every file counted:
+    say about this PR's scope, then get CI green again before you go on. The
+    size is the lines added plus deleted, every file counted:
 
     ```bash
     git fetch origin feature/remote-cache &&
