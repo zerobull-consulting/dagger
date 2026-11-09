@@ -276,7 +276,6 @@ verbatim.
 **The rules. These are plain on purpose: no jokes, no exceptions beyond the
 ones written here.**
 
-- CI red: fix the root cause. Never retry, skip, loosen or quarantine a check.
 - **Verify by running:** a claim about the engine's, GitHub's or a store's
   behaviour goes into an issue, a doc or the code only after a real run shows
   it, not from reading code.
@@ -390,7 +389,8 @@ draft".
     read the PR's checks and reviews yourself: they can land without waking
     you. This goes for every wait from here on.
 14. **Get CI green.** Red? Fix it. Test it. Repeat until green. Draft pushes
-    are cheap insurance.
+    are cheap insurance. Fix the root cause: never retry, skip, loosen or
+    quarantine a check.
 
 *Copilot, round 1*
 
@@ -406,7 +406,8 @@ draft".
 17. **Reject** the ones that don't hold up, same bar as your self-reviews.
     Reply on each thread with what you traced, and resolve it. Scratchpad it.
 18. **Fix** the real ones, each with a test that fails without the fix. If CI
-    went red on the ready PR, fix that too. Run the tests, then read your
+    went red on the ready PR, fix that too, at the root cause, same as on the
+    draft. Run the tests, then read your
     whole diff once more yourself: nobody else checks these fixes before
     Copilot does. **Commit. Do not push yet.** Hold that push like it's the
     last slice of pizza.
@@ -434,7 +435,8 @@ draft".
     ask your lead what to do with that finding. Do what they say, then reply
     on its thread and resolve it.
 24. **The only two pushes allowed after review 2:**
-    - CI is red on review 2's head: fix the root cause.
+    - CI is red on review 2's head: fix the root cause. No retries, skips or
+      loosened checks here either.
     - A confirmed finding means the PR deletes data it shouldn't, publishes
       an unverified blob or bundle, or exposes a token: fix it, with a test.
 
