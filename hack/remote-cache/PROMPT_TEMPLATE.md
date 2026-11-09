@@ -1,6 +1,6 @@
 # Remote cache prompt template
 
-**Version:** [zerobull-consulting/dagger#175](https://github.com/zerobull-consulting/dagger/pull/175)
+**Version:** [zerobull-consulting/dagger#191](https://github.com/zerobull-consulting/dagger/pull/191)
 
 Every work item's prompt for the remote cache work is generated from this file. It holds the template, the conventions for the
 whole prompt, and the working agreement for review and merge (section 12).
@@ -168,12 +168,15 @@ agreement's full text below:
   real findings, then mark the PR ready;
 - at most **two** Copilot reviews in all, counting every push's: review 1,
   one fix push, review 2, and **no push after review 2**;
+- a second `/code-review high` after review 1, fixed in that same fix push;
+- never end a turn waiting on Copilot or CI without a check-in scheduled;
 - review 2's confirmed findings become issues, the rest go to the tracking
   issue's rolling leads issue, then the squash merge of review 2's head, or
   the head of a push step 4's exception or step 6's CI fix allowed after it,
   once the ruleset's required checks have passed on that head, with its
-  explicit message, made by the session itself unless the prompt says the
-  user merges;
+  explicit message. The session merges it itself, unless the prompt says the
+  user merges, or an orchestrating session started it: then the session
+  sends a "ready to merge" report and the orchestrator merges;
 - the exception for deleting data, publishing unverified blobs or bundles, or
   exposing a token.
 
@@ -249,16 +252,37 @@ keeps the rounds productive.
      above).
    - CI is green on the draft, and the PR's tests have passed locally.
    - Run `/code-review high` on the branch against
-     `origin/feature/remote-cache` and fix the real findings.
+     `origin/feature/remote-cache` and fix the real findings. Give it the
+     range explicitly (`origin/feature/remote-cache...HEAD`, from your
+     branch), check that the files it names are yours, and check that you're
+     back on your branch before committing: on
+     zerobull-consulting/dagger#182 it reviewed an earlier PR's commits and
+     left `HEAD` detached.
    - Then mark the PR ready. That starts **review 1**.
-3. **Each fix round:**
+3. **The fix round:**
    - Trace every finding: red, yellow, blue, and any you can read only in its
      session.
    - Fix the real ones, each with a test that fails without the fix.
    - Answer the others on their thread with what you traced, and resolve the
      threads you've handled.
+   - **Then run `/code-review high` again** (same range and checks as in
+     step 2) on the fixed branch, and fix its real findings too.
    - Push all of it in **one push**. Gather everything into that push: no
      README touch-ups, rebases or follow-up commits in between.
+   - *Why the second self-review:* review 2 is the last look before the
+     merge, and nothing can be pushed after it, so a mistake in the fixes
+     themselves is otherwise only filed, not fixed. In the round of
+     zerobull-consulting/dagger#180 to zerobull-consulting/dagger#190, it caught real problems in the
+     fix pushes of zerobull-consulting/dagger#186 (a duplicated deadline, a
+     ref check's scope) and zerobull-consulting/dagger#188 (an unfiltered publish-run query), and no
+     PR needed a third Copilot review.
+   - **Waiting on Copilot or CI:** a review can land without waking the
+     session. Never end a turn while waiting on Copilot or CI without first
+     scheduling a check-in to yourself about 10 minutes out (the Claude Code
+     Remote `send_later` tool, where you have it), and then read the PR's
+     reviews and checks yourself. Three sessions in that round went idle
+     beside a review that had already arrived (zerobull-consulting/dagger#180,
+     #182, #188) and sat until someone nudged them.
 4. **After review 2, push nothing more.** Handle whatever it reports (new
    findings, a 🔵 "Needs a closer look" with or without text, findings only in
    its session) without changing the PR:
@@ -278,18 +302,41 @@ keeps the rounds productive.
      token is fixed with a test in one more push, instead of being filed. The
      review that push starts is handled like review 2: nothing more is pushed
      for it. If the fix needs a design decision, don't merge: stop and report.
-5. **Merge** (the session merges, unless the prompt says the user does):
-   squash-merge review 2's head, or the head of a push step 4's exception or
-   step 6's CI fix allowed after it, once the ruleset's required checks have
-   passed on that head, with the title and message set as in
+5. **Merge:** squash-merge review 2's head, or the head of a push step 4's
+   exception or step 6's CI fix allowed after it, once the ruleset's required
+   checks have passed on that head, with the title and message set as in
    section 4, pinned to that head commit. Where the auto-merge tool can set
    the title and message and pin the head, enabling auto-merge (squash) is
-   fine.
+   fine. Who does it:
+   - **By default, the session.**
+   - **When the prompt says the user merges,** the session stops at this
+     step and reports.
+   - **When an orchestrating session started it** (a session the requester
+     told directly to run the items and merge them), the session stops here
+     and sends the orchestrator a **"ready to merge" report** (the Claude
+     Code Remote `send_message` tool, `session_id` `@parent`): the head SHA,
+     the Copilot reviews used, what the self-reviews and Copilot found and
+     what was fixed, issues and leads filed, and the exact squash title and
+     message. The orchestrator then checks it itself, before merging: the
+     ruleset's required checks passed on that head, no more than two Copilot
+     reviews and nothing pushed after review 2, and the prompt verbatim in
+     the PR. Then it merges as above, does section 13's after-merge steps,
+     and tells the session.
+   - *Why the orchestrator merges:* a session reads an approval quoted in a
+     prompt that another session wrote as an automated message, not the
+     requester's own, and won't merge on it. That's the right call, and
+     telling it again from the orchestrator carries the same weight. The #170
+     session stopped short of merging (zerobull-consulting/dagger#176 was then
+     merged with GitHub's default `(#176)` title), and the #87 session
+     asked for confirmation before its reviews. Splitting the work this way let
+     six PRs in a row (zerobull-consulting/dagger#182 to #190) merge without
+     the requester.
 6. **CI red at any point:** fix it at the root cause; never retry or loosen a
    check. A fix push after review 2 is allowed only for CI that is red on
    review 2's head, and its review is handled like review 2's.
 7. **After the merge:**
-   - Close the PR's issue by hand, and unsubscribe.
+   - Close the PR's issue by hand (the orchestrator does this when it
+     merged), and unsubscribe.
    - Report how many review rounds were used, what was fixed, and which
      issues were filed.
 
@@ -320,13 +367,18 @@ Observable outcomes, each shown by a test or a run.
   and written into the prompt as decided: credentials, engine changes,
   ruleset changes, design forks. A question that only the requester can answer
   stalls a session that hits it.
-- **Who merges** is stated: by default the session, as in section 12.
+- **Who merges** is stated: by default the session, as in section 12. A
+  prompt written by an orchestrating session says the orchestrator merges,
+  and asks for the "ready to merge" report of section 12, step 5.
 - When picking several items to run in parallel: refresh the state first
   (commits, open PRs, issues filed since the last round, and running sessions,
   not just PRs); map which files each item touches and avoid two items in the
   same hot file; follow the tracking issues' stated order; pair a critical-path
   item with an independent one and, where there is one, a small reliability
   fix such as a CI flake, which speeds up the others.
+- When running items **one at a time** instead, refresh `feature/remote-cache`
+  and the **Version** line before each launch, and carry what the last
+  session hit into the next prompt's section 11.
 - End the prompt with a line naming the template version it was generated
   from:
 
