@@ -735,72 +735,133 @@ func (o *holdReads) Get(ctx context.Context, key string) ([]byte, string, error)
 	return o.Objects.Get(ctx, key)
 }
 
-// KNOWN GAP: the drain doesn't wait for an explicit export (POST
-// /debug/engines/{conn}/export) admitted just before it started. Once it
-// started, the hook is refused (503), but one that got past that check runs
-// on: of roots the tracker doesn't know, it has no in-flight state the
-// drain waits on, so the drain can report it complete, and the stop that
-// follows cuts it off. Cut off, it publishes nothing. It needs a local,
-// unauthenticated debug request racing the signal. Tracked in
-// https://github.com/zerobull-consulting/dagger/issues/72.
-func TestKnownGapDrainDoesNotWaitForExplicitExport(t *testing.T) {
+// The drain waits for an explicit export (POST
+// /debug/engines/{conn}/export) admitted just before it started, of roots
+// the tracker doesn't know, and counts what it stored
+// (zerobull-consulting/dagger#72, the known gap this test pinned before).
+func TestDrainWaitsForExplicitExport(t *testing.T) {
 	h, _ := newDrainHarness(t, nil)
 	h.cache.Add(fakeengine.Entry{Number: 99, Layers: [][]byte{testLayer("explicit")}})
 	release := h.cache.Hold()
 	defer release()
+	done := startExplicitExport(h, 99)
+	waitUntil(t, 5*time.Second, "the explicit export to be held", func() bool { return h.cache.InFlight() == 1 })
+	drained := startDrain(t, h.svc, time.Minute)
+	select {
+	case rep := <-drained:
+		t.Fatalf("the drain didn't wait for the explicit export: %+v", rep)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := h.svc.Export(context.Background(), h.engine.id, exporter.Request{}); !errors.Is(err, ErrDraining) {
+		t.Fatalf("an explicit export during the drain: %v", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("the explicit export: %v", err)
+	}
+	rep := waitDrain(t, drained, 10*time.Second)
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.Stored[h.cache.ID] != 1 {
+		t.Fatalf("drain report %+v", rep)
+	}
+}
+
+// An explicit export that hangs doesn't hold the drain past its deadline:
+// the drain ends there, and reports it still running.
+func TestDrainEndsAtDeadlineWithExplicitExport(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.cache.Add(fakeengine.Entry{Number: 99, Layers: [][]byte{testLayer("explicit")}})
+	release := h.cache.Hold()
+	defer release()
+	done := startExplicitExport(h, 99)
+	defer func() { release(); <-done }()
+	waitUntil(t, 5*time.Second, "the explicit export to be held", func() bool { return h.cache.InFlight() == 1 })
+	start := time.Now()
+	rep := drainFor(h.svc, 300*time.Millisecond)
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the drain took %s", took)
+	}
+	if rep.Outcome != metrics.DrainDeadline || rep.Explicit != 1 {
+		t.Fatalf("drain report %+v", rep)
+	}
+}
+
+// startExplicitExport exports root of h's engine with Service.Export, in
+// the background; the channel gets its error.
+func startExplicitExport(h *exportHarness, root uint64) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		_, err := h.svc.Export(context.Background(), h.engine.id, exporter.Request{
-			Roots:   []uint64{99},
-			Outputs: []protocol.ExportOutput{{Number: 99, Address: fakeengine.FSPart}},
+			Roots:   []uint64{root},
+			Outputs: []protocol.ExportOutput{{Number: root, Address: fakeengine.FSPart}},
 		})
 		done <- err
 	}()
-	waitUntil(t, 5*time.Second, "the explicit export to be held", func() bool { return h.cache.InFlight() == 1 })
-	rep := drainFor(h.svc, 10*time.Second)
-	if h.cache.InFlight() != 1 || rep.Outcome != metrics.DrainComplete || rep.LeftRoots() != 0 {
-		t.Fatalf("the drain waited for, or counted, the explicit export (in flight %d, report %+v): the gap is fixed; update this test, the README and the issue",
-			h.cache.InFlight(), rep)
-	}
-	release()
-	<-done
+	return done
 }
 
-// KNOWN GAP: as TestKnownGapDrainDoesNotWaitForExplicitExport, for the
-// explicit import (POST /debug/engines/{conn}/import): one admitted just
-// before the drain runs on its caller's context, which the drain doesn't
-// cancel or wait for. Tracked in
-// https://github.com/zerobull-consulting/dagger/issues/72.
-func TestKnownGapDrainDoesNotWaitForExplicitImport(t *testing.T) {
-	var hold *holdReads
+// newHeldImportHarness is an export harness whose explicit import, started
+// in the background, is held at its index read until release is called.
+func newHeldImportHarness(t *testing.T) (h *exportHarness, done <-chan error, release func()) {
+	t.Helper()
 	blobs, _ := newMemStores(t)
-	objs := metastore.NewMemObjects()
-	hold = &holdReads{Objects: objs, held: make(chan struct{}), released: make(chan struct{})}
+	hold := &holdReads{Objects: metastore.NewMemObjects(), held: make(chan struct{}), released: make(chan struct{})}
 	meta, err := metastore.New(metastore.Config{Objects: hold})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := newExportHarness(t, blobs, meta, nil)
-	defer close(hold.released)
-	done := make(chan error, 1)
+	h = newExportHarness(t, blobs, meta, nil)
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold.released) }) }
+	t.Cleanup(release)
+	ch := make(chan error, 1)
 	go func() {
 		_, err := h.svc.Import(context.WithValue(context.Background(), holdKey{}, true), h.engine.id)
-		done <- err
+		ch <- err
 	}()
 	select {
 	case <-hold.held:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the explicit import didn't reach its index read")
 	}
-	start := time.Now()
-	rep := drainFor(h.svc, 10*time.Second)
+	return h, ch, release
+}
+
+// The drain waits for an explicit import (POST
+// /debug/engines/{conn}/import) admitted just before it started, which runs
+// on its caller's context (zerobull-consulting/dagger#72, the known gap this
+// test pinned before).
+func TestDrainWaitsForExplicitImport(t *testing.T) {
+	h, done, release := newHeldImportHarness(t)
+	drained := startDrain(t, h.svc, time.Minute)
 	select {
-	case <-done:
-		t.Fatal("the explicit import ended with the drain: the gap is fixed; update this test, the README and the issue")
-	default:
+	case rep := <-drained:
+		t.Fatalf("the drain didn't wait for the explicit import: %+v", rep)
+	case <-time.After(300 * time.Millisecond):
 	}
-	if took := time.Since(start); took > 5*time.Second || rep.Outcome != metrics.DrainComplete {
-		t.Fatalf("the drain waited for the explicit import (%s, %+v): the gap is fixed; update this test", took, rep)
+	if _, err := h.svc.Import(context.Background(), h.engine.id); !errors.Is(err, ErrDraining) {
+		t.Fatalf("an explicit import during the drain: %v", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("the explicit import: %v", err)
+	}
+	rep := waitDrain(t, drained, 10*time.Second)
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 {
+		t.Fatalf("drain report %+v", rep)
+	}
+}
+
+// An explicit import that hangs doesn't hold the drain past its deadline.
+func TestDrainEndsAtDeadlineWithExplicitImport(t *testing.T) {
+	h, done, release := newHeldImportHarness(t)
+	defer func() { release(); <-done }()
+	start := time.Now()
+	rep := drainFor(h.svc, 300*time.Millisecond)
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the drain took %s", took)
+	}
+	if rep.Outcome != metrics.DrainDeadline || rep.Explicit != 1 {
+		t.Fatalf("drain report %+v", rep)
 	}
 }
 

@@ -108,10 +108,13 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 	if p == nil {
 		return exporter.Result{}, s.exportOff()
 	}
-	// New work: the drain runs what is pending itself.
-	if s.draining.Load() {
-		return exporter.Result{}, ErrDraining
+	// New work: the drain runs what is pending itself. One admitted before
+	// the drain started is waited for (zerobull-consulting/dagger#72).
+	done, err := s.admitExplicit()
+	if err != nil {
+		return exporter.Result{}, err
 	}
+	defer done()
 	c, err := s.conn(conn)
 	if err != nil {
 		return exporter.Result{}, err
@@ -169,9 +172,13 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 	if s.imports == nil {
 		return importer.Result{}, ErrImportOff
 	}
-	if s.draining.Load() {
-		return importer.Result{}, ErrDraining
+	// A drain that starts once it was admitted waits for it
+	// (zerobull-consulting/dagger#72).
+	done, err := s.admitExplicit()
+	if err != nil {
+		return importer.Result{}, err
 	}
+	defer done()
 	c, err := s.conn(conn)
 	if err != nil {
 		return importer.Result{}, err

@@ -2491,7 +2491,8 @@ returns at once, and logs `drain: nothing to export (read-only:
    scheduled GC stop; a GC run under way is canceled (GC is idempotent, and
    the next run finishes it), whether scheduled or asked for. `POST
    /debug/gc`, and the explicit export and import hooks, answer 503: the
-   drain runs what is pending itself. Engine events
+   drain runs what is pending itself. An explicit export or import admitted
+   before the drain started is waited for (see below). Engine events
    (`engine.start`, `engine.prune`) are still taken: a prune makes an entry
    no longer worth exporting.
 2. **It flushes.** Every dirty entry is due now, without waiting for it to
@@ -2783,12 +2784,18 @@ doesn't wait for it, and logs its roots as left (`connected=false`). Known
 gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
 ([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
 
-**An explicit export or import admitted just before the drain.** One that
-passed the 503 check as the drain started runs on, and the drain doesn't wait
-for it: the stop cuts it off, and it publishes nothing. Known gap, pinned by
-`TestKnownGapDrainDoesNotWaitForExplicitExport` and
-`TestKnownGapDrainDoesNotWaitForExplicitImport`
-([#72](https://github.com/zerobull-consulting/dagger/issues/72)).
+**An explicit export or import admitted just before the drain.** The hooks
+are admitted under the drain's lock, so each one is either admitted before
+the drain starts, and waited for, or refused with 503. The drain waits for
+those admitted, up to its deadline, as for the exports it runs; it doesn't
+cancel them. Roots such an export stores while draining are counted in the
+report's `stored`; one still running when the drain ends (at its deadline,
+or canceled) is counted in its `explicit`, logged as `explicitLeft`, and cut
+off by the stop that follows, publishing nothing. Pinned by
+`TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`, their
+`TestDrainEndsAtDeadlineWith…` counterparts, and
+`TestReadOnlyDrainWaitsForExplicitImport`
+([#72](https://github.com/zerobull-consulting/dagger/issues/72), fixed).
 
 **What a crash still loses.** The drain covers a clean stop. A crash, a
 SIGKILL (including a process manager's, past its stop timeout), or
@@ -3676,12 +3683,13 @@ later session names its entries
 stop drains first and stores it (see
 [Stopping and draining](#stopping-and-draining)); an engine that disconnects
 during the drain can't reconnect, and its exports are left
-([#70](https://github.com/zerobull-consulting/dagger/issues/70)); and the
-drain doesn't wait for an explicit export or import admitted just before it
-([#72](https://github.com/zerobull-consulting/dagger/issues/72)). The drain
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)). The drain
 starting an export past its deadline
 ([#73](https://github.com/zerobull-consulting/dagger/issues/73)) is fixed:
-it starts nothing past it.
+it starts nothing past it. So is the drain not waiting for an explicit
+export or import admitted just before it
+([#72](https://github.com/zerobull-consulting/dagger/issues/72)): it waits
+for it, up to its deadline.
 
 **Fixed since: bundles of moved imports.** The first run of
 `service-restart` found that a bundle holding imports could no longer be

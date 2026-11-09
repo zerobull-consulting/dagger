@@ -412,6 +412,48 @@ func debugGet(t *testing.T, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
+// The drain of a read-only service, which has no export path, still waits
+// for an explicit import admitted before it, up to its deadline
+// (zerobull-consulting/dagger#72).
+func TestReadOnlyDrainWaitsForExplicitImport(t *testing.T) {
+	for _, hang := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ends", true: "hangs"}[hang], func(t *testing.T) {
+			h := newReadOnlyHarness(t, newSharedStores(t), readOnlyOptions())
+			// As Service.Import admits itself.
+			done, err := h.svc.admitExplicit()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer done()
+			d := time.Minute
+			if hang {
+				d = 300 * time.Millisecond
+			}
+			drained := startDrain(t, h.svc, d)
+			if hang {
+				rep := waitDrain(t, drained, 5*time.Second)
+				if rep.Outcome != metrics.DrainDeadline || rep.Explicit != 1 {
+					t.Fatalf("drain report %+v", rep)
+				}
+				return
+			}
+			select {
+			case rep := <-drained:
+				t.Fatalf("the drain didn't wait for the explicit import: %+v", rep)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if _, err := h.svc.admitExplicit(); !errors.Is(err, ErrDraining) {
+				t.Fatalf("admitted during the drain: %v", err)
+			}
+			done()
+			rep := waitDrain(t, drained, 5*time.Second)
+			if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 {
+				t.Fatalf("drain report %+v", rep)
+			}
+		})
+	}
+}
+
 // The drain of a read-only service has nothing to flush: it returns at
 // once, complete, and its log says why.
 func TestReadOnlyDrainReturnsAtOnce(t *testing.T) {
