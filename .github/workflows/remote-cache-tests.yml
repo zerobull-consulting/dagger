@@ -101,7 +101,7 @@ jobs:
         timeout-minutes: 5
         run: ./hack/remote-cache/release-tags_test.sh
       # The hourly release check (remote-cache-release-check.yml) and the
-      # accept-line-only check (remote-cache-accept-line.yml), against fake
+      # accept-line-only check (remote-cache-auto-merge-add-compatible-engine.yml), against fake
       # gh, registry and go, and scratch repositories.
       - name: Release check
         timeout-minutes: 5

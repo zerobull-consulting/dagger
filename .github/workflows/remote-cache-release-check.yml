@@ -302,7 +302,7 @@ jobs:
         run: ./hack/remote-cache/release-check.sh accept "$VERSION" "$DIGEST" "$RUN" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Squash auto-merge on an accept PR, with GITHUB_TOKEN, only once
-  # RELEASE_CHECK_AUTO_MERGE is true: set it only after "accept line only"
+  # RELEASE_CHECK_AUTO_MERGE is true: set it only after "auto-merge: adds compatible engine only"
   # is a required check. Also for an accept PR opened by an earlier run.
   auto-merge:
     name: "A: auto-merge"

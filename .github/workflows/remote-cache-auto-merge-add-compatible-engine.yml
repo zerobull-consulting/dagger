@@ -1,5 +1,5 @@
-name: Remote cache accept line
-# The "accept line only" check (zerobull-consulting/dagger#117, D5): the
+name: Remote cache auto-merge add compatible engine
+# The "auto-merge: adds compatible engine only" check (zerobull-consulting/dagger#117, D5): the
 # release check's accept PRs (release-check/accept/<version>) auto-merge,
 # so each must add one accept line to cmd/cacheservice/compat/engines.txt
 # and change nothing else. Any other PR passes it. When it fails, it turns
@@ -31,8 +31,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
-  accept-line-only:
-    name: accept line only
+  auto-merge-add-compatible-engine:
+    name: "auto-merge: adds compatible engine only"
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

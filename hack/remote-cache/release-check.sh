@@ -740,7 +740,7 @@ cmd_accept() {
 		echo
 		[[ -f "$notes/advisory.md" ]] && cat "$notes/advisory.md" && echo
 		if [[ "$auto_merge" == true ]]; then
-			echo "**Auto-merge** (squash) is enabled by the release check once this opens, and the \`accept line only\` check turns it off if this PR ever changes anything else. After the merge, the next hourly run dispatches \`cacheservice-publish.yml\`, which moves \`dagger-remote-cache:$v\`."
+			echo "**Auto-merge** (squash) is enabled by the release check once this opens, and the \`auto-merge: adds compatible engine only\` check turns it off if this PR ever changes anything else. After the merge, the next hourly run dispatches \`cacheservice-publish.yml\`, which moves \`dagger-remote-cache:$v\`."
 		else
 			echo "**Auto-merge is off** (\`RELEASE_CHECK_AUTO_MERGE\` isn't \`true\`): merge by hand with a squash. The next hourly run then dispatches \`cacheservice-publish.yml\` if nothing published the merge."
 		fi
@@ -755,7 +755,7 @@ cmd_auto_merge() {
 	local pr="$1" info files title node
 	need_number "$pr"
 	if [[ "$auto_merge" != true ]]; then
-		say "auto-merge is off: RELEASE_CHECK_AUTO_MERGE isn't true (set it once 'accept line only' is a required check)"
+		say "auto-merge is off: RELEASE_CHECK_AUTO_MERGE isn't true (set it once 'auto-merge: adds compatible engine only' is a required check)"
 		out auto_merge off
 		return
 	fi
