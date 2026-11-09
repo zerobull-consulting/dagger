@@ -754,7 +754,7 @@ stop() {
 			echo "remote-cache-sidecar: the engine was still running after docker stop" >&2
 		else
 			# 0 for a clean stop; 137 when docker stop killed it.
-			engine_code="$(timeout 30 docker inspect -f '{{.State.ExitCode}}' "$st_engine" 2>/dev/null || true)"
+			engine_code="$(exit_code "$st_engine")"
 			echo "remote-cache-sidecar: the engine stopped (exit ${engine_code:-unknown})"
 		fi
 		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
@@ -781,11 +781,11 @@ stop() {
 	# change the stop's exit status: an ephemeral runner discards what is
 	# left, and a self-hosted one's next start says what is in its way.
 	local leftovers=""
-	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || leftovers+=" container $st_service"; }
-	created engine && { timeout 60 docker rm -f "$st_engine" >/dev/null 2>&1 || leftovers+=" container $st_engine"; }
-	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || leftovers+=" volume $st_volume"; }
-	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || leftovers+=" network $st_network"; }
-	[[ -z "$leftovers" ]] || echo "remote-cache-sidecar: couldn't remove, so left behind:$leftovers; remove them by hand if the runner is kept" >&2
+	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || leftovers+="${leftovers:+, }container $st_service"; }
+	created engine && { timeout 60 docker rm -f "$st_engine" >/dev/null 2>&1 || leftovers+="${leftovers:+, }container $st_engine"; }
+	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || leftovers+="${leftovers:+, }volume $st_volume"; }
+	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || leftovers+="${leftovers:+, }network $st_network"; }
+	[[ -z "$leftovers" ]] || echo "remote-cache-sidecar: couldn't remove, so left behind: $leftovers; remove them by hand if the runner is kept" >&2
 	rm -f "$state"
 	# The debug token, if this start generated it: it opened only this
 	# service. Its directory goes only if nothing else is in it.
@@ -823,7 +823,7 @@ stop() {
 			echo "- service exit code: ${code:-unknown}"
 			echo "- engine exit code: ${engine_code:-unknown}"
 			echo "- logs: \`$st_logs\`"
-			[[ -n "$leftovers" ]] && echo "- **left behind (couldn't be removed):**$leftovers"
+			[[ -n "$leftovers" ]] && echo "- **left behind (couldn't be removed):** $leftovers"
 			[[ -n "$failed" ]] && echo "- **failed:** $failed"
 		} >>"$GITHUB_STEP_SUMMARY"
 	fi
