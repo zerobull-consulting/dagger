@@ -72,7 +72,7 @@ it isn't.
 - The closing-keyword caveat: keywords don't fire on feature branches, so
   close by hand.
 - **Who merges:** the session (the default), the user, or the orchestrating
-  session. Step 26 of section 12 covers each case.
+  session. Step 27 of section 12 covers each case.
 
 The rest (draft first, full references, the prompt in the PR, the squash title
 and message) is in section 12, so it isn't repeated here.
@@ -136,7 +136,7 @@ the work they're about.
 
 ### 12. The rules and the steps
 
-Copy everything from here to the end of step 27 into the prompt, verbatim.
+Copy everything from here to the end of step 28 into the prompt, verbatim.
 
 <!-- BEGIN VERBATIM: copy from here -->
 
@@ -145,7 +145,7 @@ ones written here.**
 
 - At most **two** Copilot reviews. While the PR is a draft, push as often as
   you like. Once it's ready, there is exactly **one** push (step 20), and
-  **nothing** after Copilot review 2 except the two cases in step 24.
+  **nothing** after Copilot review 2 except the two cases in step 25.
 - CI red: fix the root cause. Never retry, skip, loosen or quarantine a check.
 - No engine changes without stopping to ask first. The `fork paths` check
   fails any change outside the service's paths.
@@ -247,11 +247,12 @@ ones written here.**
 15. **Reject** the ones that don't hold up, same bar as step 10. Reply on
     each thread with what you traced, and resolve it. Write it down too.
 16. **Fix** the real ones, each with a test that fails without the fix. Run
-    the tests. **Commit locally. Do not push.** Hold that push like it's the
-    last slice of pizza.
+    the tests. If CI went red on the ready PR, fix that here too. **Commit
+    locally. Do not push.** Hold that push like it's the last slice of pizza.
 
-    *Go home early:* if review 1 came back clean and CI is green, you're done
-    reviewing. Skip to step 25. Nice.
+    *Go home early:* if CI is green and there's nothing committed since step
+    13 (review 1 came back clean, or you rejected everything it said), there's
+    nothing for review 2 to look at. Skip to step 26. Nice.
 
 *Self-review 2: checks your fixes*
 
@@ -275,30 +276,32 @@ ones written here.**
     as an issue that references the tracking issue, says how to reproduce it,
     and asks for a known-gap test or the fix. The test comes with that later
     work, not this PR.
-23. **Park** each finding you couldn't confirm, or can't read, in the
+23. **Answer** each finding you traced and found wrong: reply on its thread
+    with what you traced, resolve it, and note it in the scratchpad.
+24. **Park** each finding you couldn't confirm, or can't read, in the
     tracking issue's rolling leads issue (find it by title, "unverified
     leads"; open one only if none exists): file, lines, type, and this PR.
     Don't ask Copilot for its session findings. Reply on each thread with the
     issue link, and resolve it.
-24. **The only two pushes allowed after review 2:**
+25. **The only two pushes allowed after review 2:**
     - CI is red on review 2's head: fix the root cause.
     - A confirmed finding means the PR deletes data it shouldn't, publishes
       an unverified blob or bundle, or exposes a token: fix it, with a test.
 
     Either push starts a review that's handled like review 2: nothing more is
-    pushed for it. If the fix needs a design decision, or CI stays red after
-    a genuine fix, stop and report instead of merging. Otherwise, Copilot's
-    verdict alone doesn't block the merge.
+    pushed for it.
 
 *Wrap it up*
 
-25. **File little issues.** Your value here is your thought. Go through the
+26. **File little issues.** Your value here is your thought. Go through the
     scratchpad: every rejection, and every finding you decided not to address,
     that deserves a follow-up gets its **own tiny issue** referencing the
     tracking issue. One idea per issue. Small radius, every time. Rejections
     that were plainly wrong (the tests contradict them) need no issue.
-26. **Merge, or hand off.** Check the prompt's "Done when" list first. The
-    merge is a squash of the final head, once `feature/remote-cache`'s
+27. **Merge, or hand off.** Check the prompt's "Done when" list first.
+    **Stop and report instead of merging** if an item on it isn't met, if CI
+    stays red after a genuine fix, or if a step 25 fix needs a design
+    decision. Copilot's verdict alone never blocks the merge. The merge is a squash of the final head, once `feature/remote-cache`'s
     ruleset's required checks (read them from the ruleset, not the PR's
     checks list) have passed on it, pinned to that head, with the title and
     message set explicitly: the title is the PR's title plus
@@ -312,7 +315,7 @@ ones written here.**
       the head SHA, Copilot reviews used, what the self-reviews and Copilot
       found, what you fixed, the issues and leads you filed, and the exact
       squash title and message. It checks and merges, and tells you.
-27. **After the merge:** do your part of the prompt's "After the merge" list
+28. **After the merge:** do your part of the prompt's "After the merge" list
     (the orchestrator does the rest when it merged), and unsubscribe from the
     PR. Report review rounds used, what was fixed, and which issues were
     filed. Go home. You earned it.
@@ -413,7 +416,7 @@ small (zerobull-consulting/dagger#198).
   stalls a session that hits it.
 - **Who merges** is stated in section 4: by default the session. A prompt
   written by an orchestrating session says the orchestrator merges, which
-  makes step 26 a "ready to merge" report.
+  makes step 27 a "ready to merge" report.
 - When picking several items to run in parallel: refresh the state first
   (commits, open PRs, issues filed since the last round, and running sessions,
   not just PRs); map which files each item touches and avoid two items in the
