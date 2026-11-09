@@ -21,10 +21,18 @@ import (
 // (allocation size classes), each element of a repeated field 16 bytes more
 // (its pointer, and the slice's growth), each string or bytes field its
 // length plus a header, and each varint, fixed or group field its wire size,
-// tag included, or the header if that is more. A group the message doesn't
-// know, like any field of the wrong wire type for its number, is kept by
-// proto.Unmarshal as raw bytes, so it is charged at least its size.
+// tag included, or the header if that is more. A field the message doesn't
+// know (a group, a bytes field, like any field of the wrong wire type for
+// its number) is kept by proto.Unmarshal as raw bytes, appended to one slice
+// per message, so it is charged otlpUnknownGrowth times its wire size, for
+// the old array and the new one that append holds at once while it grows.
 const (
+	// otlpUnknownGrowth multiplies the wire size of an unknown field. Appending
+	// to a slice that must grow holds the old array and a new one, up to 1.25
+	// times as big, so peak live heap is up to about twice the bytes kept.
+	// Measured in zerobull-consulting/dagger#204: 1.5 to 1.6 times the wire
+	// bytes sampled at GC, 2.0 times at the growth step itself.
+	otlpUnknownGrowth = 2
 	// otlpListElemCost is what one element of a repeated field adds to its
 	// slice: a pointer or a scalar, and room for the slice's doubling.
 	otlpListElemCost = 16
@@ -76,7 +84,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 				return 0, protowire.ParseError(n)
 			}
 			b = b[n:]
-			size += max(int64(protowire.SizeTag(num)+n), otlpFieldCost)
+			size += max(otlpUnknownGrowth*int64(protowire.SizeTag(num)+n), otlpFieldCost)
 			continue
 		}
 		v, n := protowire.ConsumeBytes(b)
@@ -85,23 +93,33 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 		}
 		b = b[n:]
 		switch {
-		case fd != nil && fd.Message() != nil:
+		case fd == nil || !otlpBytesKind(fd):
+			// A field the message doesn't know, or of the wrong wire type for
+			// its number: kept as raw bytes, tag and length included, in the
+			// message's unknown fields, which append grows.
+			size += otlpUnknownGrowth*int64(protowire.SizeTag(num)+protowire.SizeBytes(len(v))) + otlpFieldCost
+		case fd.Message() != nil:
 			sub, err := otlpProtoSize(v, fd.Message(), depth+1)
 			if err != nil {
 				return 0, err
 			}
 			size += sub + otlpListElemCost
-		case fd != nil && fd.IsList():
+		case fd.IsList():
 			// Packed scalars: each takes at least a byte on the wire, and
 			// at most 8 decoded, plus the slice's growth.
 			size += int64(len(v)) * otlpListElemCost
 		default:
-			// A string or bytes field, copied; or a field the message
-			// doesn't know, kept as raw bytes.
+			// A string or bytes field, copied.
 			size += int64(len(v)) + otlpFieldCost
 		}
 	}
 	return size, nil
+}
+
+// otlpBytesKind says whether a known field is read from a length-delimited
+// value: a message, a string, bytes, or a packed list.
+func otlpBytesKind(fd protoreflect.FieldDescriptor) bool {
+	return fd.IsList() || fd.Message() != nil || fd.Kind() == protoreflect.StringKind || fd.Kind() == protoreflect.BytesKind
 }
 
 // otlpJSONSize estimates what a JSON body decodes to: each object at the

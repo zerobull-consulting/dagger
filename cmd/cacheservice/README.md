@@ -1578,7 +1578,11 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     three times while it grows;
   - the **decoded message**, estimated from the body before it is decoded,
     from each OTLP message's Go struct size, each repeated element and each
-    string (`TestOTLPDecodedSizeEstimate`). A body decodes to more than its
+    string (`TestOTLPDecodedSizeEstimate`), and each field the message
+    doesn't know at twice its wire size, since the decoder appends it to a
+    growing slice that briefly holds the old array beside the new
+    (`TestOTLPUnknownFieldsEstimateCoversDecodePeak`,
+    [zerobull-consulting/dagger#204](https://github.com/zerobull-consulting/dagger/issues/204)). A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded

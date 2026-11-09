@@ -1139,3 +1139,67 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 		t.Fatalf("status %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
 	}
 }
+
+// proto.Unmarshal keeps each unknown field by appending it to one slice per
+// message, and append holds the old array and the new one at once while it
+// grows. The estimate covers that peak: the old and the new array of the
+// largest growth step, which this test finds by appending the same fields
+// itself (append's growth is deterministic, so no timing or heap sampling is
+// involved), after checking that the decoder ends with the same capacity.
+// The margin is none: the estimate must be at least the peak, and it is
+// otlpUnknownGrowth times the wire bytes, plus a header per field.
+// zerobull-consulting/dagger#204 measured peak live heap with the GC at
+// 1.5 to 1.6 times the wire bytes, and 2.0 times at the growth step.
+func TestOTLPUnknownFieldsEstimateCoversDecodePeak(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		n      int
+		varint bool
+		size   int
+	}{
+		{"1000 varints", 1000, true, 0},
+		{"100000 varints", 100000, true, 0},
+		{"1000 bytes of 8", 1000, false, 8},
+		{"100000 bytes of 8", 100000, false, 8},
+		{"100 bytes of 64", 100, false, 64},
+		{"10000 bytes of 64", 10000, false, 64},
+		{"100000 bytes of 64", 100000, false, 64},
+		{"1000 bytes of 1024", 1000, false, 1024},
+		{"100 bytes of 64 KiB", 100, false, 64 << 10},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var field []byte
+			if c.varint {
+				field = protowire.AppendVarint(protowire.AppendTag(nil, 99, protowire.VarintType), 1)
+			} else {
+				field = protowire.AppendBytes(protowire.AppendTag(nil, 99, protowire.BytesType), make([]byte, c.size))
+			}
+			body := bytes.Repeat(field, c.n)
+			// The decoder's unknown slice, and the peak of appending to it.
+			var sim []byte
+			var peak int64
+			for range c.n {
+				before := cap(sim)
+				sim = append(sim, field...)
+				if cap(sim) != before {
+					peak = max(peak, int64(before+cap(sim)))
+				}
+			}
+			m := &commonpb.AnyValue{}
+			if err := proto.Unmarshal(body, m); err != nil {
+				t.Fatal(err)
+			}
+			kept := m.ProtoReflect().GetUnknown()
+			if len(kept) != len(body) || cap(kept) != cap(sim) {
+				t.Fatalf("decoder kept %d bytes in %d, appending gives %d", len(kept), cap(kept), cap(sim))
+			}
+			est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if est < peak {
+				t.Fatalf("estimate %d is under the %d bytes the decode holds at its peak (%.2f times)", est, peak, float64(est)/float64(peak))
+			}
+		})
+	}
+}
