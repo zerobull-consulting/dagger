@@ -27,10 +27,89 @@ tracking issue", it means that one.
 
 ## The template
 
-Keep the sections in this order, and leave out a section only when it would
-be empty. Sections 1 to 11 are written for each item. Section 12 is the same
-in every prompt: copy it verbatim, from its first line to its last, and don't
-summarize it or give it by reference.
+A prompt has two parts. Sections 1 to 11 are written for each item. Section 12
+is the same in every prompt: copy it verbatim, from its first line to its
+last, and don't summarize it or give it by reference. Keep the sections in
+this order, and leave out a section only when it would be empty.
+
+An example comes first, then each section in detail.
+
+### Example
+
+An illustration, not a real item: `<issue>`, `<tracking>`, `<other>` and
+`<N>` stand in for real numbers. Everything else is the shape a real prompt
+takes, down to how much each section says.
+
+````markdown
+# `lifecycle claim`: a `-dry-run` flag (zerobull-consulting/dagger#<issue>)
+
+## 1. Header
+Repository: zerobull-consulting/dagger. Issue:
+zerobull-consulting/dagger#<issue>, `cacheservice lifecycle claim` writes a
+bucket's lifecycle rules with no way to preview them. Tracking issue:
+zerobull-consulting/dagger#<tracking>. Why now: `claim` is about to run
+against the shared Spaces bucket, and whoever runs it wants to see the rules
+before they land.
+
+## 2. Before starting, read
+- zerobull-consulting/dagger#<issue>, and its first comment (the rule
+  format the operator expects to see).
+- `cmd/cacheservice/lifecycle/command.go` (how `claim` parses its flags and
+  applies the rules) and `rules.go` (how the rules are built).
+- zerobull-consulting/dagger#177, which added `claim`, and
+  zerobull-consulting/dagger#180, which settled `-max-rules`: don't redo
+  either.
+
+## 3. Prerequisites
+None.
+
+## 4. Branch and PR
+- Branch `claude/lifecycle-claim-dry-run-<issue>` from
+  `origin/feature/remote-cache`.
+- Closing keywords don't fire on feature branches; the issue is closed by
+  hand (section 10).
+- Who merges: your lead, the orchestrator session that started you.
+
+## 5. Design
+- **Decided:** a dry run makes no write call to the bucket, of any kind.
+- **Proposed, confirm or change in the PR:** print the rules as the same
+  JSON `claim` would send, and exit 0.
+
+## 6. What to build
+1. A `-dry-run` flag on `claim`.
+2. With it, `claim` prints the rules and skips the write.
+3. The flag in the README's `lifecycle claim` section.
+
+## 7. Out of scope
+A dry run for the other `lifecycle` subcommands
+(zerobull-consulting/dagger#<other>).
+
+## 8. Tests
+- Unit: a fake S3 client that fails the test on any write call.
+  `go test -race -count=1 ./cmd/cacheservice/...`
+- MinIO: one run of `claim -dry-run` against the compose MinIO
+  (`hack/remote-cache/compose.yaml`), showing the bucket's rules unchanged.
+
+## 9. Done when
+- `claim -dry-run` prints the rules `claim` would write, and the MinIO run
+  shows the bucket's rules unchanged.
+- A unit test fails if a dry run makes any write call.
+
+## 10. After the merge
+Your lead closes zerobull-consulting/dagger#<issue> with a comment linking
+the merged PR, and ticks its box on zerobull-consulting/dagger#<tracking>.
+
+## 11. Heads up
+- Environment: use the compose MinIO; never point a test at the shared
+  Spaces bucket.
+- Lessons: none yet for `lifecycle`.
+
+## 12. The rules and the steps
+(section 12 of `hack/remote-cache/PROMPT_TEMPLATE.md`, copied verbatim)
+
+Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
+`zerobull-consulting/dagger#<N>`
+````
 
 ### 1. Header
 
@@ -38,17 +117,6 @@ Repository, the issue or issues it works on, the tracking issue, where it sits
 in the plan, and *why it matters now*.
 
 *Why:* the agent weighs trade-offs better when it knows what the work is for.
-
-### 1a. Running alongside
-
-When the item runs in parallel with others: each sibling session's ID and
-title, the issue it works on, and the files and sections it owns. Then: stay
-in your own files; when `feature/remote-cache` moves, merge it in, never
-rebase (force-pushes are blocked); and whoever merges second resolves the
-conflict, keeping both changes.
-
-*Why:* every parallel round so far needed this, written by hand, and
-sessions had to be sent each other's IDs after they started.
 
 ### 2. Before starting, read
 
@@ -440,15 +508,10 @@ each change small (zerobull-consulting/dagger#198).
   exposed token), and nothing else pushed after review 2; and the prompt
   verbatim in the PR. The steps don't state the cap as a number, so this is
   where it's checked.
-- When picking several items to run in parallel: refresh the state first
-  (commits, open PRs, issues filed since the last round, and running sessions,
-  not just PRs); map which files each item touches and avoid two items in the
-  same hot file; follow the tracking issues' stated order; pair a critical-path
-  item with an independent one and, where there is one, a small reliability
-  fix such as a CI flake, which speeds up the others.
-- When running items **one at a time** instead, refresh `feature/remote-cache`
-  and the **Version** line before each launch, and carry what the last
-  session hit into the next prompt's "Heads up" (section 11).
+- **Run items one at a time,** in the tracking issues' stated order. Before
+  each launch, refresh `feature/remote-cache` and the **Version** line, and
+  carry what the last session hit into the next prompt's "Heads up"
+  (section 11). Running items in parallel turned out to be hard.
 - End the prompt with a line naming the template version it was generated
   from:
 
