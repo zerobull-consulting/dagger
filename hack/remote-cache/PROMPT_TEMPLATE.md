@@ -72,7 +72,7 @@ it isn't.
 - The closing-keyword caveat: keywords don't fire on feature branches, so
   close by hand.
 - **Who merges:** the session (the default), the user, or the orchestrating
-  session. Step 27 of section 12 covers each case.
+  session. Section 12's merge step covers each case.
 
 The rest (draft first, full references, the prompt in the PR, the squash title
 and message) is in section 12, so it isn't repeated here.
@@ -83,7 +83,7 @@ and message) is in section 12, so it isn't repeated here.
 
 Each point marked **decided** (the requester's) or **proposed, confirm or
 change in the PR** (the agent's to judge). Section 12 has the agent write its
-proposals down before building on them.
+design choices into the PR description.
 
 *Why:* separates the requester's decisions from the agent's, and puts the
 reasoning on the record before code.
@@ -136,7 +136,8 @@ the work they're about.
 
 ### 12. The rules and the steps
 
-Copy everything from here to the end of step 28 into the prompt, verbatim.
+Copy everything from here to the end of the last step into the prompt,
+verbatim.
 
 <!-- BEGIN VERBATIM: copy from here -->
 
@@ -144,8 +145,8 @@ Copy everything from here to the end of step 28 into the prompt, verbatim.
 ones written here.**
 
 - At most **two** Copilot reviews. While the PR is a draft, push as often as
-  you like. Once it's ready, there is exactly **one** push (step 20), and
-  **nothing** after Copilot review 2 except the two cases in step 25.
+  you like. Once it's ready, there is exactly **one** push, and **nothing**
+  after Copilot review 2 except the two cases spelled out there.
 - CI red: fix the root cause. Never retry, skip, loosen or quarantine a check.
 - No engine changes without stopping to ask first. The `fork paths` check
   fails any change outside the service's paths.
@@ -167,22 +168,18 @@ ones written here.**
 
 1. **Read.** Everything in "Before starting, read", and the whole prompt. All
    of it. Coffee's on us.
-2. **Record:** open a scratchpad file outside the repo (never committed) for
-   findings, decisions, rejections and anything weird. You *will* forget some
-   of this if you don't write it down.
-3. **Propose.** Write each "proposed" design point down in the scratchpad,
-   with your call and why. It goes into the PR description in step 7, before
-   anyone reviews code built on it.
+2. **Record:** open a scratchpad file outside the repo (never committed).
+   You *will* forget some of this if you don't write it down.
 
 *Build it*
 
-4. **Build.** Now, after all that reading: write the code. Do your best job
+3. **Build.** Now, after all that reading: write the code. Do your best job
    to keep the code simple and the tests ample.
-5. **Test.** Run the prompt's test commands until they pass. Then prove each
-   new test can fail: break what it guards, watch it go red, put it back. A
-   test that can't fail is just vibes.
-6. **Commit** and **measure.** Commit, then run this and write the number in
-   the scratchpad:
+4. **Test.** Run the prompt's test commands until they pass. Then prove each
+   new test can fail: break what it guards, watch it go red, put it back.
+   They could call you the King's Men, 'cause you can break and fix Humpty
+   all day.
+5. **Commit** and **measure.** Commit, then run:
 
    ```bash
    git fetch origin feature/remote-cache &&
@@ -190,100 +187,111 @@ ones written here.**
      awk '{n += $1 + $2} END {print n}'
    ```
 
-   Over about 2,500 lines: stop and split it into smaller PRs, now, before
-   anyone reviews it. You decide this once, from this number, and never
-   again.
+   Over about 2,500 lines: stop and split it into issues, now, before
+   anybody reviews it. Ask your orchestrator for help. This number decides
+   it once, and nothing later reopens it.
 
-*The draft*
+*Self-review, round 1: before anyone else sees it*
 
-7. **Open the draft.** Push, and open the PR as a **draft** against
-   `feature/remote-cache`. Copilot doesn't review drafts, so draft pushes are
-   free. Follow the repository's PR template, if it has one. The
-   description says what the PR does, the step 6 size (and why, if
-   it's over 2,500 and not split), your design calls from step 3, and, at the
-   very end, the prompt verbatim:
-
-   ```markdown
-   ## Prompt
-
-   <details><summary>The prompt that started this PR</summary>
-
-   (the prompt, verbatim)
-
-   </details>
-   ```
-
-   Keep the blank lines around the prompt, so its Markdown renders.
-8. **Check in later.** Before you end any turn while waiting on CI or
-   Copilot, schedule a check-in to yourself about 10 minutes out (the Claude
-   Code Remote `send_later` tool). Never go idle without one. When it fires,
-   read the PR's checks and reviews yourself: they can land without waking
-   you. This goes for every wait below.
-
-*Self-review 1: before anyone else sees it*
-
-9. **Review:** run exactly
+6. **Review:** run exactly
    `/code-review high origin/feature/remote-cache...HEAD`. You need somebody
    who can call you out when you're trippin' in order to be your best self.
-   Then check that the files it names are yours, and that you're still on your
-   branch (`git status`): it has wandered off to other commits before.
-10. **Reject** findings that are wack: ones that need a significant design
-    change, or that the test suite you can see with your own two eyes
-    contradicts. Write each rejection and your reasoning into the scratchpad.
-11. **Fix** each finding you accepted, and run the tests. You got this. Don't
-    call it done until the fix is slappin' and the tests are passin'. Commit,
-    and push to the draft.
+   Then check that the files it names are yours, and that you're still on
+   your branch (`git status`): it has wandered off to other commits before.
 
-    *Go home early (a little):* if step 9 found nothing, skip 10 and 11.
+   *Go home early (a little):* found nothing? Skip the next two steps.
 
-12. **Get CI green.** Red? Root cause, commit, push to the draft, check in
+7. **Reject** findings that are wack: ones that need a significant design
+   change, or that the test suite you can see with your own two eyes
+   contradicts. Write each one and your reasoning into the scratchpad.
+8. **Fix** each finding you kept, and run the tests. You got this. Don't call
+   it done until the fix is slappin' and the tests are passin'. **Commit.**
+
+*Self-review, round 2: check the fixes*
+
+9. **Review again,** same exact command. It reads commits, not your working
+   tree, which is why you committed. Fresh eyes on fresh code. Check the
+   files and your branch again.
+
+   *Go home early (a little more):* found nothing? Skip the next two steps.
+
+10. **Reject** what doesn't hold up. Same bar as before, new scratchpad
+    entries.
+11. **Fix** what does, test it, **commit.** Look at you go.
+
+*The draft: CI starts here*
+
+12. **Open the draft.** Push, and open the PR as a **draft** against
+    `feature/remote-cache`. Copilot doesn't review drafts, so draft pushes are
+    free. Follow the repository's PR template, if it has one. The description
+    says:
+    - what the PR does;
+    - the size you measured (and why, if it's over 2,500 and not split);
+    - **the design choices you made:** what you weighed, what you picked and
+      why, and where you'd want a reviewer to push back. Give this real
+      thought: it's the part nobody can get from the diff;
+    - at the very end, the prompt, verbatim:
+
+    ```markdown
+    ## Prompt
+
+    <details><summary>The prompt that started this PR</summary>
+
+    (the prompt, verbatim)
+
+    </details>
+    ```
+
+    Keep the blank lines around the prompt, so its Markdown renders.
+13. **Check in later.** Before you end any turn while waiting on CI or
+    Copilot, schedule a check-in to yourself about 10 minutes out (the Claude
+    Code Remote `send_later` tool). Never go idle without one. When it fires,
+    read the PR's checks and reviews yourself: they can land without waking
+    you. This goes for every wait from here on.
+14. **Get CI green.** Red? Root cause, commit, push to the draft, check in
     later, look again. Repeat until green. Draft pushes are still free.
 
-*Copilot review 1*
+*Copilot, round 1*
 
-13. **Mark ready.** That starts Copilot review 1. Check in later.
-14. **Record** every finding from review 1 in the scratchpad: red, yellow,
+15. **Mark ready,** now that CI is green. That starts Copilot review 1. Check
+    in later.
+16. **Record** every finding from review 1 in the scratchpad: red, yellow,
     blue, and anything you can only read in its session.
-15. **Reject** the ones that don't hold up, same bar as step 10. Reply on
-    each thread with what you traced, and resolve it. Write it down too.
-16. **Fix** the real ones, each with a test that fails without the fix. Run
-    the tests. If CI went red on the ready PR, fix that here too. **Commit
-    locally. Do not push.** Hold that push like it's the last slice of pizza.
 
-    *Go home early:* if CI is green and there's nothing committed since step
-    13 (review 1 came back clean, or you rejected everything it said), there's
-    nothing for review 2 to look at. Skip to step 26. Nice.
+    *Go home early:* review 1 came back clean and CI is green? You're done
+    reviewing. Skip to "Wrap it up". Nice.
 
-*Self-review 2: checks your fixes*
+17. **Reject** the ones that don't hold up, same bar as your self-reviews.
+    Reply on each thread with what you traced, and resolve it. Scratchpad it.
+18. **Fix** the real ones, each with a test that fails without the fix. If CI
+    went red on the ready PR, fix that too. Run the tests, then read your
+    whole diff once more yourself: nobody else checks these fixes before
+    Copilot does. **Commit. Do not push yet.** Hold that push like it's the
+    last slice of pizza.
+19. **Push, once.** One push carrying every commit since you marked it ready.
+    It's your one fix push, and it starts Copilot review 2. No touch-ups or
+    rebases sneaking in alongside. Check in later.
 
-17. **Review:** run exactly
-    `/code-review high origin/feature/remote-cache...HEAD` again. It reads
-    commits, not your working tree, which is why step 16 committed. Fresh eyes
-    on fresh code. Check the files and your branch again, like step 9.
-18. **Reject** what doesn't hold up. Same bar, new scratchpad entries.
-19. **Fix** what does, test it, **commit** locally. Almost there. Keep your
-    head in the game.
-20. **Push, once.** One push carrying every commit since step 13. This is
-    your one fix push, and it starts Copilot review 2. No touch-ups or rebases
-    sneaking in alongside. Check in later.
+    *Go home early:* nothing to push because you rejected everything? Don't
+    push. Skip to "Wrap it up".
 
-*Copilot review 2: hands off the code*
+*Copilot, round 2: hands off the code*
 
-21. **Record** every finding from review 2: new findings, a 🔵 "Needs a
+20. **Record** every finding from review 2: new findings, a 🔵 "Needs a
     closer look" with or without text, findings only in its session. From
     here on you don't push. You've done the work. Let it ride.
-22. **File** each *confirmed* finding (you traced a real path to the failure)
+21. **File** each *confirmed* finding (you traced a real path to the failure)
     as an issue that references the tracking issue, says how to reproduce it,
     and asks for a known-gap test or the fix. The test comes with that later
     work, not this PR.
-23. **Answer** each finding you traced and found wrong: reply on its thread
-    with what you traced, resolve it, and note it in the scratchpad.
-24. **Park** each finding you couldn't confirm, or can't read, in the
+22. **Answer** each finding you traced and found wrong: reply on its thread
+    with what you traced, resolve it, and scratchpad it.
+23. **Park** each finding you couldn't confirm, or can't read, in the
     tracking issue's rolling leads issue (find it by title, "unverified
     leads"; open one only if none exists): file, lines, type, and this PR.
     Don't ask Copilot for its session findings. Reply on each thread with the
     issue link, and resolve it.
-25. **The only two pushes allowed after review 2:**
+24. **The only two pushes allowed after review 2:**
     - CI is red on review 2's head: fix the root cause.
     - A confirmed finding means the PR deletes data it shouldn't, publishes
       an unverified blob or bundle, or exposes a token: fix it, with a test.
@@ -293,19 +301,19 @@ ones written here.**
 
 *Wrap it up*
 
-26. **File little issues.** Your value here is your thought. Go through the
+25. **File little issues.** Your value here is your thought. Go through the
     scratchpad: every rejection, and every finding you decided not to address,
     that deserves a follow-up gets its **own tiny issue** referencing the
     tracking issue. One idea per issue. Small radius, every time. Rejections
     that were plainly wrong (the tests contradict them) need no issue.
-27. **Merge, or hand off.** Check the prompt's "Done when" list first.
+26. **Merge, or hand off.** Check the prompt's "Done when" list first.
     **Stop and report instead of merging** if an item on it isn't met, if CI
-    stays red after a genuine fix, or if a step 25 fix needs a design
+    stays red after a genuine fix, or if a fix after review 2 needs a design
     decision. Copilot's verdict alone never blocks the merge. The merge is a
     squash of the final head, once `feature/remote-cache`'s ruleset's
-    required checks (read them from the ruleset, not the PR's
-    checks list) have passed on it, pinned to that head, with the title and
-    message set explicitly: the title is the PR's title plus
+    required checks (read them from the ruleset, not the PR's checks list)
+    have passed on it, pinned to that head, with the title and message set
+    explicitly: the title is the PR's title plus
     `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`; the
     message is the PR's summary, without the prompt. Then, depending on who
     merges (the prompt's "Branch and PR" says):
@@ -316,7 +324,7 @@ ones written here.**
       the head SHA, Copilot reviews used, what the self-reviews and Copilot
       found, what you fixed, the issues and leads you filed, and the exact
       squash title and message. It checks and merges, and tells you.
-28. **After the merge:** do your part of the prompt's "After the merge" list
+27. **After the merge:** do your part of the prompt's "After the merge" list
     (the orchestrator does the rest when it merged), and unsubscribe from the
     PR. Report review rounds used, what was fixed, and which issues were
     filed. Go home. You earned it.
@@ -364,14 +372,19 @@ included, from committed `HEAD` (a binary file counts as 0).
 zerobull-consulting/dagger#182, `/code-review` reviewed an earlier PR's
 commits and left `HEAD` detached.
 
-**Why the second self-review, and why step 16 commits.** Review 2 is the last
-look before the merge, and nothing can be pushed after it, so a mistake in the
-fixes themselves is otherwise only filed, not fixed. In the round of
-zerobull-consulting/dagger#180 to zerobull-consulting/dagger#190, it caught
-real problems in the fix pushes of zerobull-consulting/dagger#186 (a
-duplicated deadline, a ref check's scope) and zerobull-consulting/dagger#188
-(an unfiltered publish-run query), and no PR needed a third Copilot review.
-The range compares commits only, so uncommitted fixes would go unchecked
+**Why two self-reviews, both before the draft.** A second self-review checks
+the fixes from the first. In the round of zerobull-consulting/dagger#180 to
+zerobull-consulting/dagger#190, a second self-review caught real problems in
+fixes on zerobull-consulting/dagger#186 (a duplicated deadline, a ref check's
+scope) and zerobull-consulting/dagger#188 (an unfiltered publish-run query),
+and no PR needed a third Copilot review. Back then it ran between the Copilot
+rounds, to check the fixes for review 1. Interleaving it there made the flow a
+loop sessions got lost in, so both self-reviews now run up front, and the fixes
+for Copilot review 1 get the tests and a read of the whole diff instead. The
+trade: a mistake in those fixes that only `/code-review` would catch is now
+filed after review 2, not fixed. Both reviews run before the draft so CI only
+spends on code that's been reviewed. Fixes are committed before the next
+review because the range compares commits only
 (zerobull-consulting/dagger#193).
 
 **Why the check-ins.** A review can land without waking the session. Three
@@ -401,8 +414,8 @@ to be split across sections 9 to 14, given by reference, with nested "why"
 bullets and loops ("fix, then review again, then gather it into one push").
 Sessions got lost in the middle, and zerobull-consulting/dagger#193 was one
 result. One step per action, written out again instead of "repeat", with
-different wording each time, makes step 17 visibly not step 9. The rules stay
-plain so the limits are never ambiguous. The "go home early" exits and the
+different wording each time, makes the second round visibly not the first.
+The rules stay plain so the limits are never ambiguous. The "go home early" exits and the
 tiny follow-up issues reward a PR that's going well and keep each change
 small (zerobull-consulting/dagger#198).
 
@@ -417,7 +430,7 @@ small (zerobull-consulting/dagger#198).
   stalls a session that hits it.
 - **Who merges** is stated in section 4: by default the session. A prompt
   written by an orchestrating session says the orchestrator merges, which
-  makes step 27 a "ready to merge" report.
+  makes the merge step a "ready to merge" report.
 - When picking several items to run in parallel: refresh the state first
   (commits, open PRs, issues filed since the last round, and running sessions,
   not just PRs); map which files each item touches and avoid two items in the
@@ -444,7 +457,7 @@ small (zerobull-consulting/dagger#198).
 ## Starting a session
 
 Paste the full prompt, section 12 included. The agent copies the whole prompt,
-verbatim, into the PR it opens (step 7). A follow-up PR from the same prompt
+verbatim, into the draft PR it opens. A follow-up PR from the same prompt
 links to the original's instead of copying it.
 
 ## Changing this file
