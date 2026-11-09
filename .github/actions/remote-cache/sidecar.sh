@@ -804,6 +804,9 @@ stop() {
 	elif [[ -z "$code" ]] && ! created service; then
 		# The start failed before it ran the service; its step said why.
 		echo "remote-cache-sidecar: the start didn't get as far as the service; cleaned up what it left"
+		if [[ -n "$leftovers" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+			printf '%s\n' "### remote-cache-sidecar: $st_role stopped" "" "- **left behind (couldn't be removed):** $leftovers" >>"$GITHUB_STEP_SUMMARY"
+		fi
 		return 0
 	elif [[ -z "$code" ]]; then
 		failed="the service's exit code is unknown (its container is gone, or docker didn't say)"

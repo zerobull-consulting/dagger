@@ -212,12 +212,14 @@ stop_with() {
 		export FAKE_DRAIN=after FAKE_SERVICE=after-engine FAKE_ENGINE=stops FAKE_EXIT="$code"
 		(($#)) && export "$@"
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		# T_SUMMARY: a step summary file; T_CREATED: what the state says the start created.
+		[[ -n "${T_SUMMARY:-}" ]] && export GITHUB_STEP_SUMMARY="$T_SUMMARY"
 		mkdir -p "$FAKE_DIR" "$SIDECAR_DIR/t/logs"
 		: >"$FAKE_DIR/service.running"
 		: >"$FAKE_DIR/engine.running"
 		printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
 			"stop_seconds=$stop_seconds" $state_linger "logs=$SIDECAR_DIR/t/logs" role=writer \
-			created=network created=service created=volume created=engine >"$SIDECAR_DIR/t/state"
+			${T_CREATED:-created=network created=service created=volume created=engine} >"$SIDECAR_DIR/t/state"
 		stop
 	) >"$tmp/stop.out" 2>&1
 	rc=$?
@@ -255,6 +257,11 @@ check "a stop whose network can't be removed still passes" stop_with 0 FAKE_RM_F
 check "... and reports the network by kind and name" grep -q "left behind: network t-net" "$tmp/stop.out"
 check "a clean stop reports nothing left behind" stop_with 0
 check "... in its output" not grep -q "left behind" "$tmp/stop.out"
+# A start that failed after the network, before the service: a failed removal
+# still reaches the step summary.
+rm -f "$tmp/summary"
+check "a partial start whose network can't be removed still passes" stop_with 0 FAKE_RM_FAIL=network T_CREATED="created=network" T_SUMMARY="$tmp/summary"
+check "... and its step summary names the network" grep -q "left behind.*network t-net" "$tmp/summary"
 check "a stop that can't remove two things names both" stop_with 0 FAKE_RM_FAIL=both
 check "... separated" grep -q "left behind: volume t-engine-state, network t-net;" "$tmp/stop.out"
 # A docker that hangs on the exit code is cut off at the bound, not waited on.
@@ -265,7 +272,8 @@ exit_code_hang() {
 }
 mkdir -p "$tmp/fake"
 check "an exit code that docker doesn't answer in time is 'unknown', within the bound" exit_code_hang
-check "a stop whose service exit code is unknown fails, and says so" not stop_with 0 FAKE_EXITCODE=hangs
+check "a stop whose service exit code is unknown fails" not stop_with 0 FAKE_EXITCODE=hangs
+check "... and says so" grep -q "exit code is unknown" "$tmp/stop.out"
 check "a stop that exits 1 fails" not stop_with 1
 check "a stop that exits 137 fails" not stop_with 137
 
