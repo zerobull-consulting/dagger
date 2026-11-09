@@ -144,9 +144,6 @@ verbatim.
 **The rules. These are plain on purpose: no jokes, no exceptions beyond the
 ones written here.**
 
-- At most **two** Copilot reviews. While the PR is a draft, push as often as
-  you like. Once it's ready, there is exactly **one** push, and **nothing**
-  after Copilot review 2 except the two cases spelled out there.
 - CI red: fix the root cause. Never retry, skip, loosen or quarantine a check.
 - No engine changes without stopping to ask first. The `fork paths` check
   fails any change outside the service's paths.
