@@ -620,6 +620,20 @@ check "... the wrapper runs that CLI" grep -qF "$fake_cli" "$sidecar_wrapper"
 wrapped() { TRACEPARENT=00-aa-bb-00 DAGGER_ENGINE=other OTEL_X=1 PATH="$tmp/okbin:$PATH" "$sidecar_wrapper" call; }
 check "... which drops an inherited TRACEPARENT, DAGGER_* and OTEL_*" grep -q "^TRACEPARENT=unset DAGGER_ENGINE=unset OTEL_X=unset" <<<"$(wrapped)"
 check "... and sets this engine and this service" grep -q "RUNNER=docker-container://remote-cache-engine CLOUD=http://10.9.0.1:30000 sidecar-cli" <<<"$(wrapped)"
+# zerobull-consulting/dagger#174: the wrapper and cli_run had a list each.
+# Now one function is both, and the wrapper carries a copy of it.
+scrubbed_names="TRACEPARENT TRACESTATE OTEL_X DAGGER_ENGINE _EXPERIMENTAL_DAGGER_RUNNER_HOST"
+unscrubbed_by_wrapper() {
+	local v n=0 out
+	local -a assign=()
+	for v in $scrubbed_names; do assign+=("$v=1"); done
+	out="$(env "${assign[@]}" PATH="$tmp/okbin:$PATH" bash -c 'source "$1"; env' _ <(sed -n '/^scrub_env ()/,/^}/p' "$sidecar_wrapper"; echo 'scrub_env') 2>&1)"
+	for v in $scrubbed_names; do grep -q "^$v=" <<<"$out" && n=$((n + 1)); done
+	((n == 0))
+}
+check "... the wrapper carries the scrub_env function of sidecar.sh" [ "$(declare -f scrub_env)" = "$(sed -n '/^scrub_env ()/,/^}/p' "$sidecar_wrapper")" ]
+check "... which scrubs every name of the list" unscrubbed_by_wrapper
+check "... and cli_run scrubs the same names" bash -c 'source "$1"; set +e; export TRACEPARENT=1 TRACESTATE=1 OTEL_X=1 DAGGER_ENGINE=1 _EXPERIMENTAL_DAGGER_RUNNER_HOST=1; cli_run env | grep -qE "^(TRACEPARENT|TRACESTATE|OTEL_X|DAGGER_ENGINE|_EXPERIMENTAL_DAGGER_RUNNER_HOST)="; [[ $? -ne 0 ]]' _ "$here/sidecar.sh"
 mismatch_start() {
 	hello_start welcome FAKE_CLI_VERSION=v1.0.0-beta.1 SIDECAR_CLI="$fake_cli" SIDECAR_SERVICE_IMAGE=
 	local rc=$?
