@@ -622,7 +622,9 @@ func (x *Exporter) checkOffered(ctx context.Context, bundle *dagql.ValueBundle, 
 // earlier is still read before this try's checks, so it is as safe, and at
 // worst older, which only refuses more. A refused export forgets it
 // (forgetEpoch), so its next try reads a fresh one; a read that began before
-// the forgetting isn't kept, or it would hand that try the older epoch.
+// the forgetting isn't kept, or it would hand that try the older epoch; nor
+// is one that read an older epoch than the kept fence, which a slower
+// concurrent read would otherwise overwrite it with.
 func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 	x.mu.Lock()
 	f, ok, gen := x.epoch, x.epochOK, x.epochGen
@@ -638,7 +640,7 @@ func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 	}
 	f = metastore.Fence{Epoch: epoch, Started: started}
 	x.mu.Lock()
-	if x.epochGen == gen {
+	if x.epochGen == gen && (!x.epochOK || f.Epoch >= x.epoch.Epoch) {
 		x.epoch, x.epochOK = f, true
 	}
 	x.mu.Unlock()

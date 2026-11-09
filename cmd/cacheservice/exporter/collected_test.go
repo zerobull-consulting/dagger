@@ -166,17 +166,7 @@ func (o *blockEpochRead) Get(ctx context.Context, key string) ([]byte, string, e
 // one, and a slow read of an older epoch landing in between would be reused
 // within epochTTL and refused again for the same deletion.
 func TestFenceReadStartedBeforeForgetEpochIsNotKept(t *testing.T) {
-	e := newTestEnv(t, nil)
-	blocker := &blockEpochRead{Objects: e.objects, reading: make(chan struct{}), release: make(chan struct{})}
-	now := time.Unix(1_800_000_000, 0)
-	meta, err := metastore.New(metastore.Config{Objects: blocker, Now: func() time.Time { return now }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	x, err := New(Config{Blobs: e.blobs, Meta: meta, Scope: "team"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	x, meta, blocker := newBlockedFenceEnv(t)
 	ctx := context.Background()
 
 	// Export A's fence read begins; it reads the epoch object (none: 0) and
@@ -203,4 +193,59 @@ func TestFenceReadStartedBeforeForgetEpochIsNotKept(t *testing.T) {
 	if f := x.fence(ctx); f.Epoch != 1 {
 		t.Fatalf("B's fence after forgetEpoch is epoch %d, want 1: A's stale read was kept", f.Epoch)
 	}
+}
+
+// A slow fence read that began before a faster one, and read an older epoch,
+// must not overwrite the fresher fence the faster one kept.
+func TestFenceSlowOlderReadDoesNotOverwriteFresher(t *testing.T) {
+	x, meta, blocker := newBlockedFenceEnv(t)
+	ctx := context.Background()
+
+	blocker.armed.Store(true)
+	done := make(chan metastore.Fence)
+	go func() { done <- x.fence(ctx) }()
+	<-blocker.reading
+
+	// GC publishes epoch 1; a later read B sees it, and keeps it.
+	if err := meta.WriteEpoch(ctx, "team", 1); err != nil {
+		t.Fatal(err)
+	}
+	if f := x.fence(ctx); f.Epoch != 1 {
+		t.Fatalf("B's fence is epoch %d, want 1", f.Epoch)
+	}
+
+	// A's older read lands last.
+	close(blocker.release)
+	if f := <-done; f.Epoch != 0 {
+		t.Fatalf("A's own fence is epoch %d, want 0 (what it read)", f.Epoch)
+	}
+	if f := x.fence(ctx); f.Epoch != 1 {
+		t.Fatalf("fence after A landed is epoch %d, want 1: A's older read overwrote B's", f.Epoch)
+	}
+}
+
+// newBlockedFenceEnv returns an Exporter whose next epoch read (once armed)
+// blocks after reading the object, until released. The test's cleanup
+// releases it, so a failed test leaves no goroutine blocked.
+func newBlockedFenceEnv(t *testing.T) (*Exporter, *metastore.Store, *blockEpochRead) {
+	t.Helper()
+	e := newTestEnv(t, nil)
+	blocker := &blockEpochRead{Objects: e.objects, reading: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-blocker.release:
+		default:
+			close(blocker.release)
+		}
+	})
+	now := time.Unix(1_800_000_000, 0)
+	meta, err := metastore.New(metastore.Config{Objects: blocker, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := New(Config{Blobs: e.blobs, Meta: meta, Scope: "team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return x, meta, blocker
 }
