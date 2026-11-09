@@ -208,6 +208,9 @@ lead" means whoever started you: a human, or an orchestrator session.
 8. **Fix** each finding you kept, and run the tests. You got this. Don't call
    it done until the fix is slappin' and the tests are passin'. **Commit.**
 
+   *Bail early:* nothing committed this round? Round 2 would just review the
+   same code again. Skip to "The draft".
+
 *Self-review, round 2: check the fixes*
 
 9. **Review again,** same exact command. It reads commits, not your working
