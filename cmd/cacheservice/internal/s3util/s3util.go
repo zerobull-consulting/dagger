@@ -26,7 +26,12 @@ func HasStatus(err error, status int) bool {
 }
 
 // SleepCtx waits for d, or until ctx ends, in which case it returns ctx.Err().
+// A context that has already ended always returns its error: the select
+// below would pick at random between it and a timer that has already fired.
 func SleepCtx(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
