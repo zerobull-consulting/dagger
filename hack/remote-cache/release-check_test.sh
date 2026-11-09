@@ -655,7 +655,7 @@ check "dispatch first: after the dispatch" test -f "$FAKE/dispatch-remote-cache-
 check "dispatch first: so no result is given" not has "$tmp/out" "result="
 check "dispatch first: saying the run isn't awaited" has "$tmp/out" "is not awaited"
 check "dispatch first: and cancelling it" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "dispatch first: and saying it is cancelled" has "$tmp/out" "no result is given: cancelled it"
+check "dispatch first: and saying the cancel was asked for" has "$tmp/out" "no result is given: asked GitHub to cancel it"
 # zerobull-consulting/dagger#187: a wait that times out, or a verdict that
 # can't be read, cancels the run too.
 setup
@@ -665,13 +665,16 @@ check "a wait that times out (zerobull-consulting/dagger#187): is an error" test
 check "a wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
 check "a wait that times out (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
 check "a wait that times out (zerobull-consulting/dagger#187): the run is cancelled" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "a wait that times out (zerobull-consulting/dagger#187): and said to be" has "$tmp/out" "is not awaited and no result is given: cancelled it"
+check "a wait that times out (zerobull-consulting/dagger#187): and the cancel said to be asked for" has "$tmp/out" "is not awaited and no result is given: asked GitHub to cancel it"
 # A cancel that fails on a run still going: said so, not cancelled.
 setup
 echo running >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0 FAKE_CANCEL_FAIL=1
+check "a cancel that fails (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a cancel that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+check "a cancel that fails (zerobull-consulting/dagger#187): then the run is read" bash -c "grep -A1 -F 'gh POST repos/o/r/actions/runs/5001/cancel' '$FAKE/calls' | tail -n1 | grep -qxF 'gh GET repos/o/r/actions/runs/5001'"
 check "a cancel that fails (zerobull-consulting/dagger#187): is said to have failed" has "$tmp/out" "cancelling it failed: it will finish unread"
-check "a cancel that fails (zerobull-consulting/dagger#187): not to have cancelled" not has "$tmp/out" "cancelled it"
+check "a cancel that fails (zerobull-consulting/dagger#187): not to have cancelled" not has "$tmp/out" "asked GitHub to cancel it"
 # Neither the cancel nor the run's read works: its state is unknown.
 setup
 echo running >"$FAKE/conclusions"
@@ -689,7 +692,7 @@ check "a jobs read that fails (zerobull-consulting/dagger#187): is an error" tes
 check "a jobs read that fails (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
 check "a jobs read that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
 check "a jobs read that fails (zerobull-consulting/dagger#187): the run is said to have ended" has "$tmp/out" "ended 'success' and no result is given: nothing to cancel"
-check "a jobs read that fails (zerobull-consulting/dagger#187): not to be cancelled" not has "$tmp/out" "cancelled it"
+check "a jobs read that fails (zerobull-consulting/dagger#187): not to be cancelled" not has "$tmp/out" "asked GitHub to cancel it"
 check "a jobs read that fails (zerobull-consulting/dagger#187): nor that the cancel failed" not has "$tmp/out" "cancelling it failed"
 # A run that ended cancelled: neither green nor red, and not cancelled again.
 setup
@@ -699,7 +702,7 @@ check "a run that ended cancelled (zerobull-consulting/dagger#187): is an error"
 check "a run that ended cancelled (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
 check "a run that ended cancelled (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
 check "a run that ended cancelled (zerobull-consulting/dagger#187): is said to have ended" has "$tmp/out" "ended 'cancelled' and no result is given: nothing to cancel"
-check "a run that ended cancelled (zerobull-consulting/dagger#187): not to be cancelled by the check" not has "$tmp/out" "cancelled it"
+check "a run that ended cancelled (zerobull-consulting/dagger#187): not to be cancelled by the check" not has "$tmp/out" "asked GitHub to cancel it"
 # A verdict that is read: nothing is cancelled.
 setup
 echo failure >"$FAKE/conclusions"
@@ -714,7 +717,7 @@ ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" RELEASE_CHEC
 check "a rebuild wait that times out (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
 check "a rebuild wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
 check "a rebuild wait that times out (zerobull-consulting/dagger#187): the run is cancelled" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5002/cancel"
-check "a rebuild wait that times out (zerobull-consulting/dagger#187): and said to be" has "$tmp/out" "is not awaited and no result is given: cancelled it"
+check "a rebuild wait that times out (zerobull-consulting/dagger#187): and the cancel said to be asked for" has "$tmp/out" "is not awaited and no result is given: asked GitHub to cancel it"
 check "a rebuild wait that times out (zerobull-consulting/dagger#187): no PR" test "$(jq length "$FAKE/pulls.json")" = 0
 setup
 printf 'failure\nsuccess\n' >"$FAKE/conclusions"

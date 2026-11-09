@@ -257,7 +257,7 @@ cleanup() {
 		# A run that has already ended can't be cancelled (the API refuses):
 		# it is said to have ended, not to be cancelled.
 		if api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1; then
-			say "the candidate run $url is not awaited and no result is given: cancelled it"
+			say "the candidate run $url is not awaited and no result is given: asked GitHub to cancel it"
 		else
 			# "<status> <conclusion>", read once; empty when the read fails
 			# (gh prints an error's body on stdout, so its output alone
