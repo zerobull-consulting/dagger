@@ -234,8 +234,8 @@ What's excluded, and which issue owns it.
 
 ### 8. Tests
 
-By layer (fake engine, MinIO, built binary, real engines), with the exact
-commands that must pass.
+By layer (a fake Dagger engine, MinIO, the built binary, real Dagger
+engines), with the exact commands that must pass.
 
 *Why:* every layer has caught bugs the others missed.
 
@@ -281,12 +281,12 @@ ones written here.**
   tests, DigitalOcean Spaces for real) behaves goes into an issue, a doc or
   a code comment only after a real run shows it. Reading the code isn't
   enough.
-- **The engine never makes the service delete.** An engine event such as
-  `engine.prune` or a cache wipe can make the service forget entries, but
-  objects leave the bucket only through GC.
+- **The Dagger engine never makes the service delete.** A Dagger engine
+  event such as `engine.prune` or a cache wipe can make the service forget
+  entries, but objects leave the bucket only through GC.
 - Bound every loop, retry, wait and buffer.
-- Validate any string that came from the engine or the bucket before it goes
-  into a metric label, an object key or a file name.
+- Validate any string that came from the Dagger engine or the bucket before
+  it goes into a metric label, an object key or a file name.
 - Stage files explicitly. Never commit built binaries or `dagger.lock`
   changes by accident.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
@@ -311,11 +311,11 @@ reply.
 
 *Build it*
 
-3. **Build.** Now, after all that reading: write the code. Do your best job
-   to keep the code simple and the tests ample. Hit a design decision the
-   prompt didn't make, or need an engine change or something you can't undo?
-   Stop and ask your lead. (The `fork paths` check fails any change outside
-   the service's paths.)
+3. **Build.** Now, after all that reading: write the code. Do your best job to
+   keep the code simple and the tests ample. Hit a design decision the prompt
+   didn't make, or need a change to the Dagger engine or something you can't
+   undo? Stop and ask your lead. (The `fork paths` check fails any change
+   outside the service's paths.)
 4. **Test.** Run the prompt's test commands until they pass. Then prove each
    new test can fail: break what it guards, watch it go red, put it back.
    They could call you the King's Men, 'cause you can break and fix Humpty
@@ -568,9 +568,9 @@ in a row (zerobull-consulting/dagger#182 to zerobull-consulting/dagger#190)
 merge without the requester.
 
 **Why "see it run before you write it down".** zerobull-consulting/dagger#127
-corrected a code-reading claim about the engine that a real kept-volume run
-disproved. The rule used to name "GitHub's" behaviour too, with no incident
-behind it, so it was dropped.
+corrected a code-reading claim about the Dagger engine that a real kept-volume
+run disproved. The rule used to name "GitHub's" behaviour too, with no
+incident behind it, so it was dropped.
 
 **Why one linear list, copied verbatim, in an informal voice.** The steps used
 to be split across sections 9 to 14, given by reference, with nested "why"
@@ -588,7 +588,7 @@ each change small (zerobull-consulting/dagger#198).
   prerequisite, anything irreversible.
 - **Measure before choosing a number,** and put the measurement in the PR.
 - **Decisions that are the requester's are settled before the session starts,**
-  and written into the prompt as decided: credentials, engine changes,
+  and written into the prompt as decided: credentials, Dagger engine changes,
   ruleset changes, design forks. A question that only the requester can answer
   stalls a session that hits it.
 - **Who merges** is stated in section 4 and in the standing authorization,
