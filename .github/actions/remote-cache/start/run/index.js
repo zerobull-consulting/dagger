@@ -32,6 +32,11 @@ function sidecarDir(env) {
   return path.join(env.TMPDIR || os.tmpdir(), 'remote-cache-sidecar');
 }
 
+// sidecar.sh's valid_name.
+function validName(name) {
+  return /^[a-z0-9][a-z0-9_.-]{0,39}$/.test(name);
+}
+
 function stopSeconds(file) {
   try {
     const m = /^stop_seconds=(\d{1,9})$/m.exec(fs.readFileSync(file, 'utf8'));
@@ -92,9 +97,16 @@ function post(env) {
   // Always `sidecar.sh stop`, which knows where its state is and says
   // "nothing to stop" itself: this shim holds a copy of the state's place and
   // format only to bound the stop, and a drift between the two (the script
-  // comes from the caller's commit, the shim is pinned) shortens or lengthens
-  // that bound, but never leaves a sidecar running.
+  // comes from the caller's commit, the shim is pinned) changes that bound to
+  // the default: it still runs the stop, but one with a longer drain than the
+  // default allows can be cut off by it.
   const file = path.join(dir, name, 'state');
+  // A name the script refuses (sidecar.sh valid_name) was refused by the start
+  // too, before any state: the main step already failed, so no second error.
+  if (!validName(name) && !fs.existsSync(file)) {
+    console.log(`remote-cache-sidecar: nothing to stop for '${name}': not a valid name, so no start of it got going`);
+    return 0;
+  }
   try {
     scriptOf(env);
   } catch (e) {

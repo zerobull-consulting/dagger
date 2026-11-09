@@ -31,9 +31,8 @@ sidecar="$repo/.github/actions/remote-cache/sidecar.sh"
 [[ -z "${ENGINE_IMAGE:-}" ]] ||
 	{ echo "run.sh: ENGINE_IMAGE is gone: set VERSION, which selects the engine and the service that accepts it" >&2; exit 2; }
 # VERSION is a common name: say which one this is when it isn't accepted.
-# The sidecar reads this checkout's manifest, never ENGINES_FILE: so does
-# this check.
-if [[ -n "${VERSION:-}" ]] && ! env -u ENGINES_FILE "$here/../engines.sh" pin "$VERSION" >/dev/null; then
+# The sidecar's own check (sidecar.sh version): one rule with the start's.
+if [[ -n "${VERSION:-}" ]] && ! SIDECAR_VERSION="$VERSION" "$sidecar" version >/dev/null 2>&1; then
 	echo "run.sh: VERSION is the demo's engine version, an accept line of cmd/cacheservice/compat/engines.txt; unset it for the first one" >&2
 	exit 2
 fi

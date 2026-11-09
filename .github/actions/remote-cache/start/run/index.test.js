@@ -116,7 +116,7 @@ test('known gap: a run past its bound leaves the processes it spawned running', 
   const { dir, env } = setup(t);
   const pidFile = path.join(dir, 'child.pid');
   fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\nsleep 300 &\necho $! >"$CHILD_PID"\nwait\n', { mode: 0o755 });
-  const code = require(shim).run('stop', { ...env, CHILD_PID: pidFile }, 1000);
+  const code = require(shim).run('stop', { ...env, CHILD_PID: pidFile }, 3000);
   assert.strictEqual(code, 1);
   const pid = Number(fs.readFileSync(pidFile, 'utf8'));
   let state = 'gone';
@@ -130,6 +130,16 @@ test('known gap: a run past its bound leaves the processes it spawned running', 
 });
 
 // A start that never had a script to run leaves the post step nothing to stop.
+// A name the start refuses leaves no state: the main step failed, and a stop
+// of it (which refuses the name too) would be a second error.
+test('the post step for a name the start refuses, with no state, does nothing and does not fail', (t) => {
+  const { env, log } = setup(t);
+  const p = post(env, { STATE_isPost: 'true', STATE_name: '../x', STATE_dir: env.SIDECAR_DIR });
+  assert.strictEqual(p.status, 0, p.stdout + p.stderr);
+  assert.match(p.stdout, /nothing to stop for '\.\.\/x': not a valid name/);
+  assert.strictEqual(log(), '');
+});
+
 test('the post step with an invalid SIDECAR_SCRIPT and no state logs one line and does not fail', (t) => {
   const { env } = setup(t);
   main(env);
