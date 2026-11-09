@@ -126,6 +126,7 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 		metrics:    newMetrics(reg),
 		otlp:       defaultOTLPLimits(),
 		engines:    defaultEnginePolicy(),
+		drain:      drainState{explicitEnded: make(chan struct{}, 1)},
 	}
 }
 

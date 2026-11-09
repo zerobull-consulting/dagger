@@ -108,10 +108,13 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 	if p == nil {
 		return exporter.Result{}, s.exportOff()
 	}
-	// New work: the drain runs what is pending itself.
-	if s.draining.Load() {
-		return exporter.Result{}, ErrDraining
+	// New work: the drain runs what is pending itself. One admitted before
+	// the drain started is waited for (zerobull-consulting/dagger#72).
+	done, err := s.admitExplicit()
+	if err != nil {
+		return exporter.Result{}, err
 	}
+	defer done()
 	c, err := s.conn(conn)
 	if err != nil {
 		return exporter.Result{}, err
@@ -121,9 +124,9 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 		return exporter.Result{}, fmt.Errorf("waiting for the export of cache %s in flight: %w", c.CacheID(), err)
 	}
 	defer release()
-	if s.draining.Load() {
-		return exporter.Result{}, ErrDraining
-	}
+	// Admitted, it runs even if the drain started while it waited for the
+	// slot: the drain waits for it, and starts no export of this cache
+	// while it waits for the slot or runs.
 	if len(req.Roots) > 0 {
 		b, err := c.ns.tracker.Claim(c.CacheID(), req)
 		if err != nil {
@@ -169,9 +172,13 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 	if s.imports == nil {
 		return importer.Result{}, ErrImportOff
 	}
-	if s.draining.Load() {
-		return importer.Result{}, ErrDraining
+	// A drain that starts once it was admitted waits for it
+	// (zerobull-consulting/dagger#72).
+	done, err := s.admitExplicit()
+	if err != nil {
+		return importer.Result{}, err
 	}
+	defer done()
 	c, err := s.conn(conn)
 	if err != nil {
 		return importer.Result{}, err
