@@ -258,6 +258,15 @@ read_state() {
 		die "the state file $file isn't one start wrote"
 }
 
+# A container's exit code, or "unknown" when docker fails or doesn't answer
+# within the bound (a second argument, in seconds; default 30): never a hang,
+# and never a different failure.
+exit_code() {
+	local c
+	c="$(timeout "${2:-30}" docker inspect -f '{{.State.ExitCode}}' "$1" 2>/dev/null || true)"
+	[[ "$c" =~ ^[0-9]+$ ]] && echo "$c" || echo unknown
+}
+
 running() { [[ "$(timeout 30 docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]; }
 
 # Whether docker says a container has stopped. Unlike ! running, a docker
@@ -410,6 +419,9 @@ start() {
 	true | false | "") ;;
 	*) die "verbose must be true or false, not '$SIDECAR_VERBOSE'" ;;
 	esac
+	# Checked here, before the network or any container exists.
+	local config="${SIDECAR_ENGINE_CONFIG:-$here/engine.json}"
+	[[ -f "$config" && "$config" != *:* ]] || die "engine-config '$config' isn't a file (or its path has a ':')"
 	local var
 	for var in ENDPOINT REGION BUCKET ACCESS_KEY_ID SECRET_ACCESS_KEY; do
 		[[ -n "$(printenv "CACHESERVICE_S3_$var" || true)" ]] || die "the S3 setting CACHESERVICE_S3_$var is empty: pass it from the caller's secrets or variables"
@@ -534,7 +546,7 @@ start() {
 	# Deadlines by the clock, not by tries: each try reads the log.
 	local deadline=$((SECONDS + wait)) up=false
 	while ((SECONDS < deadline)); do
-		running "$service" || { show_log "$service" 200; die "the service exited at startup (code $(docker inspect -f '{{.State.ExitCode}}' "$service"))"; }
+		running "$service" || { show_log "$service" 200; die "the service exited at startup (code $(exit_code "$service"))"; }
 		log_has "$service" 'msg=listening addr=:8090' && { up=true; break; }
 		sleep 1
 	done
@@ -546,8 +558,6 @@ start() {
 	# session, before the service has exported them (a host whose disk looks
 	# full prunes everything). docker.io through mirror.gcr.io, as in the
 	# release image's own engine.json.
-	local config="${SIDECAR_ENGINE_CONFIG:-$here/engine.json}"
-	[[ -f "$config" && "$config" != *:* ]] || die "engine-config '$config' isn't a file (or its path has a ':')"
 	config="$(cd "$(dirname "$config")" && pwd)/$(basename "$config")"
 	local mounts=(-v "$config:/etc/dagger/engine.json:ro")
 	if [[ -n "${SIDECAR_ENGINE_CA_FILE:-}" ]]; then
@@ -744,7 +754,7 @@ stop() {
 			echo "remote-cache-sidecar: the engine was still running after docker stop" >&2
 		else
 			# 0 for a clean stop; 137 when docker stop killed it.
-			engine_code="$(timeout 30 docker inspect -f '{{.State.ExitCode}}' "$st_engine" 2>/dev/null || true)"
+			engine_code="$(exit_code "$st_engine")"
 			echo "remote-cache-sidecar: the engine stopped (exit ${engine_code:-unknown})"
 		fi
 		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
@@ -762,14 +772,20 @@ stop() {
 		fi
 	fi
 	if created service && timeout 30 docker container inspect "$st_service" >/dev/null 2>&1; then
-		code="$(docker inspect -f '{{.State.ExitCode}}' "$st_service")"
+		code="$(exit_code "$st_service")"
+		[[ "$code" != unknown ]] || code=""
 		timeout 60 docker logs "$st_service" 2>&1 | redact >"$st_logs/service.log" || true
 	fi
 	# Only what this sidecar's start created.
-	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || true; }
-	created engine && { timeout 60 docker rm -f "$st_engine" >/dev/null 2>&1 || true; }
-	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || true; }
-	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || true; }
+	# A removal that fails is reported, with its name and kind, but doesn't
+	# change the stop's exit status: an ephemeral runner discards what is
+	# left, and a self-hosted one's next start says what is in its way.
+	local leftovers=""
+	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || leftovers+="${leftovers:+, }container $st_service"; }
+	created engine && { timeout 60 docker rm -f "$st_engine" >/dev/null 2>&1 || leftovers+="${leftovers:+, }container $st_engine"; }
+	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || leftovers+="${leftovers:+, }volume $st_volume"; }
+	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || leftovers+="${leftovers:+, }network $st_network"; }
+	[[ -z "$leftovers" ]] || echo "remote-cache-sidecar: couldn't remove, so left behind: $leftovers; remove them by hand if the runner is kept" >&2
 	rm -f "$state"
 	# The debug token, if this start generated it: it opened only this
 	# service. Its directory goes only if nothing else is in it.
@@ -788,9 +804,12 @@ stop() {
 	elif [[ -z "$code" ]] && ! created service; then
 		# The start failed before it ran the service; its step said why.
 		echo "remote-cache-sidecar: the start didn't get as far as the service; cleaned up what it left"
+		if [[ -n "$leftovers" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+			printf '%s\n' "### remote-cache-sidecar: $st_role stopped" "" "- **left behind (couldn't be removed):** $leftovers" >>"$GITHUB_STEP_SUMMARY"
+		fi
 		return 0
 	elif [[ -z "$code" ]]; then
-		failed="the service's container is gone, so its exit code is unknown"
+		failed="the service's exit code is unknown (its container is gone, or docker didn't say)"
 	elif [[ "$was_running" != true ]]; then
 		failed="the service exited during the job, with code $code, before the stop"
 	elif [[ "$overran" == true ]]; then
@@ -807,6 +826,7 @@ stop() {
 			echo "- service exit code: ${code:-unknown}"
 			echo "- engine exit code: ${engine_code:-unknown}"
 			echo "- logs: \`$st_logs\`"
+			[[ -n "$leftovers" ]] && echo "- **left behind (couldn't be removed):** $leftovers"
 			[[ -n "$failed" ]] && echo "- **failed:** $failed"
 		} >>"$GITHUB_STEP_SUMMARY"
 	fi

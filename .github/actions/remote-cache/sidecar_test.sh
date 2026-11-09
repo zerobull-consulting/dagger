@@ -69,6 +69,11 @@ check "start refuses s3-path-style 'yes'" start_refuses CACHESERVICE_S3_PATH_STY
 check "start refuses verbose '1'" start_refuses SIDECAR_VERBOSE=1
 check "start refuses role 'admin'" start_refuses SIDECAR_ROLE=admin
 check "start refuses a missing secret key" start_refuses CACHESERVICE_S3_SECRET_ACCESS_KEY=
+# zerobull-consulting/dagger#104: the engine's config is checked with the
+# other inputs, before the directory, the network or any container.
+check "start refuses an engine-config that isn't a file, before it creates anything" start_refuses SIDECAR_ENGINE_CONFIG="$tmp/no-such-engine.json"
+: >"$tmp/a:b.json" # it exists: only the ':' check can refuse it
+check "start refuses an engine-config whose path has a ':', before it creates anything" start_refuses SIDECAR_ENGINE_CONFIG="$tmp/a:b.json"
 
 # --- the images the version selects ---
 engines="$here/../../../hack/remote-cache/engines.sh"
@@ -122,6 +127,8 @@ check "start refuses engine-image without service-image" start_refuses SIDECAR_E
 #                 only on docker stop
 #   FAKE_ENGINE   stops, or hangs: docker stop fails, and it keeps running
 #   FAKE_EXIT     the service's exit code
+#   FAKE_EXITCODE hangs: docker inspect of an exit code sleeps 5s, then fails
+#   FAKE_RM_FAIL  volume, network or both: that removal fails (exit 1)
 #   FAKE_FLAKY    true: after the SIGTERM, docker inspect of the service
 #                 fails its first 3 times; early: its first 3 inspects fail,
 #                 before the SIGTERM
@@ -142,11 +149,16 @@ case "$1 $2" in
 		((fails <= 3)) && { [[ -n "${FAKE_PROBE_SLEEP:-}" && ! -f "$FAKE_DIR/signaled" ]] && sleep "$FAKE_PROBE_SLEEP" >/dev/null 2>&1 </dev/null; exit 1; }
 	fi
 	case "$3" in
+	*ExitCode*) [[ "${FAKE_EXITCODE:-}" == hangs ]] && { sleep 5 >/dev/null 2>&1 </dev/null; exit 1; } ;;
+	esac
+	case "$3" in
 	*Running*) [[ -f "$f" ]] && echo true || echo false ;;
 	*ExitCode*) [[ -f "$f" ]] && echo 0 || echo "$FAKE_EXIT" ;;
 	esac
 	;;
 "container inspect") exit 0 ;;
+"volume rm") [[ "${FAKE_RM_FAIL:-}" == volume || "${FAKE_RM_FAIL:-}" == both ]] && exit 1; exit 0 ;;
+"network rm") [[ "${FAKE_RM_FAIL:-}" == network || "${FAKE_RM_FAIL:-}" == both ]] && { echo "network has active endpoints" >&2; exit 1; }; exit 0 ;;
 "kill -s")
 	: >"$FAKE_DIR/signaled"
 	if [[ "$FAKE_SERVICE" == by-itself ]]; then
@@ -200,12 +212,14 @@ stop_with() {
 		export FAKE_DRAIN=after FAKE_SERVICE=after-engine FAKE_ENGINE=stops FAKE_EXIT="$code"
 		(($#)) && export "$@"
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		# T_SUMMARY: a step summary file; T_CREATED: what the state says the start created.
+		[[ -n "${T_SUMMARY:-}" ]] && export GITHUB_STEP_SUMMARY="$T_SUMMARY"
 		mkdir -p "$FAKE_DIR" "$SIDECAR_DIR/t/logs"
 		: >"$FAKE_DIR/service.running"
 		: >"$FAKE_DIR/engine.running"
 		printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
 			"stop_seconds=$stop_seconds" $state_linger "logs=$SIDECAR_DIR/t/logs" role=writer \
-			created=network created=service created=volume created=engine >"$SIDECAR_DIR/t/state"
+			${T_CREATED:-created=network created=service created=volume created=engine} >"$SIDECAR_DIR/t/state"
 		stop
 	) >"$tmp/stop.out" 2>&1
 	rc=$?
@@ -234,6 +248,32 @@ check "... the engine is stopped only once the drain is done" called "ENGINE STO
 check "... the service gets no second signal" not called "stop --time 5 t-service"
 check "... in seconds" took_at_most 3
 check "... and keeps both logs" [ -f "$tmp/sc/t/logs/service.log" -a -f "$tmp/sc/t/logs/engine.log" ]
+# zerobull-consulting/dagger#104: a failed removal is reported, with its
+# name and kind; it doesn't change the stop's exit status.
+check "a stop whose volume can't be removed still passes" stop_with 0 FAKE_RM_FAIL=volume
+check "... and reports the volume by kind and name" grep -q "left behind: volume t-engine-state" "$tmp/stop.out"
+check "... and the rest is still removed" called "network rm t-net"
+check "a stop whose network can't be removed still passes" stop_with 0 FAKE_RM_FAIL=network
+check "... and reports the network by kind and name" grep -q "left behind: network t-net" "$tmp/stop.out"
+check "a clean stop reports nothing left behind" stop_with 0
+check "... in its output" not grep -q "left behind" "$tmp/stop.out"
+# A start that failed after the network, before the service: a failed removal
+# still reaches the step summary.
+rm -f "$tmp/summary"
+check "a partial start whose network can't be removed still passes" stop_with 0 FAKE_RM_FAIL=network T_CREATED="created=network" T_SUMMARY="$tmp/summary"
+check "... and its step summary names the network" grep -q "left behind.*network t-net" "$tmp/summary"
+check "a stop that can't remove two things names both" stop_with 0 FAKE_RM_FAIL=both
+check "... separated" grep -q "left behind: volume t-engine-state, network t-net;" "$tmp/stop.out"
+# A docker that hangs on the exit code is cut off at the bound, not waited on.
+exit_code_hang() {
+	local t=$SECONDS out
+	out="$(PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp/fake" FAKE_EXITCODE=hangs FAKE_EXIT=0 exit_code t-service 1)"
+	[[ "$out" == unknown && $((SECONDS - t)) -le 3 ]]
+}
+mkdir -p "$tmp/fake"
+check "an exit code that docker doesn't answer in time is 'unknown', within the bound" exit_code_hang
+check "a stop whose service exit code is unknown fails" not stop_with 0 FAKE_EXITCODE=hangs
+check "... and says so" grep -q "exit code is unknown" "$tmp/stop.out"
 check "a stop that exits 1 fails" not stop_with 1
 check "a stop that exits 137 fails" not stop_with 137
 
