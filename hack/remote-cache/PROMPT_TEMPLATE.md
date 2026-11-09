@@ -272,9 +272,9 @@ keeps the rounds productive.
    - *Why the second self-review:* review 2 is the last look before the
      merge, and nothing can be pushed after it, so a mistake in the fixes
      themselves is otherwise only filed, not fixed. In the round of
-     zerobull-consulting/dagger#180 to #190, it caught real problems in the
+     zerobull-consulting/dagger#180 to zerobull-consulting/dagger#190, it caught real problems in the
      fix pushes of zerobull-consulting/dagger#186 (a duplicated deadline, a
-     ref check's scope) and #188 (an unfiltered publish-run query), and no
+     ref check's scope) and zerobull-consulting/dagger#188 (an unfiltered publish-run query), and no
      PR needed a third Copilot review.
    - **Waiting on Copilot or CI:** a review can land without waking the
      session. Never end a turn while waiting on Copilot or CI without first
