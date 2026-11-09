@@ -31,12 +31,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"math/rand/v2"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"

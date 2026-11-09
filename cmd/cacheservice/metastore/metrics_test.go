@@ -3,12 +3,12 @@ package metastore
 import (
 	"context"
 	"errors"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
 )

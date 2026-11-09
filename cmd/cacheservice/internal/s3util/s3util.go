@@ -22,8 +22,7 @@ func HTTPStatus(err error) int {
 
 // HasStatus reports whether err carries an HTTP response with status.
 func HasStatus(err error, status int) bool {
-	var re *smithyhttp.ResponseError
-	return errors.As(err, &re) && re.HTTPStatusCode() == status
+	return status != 0 && HTTPStatus(err) == status
 }
 
 // SleepCtx waits for d, or until ctx ends, in which case it returns ctx.Err().

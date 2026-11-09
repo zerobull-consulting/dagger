@@ -49,7 +49,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"log/slog"
 	"slices"
 	"sync"
@@ -59,6 +58,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/dagql"

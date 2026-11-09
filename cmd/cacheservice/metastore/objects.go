@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"io"
 	"net/http"
 	"slices"
@@ -18,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 // Objects is the small part of an object store the metadata store needs:
@@ -316,13 +316,10 @@ func (m *MemObjects) Keys() []string {
 // blob store does. It ignores cfg's prefix and expiries, and makes no
 // requests.
 func NewS3Objects(ctx context.Context, cfg blobstore.S3Config) (*S3Objects, error) {
-	return NewS3ObjectsWithClient(ctx, cfg, nil)
+	return newS3Objects(ctx, cfg, nil)
 }
 
-// NewS3ObjectsWithClient is NewS3Objects with client, which
-// blobstore.NewS3Client built for cfg, instead of a client of its own. A nil
-// client builds one.
-func NewS3ObjectsWithClient(ctx context.Context, cfg blobstore.S3Config, client *s3.Client) (*S3Objects, error) {
+func newS3Objects(ctx context.Context, cfg blobstore.S3Config, client *s3.Client) (*S3Objects, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3 metadata store: no bucket")
 	}
@@ -347,7 +344,7 @@ func NewS3(ctx context.Context, cfg blobstore.S3Config) (*Store, error) {
 // NewS3WithClient is NewS3 with client, which blobstore.NewS3Client built for
 // cfg, instead of a client of its own. A nil client builds one.
 func NewS3WithClient(ctx context.Context, cfg blobstore.S3Config, client *s3.Client) (*Store, error) {
-	objects, err := NewS3ObjectsWithClient(ctx, cfg, client)
+	objects, err := newS3Objects(ctx, cfg, client)
 	if err != nil {
 		return nil, err
 	}

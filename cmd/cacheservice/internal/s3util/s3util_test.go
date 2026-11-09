@@ -50,7 +50,8 @@ func TestSleepCtx(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(errors.New("cause"))
-	if err := SleepCtx(ctx, time.Hour); !errors.Is(err, context.Canceled) {
-		t.Fatalf("SleepCtx on a cancelled context = %v, want context.Canceled", err)
+	// ctx.Err(), not the cause: the exporter adapts it (exporter.TestSleepCtxCause).
+	if err := SleepCtx(ctx, time.Hour); err != ctx.Err() {
+		t.Fatalf("SleepCtx on a cancelled context = %v, want %v", err, ctx.Err())
 	}
 }

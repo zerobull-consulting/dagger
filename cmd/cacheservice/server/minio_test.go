@@ -12,7 +12,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"io"
 	"net/http"
 	"os"
@@ -25,6 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 type minioTestEnv struct {

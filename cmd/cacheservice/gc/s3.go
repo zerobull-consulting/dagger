@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"net/http"
 	"strings"
 
@@ -12,6 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 // S3Bucket is a Bucket in S3. The service's credentials need, besides what
