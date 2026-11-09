@@ -130,13 +130,24 @@ test('known gap: a run past its bound leaves the processes it spawned running', 
 });
 
 // A start that never had a script to run leaves the post step nothing to stop.
-test('the post step with an invalid SIDECAR_SCRIPT logs one line and does not fail', (t) => {
+test('the post step with an invalid SIDECAR_SCRIPT and no state logs one line and does not fail', (t) => {
   const { env } = setup(t);
   main(env);
+  fs.rmSync(path.join(env.SIDECAR_DIR, 't', 'state'));
   const p = post({ ...env, SIDECAR_SCRIPT: '/nonexistent/sidecar.sh' });
   assert.strictEqual(p.status, 0, p.stdout + p.stderr);
   assert.match(p.stdout, /nothing to stop for t: SIDECAR_SCRIPT/);
   assert.doesNotMatch(p.stdout + p.stderr, /::error::/);
+});
+
+// ... but with state a sidecar is running: the failed cleanup is reported.
+test('the post step with an invalid SIDECAR_SCRIPT and a state fails, with one error line', (t) => {
+  const { env } = setup(t);
+  main(env);
+  const p = post({ ...env, SIDECAR_SCRIPT: '/nonexistent/sidecar.sh' });
+  assert.strictEqual(p.status, 1, p.stdout + p.stderr);
+  assert.strictEqual((p.stdout.match(/::error::/g) || []).length, 1, p.stdout);
+  assert.match(p.stdout, /t is still running .* can't be stopped: SIDECAR_SCRIPT/);
 });
 
 test('stopping twice is safe: a second post step after a first one finds nothing to stop', (t) => {

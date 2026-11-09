@@ -98,10 +98,15 @@ function post(env) {
   try {
     scriptOf(env);
   } catch (e) {
-    // No script, so no start of this action's can have run it: one line, and
-    // no second error on top of the main step's.
-    console.log(`remote-cache-sidecar: nothing to stop for ${name}: ${e.message}`);
-    return 0;
+    // No script to run. With no state either, no start of this action's ever
+    // got going: one line, and no second error on top of the main step's.
+    // With state, a sidecar is running and can't be stopped: say so.
+    if (!fs.existsSync(file)) {
+      console.log(`remote-cache-sidecar: nothing to stop for ${name}: ${e.message}`);
+      return 0;
+    }
+    console.log(`::error::remote-cache-sidecar: ${name} is still running (state at ${file}) and can't be stopped: ${e.message}`);
+    return 1;
   }
   console.log(`remote-cache-sidecar: stopping ${name} at the end of the job (if it isn't stopped already)`);
   const childEnv = { ...env, SIDECAR_NAME: name, SIDECAR_DIR: dir };
