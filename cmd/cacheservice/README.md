@@ -586,8 +586,10 @@ shell, in this order:
    environment, so no writer can claim the prefix first. `claim` makes the
    claim a writer makes at startup. It doesn't need the admin key (a
    Read/Write/Delete key can claim), only a key that can list the prefix and
-   its multipart uploads, and read and write the marker
-   (`<prefix>/cacheservice.json`); on a fresh bucket, that is the admin key.
+   its multipart uploads, and `s3:GetObject` and `s3:PutObject` on the marker
+   (`<prefix>/cacheservice.json`), plus `s3:GetObject` on each ancestor
+   prefix's marker for the nested-prefix check (see the keys table); on a
+   fresh bucket, that is the admin key.
 2. `lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>` (on
    MinIO, with `-abort-rule=false`).
 3. `lifecycle check -tokens-file tokens`: exit 0.
@@ -599,7 +601,7 @@ a writer already started on needs no `claim`; running it anyway is harmless.
 takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
 key), since a rule can expire anything in the bucket. `claim` doesn't need
 that power, only a key that can list the prefix and its multipart uploads,
-and read and write the marker; on a fresh bucket the admin
+and `s3:GetObject` and `s3:PutObject` on the marker; on a fresh bucket the admin
 key is the only key there is, so that is the one to use. Run `apply` once when a
 bucket is set up, and again when the tokens file's namespaces change, from
 your own shell, with the key in your environment for that one command. Never
@@ -2432,7 +2434,7 @@ Keep three credentials, each with only what it needs
 | --- | --- | --- |
 | **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
 | **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
-| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs less: only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor), so the Read/Write/Delete key can claim a prefix, and the Admin key can too. |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs none of the lifecycle permissions, only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor), so the Read/Write/Delete key can claim a prefix, and so can an admin key that also has these (on Spaces, a full-access key does). |
 
 The admin key is the most powerful: a lifecycle rule can expire anything in
 the bucket. Use it for `lifecycle apply`, and for `plan` and `check` where the writer's
@@ -2527,14 +2529,16 @@ answer and work that ignores cancellation (GC's finish update and a
 promotion's cleanup run on after a cancel, against a store that may not
 answer).
 
-- **Exit codes.** 0 when everything ended within the bound: a clean stop.
+- **Exit codes.** 0 when everything ended within the bound without an
+  error: a clean stop.
   1 when the shutdown ended in any error: engine connections still closing
-  after they were dropped (about 2.5s in, well before the bound), or the
-  bound cutting the shutdown off with work still running (such as an HTTP
-  request). It logs `stopped uncleanly` with the reason in `error=` and what
-  was still running (`exports`, `imports`, `gc`, `engines`), says the
-  shutdown's bound passed only when it did, and exits without waiting for
-  the rest. 1 too when a signal, or the backstop for a step that overran its
+  after they were dropped (an error that comes about 2.5s in, before the
+  bound; the shutdown still shuts the servers down and waits for what is
+  running), or the bound cutting the shutdown off with work still running
+  (such as an HTTP request). It logs `stopped uncleanly` with the reason in
+  `error=` and what was still running (`exports`, `imports`, `gc`,
+  `engines`), says the shutdown's bound passed only when it did, and exits.
+  1 too when a signal, or the backstop for a step that overran its
   own bound (`stopped: the shutdown overran its bound`), cut the shutdown
   off: it logs what was still running, and exits without waiting for it. 1 also when an HTTP server
   failed (such as its address in use), which stops the service too, or
@@ -2546,7 +2550,7 @@ answer).
 - **Signals.** A second signal during the drain ends the drain at once, and
   skips the linger; during the linger, it ends the linger at once
   (`TestMinIOBinarySecondSIGTERMEndsLinger`). The shutdown follows, and
-  exits 0 if it ends within its bound. A signal during the shutdown (the
+  exits 0 if it ends within its bound without an error. A signal during the shutdown (the
   second with `-drain-timeout 0`, or after the drain and the linger ended)
   exits at once, with 1, logging `signal during the shutdown: exiting at
   once` and what was still running

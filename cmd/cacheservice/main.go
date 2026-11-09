@@ -72,16 +72,18 @@
 //     engine.stop, and stops at once. It ends once each connected engine
 //     whose events come here sent engine.stop (at once when there is
 //     none). A shutdown follows, bounded at 5s: it closes the engine
-//     connections (within 2s), shuts the HTTP servers down and waits for
+//     connections (dropping those not closed within 2s), shuts the HTTP
+//     servers down and waits for
 //     what is still running. So the whole stop takes at most -drain-timeout
 //     plus -drain-linger plus 5s: give the process manager a stop timeout
 //     longer than that. A second signal ends the drain, or the linger, at
 //     once, and skips the linger; a signal during the shutdown exits at
 //     once.
-//     The process exits 0 only when everything ended within the bound, and
-//     1 when the shutdown ended in any error (such as engine connections
-//     still closing after they were dropped, about 2.5s in, or the bound
-//     cutting it off), a signal cut it off, or an HTTP server failed,
+//     The process exits 0 only when everything ended within the bound
+//     without an error, and 1 when the shutdown ended in any error (such
+//     as engine connections still closing after they were dropped, an
+//     error that comes about 2.5s in, or the bound cutting it off), a
+//     signal cut it off, or an HTTP server failed,
 //     logging the reason and what was still running. GET /debug/drain
 //     shows the drain. See README.md, "Stopping and draining".
 //
