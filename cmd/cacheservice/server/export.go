@@ -349,7 +349,7 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 			// Their IDs would key the tracker's state: none of these
 			// spans is taken.
 			if n := cacheSpanCount(rs); n > 0 {
-				s.refusedEngineIDs(metrics.EngineIDSourceSpan, n, len(cache), len(session))
+				s.refusedEngineIDs(s.logger, metrics.EngineIDSourceSpan, n, len(cache), len(session))
 			}
 			continue
 		}
@@ -432,7 +432,7 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 		if wiped != "" && !validEngineID(wiped) {
 			// The start is taken; the wiped cache, which no cache can
 			// be named, isn't.
-			s.refusedEngineIDs(metrics.EngineIDSourceWipedCache, 1, len(wiped), 0)
+			s.refusedEngineIDs(s.logger, metrics.EngineIDSourceWipedCache, 1, len(wiped), 0)
 			wiped = ""
 		}
 		if wiped != "" && authenticated && !ns.ownerAccepts(wiped, key) {
@@ -521,14 +521,15 @@ func cacheSpanCount(rs *tracepb.ResourceSpans) int {
 // attribute isn't "<cacheID>/<generation>" with a valid engine ID, or their
 // cache ID or session isn't one (validEngineID), and logs it: at warning
 // level at most once a minute per source (rejectionLog), the rest at debug
-// level. The values themselves aren't logged, only their lengths.
-func (s *Service) refusedEngineIDs(source string, n, cacheLen, sessionLen int) {
+// level, through logger (the connection's, where there is one, so the record
+// names it). The values themselves aren't logged, only their lengths.
+func (s *Service) refusedEngineIDs(logger *slog.Logger, source string, n, cacheLen, sessionLen int) {
 	s.metrics.EngineIDsRefused(source, n)
 	level := slog.LevelDebug
 	if s.engineIDRefusals.allow(source, time.Now()) {
 		level = slog.LevelWarn
 	}
-	s.logger.Log(context.Background(), level, LogEngineIDsRefused, "source", source, "count", n,
+	logger.Log(context.Background(), level, LogEngineIDsRefused, "source", source, "count", n,
 		"cacheLength", cacheLen, "sessionLength", sessionLen, "maxLength", MaxEngineIDLen)
 }
 

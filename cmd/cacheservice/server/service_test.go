@@ -40,18 +40,32 @@ import (
 type logRecorder struct {
 	mu      sync.Mutex
 	records []slog.Record
+	attrs   []slog.Attr // from With, added to each record this handler keeps
+	root    *logRecorder
 }
 
 func (h *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *logRecorder) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.records = append(h.records, r.Clone())
+	r = r.Clone()
+	r.AddAttrs(h.attrs...)
+	root := h
+	if h.root != nil {
+		root = h.root
+	}
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	root.records = append(root.records, r)
 	return nil
 }
 
-func (h *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {
+	root := h
+	if h.root != nil {
+		root = h.root
+	}
+	return &logRecorder{root: root, attrs: append(append([]slog.Attr(nil), h.attrs...), attrs...)}
+}
 func (h *logRecorder) WithGroup(string) slog.Handler      { return h }
 
 // find returns the attributes of every record with the message msg.
