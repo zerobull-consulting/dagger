@@ -214,7 +214,7 @@ func (s *Service) noteEngineEvent(ns *namespace, key tokenKey, kind, cache strin
 		// Every event comes here, whatever its kind: the one place an
 		// event refused for its cache attribute is counted.
 		if cache != "" {
-			s.refusedEngineIDs(metrics.EngineIDSourceEvent, 1, len(cache), 0)
+			s.refusedEngineIDs(s.logger, metrics.EngineIDSourceEvent, 1, len(cache), 0)
 		}
 		return
 	}

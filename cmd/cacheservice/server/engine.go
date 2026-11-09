@@ -312,7 +312,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// The cache ID keys the tracker's, the importer's and the namespace's
 	// state, as a span's does (parseEngineCache).
 	if !validEngineID(c.hello.CacheID) {
-		c.svc.refusedEngineIDs(metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
+		c.svc.refusedEngineIDs(c.logger.With("remote", c.remote), metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
 		_ = c.replyError(ctx, env, "invalid cache ID")
 		return errors.New("hello: invalid cache ID")
 	}
