@@ -32,6 +32,11 @@ function sidecarDir(env) {
   return path.join(env.TMPDIR || os.tmpdir(), 'remote-cache-sidecar');
 }
 
+// sidecar.sh's valid_name.
+function validName(name) {
+  return /^[a-z0-9][a-z0-9_.-]{0,39}$/.test(name);
+}
+
 function stopSeconds(file) {
   try {
     const m = /^stop_seconds=(\d{1,9})$/m.exec(fs.readFileSync(file, 'utf8'));
@@ -89,19 +94,38 @@ function main(env) {
 function post(env) {
   const name = env.STATE_name || env.SIDECAR_NAME || 'remote-cache';
   const dir = env.STATE_dir || sidecarDir(env);
+  // Always `sidecar.sh stop`, which knows where its state is and says
+  // "nothing to stop" itself: this shim holds a copy of the state's place and
+  // format only to bound the stop, and a drift between the two (the script
+  // comes from the caller's commit, the shim is pinned) changes that bound to
+  // the default: it still runs the stop, but one with a longer drain than the
+  // default allows can be cut off by it.
   const file = path.join(dir, name, 'state');
-  if (!fs.existsSync(file)) {
-    // Stopped already (remote-cache/stop), or the start never got as far as
-    // its state: nothing to do. The script says the same.
-    console.log(`remote-cache-sidecar: nothing to stop for ${name} (no state at ${file}): stopped already, or never started`);
+  // A name the script refuses (sidecar.sh valid_name) was refused by the start
+  // too, before any state: the main step already failed, so no second error.
+  if (!validName(name) && !fs.existsSync(file)) {
+    console.log(`remote-cache-sidecar: nothing to stop for '${name}': not a valid name, so no start of it got going`);
     return 0;
   }
-  console.log(`remote-cache-sidecar: stopping ${name} at the end of the job`);
+  try {
+    scriptOf(env);
+  } catch (e) {
+    // No script to run. With no state either, no start of this action's ever
+    // got going: one line, and no second error on top of the main step's.
+    // With state, a sidecar is running and can't be stopped: say so.
+    if (!fs.existsSync(file)) {
+      console.log(`remote-cache-sidecar: nothing to stop for ${name}: ${e.message}`);
+      return 0;
+    }
+    console.log(`::error::remote-cache-sidecar: ${name} is still running (state at ${file}) and can't be stopped: ${e.message}`);
+    return 1;
+  }
+  console.log(`remote-cache-sidecar: stopping ${name} at the end of the job (if it isn't stopped already)`);
   const childEnv = { ...env, SIDECAR_NAME: name, SIDECAR_DIR: dir };
   return run('stop', childEnv, stopTimeoutMs(file));
 }
 
-module.exports = { main, post, stopSeconds, stopTimeoutMs, sidecarDir };
+module.exports = { main, post, run, stopSeconds, stopTimeoutMs, sidecarDir };
 
 if (require.main === module) {
   // The runner hands the values main saved to the post step as STATE_<key>.

@@ -4,6 +4,9 @@
 # the dagger CLI set up to use them. See README.md in this directory.
 #
 #   sidecar.sh start   start the service, then the engine; set up the CLI
+#   sidecar.sh version print the engine version SIDECAR_VERSION selects (the
+#                      manifest's first accept line for none), or fail: the
+#                      check the start action runs before it installs the CLI
 #   sidecar.sh stop    stop the service (it drains), then, once its drain
 #                      is done, the engine, then wait for the service to
 #                      exit; keep their logs; remove the containers, the
@@ -195,12 +198,21 @@ cli_version() {
 	return 1
 }
 
-# cli_run CLI ARGS...: the CLI as the wrapper runs it, and bounded.
-cli_run() {
+# scrub_env: unsets the caller's trace and dagger settings, which would send
+# a CLI to another engine or onto an inherited trace (a CLI that continues an
+# unsampled TRACEPARENT records no spans). The only list of them: cli_run
+# calls it, and the wrapper start writes carries a copy of this function
+# (declare -f), so the two can't differ.
+scrub_env() {
 	local v
 	for v in $(compgen -e); do
 		case "$v" in TRACEPARENT | TRACESTATE | OTEL_* | DAGGER_* | _EXPERIMENTAL_DAGGER_*) unset "$v" ;; esac
 	done
+}
+
+# cli_run CLI ARGS...: the CLI as the wrapper runs it, and bounded.
+cli_run() {
+	scrub_env
 	export DAGGER_NO_NAG=1
 	timeout 30 "$@" </dev/null
 }
@@ -660,9 +672,8 @@ fi
 # As cmd/cacheservice/e2e runs its CLI: no inherited trace, and none of the
 # caller's OTEL_*, DAGGER_* or _EXPERIMENTAL_DAGGER_* settings (DAGGER_ENGINE
 # would take another engine), then the sidecar's own.
-for v in \$(compgen -e); do
-	case "\$v" in TRACEPARENT | TRACESTATE | OTEL_* | DAGGER_* | _EXPERIMENTAL_DAGGER_*) unset "\$v" ;; esac
-done
+$(declare -f scrub_env)
+scrub_env
 export _EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://$engine
 export DAGGER_CLOUD_URL=$url
 export DAGGER_CLOUD_TOKEN=sidecar-cli
@@ -837,14 +848,24 @@ stop() {
 	echo "remote-cache-sidecar: stopped cleanly (exit 0). Logs: $st_logs"
 }
 
+# version: the engine version SIDECAR_VERSION selects, on one line; the same
+# check start runs (select_images), so that the start action's early check and
+# the start have one rule and one error message.
+version() {
+	local version service_image engine_image service_floating
+	SIDECAR_SERVICE_IMAGE="" SIDECAR_ENGINE_IMAGE="" select_images
+	echo "$version"
+}
+
 # Sourced (by sidecar_test.sh), it only defines the functions.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case "${1:-}" in
 start) start ;;
+version) version ;;
 stop) stop ;;
 *)
-	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

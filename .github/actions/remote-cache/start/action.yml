@@ -146,10 +146,8 @@ runs:
         VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-        pin="$(env -u ENGINES_FILE ENGINES_FILE="$GITHUB_ACTION_PATH/../../../../cmd/cacheservice/compat/engines.txt" \
-          "$GITHUB_ACTION_PATH/../../../../hack/remote-cache/engines.sh" pin ${VERSION:+"$VERSION"} 2>&1)" ||
-          { echo "::error::remote-cache/start: version: ${pin#engines.sh: }"; exit 1; }
-        tag="$(sed -n 's/^STOCK_ENGINE_TAG=//p' <<<"$pin")"
+        # The same check start runs, so the error is the same.
+        tag="$(SIDECAR_VERSION="$VERSION" "$GITHUB_ACTION_PATH/../sidecar.sh" version)"
         [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
           { echo "::error::remote-cache/start: reading the manifest failed"; exit 1; }
         echo "version=$tag" >>"$GITHUB_OUTPUT"

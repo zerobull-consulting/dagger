@@ -20,6 +20,7 @@ start)
   printf 'service=x\\nstop_seconds=14\\n' >"$SIDECAR_DIR/$SIDECAR_NAME/state"
   exit "\${FAKE_START_EXIT:-0}" ;;
 stop)
+  [ -f "$SIDECAR_DIR/$SIDECAR_NAME/state" ] || echo "remote-cache-sidecar: nothing to stop"
   rm -f "$SIDECAR_DIR/$SIDECAR_NAME/state"
   exit "\${FAKE_STOP_EXIT:-0}" ;;
 esac
@@ -84,7 +85,7 @@ test('the post step stops the sidecar after a job that failed, with no stop step
   assert.ok(!fs.existsSync(path.join(env.SIDECAR_DIR, 't', 'state')));
 });
 
-test('after an explicit stop the post step does nothing', (t) => {
+test('after an explicit stop the post step still runs stop, which finds nothing to stop', (t) => {
   const { env, log } = setup(t);
   assert.strictEqual(main(env).status, 0);
   // remote-cache/stop ran sidecar.sh stop: the state file is gone.
@@ -92,15 +93,79 @@ test('after an explicit stop the post step does nothing', (t) => {
   const p = post(env);
   assert.strictEqual(p.status, 0);
   assert.match(p.stdout, /nothing to stop/);
-  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start']);
+  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start', 'stop']);
 });
 
-test('stopping twice is safe: a second post step after a first one does nothing', (t) => {
+// zerobull-consulting/dagger#174: the shim used to look for the state itself
+// and skip the stop if it found none, so a script whose state is elsewhere
+// (the script is the caller's commit's, the shim is pinned) was never stopped.
+test('the post step stops a sidecar whose state is not where the shim looks', (t) => {
+  const { env, log } = setup(t);
+  assert.strictEqual(main(env).status, 0);
+  fs.rmSync(path.join(env.SIDECAR_DIR, 't', 'state'));
+  const p = post(env);
+  assert.strictEqual(p.status, 0);
+  assert.ok(/^stop /m.test(log()), log());
+});
+
+// zerobull-consulting/dagger#174, lead 3: a run past its bound is killed with
+// SIGKILL, which reaches only bash; the processes it spawned (docker, timeout,
+// a pull) go on. Pinned as it is today. A fix (a session of its own, killed by
+// group) changes what a cancelled job does, which no run here shows yet.
+test('known gap: a run past its bound leaves the processes it spawned running', (t) => {
+  const { dir, env } = setup(t);
+  const pidFile = path.join(dir, 'child.pid');
+  fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\nsleep 300 &\necho $! >"$CHILD_PID"\nwait\n', { mode: 0o755 });
+  const code = require(shim).run('stop', { ...env, CHILD_PID: pidFile }, 3000);
+  assert.strictEqual(code, 1);
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  let state = 'gone';
+  try {
+    state = /^State:\s*(\S)/m.exec(fs.readFileSync(`/proc/${pid}/status`, 'utf8'))[1];
+  } catch (_) {}
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (_) {}
+  assert.ok(state !== 'gone' && state !== 'Z', `the spawned sleep ${pid} was ${state}: the gap is closed, so turn this into a test of the fix`);
+});
+
+// A start that never had a script to run leaves the post step nothing to stop.
+// A name the start refuses leaves no state: the main step failed, and a stop
+// of it (which refuses the name too) would be a second error.
+test('the post step for a name the start refuses, with no state, does nothing and does not fail', (t) => {
+  const { env, log } = setup(t);
+  const p = post(env, { STATE_isPost: 'true', STATE_name: '../x', STATE_dir: env.SIDECAR_DIR });
+  assert.strictEqual(p.status, 0, p.stdout + p.stderr);
+  assert.match(p.stdout, /nothing to stop for '\.\.\/x': not a valid name/);
+  assert.strictEqual(log(), '');
+});
+
+test('the post step with an invalid SIDECAR_SCRIPT and no state logs one line and does not fail', (t) => {
+  const { env } = setup(t);
+  main(env);
+  fs.rmSync(path.join(env.SIDECAR_DIR, 't', 'state'));
+  const p = post({ ...env, SIDECAR_SCRIPT: '/nonexistent/sidecar.sh' });
+  assert.strictEqual(p.status, 0, p.stdout + p.stderr);
+  assert.match(p.stdout, /nothing to stop for t: SIDECAR_SCRIPT/);
+  assert.doesNotMatch(p.stdout + p.stderr, /::error::/);
+});
+
+// ... but with state a sidecar is running: the failed cleanup is reported.
+test('the post step with an invalid SIDECAR_SCRIPT and a state fails, with one error line', (t) => {
+  const { env } = setup(t);
+  main(env);
+  const p = post({ ...env, SIDECAR_SCRIPT: '/nonexistent/sidecar.sh' });
+  assert.strictEqual(p.status, 1, p.stdout + p.stderr);
+  assert.strictEqual((p.stdout.match(/::error::/g) || []).length, 1, p.stdout);
+  assert.match(p.stdout, /t is still running .* can't be stopped: SIDECAR_SCRIPT/);
+});
+
+test('stopping twice is safe: a second post step after a first one finds nothing to stop', (t) => {
   const { env, log } = setup(t);
   main(env);
   assert.strictEqual(post(env).status, 0);
   assert.strictEqual(post(env).status, 0);
-  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start', 'stop']);
+  assert.deepStrictEqual(log().trim().split('\n').map((l) => l.split(' ')[0]), ['start', 'stop', 'stop']);
 });
 
 test('a stop that fails fails the post step', (t) => {
