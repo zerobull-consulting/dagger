@@ -268,12 +268,13 @@ ones written here.**
     whole diff once more yourself: nobody else checks these fixes before
     Copilot does. **Commit. Do not push yet.** Hold that push like it's the
     last slice of pizza.
-19. **Push, once.** One push carrying every commit since you marked it ready.
-    It's your one fix push, and it starts Copilot review 2. No touch-ups or
-    rebases sneaking in alongside. Check in later.
 
     *Go home early:* nothing to push because you rejected everything? Don't
     push. Skip to "Wrap it up".
+
+19. **Push, once.** One push carrying every commit since you marked it ready.
+    It's your one fix push, and it starts Copilot review 2. No touch-ups or
+    rebases sneaking in alongside. Check in later.
 
 *Copilot, round 2: hands off the code*
 
