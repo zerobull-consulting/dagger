@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -195,12 +196,29 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 		logUncleanStop(slog.New(slog.NewTextHandler(&buf, nil)), svc, err, 5*time.Second)
 		return buf.String()
 	}
+	// msgOf is the logged message alone, so a check on the wording can't be
+	// satisfied or tripped by the error's text or the attributes.
+	msgOf := func(err error) string {
+		var msg string
+		h := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.MessageKey {
+				msg = a.Value.String()
+			}
+			return a
+		}})
+		logUncleanStop(slog.New(h), svc, err, 5*time.Second)
+		return msg
+	}
 	engines := log(errors.New("2 engine connections still closing after they were dropped"))
 	if !strings.Contains(engines, "engine connections still closing") || strings.Contains(engines, "bound passed") || strings.Contains(engines, "bound=") {
 		t.Errorf("the engine-close error was logged as %q: want its text as the reason and no bound", engines)
 	}
 	if !strings.Contains(engines, "stopped uncleanly") {
 		t.Errorf("the engine-close error was logged as %q: want \"stopped uncleanly\"", engines)
+	}
+	// Everything else was waited for, so the line must not say it wasn't.
+	if msg := msgOf(errors.New("2 engine connections still closing after they were dropped")); strings.Contains(msg, "without waiting") {
+		t.Errorf("the engine-close error was logged with message %q: it claims not to have waited", msg)
 	}
 	// The bound passing, from a real shutdown with a request held past it.
 	srv := &http.Server{Handler: http.NotFoundHandler()}
@@ -231,6 +249,9 @@ func TestLogUncleanStopNamesTheCause(t *testing.T) {
 	bound := log(err)
 	if !strings.Contains(bound, "the shutdown's bound passed") || !strings.Contains(bound, "requests still running") {
 		t.Errorf("the bound passing was logged as %q", bound)
+	}
+	if msg := msgOf(err); !strings.Contains(msg, "exiting without waiting") {
+		t.Errorf("the bound passing was logged with message %q: want it to say it exits without waiting", msg)
 	}
 }
 
