@@ -301,8 +301,9 @@ ones written here.**
 27. **Merge, or hand off.** Check the prompt's "Done when" list first.
     **Stop and report instead of merging** if an item on it isn't met, if CI
     stays red after a genuine fix, or if a step 25 fix needs a design
-    decision. Copilot's verdict alone never blocks the merge. The merge is a squash of the final head, once `feature/remote-cache`'s
-    ruleset's required checks (read them from the ruleset, not the PR's
+    decision. Copilot's verdict alone never blocks the merge. The merge is a
+    squash of the final head, once `feature/remote-cache`'s ruleset's
+    required checks (read them from the ruleset, not the PR's
     checks list) have passed on it, pinned to that head, with the title and
     message set explicitly: the title is the PR's title plus
     `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`; the
