@@ -32,7 +32,8 @@ The lead writes two things for each session:
 
 1. **The standing authorization:** who the lead is, what the session may do
    without asking, what it may not, and how it tells the lead when it stops.
-   It goes in the session's system prompt (below).
+   It goes in the session's system prompt, or at the top of a human's first
+   message (below).
 2. **The prompt:** what to build and how (the template, next).
 
 The lead then answers the session's questions, decides what to do with
