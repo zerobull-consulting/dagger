@@ -447,13 +447,14 @@ review the same code again. Skip to "The draft".
     closer look" with or without text, findings only in its session. From
     here on you don't push, except in the cases below. You've done the work.
     Let it ride.
-21. **File** each *confirmed* finding (you traced a real path to the failure),
-    except one that deletes data it shouldn't, publishes an unverified blob or
-    bundle, or exposes a token: never file those: they get a fix push (below),
-    and a reply on their thread saying so. File the rest as an issue that
-    references the issue your PR closes, says how to reproduce it, and asks
-    for a known-gap test or the fix. The test comes with that later work, not
-    this PR. Reply on its thread with the issue link, and resolve it.
+21. **File** each *confirmed* finding (you traced a real path to the failure,
+    or, for how the Dagger engine or the bucket behaves, saw it in a run) as an
+    issue that references the issue your PR closes, says how to reproduce it,
+    and asks for a known-gap test or the fix. The test comes with that later
+    work, not this PR. Reply on its thread with the issue link, and resolve it.
+    One exception: never file a finding that the PR deletes data it shouldn't,
+    publishes an unverified blob or bundle, or exposes a token. Those get a fix
+    push (below) and a reply on their thread saying so.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
 23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
@@ -563,8 +564,8 @@ zerobull-consulting/dagger#188) and sat until someone nudged them.
 **Why the session asks its lead about unverified findings.** One leads issue
 per PR meant twelve of them piled up untriaged. One rolling leads issue fixed
 that, but it was hard to explain to a session working on a single task.
-Deciding what a lead is worth, and what it belongs with, takes a view across
-tasks, which the lead has and the session doesn't.
+Deciding what an unverified finding is worth, and what it belongs with, takes
+a view across tasks, which the lead has and the session doesn't.
 
 **Why the standing authorization goes in the system prompt.** A session reads
 an approval quoted in a prompt that another session wrote as an automated
@@ -632,8 +633,9 @@ each change small (zerobull-consulting/dagger#198).
 An orchestrator creates the session with the standing authorization as its
 appended system prompt and the full prompt, section 12 included, as its
 first message. A human pastes both into the first message, authorization
-first. Either way, the lead then checks in on the session about 10 minutes
-after launch, and every 20 minutes while it works.
+first. An orchestrator lead then checks in on the session about 10 minutes
+after launch, and every 20 minutes while it works; a human lead hears from
+the session when it stops.
 
 The session copies the whole prompt, verbatim, into the draft PR it opens,
 but never the standing authorization, even when a human pasted both into the
