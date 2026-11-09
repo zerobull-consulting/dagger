@@ -1622,8 +1622,9 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   (`uuid.NewString` in dagql's `Cache.openIdentity`), and a session ID 26
   (`crypto/rand.Text` in the engine client); the e2e's `otlp-sizes` scenario
   logs the longest of each the run's engines sent, and fails if any was
-  dropped. Before, any string of any length became a key of the tracker's
-  state, which the tracker keeps for a cache no engine connects under. That
+  dropped. Before, a cache ID or session of any length or content (with a
+  numeric generation) became a key of the tracker's state, which the
+  tracker keeps for a cache no engine connects under. That
   bounds what each cache ID costs, but not how many the tracker keeps: it
   never forgets a cache no engine connects under
   ([zerobull-consulting/dagger#203](https://github.com/zerobull-consulting/dagger/issues/203)). Now

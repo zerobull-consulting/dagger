@@ -356,14 +356,13 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 		for _, ss := range rs.ScopeSpans {
 			for _, span := range ss.Spans {
 				attrs := span.Attributes
-				if n, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr); ok {
-					count, err := strconv.Atoi(n.GetStringValue())
-					if err == nil && !tracker.SessionEnded(cacheID, generation, session, count, now) && draining {
+				if count, ok := carrierCount(attrs); ok {
+					if !tracker.SessionEnded(cacheID, generation, session, count, now) && draining {
 						s.refusedSpan()
 					}
 				}
-				number, err := strconv.ParseUint(stringAttr(attrs, telemetryattrs.CacheResultIDAttr), 10, 64)
-				if err != nil || number == 0 {
+				number, ok := cacheResultNumber(attrs)
+				if !ok {
 					continue
 				}
 				o := exporter.Observation{
@@ -485,15 +484,31 @@ func parseEngineCache(v string) (string, uint64, bool) {
 	return v[:i], gen, true
 }
 
-// cacheSpanCount is how many of rs's spans the tracker would take: cache
-// spans and session carriers.
+// cacheResultNumber is a cache span's engine number: set, and not 0.
+func cacheResultNumber(attrs []*commonpb.KeyValue) (uint64, bool) {
+	n, err := strconv.ParseUint(stringAttr(attrs, telemetryattrs.CacheResultIDAttr), 10, 64)
+	return n, err == nil && n != 0
+}
+
+// carrierCount is a session carrier's count of the session's cache spans.
+func carrierCount(attrs []*commonpb.KeyValue) (int, bool) {
+	v, ok := attrValue(attrs, telemetryattrs.CacheSessionSpansAttr)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v.GetStringValue())
+	return n, err == nil
+}
+
+// cacheSpanCount is how many of rs's spans trackSpans would take, by the
+// same checks: cache spans and session carriers.
 func cacheSpanCount(rs *tracepb.ResourceSpans) int {
 	n := 0
 	for _, ss := range rs.ScopeSpans {
 		for _, span := range ss.Spans {
-			if _, ok := attrValue(span.Attributes, telemetryattrs.CacheResultIDAttr); ok {
-				n++
-			} else if _, ok := attrValue(span.Attributes, telemetryattrs.CacheSessionSpansAttr); ok {
+			_, isCache := cacheResultNumber(span.Attributes)
+			_, isCarrier := carrierCount(span.Attributes)
+			if isCache || isCarrier {
 				n++
 			}
 		}

@@ -90,9 +90,16 @@ func TestTrackSpansValidatesEngineIDs(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			h, _ := newMemExportHarness(t, nil)
 			before := engineIDsRefused(t, h.svc, "span")
-			// Two cache spans, and one span that isn't, which isn't
-			// counted.
-			postResourceSpans(t, h.srv.URL, c.cacheID+"/1", c.session, cacheSpan(5), cacheSpan(6), &tracepb.Span{Name: "other"})
+			// Two cache spans, and spans trackSpans wouldn't take,
+			// which aren't counted: one that isn't a cache span, one
+			// whose number isn't one, one numbered 0, and a carrier
+			// whose count isn't one.
+			badNumber, zero := cacheSpan(0), cacheSpan(0)
+			badNumber.Attributes[0] = kv(telemetryattrs.CacheResultIDAttr, "x")
+			badCarrier := carrierSpan(0)
+			badCarrier.Attributes[0] = kv(telemetryattrs.CacheSessionSpansAttr, "x")
+			postResourceSpans(t, h.srv.URL, c.cacheID+"/1", c.session, cacheSpan(5), cacheSpan(6),
+				&tracepb.Span{Name: "other"}, badNumber, zero, badCarrier)
 			entries := h.ns().tracker.Entries(c.cacheID)
 			refused := engineIDsRefused(t, h.svc, "span") - before
 			if c.tracked {
