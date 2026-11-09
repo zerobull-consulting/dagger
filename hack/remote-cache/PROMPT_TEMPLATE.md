@@ -2,10 +2,11 @@
 
 **Version:** [zerobull-consulting/dagger#194](https://github.com/zerobull-consulting/dagger/pull/194)
 
-Every work item's prompt for the remote cache work is generated from this file. It holds the template, the conventions for the
-whole prompt, and the working agreement for review and merge (section 12).
-It is the process's source, and it changes by PR (see
-[Changing this file](#changing-this-file)).
+Every work item's prompt for the remote cache work is generated from this
+file. It holds the template, the steps every session follows (section 12,
+copied verbatim into every prompt), the reasons behind them, and the
+conventions for the whole prompt. It is the process's source, and it changes
+by PR (see [Changing this file](#changing-this-file)).
 
 **Tracking issues.** zerobull-consulting/dagger#1, the original tracking
 issue, is closed. Each prompt names its item's own tracking issue (for
@@ -26,8 +27,10 @@ tracking issue", it means that one.
 
 ## The template
 
-Keep the sections in this order, leave out a section only when it would be
-empty, and keep each section's purpose in mind.
+Keep the sections in this order, and leave out a section only when it would
+be empty. Sections 1 to 11 are written for each item. Section 12 is the same
+in every prompt: copy it verbatim, from its first line to its last, and don't
+summarize it or give it by reference.
 
 ### 1. Header
 
@@ -65,31 +68,22 @@ it isn't.
 
 ### 4. Branch and PR
 
-- Branch name and base; open as a draft.
+- Branch name and base.
 - The closing-keyword caveat: keywords don't fire on feature branches, so
   close by hand.
-- Full `owner/repo#N` references, since a bare `#N` can link to the upstream
-  repository.
-- **The prompt goes in the PR, verbatim:** at the end of the PR description,
-  under a "Prompt" heading, inside
-  `<details><summary>The prompt that started this PR</summary>` …
-  `</details>`. Follow the repository's PR template, if it has one, for
-  everything above it. A follow-up PR from the same prompt links to the
-  original's instead of copying it.
-- **The prompt stays out of the commit history:** set the squash commit's
-  title and message explicitly. The title is the PR's title with its full
-  reference, like `(zerobull-consulting/dagger#97)`, never GitHub's default
-  `(#97)`; the message is the PR's summary, without the prompt. Section 12,
-  step 5 says how.
+- **Who merges:** the session (the default), the user, or the orchestrating
+  session. Step 26 of section 12 covers each case.
 
-*Why:* repository quirks that bit earlier rounds, and a record of exactly what
-produced each PR.
+The rest (draft first, full references, the prompt in the PR, the squash title
+and message) is in section 12, so it isn't repeated here.
+
+*Why:* repository quirks that bit earlier rounds, and who has the last word.
 
 ### 5. Design
 
 Each point marked **decided** (the requester's) or **proposed, confirm or
-change in the PR** (the agent's to judge), and "write this into the PR before
-building on it".
+change in the PR** (the agent's to judge). Section 12 has the agent write its
+proposals down before building on them.
 
 *Why:* separates the requester's decisions from the agent's, and puts the
 reasoning on the record before code.
@@ -109,262 +103,304 @@ What's excluded, and which issue owns it.
 ### 8. Tests
 
 By layer (fake engine, MinIO, built binary, real engines), with the exact
-commands that must pass, and "prove each new test can fail by breaking what it
-guards".
+commands that must pass.
 
 *Why:* every layer has caught bugs the others missed.
 
-### 9. Rules
+### 9. Done when
 
-Invariants:
+Observable outcomes, each shown by a test or a run.
 
-- no engine changes without stopping first (the `fork paths` check,
-  zerobull-consulting/dagger#141, also fails any change outside the
-  service's paths);
-- **verify by running:** a claim about the engine's, GitHub's or a store's
+*Why:* an end the agent can check for itself.
+
+### 10. After the merge
+
+Issues to close by hand, comments to post and where, and follow-up issues to
+file. Say who does each (the orchestrator, when it merges).
+
+*Why:* keeps the tracking issue and the issues that depend on this one current
+without the requester doing it.
+
+### 11. Heads up
+
+A short list, kept to what this item will actually hit:
+
+- **Environment:** the sandbox's quirks it will meet (the Docker Hub mirror,
+  the TLS CA bundle, the unsampled `TRACEPARENT`, which buckets not to touch).
+- **Lessons:** what earlier sessions hit that applies here. This is where
+  process improvements go first, before they become steps or rules.
+- **Extra rules:** anything beyond section 12's that only this item needs.
+
+*Why:* each environment quirk cost a round once, and lessons belong next to
+the work they're about.
+
+### 12. The rules and the steps
+
+Copy everything from here to the end of step 27 into the prompt, verbatim.
+
+<!-- BEGIN VERBATIM: copy from here -->
+
+**The rules. These are plain on purpose: no jokes, no exceptions beyond the
+ones written here.**
+
+- At most **two** Copilot reviews. While the PR is a draft, push as often as
+  you like. Once it's ready, there is exactly **one** push (step 20), and
+  **nothing** after Copilot review 2 except the two cases in step 24.
+- CI red: fix the root cause. Never retry, skip, loosen or quarantine a check.
+- No engine changes without stopping to ask first. The `fork paths` check
+  fails any change outside the service's paths.
+- **Verify by running:** a claim about the engine's, GitHub's or a store's
   behaviour goes into an issue, a doc or the code only after a real run shows
-  it, not from reading code (zerobull-consulting/dagger#127 corrected a
-  code-reading claim that a real kept-volume run disproved);
-- never delete on an engine's signal;
-- bound everything;
-- no engine- or bucket-supplied strings in labels, keys or file names without
-  validating them;
-- known-gap tests plus issues for confirmed gaps not fixed; unconfirmed leads
-  are appended to the tracking issue's rolling leads issue (see section 12),
-  with no test;
-- stage files explicitly, and never commit built binaries or `dagger.lock`
+  it, not from reading code.
+- Never delete on an engine's signal. Bound everything. Validate any engine-
+  or bucket-supplied string before it goes into a label, key or file name.
+- Stage files explicitly. Never commit built binaries or `dagger.lock`
   changes by accident.
+- Full `owner/repo#N` references everywhere: a bare `#N` can link to the
+  upstream repository.
+- Stop and ask, instead of deciding, on a design decision that's the
+  requester's, a missing prerequisite, or anything irreversible.
 
-*Why:* the lines that must never move, whatever the task.
+**The steps. One at a time, top to bottom. Each one is one thing.**
 
-**Sections 9, 10 and 12 may be given by reference.** A prompt can say
-"Rules, environment notes and review: sections 9, 10 and 12 of
-`hack/remote-cache/PROMPT_TEMPLATE.md`, as of the version named at the end",
-and add only what differs for the item (an extra rule, an environment quirk
-it will hit). The agent reads the file. Copying
-them into every prompt cost about 3k characters each, and the copies drifted.
+*Get set up*
 
-### 10. Environment notes
+1. **Read.** Everything in "Before starting, read", and the whole prompt. All
+   of it. Coffee's on us.
+2. **Record:** open a scratchpad file outside the repo (never committed) for
+   findings, decisions, rejections and anything weird. You *will* forget some
+   of this if you don't write it down.
+3. **Propose.** Write each "proposed" design point down in the scratchpad,
+   with your call and why. It goes into the PR description in step 7, before
+   anyone reviews code built on it.
 
-The sandbox's quirks: the Docker Hub mirror, the TLS CA bundle, the unsampled
-`TRACEPARENT`, and which buckets not to touch.
+*Build it*
 
-*Why:* each one cost a round once.
+4. **Build.** Now, after all that reading: write the code. Do your best job
+   to keep the code simple and the tests ample.
+5. **Test.** Run the prompt's test commands until they pass. Then prove each
+   new test can fail: break what it guards, watch it go red, put it back. A
+   test that can't fail is just vibes.
+6. **Commit** and **measure.** Commit, then run this and write the number in
+   the scratchpad:
 
-### 11. Lessons from earlier rounds
+   ```bash
+   git fetch origin feature/remote-cache &&
+     git diff --numstat origin/feature/remote-cache...HEAD |
+     awk '{n += $1 + $2} END {print n}'
+   ```
 
-Only the ones relevant to this task.
+   Over about 2,500 lines: stop and split it into smaller PRs, now, before
+   anyone reviews it. You decide this once, from this number, and never
+   again.
 
-*Why:* that's where process improvements go first, before they become rules.
+*The draft*
 
-### 12. Review and merge
+7. **Open the draft.** Push, and open the PR as a **draft** against
+   `feature/remote-cache`. Copilot doesn't review drafts, so draft pushes are
+   free. Follow the repository's PR template, if it has one. The
+   description says what the PR does, the step 6 size (and why, if
+   it's over 2,500 and not split), your design calls from step 3, and, at the
+   very end, the prompt verbatim:
 
-In the prompt, the working agreement's points; the agent follows the
-agreement's full text below:
+   ```markdown
+   ## Prompt
 
-- open as a draft, and get CI green;
-- decide on splitting once, from the first diff's lines added plus deleted;
-- run `/code-review high` against `origin/feature/remote-cache` and fix the
-  real findings, then mark the PR ready;
-- at most **two** Copilot reviews in all, counting every push's: review 1,
-  one fix push, review 2, and **no push after review 2**;
-- commit review 1's fixes locally (no push), run a second `/code-review high`,
-  commit the fixes for its findings too, then make that one fix push;
-- never end a turn waiting on Copilot or CI without a check-in scheduled;
-- review 2's confirmed findings become issues, the rest go to the tracking
-  issue's rolling leads issue, then the squash merge of review 2's head, or
-  the head of a push step 4's exception or step 6's CI fix allowed after it,
-  once the ruleset's required checks have passed on that head, with its
-  explicit message. The session merges it itself, unless the prompt says the
-  user merges, or an orchestrating session started it: then the session
-  sends a "ready to merge" report and the orchestrator merges;
-- the exception for deleting data, publishing unverified blobs or bundles, or
-  exposing a token.
+   <details><summary>The prompt that started this PR</summary>
 
-*Why:* fewer, more useful review rounds.
+   (the prompt, verbatim)
 
-#### The working agreement: Copilot review rounds
+   </details>
+   ```
 
-This is the agreement's current text. It was first posted on
-zerobull-consulting/dagger#1 as
-[the agreement](https://github.com/zerobull-consulting/dagger/issues/1#issuecomment-6639444472)
+   Keep the blank lines around the prompt, so its Markdown renders.
+8. **Check in later.** Before you end any turn while waiting on CI or
+   Copilot, schedule a check-in to yourself about 10 minutes out (the Claude
+   Code Remote `send_later` tool). Never go idle without one. When it fires,
+   read the PR's checks and reviews yourself: they can land without waking
+   you. This goes for every wait below.
+
+*Self-review 1: before anyone else sees it*
+
+9. **Review:** run exactly
+   `/code-review high origin/feature/remote-cache...HEAD`. You need somebody
+   who can call you out when you're trippin' in order to be your best self.
+   Then check that the files it names are yours, and that you're still on your
+   branch (`git status`): it has wandered off to other commits before.
+10. **Reject** findings that are wack: ones that need a significant design
+    change, or that the test suite you can see with your own two eyes
+    contradicts. Write each rejection and your reasoning into the scratchpad.
+11. **Fix** each finding you accepted, and run the tests. You got this. Don't
+    call it done until the fix is slappin' and the tests are passin'. Commit,
+    and push to the draft.
+
+    *Go home early (a little):* if step 9 found nothing, skip 10 and 11.
+
+12. **Get CI green.** Red? Root cause, commit, push to the draft, check in
+    later, look again. Repeat until green. Draft pushes are still free.
+
+*Copilot review 1*
+
+13. **Mark ready.** That starts Copilot review 1. Check in later.
+14. **Record** every finding from review 1 in the scratchpad: red, yellow,
+    blue, and anything you can only read in its session.
+15. **Reject** the ones that don't hold up, same bar as step 10. Reply on
+    each thread with what you traced, and resolve it. Write it down too.
+16. **Fix** the real ones, each with a test that fails without the fix. Run
+    the tests. **Commit locally. Do not push.** Hold that push like it's the
+    last slice of pizza.
+
+    *Go home early:* if review 1 came back clean and CI is green, you're done
+    reviewing. Skip to step 25. Nice.
+
+*Self-review 2: checks your fixes*
+
+17. **Review:** run exactly
+    `/code-review high origin/feature/remote-cache...HEAD` again. It reads
+    commits, not your working tree, which is why step 16 committed. Fresh eyes
+    on fresh code. Check the files and your branch again, like step 9.
+18. **Reject** what doesn't hold up. Same bar, new scratchpad entries.
+19. **Fix** what does, test it, **commit** locally. Almost there. Keep your
+    head in the game.
+20. **Push, once.** One push carrying every commit since step 13. This is
+    your one fix push, and it starts Copilot review 2. No touch-ups or rebases
+    sneaking in alongside. Check in later.
+
+*Copilot review 2: hands off the code*
+
+21. **Record** every finding from review 2: new findings, a 🔵 "Needs a
+    closer look" with or without text, findings only in its session. From
+    here on you don't push. You've done the work. Let it ride.
+22. **File** each *confirmed* finding (you traced a real path to the failure)
+    as an issue that references the tracking issue, says how to reproduce it,
+    and asks for a known-gap test or the fix. The test comes with that later
+    work, not this PR.
+23. **Park** each finding you couldn't confirm, or can't read, in the
+    tracking issue's rolling leads issue (find it by title, "unverified
+    leads"; open one only if none exists): file, lines, type, and this PR.
+    Don't ask Copilot for its session findings. Reply on each thread with the
+    issue link, and resolve it.
+24. **The only two pushes allowed after review 2:**
+    - CI is red on review 2's head: fix the root cause.
+    - A confirmed finding means the PR deletes data it shouldn't, publishes
+      an unverified blob or bundle, or exposes a token: fix it, with a test.
+
+    Either push starts a review that's handled like review 2: nothing more is
+    pushed for it. If the fix needs a design decision, or CI stays red after
+    a genuine fix, stop and report instead of merging. Otherwise, Copilot's
+    verdict alone doesn't block the merge.
+
+*Wrap it up*
+
+25. **File little issues.** Your value here is your thought. Go through the
+    scratchpad: every rejection, and every finding you decided not to address,
+    that deserves a follow-up gets its **own tiny issue** referencing the
+    tracking issue. One idea per issue. Small radius, every time. Rejections
+    that were plainly wrong (the tests contradict them) need no issue.
+26. **Merge, or hand off.** Check the prompt's "Done when" list first. The
+    merge is a squash of the final head, once `feature/remote-cache`'s
+    ruleset's required checks (read them from the ruleset, not the PR's
+    checks list) have passed on it, pinned to that head, with the title and
+    message set explicitly: the title is the PR's title plus
+    `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`; the
+    message is the PR's summary, without the prompt. Then, depending on who
+    merges (the prompt's "Branch and PR" says):
+    - **You:** merge it.
+    - **The user:** stop here and report.
+    - **The orchestrating session:** send it a **"ready to merge" report**
+      (the Claude Code Remote `send_message` tool, `session_id` `@parent`):
+      the head SHA, Copilot reviews used, what the self-reviews and Copilot
+      found, what you fixed, the issues and leads you filed, and the exact
+      squash title and message. It checks and merges, and tells you.
+27. **After the merge:** do your part of the prompt's "After the merge" list
+    (the orchestrator does the rest when it merged), and unsubscribe from the
+    PR. Report review rounds used, what was fixed, and which issues were
+    filed. Go home. You earned it.
+
+<!-- END VERBATIM: copy to here -->
+
+## Why the steps look like this
+
+This section isn't copied into prompts. It's the history behind section 12,
+so changes to the steps can be weighed against what taught us each one.
+
+**The working agreement.** It was first posted on zerobull-consulting/dagger#1
+as [the agreement](https://github.com/zerobull-consulting/dagger/issues/1#issuecomment-6639444472)
 and [its amendment](https://github.com/zerobull-consulting/dagger/issues/1#issuecomment-6651252824)
-(four rounds for every PR); this file supersedes both.
-
-**Why:** large PRs (zerobull-consulting/dagger#56: 16 Copilot reviews;
+(four rounds for every PR); this file supersedes both. Large PRs
+(zerobull-consulting/dagger#56: 16 Copilot reviews;
 zerobull-consulting/dagger#71: 6) kept collecting 🔵 "Needs a closer look"
 reviews and never reached a clean one. With draft-first, a self-review before
 marking ready, and one push per round, reviews stopped multiplying by the
 number of commits: zerobull-consulting/dagger#76 (321 lines) took 3 Copilot
 reviews, zerobull-consulting/dagger#78 (1,543) took 2, and
-zerobull-consulting/dagger#79 (1,238) took 5, which is four rounds plus the
-final push's review. The cap is what bounds the cost, and splitting large work
-keeps the rounds productive.
+zerobull-consulting/dagger#79 (1,238) took 5. The cap is what bounds the cost,
+and splitting large work keeps the rounds productive.
 
-**How this repository is set up:**
+**How this repository is set up.** An org ruleset has Copilot review every
+push to a ready PR, and not drafts, so each push is a review round.
+`feature/remote-cache`'s ruleset is the source of truth for required checks;
+a PR's checks list also shows optional ones. Copilot is not a required check.
 
-- An org ruleset has Copilot review **every push** to a ready PR, and not
-  drafts. So each push is a review round.
-- `feature/remote-cache`'s ruleset is the source of truth for required checks.
-  Read them from the ruleset, not from this file and not from a PR's checks
-  list, which also shows optional checks. Use the PR's checks only to confirm
-  that each required one passed on the head being merged. Copilot is not a
-  required check, so the merge waits on those checks only.
+**Why every push counts, and why two.** The earlier text capped "rounds" but
+required a final push after the last one, so a cap of four meant five reviews
+(zerobull-consulting/dagger#121 and zerobull-consulting/dagger#141 had five).
+Under that cap, most PRs from zerobull-consulting/dagger#107 to
+zerobull-consulting/dagger#168 already finished in two, thanks to the
+self-review before marking ready, and zerobull-consulting/dagger#168 met every
+target under a cap of two.
 
-**The limit:**
+**Why split once, from the first diff.** Splitting large work where it splits
+naturally cuts findings more than anything else. Deciding once, before any
+review, stops fixes during the rounds from reopening it; the review cap limits
+growth after that. The size counts every file, tests and generated ones
+included, from committed `HEAD` (a binary file counts as 0).
 
-- Every PR gets at most **two** Copilot reviews (reviews 1 and 2), whatever
-  its size or what it touches. **Every push to a ready PR counts,** so there
-  is exactly one fix push, and nothing is pushed after review 2.
-  - *Why the final push counts:* the earlier text capped "rounds" but required
-    a final push after the last one, so a cap of four meant five reviews
-    (zerobull-consulting/dagger#121 and zerobull-consulting/dagger#141 had
-    five). Counting every review makes the cap what it says.
-  - *Why two:* under the earlier cap of four, most PRs from
-    zerobull-consulting/dagger#107 to zerobull-consulting/dagger#168 already
-    finished in two, thanks to the self-review before marking ready.
-    zerobull-consulting/dagger#168 met every target under a cap of two.
-- **Decide on splitting once, from the first diff:** when the draft first does
-  what the prompt asks, before `/code-review` or any other review. Its size is
-  the lines added plus the lines deleted, counting every file (tests, docs and
-  generated files included). A PR that adds 2,500 lines and deletes 500 counts
-  as 3,000. The command compares the base with the committed `HEAD`, so
-  commit the draft first. A binary file shows as `-` and counts as 0:
+**Why the explicit review range and the branch check.** On
+zerobull-consulting/dagger#182, `/code-review` reviewed an earlier PR's
+commits and left `HEAD` detached.
 
-  ```bash
-  git fetch origin feature/remote-cache &&
-    git diff --numstat origin/feature/remote-cache...HEAD |
-    awk '{n += $1 + $2} END {print n}'
-  ```
+**Why the second self-review, and why step 16 commits.** Review 2 is the last
+look before the merge, and nothing can be pushed after it, so a mistake in the
+fixes themselves is otherwise only filed, not fixed. In the round of
+zerobull-consulting/dagger#180 to zerobull-consulting/dagger#190, it caught
+real problems in the fix pushes of zerobull-consulting/dagger#186 (a
+duplicated deadline, a ref check's scope) and zerobull-consulting/dagger#188
+(an unfiltered publish-run query), and no PR needed a third Copilot review.
+The range compares commits only, so uncommitted fixes would go unchecked
+(zerobull-consulting/dagger#193).
 
-- Over about 2,500 lines, split it before it's marked ready. Put the size in
-  the PR description, and if a PR over it isn't split, say why.
-- Don't revisit the decision later: fixes during the rounds never reopen it.
-  The cap on review rounds is what limits how big a PR gets after that.
-- Split large work into smaller PRs where it splits naturally. That cuts
-  findings more than anything else.
+**Why the check-ins.** A review can land without waking the session. Three
+sessions in that round went idle beside a review that had already arrived
+(zerobull-consulting/dagger#180, zerobull-consulting/dagger#182,
+zerobull-consulting/dagger#188) and sat until someone nudged them.
 
-**The flow:**
+**Why one rolling leads issue.** One leads issue per PR meant twelve of them
+piled up untriaged.
 
-1. **Open the PR as a draft.** Push as often as you need; Copilot doesn't
-   review drafts.
-2. **Before marking it ready:**
-   - Measure the first diff and decide on splitting, once (see the limit
-     above).
-   - CI is green on the draft, and the PR's tests have passed locally.
-   - Run `/code-review high` on the branch against
-     `origin/feature/remote-cache` and fix the real findings. Give it the
-     range explicitly (`origin/feature/remote-cache...HEAD`, from your
-     branch), check that the files it names are yours, and check that you're
-     back on your branch before committing: on
-     zerobull-consulting/dagger#182 it reviewed an earlier PR's commits and
-     left `HEAD` detached.
-   - Then mark the PR ready. That starts **review 1**.
-3. **The fix round:**
-   - Trace every finding: red, yellow, blue, and any you can read only in its
-     session.
-   - Fix the real ones, each with a test that fails without the fix.
-   - **Commit those fixes locally, without pushing.** The second review
-     compares commits only (`origin/feature/remote-cache...HEAD`), so
-     uncommitted fixes would go unchecked.
-   - Answer the others on their thread with what you traced, and resolve the
-     threads you've handled.
-   - **Then run `/code-review high` again** (same range and checks as in
-     step 2) on the fixed branch, and fix its real findings too, in more
-     local commits.
-   - Push all of it in **one push**; one push can carry several commits.
-     Gather everything into that push: no README touch-ups or rebases in
-     between.
-   - *Why the second self-review:* review 2 is the last look before the
-     merge, and nothing can be pushed after it, so a mistake in the fixes
-     themselves is otherwise only filed, not fixed. In the round of
-     zerobull-consulting/dagger#180 to zerobull-consulting/dagger#190, it caught real problems in the
-     fix pushes of zerobull-consulting/dagger#186 (a duplicated deadline, a
-     ref check's scope) and zerobull-consulting/dagger#188 (an unfiltered publish-run query), and no
-     PR needed a third Copilot review.
-   - **Waiting on Copilot or CI:** a review can land without waking the
-     session. Never end a turn while waiting on Copilot or CI without first
-     scheduling a check-in to yourself about 10 minutes out (the Claude Code
-     Remote `send_later` tool, where you have it), and then read the PR's
-     reviews and checks yourself. Three sessions in that round went idle
-     beside a review that had already arrived (zerobull-consulting/dagger#180,
-     zerobull-consulting/dagger#182, zerobull-consulting/dagger#188) and sat
-     until someone nudged them.
-4. **After review 2, push nothing more.** Handle whatever it reports (new
-   findings, a 🔵 "Needs a closer look" with or without text, findings only in
-   its session) without changing the PR:
-   - **Confirmed** (you traced a real path to the failure): file an issue that
-     references the tracking issue, says how to reproduce it, and asks for a
-     known-gap test or the fix. The test comes with that later work, not in
-     this PR.
-   - **Not confirmed, or text you can't read:** append them to the tracking
-     issue's **rolling leads issue** (file, lines, type, and the PR they came
-     from), with no test. Find it by title ("unverified leads", under the
-     tracking issue); open one only if none exists. Don't open a leads issue
-     per PR: twelve of those piled up untriaged.
-     Don't ask for Copilot's session findings.
-   - Answer each thread with its issue link, and resolve it.
-   - **The one exception:** a confirmed finding that means the PR deletes
-     data it shouldn't, publishes an unverified blob or bundle, or exposes a
-     token is fixed with a test in one more push, instead of being filed. The
-     review that push starts is handled like review 2: nothing more is pushed
-     for it. If the fix needs a design decision, don't merge: stop and report.
-5. **Merge:** squash-merge review 2's head, or the head of a push step 4's
-   exception or step 6's CI fix allowed after it, once the ruleset's required
-   checks have passed on that head, with the title and message set as in
-   section 4, pinned to that head commit. Where the auto-merge tool can set
-   the title and message and pin the head, enabling auto-merge (squash) is
-   fine. Who does it:
-   - **By default, the session.**
-   - **When the prompt says the user merges,** the session stops at this
-     step and reports.
-   - **When an orchestrating session started it** (a session the requester
-     told directly to run the items and merge them), the session stops here
-     and sends the orchestrator a **"ready to merge" report** (the Claude
-     Code Remote `send_message` tool, `session_id` `@parent`): the head SHA,
-     the Copilot reviews used, what the self-reviews and Copilot found and
-     what was fixed, issues and leads filed, and the exact squash title and
-     message. The orchestrator then checks it itself, before merging: the
-     ruleset's required checks passed on that head, no more than two Copilot
-     reviews and nothing pushed after review 2, and the prompt verbatim in
-     the PR. Then it merges as above, does section 13's after-merge steps,
-     and tells the session.
-   - *Why the orchestrator merges:* a session reads an approval quoted in a
-     prompt that another session wrote as an automated message, not the
-     requester's own, and won't merge on it. That's the right call, and
-     telling it again from the orchestrator carries the same weight. The
-     zerobull-consulting/dagger#170 session stopped short of merging
-     (zerobull-consulting/dagger#176 was then merged with GitHub's default
-     `(#176)` title), and the zerobull-consulting/dagger#87 session asked for
-     confirmation before its reviews. Splitting the work this way let six PRs
-     in a row (zerobull-consulting/dagger#182 to
-     zerobull-consulting/dagger#190) merge without the requester.
-6. **CI red at any point:** fix it at the root cause; never retry or loosen a
-   check. A fix push after review 2 is allowed only for CI that is red on
-   review 2's head, and its review is handled like review 2's.
-7. **After the merge:**
-   - Close the PR's issue by hand (the orchestrator does this when it
-     merged), and unsubscribe.
-   - Report how many review rounds were used, what was fixed, and which
-     issues were filed.
+**Why the orchestrator merges.** A session reads an approval quoted in a
+prompt that another session wrote as an automated message, not the
+requester's own, and won't merge on it. That's the right call, and telling it
+again from the orchestrator carries the same weight. The
+zerobull-consulting/dagger#170 session stopped short of merging
+(zerobull-consulting/dagger#176 was then merged with GitHub's default
+`(#176)` title), and the zerobull-consulting/dagger#87 session asked for
+confirmation before its reviews. Splitting the work this way let six PRs in a
+row (zerobull-consulting/dagger#182 to zerobull-consulting/dagger#190) merge
+without the requester.
 
-**Stop instead of merging** only when CI stays red after a genuine fix, or for
-the exception in step 4. Copilot's verdict alone doesn't block a merge once
-review 2 has come back.
+**Why "verify by running".** zerobull-consulting/dagger#127 corrected a
+code-reading claim that a real kept-volume run disproved.
 
-### 13. After the merge
-
-Issues to close by hand, comments to post and where, follow-up issues to file,
-and what to report.
-
-*Why:* keeps the tracking issue and the issues that depend on this one current
-without the requester doing it.
-
-### 14. Done when
-
-Observable outcomes, each shown by a test or a run.
-
-*Why:* an end the agent can check for itself.
+**Why one linear list, copied verbatim, in an informal voice.** The steps used
+to be split across sections 9 to 14, given by reference, with nested "why"
+bullets and loops ("fix, then review again, then gather it into one push").
+Sessions got lost in the middle, and zerobull-consulting/dagger#193 was one
+result. One step per action, written out again instead of "repeat", with
+different wording each time, makes step 17 visibly not step 9. The rules stay
+plain so the limits are never ambiguous. The "go home early" exits and the
+tiny follow-up issues reward a PR that's going well and keep each change
+small (zerobull-consulting/dagger#198).
 
 ## Conventions for the whole prompt
 
@@ -375,9 +411,9 @@ Observable outcomes, each shown by a test or a run.
   and written into the prompt as decided: credentials, engine changes,
   ruleset changes, design forks. A question that only the requester can answer
   stalls a session that hits it.
-- **Who merges** is stated: by default the session, as in section 12. A
-  prompt written by an orchestrating session says the orchestrator merges,
-  and asks for the "ready to merge" report of section 12, step 5.
+- **Who merges** is stated in section 4: by default the session. A prompt
+  written by an orchestrating session says the orchestrator merges, which
+  makes step 26 a "ready to merge" report.
 - When picking several items to run in parallel: refresh the state first
   (commits, open PRs, issues filed since the last round, and running sessions,
   not just PRs); map which files each item touches and avoid two items in the
@@ -386,7 +422,7 @@ Observable outcomes, each shown by a test or a run.
   fix such as a CI flake, which speeds up the others.
 - When running items **one at a time** instead, refresh `feature/remote-cache`
   and the **Version** line before each launch, and carry what the last
-  session hit into the next prompt's section 11.
+  session hit into the next prompt's "Heads up" (section 11).
 - End the prompt with a line naming the template version it was generated
   from:
 
@@ -403,26 +439,17 @@ Observable outcomes, each shown by a test or a run.
 
 ## Starting a session
 
-Paste the full prompt. The agent copies it, verbatim, into the PR it opens:
-
-```markdown
-## Prompt
-
-<details><summary>The prompt that started this PR</summary>
-
-(the prompt, verbatim)
-
-</details>
-```
-
-Keep the blank lines around the prompt inside `<details>`, so its Markdown
-renders.
+Paste the full prompt, section 12 included. The agent copies the whole prompt,
+verbatim, into the PR it opens (step 7). A follow-up PR from the same prompt
+links to the original's instead of copying it.
 
 ## Changing this file
 
 - The template changes by PR, like any other file, into `feature/remote-cache`.
 - The PR says what changed in the process and why, and sets the **Version**
   line to its own number.
+- A change to section 12 changes every prompt from then on. Put the reason in
+  "Why the steps look like this".
 - The next prompt generated names that PR (see the last convention above),
   so every prompt shows which version of the process it followed.
 - The draft in zerobull-consulting/dagger#95's body and the working
