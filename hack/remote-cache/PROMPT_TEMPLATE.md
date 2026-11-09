@@ -349,9 +349,10 @@ lead" means whoever started you: a human, or an orchestrator session.
     with that later work, not this PR.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
-23. **Park** each finding you couldn't confirm, or can't read, in the
-    rolling leads issue (find it by title, "unverified leads"; open one only
-    if none exists): file, lines, type, and this PR.
+23. **Park** each finding you couldn't confirm, or can't read, as its own
+    small issue titled "Unverified: <what it claims>", referencing the issue
+    your PR closes: file, lines, type, and this PR. One lead per issue;
+    whether it gets grouped with others is your lead's call, not yours.
     Don't ask Copilot for its session findings. Reply on each thread with the
     issue link, and resolve it.
 24. **The only two pushes allowed after review 2:**
@@ -384,10 +385,10 @@ lead" means whoever started you: a human, or an orchestrator session.
     - **You** (the default): merge it.
     - **Your lead:** send them a **"ready to merge" report**: the head SHA,
       Copilot reviews used, what the self-reviews and Copilot found, what you
-      fixed, the issues and leads you filed, and the exact squash title and
-      message. A session gets it by the Claude Code Remote `send_message`
-      tool (`session_id` `@parent`); a human, in your reply. They check it,
-      merge, and tell you.
+      fixed, the issues you filed (the "Unverified:" ones too), and the exact
+      squash title and message. A session gets it by the Claude Code Remote
+      `send_message` tool (`session_id` `@parent`); a human, in your reply.
+      They check it, merge, and tell you.
 27. **After the merge:** do your part of the prompt's "After the merge" list
     (your lead does the rest if they merged), and unsubscribe from the
     PR. Report review rounds used, what was fixed, and which issues were
@@ -456,8 +457,12 @@ sessions in that round went idle beside a review that had already arrived
 (zerobull-consulting/dagger#180, zerobull-consulting/dagger#182,
 zerobull-consulting/dagger#188) and sat until someone nudged them.
 
-**Why one rolling leads issue.** One leads issue per PR meant twelve of them
-piled up untriaged.
+**Why each unverified lead is its own issue, and the lead groups them.** One
+leads issue per PR meant twelve of them piled up untriaged. One rolling leads
+issue fixed that, but it was hard to explain to a session working on a single
+task. Grouping takes a view across tasks, which the lead has and the session
+doesn't, so the session files each lead alone and the lead decides what goes
+together.
 
 **Why the orchestrator merges.** A session reads an approval quoted in a
 prompt that another session wrote as an automated message, not the
@@ -502,6 +507,9 @@ each change small (zerobull-consulting/dagger#198).
   exposed token), and nothing else pushed after review 2; and the prompt
   verbatim in the PR. The steps don't state the cap as a number, so this is
   where it's checked.
+- **After the merge, the lead triages the "Unverified:" issues** the session
+  filed: it groups each with similar ones under a single issue, or leaves it
+  standing alone. The session never makes that call.
 - **Run items one at a time,** in the plan's order. Before
   each launch, refresh `feature/remote-cache` and the **Version** line, and
   carry what the last session hit into the next prompt's "Heads up"
