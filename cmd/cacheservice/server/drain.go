@@ -53,7 +53,8 @@ type drainState struct {
 	// mu, as the drain starts, so one is either counted here before the
 	// drain starts, and waited for, or refused (admitExplicit).
 	explicit int
-	// explicitEnded wakes a drain when an explicit request ends.
+	// explicitEnded wakes a drain when an explicit request ends. New makes
+	// it.
 	explicitEnded chan struct{}
 }
 
@@ -87,7 +88,9 @@ type DrainReport struct {
 	Engines int `json:"engines"`
 	// Explicit is how many explicit exports and imports, admitted before
 	// the drain started, still ran when it ended: none, unless it ended at
-	// its deadline or was canceled. The stop that follows cuts them off.
+	// its deadline or was canceled. They run on until they end, or the stop
+	// that follows cuts them off (CloseEngines); what they store after the
+	// drain ended isn't in its report.
 	Explicit int `json:"explicit,omitempty"`
 }
 
@@ -134,6 +137,14 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //     the last pass's interval is left. One due after the deadline isn't
 //     waited for, and is reported left (DrainState.Later). Exports started
 //     before the deadline run on until the stop that follows cuts them off.
+//  4. It waits for the explicit exports and imports (Service.Export,
+//     Service.Import: POST /debug/engines/{conn}/export and /import)
+//     admitted before it started, up to its deadline, as for the exports it
+//     runs. It doesn't cancel them: one still running when it ends is
+//     counted in its report (DrainReport.Explicit), and runs on until it
+//     ends or the stop that follows cuts it off. Roots an explicit export
+//     stores while draining are counted in DrainReport.Stored. From the
+//     drain's start, both hooks are refused (ErrDraining).
 //
 // Drain deletes nothing, and publishes nothing an export didn't verify. It
 // logs what it found to do when it starts, and what it stored and left when
@@ -155,9 +166,6 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 	s.drain.started, s.drain.deadline = start, deadline
 	s.drain.stored = map[string]int{}
-	if s.drain.explicitEnded == nil {
-		s.drain.explicitEnded = make(chan struct{}, 1)
-	}
 	explicitEnded := s.drain.explicitEnded
 	if s.drain.refused == nil {
 		s.drain.refused = map[string]int{}
@@ -190,7 +198,11 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 			why = "read-only: -export=false"
 		}
 		s.logger.Info("drain: nothing to export (" + why + ")")
-		return s.endDrain(start, s.waitExplicit(ctx, deadline, explicitEnded), nil)
+		paths := context.Background()
+		if p != nil {
+			paths = p.ctx
+		}
+		return s.endDrain(start, s.waitExplicit(ctx, paths, deadline, explicitEnded), nil)
 	}
 	// Namespaces created from now on drain from their first span
 	// (trackSpans).
@@ -260,10 +272,10 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 }
 
 // waitExplicit waits for the explicit exports and imports admitted before
-// the drain, until ctx ends or deadline passes, and returns the drain's
-// outcome. It is the drain's wait when the export path is off, and so has
-// nothing else to wait for.
-func (s *Service) waitExplicit(ctx context.Context, deadline time.Time, ended <-chan struct{}) string {
+// the drain, until ctx or paths (the export path's context) ends, or
+// deadline passes, and returns the drain's outcome. It is the drain's wait
+// when the export path is off, and so has nothing else to wait for.
+func (s *Service) waitExplicit(ctx, paths context.Context, deadline time.Time, ended <-chan struct{}) string {
 	var timeout <-chan time.Time
 	if !deadline.IsZero() {
 		t := time.NewTimer(time.Until(deadline))
@@ -271,20 +283,16 @@ func (s *Service) waitExplicit(ctx context.Context, deadline time.Time, ended <-
 		timeout = t.C
 	}
 	for s.explicitRunning() > 0 {
-		select {
-		case <-ended:
-			continue
-		case <-ctx.Done():
-		case <-timeout:
-		}
-		if s.explicitRunning() == 0 {
-			break
-		}
-		if outcome, ok := drainEnded(ctx, context.Background(), time.Now(), deadline); ok {
+		if outcome, ok := drainEnded(ctx, paths, time.Now(), deadline); ok {
 			return outcome
 		}
-		// The timer fired a little before the deadline on the wall clock.
-		return metrics.DrainDeadline
+		select {
+		case <-ended:
+		case <-ctx.Done():
+		case <-paths.Done():
+		case <-timeout:
+			timeout = nil
+		}
 	}
 	return metrics.DrainComplete
 }
@@ -301,9 +309,6 @@ func (s *Service) admitExplicit() (done func(), err error) {
 		return nil, ErrDraining
 	}
 	s.drain.explicit++
-	if s.drain.explicitEnded == nil {
-		s.drain.explicitEnded = make(chan struct{}, 1)
-	}
 	ended := s.drain.explicitEnded
 	var once sync.Once
 	return func() {
@@ -447,6 +452,9 @@ type DrainStatus struct {
 	Left []DrainLeft `json:"left,omitempty"`
 	// Report is the drain's, once it ended.
 	Report *DrainReport `json:"report,omitempty"`
+	// Explicit is how many explicit exports and imports admitted before the
+	// drain still run, while it runs: it waits for them (Service.Drain).
+	Explicit int `json:"explicit,omitempty"`
 	// Linger is the linger after the drain, once it started (Service.Linger):
 	// the engine caches it waits for, and its outcome once it ended.
 	Linger *LingerReport `json:"linger,omitempty"`
@@ -474,7 +482,10 @@ func (s *Service) DrainStatus() DrainStatus {
 	}
 	if ended != nil {
 		st.Report = ended
-	} else if p := s.export; p != nil {
+		return st
+	}
+	st.Explicit = s.explicitRunning()
+	if p := s.export; p != nil {
 		st.Left = s.drainLeft(p.now(), deadline)
 	}
 	return st

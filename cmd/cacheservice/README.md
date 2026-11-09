@@ -2788,12 +2788,17 @@ gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
 are admitted under the drain's lock, so each one is either admitted before
 the drain starts, and waited for, or refused with 503. The drain waits for
 those admitted, up to its deadline, as for the exports it runs; it doesn't
-cancel them. Roots such an export stores while draining are counted in the
-report's `stored`; one still running when the drain ends (at its deadline,
-or canceled) is counted in its `explicit`, logged as `explicitLeft`, and cut
-off by the stop that follows, publishing nothing. Pinned by
-`TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`, their
-`TestDrainEndsAtDeadlineWith…` counterparts, and
+cancel them. An explicit export admitted while it still waited for its
+cache's export slot runs once it has it. While the drain waits, `GET
+/debug/drain` counts them in `explicit`. Roots such an export stores while
+draining are counted in the report's `stored`. One still running when the
+drain ends (at its deadline, or canceled) is counted in the report's
+`explicit`, logged as `explicitLeft`, and runs on until it ends or the stop
+that follows cuts it off (an export cut off publishes nothing); what it
+stores after the drain ended isn't in the report. Pinned by
+`TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
+`TestDrainRunsExplicitExportWaitingForSlot`, the
+`TestDrainEndsAtDeadlineWith…` tests and
 `TestReadOnlyDrainWaitsForExplicitImport`
 ([#72](https://github.com/zerobull-consulting/dagger/issues/72), fixed).
 

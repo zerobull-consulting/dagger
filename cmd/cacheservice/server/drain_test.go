@@ -785,6 +785,54 @@ func TestDrainEndsAtDeadlineWithExplicitExport(t *testing.T) {
 	}
 }
 
+// An explicit export admitted before the drain, but still waiting for its
+// cache's slot when the drain starts, runs once it has the slot: the drain
+// waited for it, so it isn't refused then.
+func TestDrainRunsExplicitExportWaitingForSlot(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	h.cache.Add(fakeengine.Entry{Number: 99, Layers: [][]byte{testLayer("explicit")}})
+	release := h.cache.Hold()
+	defer release()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitUntil(t, 5*time.Second, "the scheduler's export to be held", func() bool { return h.cache.InFlight() == 1 })
+	done := startExplicitExport(h, 99)
+	waitUntil(t, 5*time.Second, "the explicit export to wait for the slot", func() bool {
+		return h.engine.ns.tracker.SlotWaiters(h.cache.ID) == 1
+	})
+	drained := startDrain(t, h.svc, time.Minute)
+	if st := h.svc.DrainStatus(); st.Explicit != 1 {
+		t.Fatalf("GET /debug/drain while the drain waits: %+v", st)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("the explicit export admitted before the drain: %v", err)
+	}
+	rep := waitDrain(t, drained, 10*time.Second)
+	// Roots 10 and 11, by the scheduler's export, and 99, by the explicit
+	// one.
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.Stored[h.cache.ID] != 3 {
+		t.Fatalf("drain report %+v", rep)
+	}
+}
+
+// A drain whose export path already stopped doesn't wait for an explicit
+// request until its deadline: it ends at once, canceled, as the drain's
+// flush does.
+func TestDrainPathsStoppedDoesNotWaitForExplicit(t *testing.T) {
+	h, done, release := newHeldImportHarness(t)
+	defer func() { release(); <-done }()
+	h.cancel()
+	start := time.Now()
+	rep := drainFor(h.svc, 3*time.Second)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the drain took %s", took)
+	}
+	if rep.Outcome != metrics.DrainCanceled || rep.Explicit != 1 {
+		t.Fatalf("drain report %+v", rep)
+	}
+}
+
 // startExplicitExport exports root of h's engine with Service.Export, in
 // the background; the channel gets its error.
 func startExplicitExport(h *exportHarness, root uint64) <-chan error {

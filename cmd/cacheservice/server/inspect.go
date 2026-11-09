@@ -124,9 +124,9 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 		return exporter.Result{}, fmt.Errorf("waiting for the export of cache %s in flight: %w", c.CacheID(), err)
 	}
 	defer release()
-	if s.draining.Load() {
-		return exporter.Result{}, ErrDraining
-	}
+	// Admitted, it runs even if the drain started while it waited for the
+	// slot: the drain waits for it, and starts no export of this cache
+	// while it waits for the slot or runs.
 	if len(req.Roots) > 0 {
 		b, err := c.ns.tracker.Claim(c.CacheID(), req)
 		if err != nil {
