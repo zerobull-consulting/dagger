@@ -447,14 +447,15 @@ review the same code again. Skip to "The draft".
     closer look" with or without text, findings only in its session. From
     here on you don't push, except in the cases below. You've done the work.
     Let it ride.
-21. **File** each *confirmed* finding (you traced a real path to the failure,
-    or, for how the Dagger engine or the bucket behaves, saw it in a run) as an
-    issue that references the issue your PR closes, says how to reproduce it,
-    and asks for a known-gap test or the fix. The test comes with that later
-    work, not this PR. Reply on its thread with the issue link, and resolve it.
-    One exception: never file a finding that the PR deletes data it shouldn't,
-    publishes an unverified blob or bundle, or exposes a token. Those get a fix
-    push (below) and a reply on their thread saying so.
+21. **File** confirmed findings. First, the exception: a finding that the PR
+    deletes data it shouldn't, publishes an unverified blob or bundle, or
+    exposes a token is never filed. It gets a fix push (below) and a reply on
+    its thread saying so. File every other *confirmed* finding (you traced a
+    real path to the failure, or, for how the Dagger engine or the bucket
+    behaves, saw it in a run) as an issue that references the issue your PR
+    closes, says how to reproduce it, and asks for a known-gap test or the
+    fix. The test comes with that later work, not this PR. Reply on its
+    thread with the issue link, and resolve it.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
 23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
