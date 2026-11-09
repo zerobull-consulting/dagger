@@ -478,9 +478,9 @@ merges; you write the code.
 25. **Hand it to your lead,** the whole list in one message, and wait for
     their answer.
 26. **Do what they say.** If that means changing code, it's block 3, and it
-    happens only because your lead said so: fix, test, commit, local green,
-    push, CI green. Reply on each of Copilot's threads with what you did, and
-    resolve it.
+    happens only because your lead said so: fix, test, prove any new test can
+    fail, commit, local green, push, CI green. Reply on each of Copilot's
+    threads with what you did, and resolve it.
 
 *Wrap it up*
 
