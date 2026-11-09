@@ -1146,60 +1146,182 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 // largest growth step, which this test finds by appending the same fields
 // itself (append's growth is deterministic, so no timing or heap sampling is
 // involved), after checking that the decoder ends with the same capacity.
-// The margin is none: the estimate must be at least the peak, and it is
-// otlpUnknownGrowth times the wire bytes, plus a header per field.
-// zerobull-consulting/dagger#204 measured peak live heap with the GC at
-// 1.5 to 1.6 times the wire bytes, and 2.0 times at the growth step.
+// The margin is none: the estimate must be at least the peak.
+// zerobull-consulting/dagger#204 measured peak live heap with the GC at 1.5
+// to 1.6 times the wire bytes; the growth step itself holds up to 2.26 times
+// (64 KiB fields, 23 of them), which otlpUnknownGrowth = 3 covers.
 func TestOTLPUnknownFieldsEstimateCoversDecodePeak(t *testing.T) {
+	varint := protowire.AppendVarint(protowire.AppendTag(nil, 99, protowire.VarintType), 1)
+	bytesField := func(size int) []byte {
+		return protowire.AppendBytes(protowire.AppendTag(nil, 99, protowire.BytesType), make([]byte, size))
+	}
+	// peak is the largest old and new array append holds at once.
+	peak := func(fields [][]byte) (peak int64, final int) {
+		var s []byte
+		for _, f := range fields {
+			before := cap(s)
+			s = append(s, f...)
+			if cap(s) != before {
+				peak = max(peak, int64(before+cap(s)))
+			}
+		}
+		return peak, cap(s)
+	}
+	repeat := func(f []byte, n int) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = f
+		}
+		return out
+	}
 	for _, c := range []struct {
 		name   string
-		n      int
-		varint bool
-		size   int
+		fields [][]byte
+		// nested says the fields are inside the request's first
+		// ResourceSpans, not the request.
+		nested bool
 	}{
-		{"1000 varints", 1000, true, 0},
-		{"100000 varints", 100000, true, 0},
-		{"1000 bytes of 8", 1000, false, 8},
-		{"100000 bytes of 8", 100000, false, 8},
-		{"100 bytes of 64", 100, false, 64},
-		{"10000 bytes of 64", 10000, false, 64},
-		{"100000 bytes of 64", 100000, false, 64},
-		{"1000 bytes of 1024", 1000, false, 1024},
-		{"100 bytes of 64 KiB", 100, false, 64 << 10},
+		{"1000 varints", repeat(varint, 1000), false},
+		{"100000 varints", repeat(varint, 100000), false},
+		{"1000 bytes of 8", repeat(bytesField(8), 1000), false},
+		{"100000 bytes of 8", repeat(bytesField(8), 100000), false},
+		{"100 bytes of 64", repeat(bytesField(64), 100), false},
+		{"10000 bytes of 64", repeat(bytesField(64), 10000), false},
+		{"100000 bytes of 64", repeat(bytesField(64), 100000), false},
+		{"1000 bytes of 1024", repeat(bytesField(1024), 1000), false},
+		{"100 bytes of 64 KiB", repeat(bytesField(64<<10), 100), false},
+		{"nested, 10000 bytes of 64", repeat(bytesField(64), 10000), true},
+		{"mixed sizes", func() [][]byte {
+			var out [][]byte
+			for i := range 5000 {
+				out = append(out, [][]byte{varint, bytesField(8), bytesField(64), bytesField(1000)}[i%4])
+			}
+			return out
+		}(), false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			var field []byte
-			if c.varint {
-				field = protowire.AppendVarint(protowire.AppendTag(nil, 99, protowire.VarintType), 1)
-			} else {
-				field = protowire.AppendBytes(protowire.AppendTag(nil, 99, protowire.BytesType), make([]byte, c.size))
+			body := bytes.Join(c.fields, nil)
+			if c.nested {
+				body = protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), body)
 			}
-			body := bytes.Repeat(field, c.n)
-			// The decoder's unknown slice, and the peak of appending to it.
-			var sim []byte
-			var peak int64
-			for range c.n {
-				before := cap(sim)
-				sim = append(sim, field...)
-				if cap(sim) != before {
-					peak = max(peak, int64(before+cap(sim)))
-				}
-			}
-			m := &commonpb.AnyValue{}
+			p, finalCap := peak(c.fields)
+			m := &coltracepb.ExportTraceServiceRequest{}
 			if err := proto.Unmarshal(body, m); err != nil {
 				t.Fatal(err)
 			}
 			kept := m.ProtoReflect().GetUnknown()
-			if len(kept) != len(body) || cap(kept) != cap(sim) {
-				t.Fatalf("decoder kept %d bytes in %d, appending gives %d", len(kept), cap(kept), cap(sim))
+			if c.nested {
+				if len(m.ResourceSpans) != 1 {
+					t.Fatalf("%d ResourceSpans decoded", len(m.ResourceSpans))
+				}
+				kept = m.ResourceSpans[0].ProtoReflect().GetUnknown()
+			}
+			if cap(kept) != finalCap {
+				t.Fatalf("decoder kept %d bytes in %d, appending gives %d", len(kept), cap(kept), finalCap)
+			}
+			est, err := otlpDecodedSize(body, &coltracepb.ExportTraceServiceRequest{}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if est < p {
+				t.Fatalf("estimate %d is under the %d bytes the decode holds at its peak (%.2f times)", est, p, float64(est)/float64(p))
+			}
+		})
+	}
+
+	// The peak depends on where the body ends relative to append's growth
+	// steps, so sweep its length: every count of fields up to 300, for
+	// three field sizes.
+	for _, size := range []int{64, 1024, 64 << 10} {
+		f := bytesField(size)
+		var body, sim []byte
+		var p int64
+		for n := 1; n <= 300; n++ {
+			body = append(body, f...)
+			before := cap(sim)
+			sim = append(sim, f...)
+			if cap(sim) != before {
+				p = max(p, int64(before+cap(sim)))
 			}
 			est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if est < peak {
-				t.Fatalf("estimate %d is under the %d bytes the decode holds at its peak (%.2f times)", est, peak, float64(est)/float64(peak))
+			if est < p {
+				t.Fatalf("%d fields of %d bytes: estimate %d is under the %d bytes held at the peak", n, size, est, p)
 			}
-		})
+		}
+	}
+}
+
+// Known fields of the right wire type are decoded into the message, not kept
+// as unknown bytes, so they aren't charged for append's growth.
+func TestOTLPKnownScalarsNotChargedForGrowth(t *testing.T) {
+	// Span.start_time_unix_nano (7) is a fixed64; Span.kind (6) a varint.
+	var span []byte
+	for range 1000 {
+		span = protowire.AppendTag(span, 7, protowire.Fixed64Type)
+		span = protowire.AppendFixed64(span, 1)
+	}
+	known, err := otlpDecodedSize(span, &tracepb.Span{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, _ := otlpDecodedSize(nil, &tracepb.Span{}, false)
+	if per := (known - empty) / 1000; per != max(9, otlpFieldCost) {
+		t.Fatalf("a known fixed64 field is charged %d bytes", per)
+	}
+	// The same bytes under a field the message doesn't know are charged
+	// otlpUnknownGrowth times.
+	var unknown []byte
+	for range 1000 {
+		unknown = protowire.AppendTag(unknown, 99, protowire.Fixed64Type)
+		unknown = protowire.AppendFixed64(unknown, 1)
+	}
+	got, err := otlpDecodedSize(unknown, &tracepb.Span{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if per := (got - empty) / 1000; per < otlpUnknownGrowth*9 {
+		t.Fatalf("an unknown fixed64 field is charged %d bytes", per)
+	}
+}
+
+// Known gap: a repeated string or bytes field takes the packed-scalar branch,
+// so an element is charged its length times 16, and an empty one nothing,
+// though it decodes to a 16-byte string header in a growing slice.
+// EntityRef.id_keys (Resource.entity_refs, field 3) is the only such field in
+// OTLP's messages. Run for zerobull-consulting/dagger#204: 1,000,000 empty
+// elements, 2,000,012 bytes on the wire, estimated at 462 bytes, allocated
+// 88 MB in total and retained 15.8 MB.
+func TestOTLPEmptyRepeatedStringsKnownGap(t *testing.T) {
+	const n = 100000
+	var ent []byte
+	for range n {
+		ent = protowire.AppendTag(ent, 3, protowire.BytesType) // id_keys
+		ent = protowire.AppendBytes(ent, nil)
+	}
+	wrap := func(num protowire.Number, b []byte) []byte {
+		return protowire.AppendBytes(protowire.AppendTag(nil, num, protowire.BytesType), b)
+	}
+	// ExportTraceServiceRequest.resource_spans (1) > ResourceSpans.resource
+	// (1) > Resource.entity_refs (3) > EntityRef.id_keys (3).
+	body := wrap(1, wrap(1, wrap(3, ent)))
+	m := &coltracepb.ExportTraceServiceRequest{}
+	if err := proto.Unmarshal(body, m); err != nil {
+		t.Fatal(err)
+	}
+	keys := m.ResourceSpans[0].Resource.EntityRefs[0].IdKeys
+	if len(keys) != n {
+		t.Fatalf("%d id_keys decoded", len(keys))
+	}
+	held := int64(len(keys)) * int64(unsafe.Sizeof(""))
+	est, err := otlpDecodedSize(body, &coltracepb.ExportTraceServiceRequest{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if est >= held {
+		t.Fatalf("the estimate %d now covers the %d bytes of string headers: the gap is closed, "+
+			"so replace this test with one that checks it", est, held)
 	}
 }

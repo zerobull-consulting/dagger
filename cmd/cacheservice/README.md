@@ -1579,10 +1579,10 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   - the **decoded message**, estimated from the body before it is decoded,
     from each OTLP message's Go struct size, each repeated element and each
     string (`TestOTLPDecodedSizeEstimate`), and each field the message
-    doesn't know at twice its wire size, since the decoder appends it to a
-    growing slice that briefly holds the old array beside the new
-    (`TestOTLPUnknownFieldsEstimateCoversDecodePeak`,
-    [zerobull-consulting/dagger#204](https://github.com/zerobull-consulting/dagger/issues/204)). A body decodes to more than its
+    doesn't know at three times its wire size, for the slice the decoder
+    appends it to (`TestOTLPUnknownFieldsEstimateCoversDecodePeak`). One gap:
+    an empty element of `EntityRef.id_keys` is charged nothing
+    (`TestOTLPEmptyRepeatedStringsKnownGap`). A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded
