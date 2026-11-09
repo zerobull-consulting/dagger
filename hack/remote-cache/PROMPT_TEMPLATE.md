@@ -276,11 +276,17 @@ verbatim.
 **The rules. These are plain on purpose: no jokes, no exceptions beyond the
 ones written here.**
 
-- **Verify by running:** a claim about the engine's, GitHub's or a store's
-  behaviour goes into an issue, a doc or the code only after a real run shows
-  it, not from reading code.
-- Never delete on an engine's signal. Bound everything. Validate any engine-
-  or bucket-supplied string before it goes into a label, key or file name.
+- **See it run before you write it down.** How the Dagger engine (the
+  upstream code the cache service sits beside) or the S3 bucket (MinIO in
+  tests, DigitalOcean Spaces for real) behaves goes into an issue, a doc or
+  a code comment only after a real run shows it. Reading the code isn't
+  enough.
+- **The engine never makes the service delete.** An engine event such as
+  `engine.prune` or a cache wipe can make the service forget entries, but
+  objects leave the bucket only through GC.
+- Bound every loop, retry, wait and buffer.
+- Validate any string that came from the engine or the bucket before it goes
+  into a metric label, an object key or a file name.
 - Stage files explicitly. Never commit built binaries or `dagger.lock`
   changes by accident.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
@@ -561,8 +567,10 @@ confirmation before its reviews. Having the orchestrator merge let six PRs
 in a row (zerobull-consulting/dagger#182 to zerobull-consulting/dagger#190)
 merge without the requester.
 
-**Why "verify by running".** zerobull-consulting/dagger#127 corrected a
-code-reading claim that a real kept-volume run disproved.
+**Why "see it run before you write it down".** zerobull-consulting/dagger#127
+corrected a code-reading claim about the engine that a real kept-volume run
+disproved. The rule used to name "GitHub's" behaviour too, with no incident
+behind it, so it was dropped.
 
 **Why one linear list, copied verbatim, in an informal voice.** The steps used
 to be split across sections 9 to 14, given by reference, with nested "why"
