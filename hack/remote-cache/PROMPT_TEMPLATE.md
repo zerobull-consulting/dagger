@@ -8,12 +8,6 @@ copied verbatim into every prompt), the reasons behind them, and the
 conventions for the whole prompt. It is the process's source, and it changes
 by PR (see [Changing this file](#changing-this-file)).
 
-**Tracking issues.** zerobull-consulting/dagger#1, the original tracking
-issue, is closed. Each prompt names its item's own tracking issue (for
-example zerobull-consulting/dagger#117 or zerobull-consulting/dagger#139, or
-the item's issue itself when it has none). Wherever this file says "the
-tracking issue", it means that one.
-
 **How the pieces fit:**
 
 - **Issues stay general:** what and why, readable by a human or an agent
@@ -36,20 +30,19 @@ An example comes first, then each section in detail.
 
 ### Example
 
-An illustration, not a real item: `<issue>`, `<tracking>`, `<other>` and
-`<N>` stand in for real numbers. Everything else is the shape a real prompt
+An illustration, not a real item: `<issue>`, `<other>` and `<N>` stand in
+for real numbers. Everything else is the shape a real prompt
 takes, down to how much each section says.
 
 ````markdown
 # `lifecycle claim`: a `-dry-run` flag (zerobull-consulting/dagger#<issue>)
 
 ## 1. Header
-Repository: zerobull-consulting/dagger. Issue:
-zerobull-consulting/dagger#<issue>, `cacheservice lifecycle claim` writes a
-bucket's lifecycle rules with no way to preview them. Tracking issue:
-zerobull-consulting/dagger#<tracking>. Why now: `claim` is about to run
-against the shared Spaces bucket, and whoever runs it wants to see the rules
-before they land.
+Repository: zerobull-consulting/dagger. You're opening a PR that closes
+zerobull-consulting/dagger#<issue>: `cacheservice lifecycle claim` writes a
+bucket's lifecycle rules with no way to preview them. Why now: `claim` is
+about to run against the shared Spaces bucket, and whoever runs it wants to
+see the rules before they land.
 
 ## 2. Before starting, read
 - zerobull-consulting/dagger#<issue>, and its first comment (the rule
@@ -97,7 +90,7 @@ A dry run for the other `lifecycle` subcommands
 
 ## 10. After the merge
 Your lead closes zerobull-consulting/dagger#<issue> with a comment linking
-the merged PR, and ticks its box on zerobull-consulting/dagger#<tracking>.
+the merged PR.
 
 ## 11. Heads up
 - Environment: use the compose MinIO; never point a test at the shared
@@ -113,8 +106,8 @@ Generated from `hack/remote-cache/PROMPT_TEMPLATE.md` as of
 
 ### 1. Header
 
-Repository, the issue or issues it works on, the tracking issue, where it sits
-in the plan, and *why it matters now*.
+Repository; "You're opening a PR that closes <full reference>", with the
+issue in a sentence; where it sits in the plan; and *why it matters now*.
 
 *Why:* the agent weighs trade-offs better when it knows what the work is for.
 
@@ -186,8 +179,8 @@ Observable outcomes, each shown by a test or a run.
 Issues to close by hand, comments to post and where, and follow-up issues to
 file. Say who does each (the lead, when it merges).
 
-*Why:* keeps the tracking issue and the issues that depend on this one current
-without the requester doing it.
+*Why:* keeps the issues that depend on this one current without the
+requester doing it.
 
 ### 11. Heads up
 
@@ -351,14 +344,14 @@ lead" means whoever started you: a human, or an orchestrator session.
     closer look" with or without text, findings only in its session. From
     here on you don't push. You've done the work. Let it ride.
 21. **File** each *confirmed* finding (you traced a real path to the failure)
-    as an issue that references the tracking issue, says how to reproduce it,
-    and asks for a known-gap test or the fix. The test comes with that later
-    work, not this PR.
+    as an issue that references the issue your PR closes, says how to
+    reproduce it, and asks for a known-gap test or the fix. The test comes
+    with that later work, not this PR.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
 23. **Park** each finding you couldn't confirm, or can't read, in the
-    tracking issue's rolling leads issue (find it by title, "unverified
-    leads"; open one only if none exists): file, lines, type, and this PR.
+    rolling leads issue (find it by title, "unverified leads"; open one only
+    if none exists): file, lines, type, and this PR.
     Don't ask Copilot for its session findings. Reply on each thread with the
     issue link, and resolve it.
 24. **The only two pushes allowed after review 2:**
@@ -374,8 +367,9 @@ lead" means whoever started you: a human, or an orchestrator session.
 25. **File little issues.** Your value here is your thought. Go through the
     scratchpad: every rejection, and every finding you decided not to address,
     that deserves a follow-up gets its **own tiny issue** referencing the
-    tracking issue. One idea per issue. Small radius, every time. Rejections
-    that were plainly wrong (the tests contradict them) need no issue.
+    issue your PR closes. One idea per issue. Small radius, every time.
+    Rejections that were plainly wrong (the tests contradict them) need no
+    issue.
 26. **Merge, or hand off.** Check the prompt's "Done when" list first.
     **Stop and report instead of merging** if an item on it isn't met, if CI
     stays red after a genuine fix, or if a fix after review 2 needs a design
@@ -508,7 +502,7 @@ each change small (zerobull-consulting/dagger#198).
   exposed token), and nothing else pushed after review 2; and the prompt
   verbatim in the PR. The steps don't state the cap as a number, so this is
   where it's checked.
-- **Run items one at a time,** in the tracking issues' stated order. Before
+- **Run items one at a time,** in the plan's order. Before
   each launch, refresh `feature/remote-cache` and the **Version** line, and
   carry what the last session hit into the next prompt's "Heads up"
   (section 11). Running items in parallel turned out to be hard.
