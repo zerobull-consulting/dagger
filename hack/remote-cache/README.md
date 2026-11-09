@@ -925,8 +925,11 @@ only decides when it runs and with which token.
    don't eat into the step's timeout), it fetches the tags and writes the
    advisory diff of the engine's side of the remote cache from the manifest's
    `base` to the release, and whether the bundle or protocol version
-   changed; if that fails, the step errors and the dispatched run is
-   cancelled (best effort), since nothing would read it. In a dry run the bundle test builds on the dry run's own branch,
+   changed. If that fails, or the wait for the run times out, or its
+   verdict can't be read, the step errors and the dispatched run is
+   cancelled (best effort), since nothing would read it; a run that had
+   already ended is said to have ended, not to be cancelled
+   (zerobull-consulting/dagger#187). In a dry run the bundle test builds on the dry run's own branch,
    as the e2e does. **The run is the gate**; the diff only informs.
    Only the run's `real engines (e2e)` and `sidecar demo` jobs decide, read
    from the run's jobs by name (a jobs read that fails is tried three times). The run's other jobs (`unit tests`,

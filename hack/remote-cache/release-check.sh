@@ -238,10 +238,13 @@ fetch_tag() {
 	timeout 600 git fetch -q --no-tags "$upstream" "+refs/tags/$1:refs/tags/$1" || die "couldn't fetch $1 from $upstream"
 }
 
-# pending_run: a dispatched candidate run nothing is waiting on yet. If the
-# script ends in failure with one pending, it is cancelled (best effort, with
-# GITHUB_TOKEN), not left to run unread. wait_since: when verify dispatched
-# (SECONDS), which wait_run counts its deadline from.
+# pending_run: a dispatched candidate run whose verdict hasn't been read
+# yet. If the script ends in failure with one pending (in the fetches, the
+# advisory diff, the wait or the verdict's read), it is cancelled (best
+# effort, with GITHUB_TOKEN), not left to run unread
+# (zerobull-consulting/dagger#163, zerobull-consulting/dagger#187).
+# wait_since: when verify dispatched (SECONDS), which wait_run counts its
+# deadline from.
 pending_run=""
 wait_since=""
 # tree: a fresh worktree of the branch's head (or of new_tree's argument), in
@@ -250,8 +253,17 @@ tree=""
 cleanup() {
 	local rc=$?
 	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
-		say "the candidate run $server/$repo/actions/runs/$pending_run is not awaited and no result is given: cancelling it"
-		api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1 || say "cancelling run $pending_run failed; it will finish unread"
+		local url="$server/$repo/actions/runs/$pending_run" run
+		# A run that has already ended can't be cancelled (the API refuses):
+		# it is said to have ended, not to be cancelled.
+		if api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1; then
+			say "the candidate run $url is not awaited and no result is given: cancelled it"
+		elif run="$(api "repos/$repo/actions/runs/$pending_run" 2>/dev/null)" &&
+			[[ "$(jq -r .status <<<"$run" 2>/dev/null)" == completed ]]; then
+			say "the candidate run $url ended '$(jq -r '.conclusion // ""' <<<"$run")' and no result is given: nothing to cancel"
+		else
+			say "the candidate run $url is not awaited and no result is given; cancelling it failed: it will finish unread"
+		fi
 	fi
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
 }
@@ -701,14 +713,16 @@ cmd_verify() {
 	# advisory diff run while the candidate run does, not before it, out of
 	# the step's timeout.
 	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
-	# A failure here is an error (a step that fails), never a verdict, and the
-	# exit trap cancels the dispatched run, which nothing would read: the next
-	# hour verifies the release again.
+	# A failure from here until the verdict is read (the fetches, the
+	# advisory diff, a wait that times out, a read that fails) is an error (a
+	# step that fails), never a verdict, and the exit trap cancels the
+	# dispatched run, which nothing would read: the next hour verifies the
+	# release again.
 	pending_run="$id"
 	fetch_tag "$v"
 	advisory "$v"
-	pending_run=""
 	a="$(finish_tests "$id" a)"
+	pending_run=""
 	# The e2e and the sidecar demo's verdict. A is this and the bundle job's
 	# both passing (the workflow decides): a bundle test that didn't run (the
 	# tag conflicts with the branch) verified nothing.

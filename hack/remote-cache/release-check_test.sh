@@ -153,7 +153,14 @@ case "$method $path" in
 "POST graphql")
 	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
 	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
-"POST repos/o/r/actions/runs/"*/cancel) echo "{}" ;;
+"POST repos/o/r/actions/runs/"*/cancel)
+	# As the API does: a run that has completed can't be cancelled.
+	# FAKE_CANCEL_FAIL: no cancel works.
+	[[ -n "${FAKE_CANCEL_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
+	rid="${path#repos/o/r/actions/runs/}"; rid="${rid%%/*}"
+	[[ "$(cat "$FAKE/run-$rid")" == running ]] || { echo "Cannot cancel a workflow run that is completed. (HTTP 409)" >&2; exit 1; }
+	echo cancelled >"$FAKE/run-$rid"
+	echo "{}" ;;
 "PUT repos/o/r/pulls/"*/merge) echo "$input" >"$FAKE/merged"; echo '{"merged": true}' ;;
 *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
 esac
@@ -638,21 +645,54 @@ check "dispatch first (zerobull-consulting/dagger#163): and it is written after"
 check "dispatch first (zerobull-consulting/dagger#163): the verdict is the same" has "$tmp/out" "result=pass"
 # A fetch that fails after the dispatch is an error, never a verdict.
 setup
-echo success >"$FAKE/conclusions"
+echo running >"$FAKE/conclusions"
 run verify v1.0.0-beta.99 "$d2"
 check "dispatch first: a tag that can't be fetched is an error" test "$status" -ne 0
 check "dispatch first: after the dispatch" test -f "$FAKE/dispatch-remote-cache-tests.yml-1"
 check "dispatch first: so no result is given" not has "$tmp/out" "result="
 check "dispatch first: saying the run isn't awaited" has "$tmp/out" "is not awaited"
 check "dispatch first: and cancelling it" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-# zerobull-consulting/dagger#187: a wait that times out. Known gap: the
-# run is left going, uncancelled.
+check "dispatch first: and saying it is cancelled" has "$tmp/out" "no result is given: cancelled it"
+# zerobull-consulting/dagger#187: a wait that times out, or a verdict that
+# can't be read, cancels the run too.
 setup
 echo running >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0
 check "a wait that times out (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
 check "a wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
-check "a wait that times out (zerobull-consulting/dagger#187): known gap, the run is not cancelled" not has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+check "a wait that times out (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
+check "a wait that times out (zerobull-consulting/dagger#187): the run is cancelled" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+check "a wait that times out (zerobull-consulting/dagger#187): and said to be" has "$tmp/out" "is not awaited and no result is given: cancelled it"
+# A cancel that fails on a run still going: said so, not cancelled.
+setup
+echo running >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0 FAKE_CANCEL_FAIL=1
+check "a cancel that fails (zerobull-consulting/dagger#187): is said to have failed" has "$tmp/out" "cancelling it failed: it will finish unread"
+check "a cancel that fails (zerobull-consulting/dagger#187): not to have cancelled" not has "$tmp/out" "cancelled it"
+# The run ends while the jobs read keeps failing: the cancel is tried and
+# refused, and the message says the run ended rather than that it was
+# cancelled.
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
+check "a jobs read that fails (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
+check "a jobs read that fails (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
+check "a jobs read that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
+check "a jobs read that fails (zerobull-consulting/dagger#187): the run is said to have ended" has "$tmp/out" "ended 'success' and no result is given: nothing to cancel"
+check "a jobs read that fails (zerobull-consulting/dagger#187): not to be cancelled" not has "$tmp/out" "cancelled it"
+check "a jobs read that fails (zerobull-consulting/dagger#187): nor that the cancel failed" not has "$tmp/out" "cancelling it failed"
+# A run that ended cancelled: neither green nor red, and not cancelled again.
+setup
+echo cancelled >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "a run that ended cancelled (zerobull-consulting/dagger#187): is said to have ended" has "$tmp/out" "ended 'cancelled' and no result is given: nothing to cancel"
+check "a run that ended cancelled (zerobull-consulting/dagger#187): not to be cancelled by the check" not has "$tmp/out" "cancelled it"
+# A verdict that is read: nothing is cancelled.
+setup
+echo failure >"$FAKE/conclusions"
+run verify v1.0.0-beta.26 "$d2"
+check "a verdict that is read (zerobull-consulting/dagger#187): is given" has "$tmp/out" "result=fail"
+check "a verdict that is read (zerobull-consulting/dagger#187): nothing is cancelled" not has "$FAKE/calls" "/cancel"
 setup
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
 check "a test ref that isn't a branch name is refused" test "$status" -ne 0
