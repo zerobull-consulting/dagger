@@ -49,6 +49,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"log/slog"
 	"slices"
 	"sync"
@@ -176,15 +177,12 @@ func New(cfg Config) (*Exporter, error) {
 	return &Exporter{cfg: cfg, log: log, sleep: sleepCtx, slots: map[Engine]chan struct{}{}}, nil
 }
 
+// sleepCtx waits for d; if ctx ends first it returns the context's cause.
 func sleepCtx(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
+	if s3util.SleepCtx(ctx, d) != nil {
 		return context.Cause(ctx)
-	case <-t.C:
-		return nil
 	}
+	return nil
 }
 
 // Forget drops what the exporter keeps for an engine whose connection ended.

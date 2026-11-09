@@ -3,6 +3,7 @@ package metastore
 import (
 	"context"
 	"errors"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"testing"
 	"time"
 
@@ -124,7 +125,7 @@ func TestMetricsIndexAbortedAndError(t *testing.T) {
 	f := &interfere{Objects: NewMemObjects(), key: "ns/s1/index.json", other: func(*Index) {}}
 	f.n.Store(1)
 	s2, reg2 := newMetricsStore(t, f, 0)
-	s2.sleep = sleepCtx
+	s2.sleep = s3util.SleepCtx
 	if _, err := s2.UpdateIndex(canceled, "s1", func(*Index) error { return nil }); err == nil {
 		t.Fatal("canceled update succeeded")
 	}

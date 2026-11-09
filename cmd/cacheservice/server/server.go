@@ -103,11 +103,17 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 	if err := s.checkS3Options(opts); err != nil {
 		return err
 	}
-	blobs, err := blobstore.NewS3(ctx, cfg)
+	// One client for the blob store, the metadata store and GC: they share
+	// cfg, so they reach S3 the same way.
+	client, err := blobstore.NewS3Client(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	meta, err := metastore.NewS3(ctx, cfg)
+	blobs, err := blobstore.NewS3WithClient(ctx, cfg, client)
+	if err != nil {
+		return err
+	}
+	meta, err := metastore.NewS3WithClient(ctx, cfg, client)
 	if err != nil {
 		return err
 	}
@@ -115,10 +121,6 @@ func (s *Service) EnableS3(ctx context.Context, cfg blobstore.S3Config, opts S3O
 		Blobs: blobs,
 		Meta:  meta,
 		GCBucket: func() (gc.Bucket, error) {
-			client, err := blobstore.NewS3Client(ctx, cfg)
-			if err != nil {
-				return nil, err
-			}
 			// A custom endpoint is an S3-compatible store, which may list
 			// multipart uploads only by exact key (MinIO); AWS S3 lists them
 			// by prefix.

@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"math/rand/v2"
 	"regexp"
 	"strings"
@@ -108,7 +109,7 @@ func New(cfg Config) (*Store, error) {
 		prefix:      strings.Trim(cfg.Prefix, "/"),
 		maxAttempts: cfg.MaxAttempts,
 		metrics:     cfg.Metrics,
-		sleep:       sleepCtx,
+		sleep:       s3util.SleepCtx,
 	}, nil
 }
 
@@ -126,17 +127,6 @@ func (s *Store) WithMetrics(m *metrics.Metrics) *Store {
 	c := *s
 	c.metrics = m
 	return &c
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
 }
 
 // ValidateScope reports whether scope can name a scope's keys: a namespace

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/opencontainers/go-digest"
 
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
@@ -186,6 +186,16 @@ var (
 
 // NewS3 returns an S3Store for cfg. It makes no requests.
 func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
+	return newS3(ctx, cfg, nil)
+}
+
+// NewS3WithClient is NewS3 with client, which NewS3Client built for cfg,
+// instead of a client of its own.
+func NewS3WithClient(ctx context.Context, cfg S3Config, client *s3.Client) (*S3Store, error) {
+	return newS3(ctx, cfg, client)
+}
+
+func newS3(ctx context.Context, cfg S3Config, client *s3.Client) (*S3Store, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3 blob store: no bucket")
 	}
@@ -213,9 +223,11 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		}
 	}
 
-	client, err := NewS3Client(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("s3 blob store: %w", err)
+	if client == nil {
+		var err error
+		if client, err = NewS3Client(ctx, cfg); err != nil {
+			return nil, fmt.Errorf("s3 blob store: %w", err)
+		}
 	}
 	return &S3Store{
 		client:    client,
@@ -348,18 +360,13 @@ func (s *S3Store) Has(ctx context.Context, dgst digest.Digest) (bool, error) {
 // isNotFound reports a 404 and nothing else: a HEAD response has no body, so
 // the status is all S3 says.
 func isNotFound(err error) bool {
-	return hasStatus(err, http.StatusNotFound)
+	return s3util.HasStatus(err, http.StatusNotFound)
 }
 
 // isConditionFailed reports a conditional write that lost: 412, or 409 for
 // one that raced another write of the same key.
 func isConditionFailed(err error) bool {
-	return hasStatus(err, http.StatusPreconditionFailed) || hasStatus(err, http.StatusConflict)
-}
-
-func hasStatus(err error, status int) bool {
-	var re *smithyhttp.ResponseError
-	return errors.As(err, &re) && re.HTTPStatusCode() == status
+	return s3util.HasStatus(err, http.StatusPreconditionFailed) || s3util.HasStatus(err, http.StatusConflict)
 }
 
 // PresignPut returns a presigned PUT of exactly size bytes to the blob's
