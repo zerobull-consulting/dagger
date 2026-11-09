@@ -349,8 +349,9 @@ lead" means whoever started you: a human, or an orchestrator session.
     with that later work, not this PR.
 22. **Answer** each finding you traced and found wrong: reply on its thread
     with what you traced, resolve it, and scratchpad it.
-23. **Ask** your lead what to do about each finding you can't confirm or
-    can't read. Do what they say, then reply on its thread and resolve it.
+23. **Ask.** If Copilot gives a "hedgy", unreadable, or untraceable finding,
+    ask your lead what to do with that finding. Do what they say, then reply
+    on its thread and resolve it.
 24. **The only two pushes allowed after review 2:**
     - CI is red on review 2's head: fix the root cause.
     - A confirmed finding means the PR deletes data it shouldn't, publishes
