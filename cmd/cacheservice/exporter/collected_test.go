@@ -172,7 +172,7 @@ func TestFenceReadStartedBeforeForgetEpochIsNotKept(t *testing.T) {
 	// Export A's fence read begins; it reads the epoch object (none: 0) and
 	// is then held up.
 	blocker.armed.Store(true)
-	done := make(chan metastore.Fence)
+	done := make(chan metastore.Fence, 1)
 	go func() { done <- x.fence(ctx) }()
 	<-blocker.reading
 
@@ -202,7 +202,7 @@ func TestFenceSlowOlderReadDoesNotOverwriteFresher(t *testing.T) {
 	ctx := context.Background()
 
 	blocker.armed.Store(true)
-	done := make(chan metastore.Fence)
+	done := make(chan metastore.Fence, 1)
 	go func() { done <- x.fence(ctx) }()
 	<-blocker.reading
 
