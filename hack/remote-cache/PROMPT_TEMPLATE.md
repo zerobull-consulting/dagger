@@ -73,7 +73,7 @@ Within the task in the first message, you may, without asking first:
 - open your PR as a draft against `feature/remote-cache`, edit its
   description, and mark it ready for review;
 - reply to and resolve review threads on your own PR, comment on it, and
-  re-request a Copilot review once if its runner failed;
+  re-request a Copilot review once for each run that failed;
 - file issues in zerobull-consulting/dagger, as the steps describe;
 - merge your own PR, as the steps describe (session merges);
 - close the issue your PR closes, once it has merged (session merges).
@@ -101,8 +101,8 @@ An example comes first, then each section in detail.
 ### Example
 
 An illustration, not a real item: `<issue>`, `<other>` and `<N>` stand in
-for real numbers. Everything else is the shape a real prompt
-takes, down to how much each section says.
+for real numbers. Everything else is the shape a real prompt takes, down to
+how much each section says.
 
 ````markdown
 # `lifecycle claim`: a `-dry-run` flag (zerobull-consulting/dagger#<issue>)
@@ -212,12 +212,13 @@ and message) is in section 12, so it isn't repeated here.
 
 ### 5. Design
 
-Each point marked **decided** (the requester's) or **proposed, confirm or
-change in the PR** (the agent's to judge). Section 12 has the agent write its
-design choices into the PR description.
+Each point marked **decided** (settled by the requester or the lead before
+launch) or **proposed, confirm or change in the PR** (the session's to
+judge). Section 12 has the session write its design choices into the PR
+description.
 
-*Why:* separates the requester's decisions from the agent's, and puts the
-reasoning on the record before code.
+*Why:* separates what was settled before launch from what the session
+decides, and puts the reasoning on the record before code.
 
 ### 6. What to build
 
@@ -276,8 +277,6 @@ verbatim.
 ones written here.**
 
 - CI red: fix the root cause. Never retry, skip, loosen or quarantine a check.
-- No engine changes without stopping to ask first. The `fork paths` check
-  fails any change outside the service's paths.
 - **Verify by running:** a claim about the engine's, GitHub's or a store's
   behaviour goes into an issue, a doc or the code only after a real run shows
   it, not from reading code.
@@ -287,13 +286,9 @@ ones written here.**
   changes by accident.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
   upstream repository.
-- Stop and ask your lead, instead of deciding, on a design decision the
-  prompt didn't make, a missing prerequisite, or anything irreversible.
 - **Never stop silently.** When you stop on a question or a blocker, tell
   your lead before you end the turn. A routine wait on CI or Copilot, with a
   check-in scheduled, needs no message.
-- Copilot's review failed to run (its runner errored)? Re-request that
-  review once. Failed again? Tell your lead. Never push to trigger a review.
 
 **The steps. One at a time, top to bottom. Each one is one thing.** "Your
 lead" is whoever started you, named in your standing authorization: a human,
@@ -304,14 +299,18 @@ reply.
 *Get set up*
 
 1. **Read.** Everything in "Before starting, read", and the whole prompt. All
-   of it. Coffee's on us.
+   of it. Coffee's on us. A prerequisite missing, or the prompt unclear? Stop
+   and ask your lead before you build anything.
 2. **Record:** open a scratchpad file outside the repo (never committed).
    You *will* forget some of this if you don't write it down.
 
 *Build it*
 
 3. **Build.** Now, after all that reading: write the code. Do your best job
-   to keep the code simple and the tests ample.
+   to keep the code simple and the tests ample. Hit a design decision the
+   prompt didn't make, or need an engine change or something you can't undo?
+   Stop and ask your lead. (The `fork paths` check fails any change outside
+   the service's paths.)
 4. **Test.** Run the prompt's test commands until they pass. Then prove each
    new test can fail: break what it guards, watch it go red, put it back.
    They could call you the King's Men, 'cause you can break and fix Humpty
@@ -396,7 +395,8 @@ draft".
 *Copilot, round 1*
 
 15. **Mark "ready for review",** now that CI is green. That starts Copilot
-    review 1. Check in later.
+    review 1. Check in later. If the review fails to run, re-request it once;
+    if the re-run fails too, tell your lead. Never push to trigger a review.
 16. **Record** every finding from review 1 in the scratchpad: red, yellow,
     blue, and anything you can only read in its session.
 
@@ -416,7 +416,8 @@ draft".
 
 19. **Push, once.** One push carrying every commit since you marked it ready.
     It's your one fix push, and it starts Copilot review 2. No touch-ups or
-    rebases sneaking in alongside. Check in later.
+    rebases sneaking in alongside. Check in later. Review 2 fails to run? Same
+    deal: re-request it once, then tell your lead.
 
 *Copilot, round 2: hands off the code*
 
@@ -550,7 +551,7 @@ zerobull-consulting/dagger#184 session pushed its fix and then stopped before
 opening its PR, asking for a go-ahead its prompt already gave. The question
 went to its own status line, where only the requester would see it, and
 nothing reached the orchestrator until a fallback check. Hence the rule to
-tell your lead whenever you stop. The
+tell your lead when you stop on a question or a blocker. The
 zerobull-consulting/dagger#170 session stopped short of merging
 (zerobull-consulting/dagger#176 was then merged with GitHub's default
 `(#176)` title), and the zerobull-consulting/dagger#87 session asked for
