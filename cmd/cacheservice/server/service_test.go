@@ -47,8 +47,14 @@ type logRecorder struct {
 func (h *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *logRecorder) Handle(_ context.Context, r slog.Record) error {
-	r = r.Clone()
-	r.AddAttrs(h.attrs...)
+	// With attributes come before the record's own, as in a real handler.
+	withFirst := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	withFirst.AddAttrs(h.attrs...)
+	r.Attrs(func(a slog.Attr) bool {
+		withFirst.AddAttrs(a)
+		return true
+	})
+	r = withFirst
 	root := h
 	if h.root != nil {
 		root = h.root
