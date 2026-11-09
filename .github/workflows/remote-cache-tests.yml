@@ -455,6 +455,18 @@ jobs:
       - name: "Read-only: a step that fails before the job's end"
         continue-on-error: true
         run: exit 1
+      # The reader's logs are written by its stop, which the start's post
+      # step does only after every step here, this upload included: a job that
+      # failed would upload no reader logs (zerobull-consulting/dagger#174).
+      # So, on failure only (a passing job keeps the post step's stop, which
+      # the verify step at the top checks), stop it here. The post step then
+      # finds nothing to stop.
+      - name: "Read-only: stop the sidecar, to upload its logs"
+        if: failure()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: demo-reader
       # The service's and the engine's logs of both phases (presigned URLs'
       # credentials redacted), and the demo's CLI output.
       - name: Upload the logs
