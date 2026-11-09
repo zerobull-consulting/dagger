@@ -40,7 +40,8 @@ After launch, the lead does everything outside the code:
 
 - answers the session's questions;
 - decides on every finding the session hands over, from every self-review
-  round and every Copilot review (below);
+  round and every Copilot review (below), and whether a self-review block
+  gets another round;
 - decides on scope at the check-in after the first green CI, and splits the
   work into issues if it's too big;
 - checks the "ready to merge" report, files the issues it decided on, merges,
@@ -57,10 +58,10 @@ first of these that fits:
 1. **Fix it:** the session changes the code or the tests in this PR.
 2. **Clarify it:** the session updates the docs, or you update the
    conventions in this file.
-3. **Pin it:** the session adds a known-gap test in this PR that shows
-   today's behaviour (named `TestKnownGap…`), and you file an issue for the
-   fix that names the test. A pinned gap can't drift unnoticed, and the fix
-   flips the test.
+3. **Pin it:** the session adds a known-gap test in this PR that shows today's
+   behaviour (named the way that file names its tests, with "known gap" in the
+   name: `TestKnownGap…` in Go), and you file an issue for the fix that names
+   the test. A pinned gap can't drift unnoticed, and the fix flips the test.
 4. **File it:** you file an issue, with no test.
 5. **Reject it:** the session notes why, and replies on the thread if it
    came from Copilot.
@@ -306,7 +307,8 @@ ones written here.**
   entries, but never makes it remove their objects from the bucket.
 - Bound every loop, retry, wait and buffer.
 - Validate any string that came from the Dagger engine or the bucket before
-  it goes into a metric label, an object key or a file name.
+  it becomes any key, label or name: a map key, a metric label, an object
+  key, a file name.
 - Stage files explicitly. Never commit built binaries or `dagger.lock`
   changes by accident.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
@@ -314,6 +316,10 @@ ones written here.**
 - **Never stop silently.** When you stop on a question or a blocker, tell
   your lead before you end the turn. A routine wait on CI or Copilot, with a
   check-in scheduled, needs no message.
+- **Waiting on your lead:** schedule a check-in to yourself about 10 minutes
+  out (the Claude Code Remote `send_later` tool) before you end the turn. No
+  answer after two check-ins? Send the question once more. Silence is never
+  a no, and never a yes.
 
 **The steps. One at a time, top to bottom. Each one is one thing.** "Your
 lead" is whoever started you, named in your standing authorization: a human,
@@ -355,20 +361,20 @@ merges; you write the code.
 
 7. **Sort** each finding in the scratchpad: **security or data loss** (it's
    real, and the code deletes data it shouldn't, publishes an unverified blob
-   or bundle, or exposes a token), **real** (you traced it, or saw it in a run
-   if it's about the Dagger engine or the bucket), **wrong** (you traced it
-   and it doesn't hold), or **can't tell**.
+   or bundle, or exposes a token), **real** (you can name the input, the code
+   path and the wrong result), **wrong** (you followed the path it names, and
+   it doesn't go wrong), or **can't tell**. A finding about how the Dagger
+   engine or the bucket behaves is real or wrong only once a run shows it;
+   until then, it's can't tell.
 8. **Hand it to your lead,** the whole list in one message, security or data
    loss first, with your read on each. Wait for their answer.
 9. **Do what they say,** finding by finding: fix the code or the tests, update
-   a doc, or add a known-gap test that pins today's behaviour (name it
-   `TestKnownGap…`). Run the tests until they pass, prove any new test can
-   fail, and **commit** what you changed. You got this. Don't call it done
-   until the fix is slappin' and the tests are passin'. Then go back to
-   **Review**, unless your lead said to change nothing this round: then the
-   block's done, on to "The draft". Five rounds in this block and still
-   finding things? Ask your lead whether to keep going, and wait for their
-   answer.
+   a doc, or add a known-gap test that pins today's behaviour (name it the
+   way that file names its tests, with "known gap" in the name). Run the
+   tests until they pass, prove any new test can fail, and **commit** what
+   you changed. You got this. Don't call it done until the fix is slappin'
+   and the tests are passin'. If your lead says "another round", go back to
+   **Review**. Otherwise, on to "The draft".
 
 *The draft: CI starts here*
 
@@ -449,9 +455,8 @@ merges; you write the code.
 20. **Hand it to your lead,** the whole list in one message, and wait for
     their answer.
 21. **Do what they say,** run the tests, prove any new test can fail, and
-    **commit what you changed.** Still no push. Then go back to **Review**,
-    unless your lead said to change nothing this round: then the block's
-    done. Five rounds in this block, then ask your lead before any more.
+    **commit what you changed.** Still no push. If your lead says "another
+    round", go back to **Review**. Otherwise, on to "Push, once".
 22. **Push, once.** Nothing committed since you marked it ready? Don't push:
     skip to "Wrap it up". Otherwise run the tests until they're green, then
     make one push carrying every commit since you marked it ready. It starts
@@ -462,9 +467,10 @@ merges; you write the code.
 *Copilot, round 2: hands off the code*
 
 23. **CI red on review 2's head?** Fix the root cause and push: no retries,
-    skips or loosened checks. That's the one push you don't need to ask for,
-    and its review is handled like review 2. Otherwise, from here on you
-    push only when your lead says to.
+    skips or loosened checks. That's the one push you don't need to ask for.
+    Otherwise, from here on you push only when your lead says to. Any
+    Copilot review after review 2 is handled like review 2: sort, hand over,
+    and no further push unless your lead says so.
 
     *Go home early:* review 2 came back clean? Skip to "Wrap it up".
 
@@ -482,9 +488,9 @@ merges; you write the code.
     **"ready to merge" report**: the head SHA, Copilot reviews used, every
     finding with what your lead decided and what you did, anything on "Done
     when" that isn't met, and a squash title and message (the PR's title plus
-    `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`;
-    the message is the PR's summary, without the prompt). Your lead merges,
-    files what they decided to file, closes the issue, and tells you.
+    `(zerobull-consulting/dagger#<PR>)`, never GitHub's default `(#<PR>)`; the
+    message is everything in the PR description above `## Prompt`). Your lead
+    merges, files what they decided to file, closes the issue, and tells you.
 28. **After the merge:** unsubscribe from the PR if you subscribed. Report
     review rounds used and what changed. Go home. You earned it.
 
@@ -538,15 +544,15 @@ self-review checks the fixes from the first: in the round of
 zerobull-consulting/dagger#180 to zerobull-consulting/dagger#190 it caught
 real problems in fixes on zerobull-consulting/dagger#186 (a duplicated
 deadline, a ref check's scope) and zerobull-consulting/dagger#188 (an
-unfiltered publish-run query), and no PR needed a third Copilot review. A
-fixed number of rounds either stopped too soon or ran when there was nothing
-left, so a block runs until a round finds nothing, with five as the point to
-ask the lead. Copilot's findings start the next block, so its fixes get a
-self-review before the one push. Every round goes through the lead so the
-session's instruction stays the same each time: sort, hand over, do what the
-lead says. Block 1 runs before the draft so CI only spends on reviewed code.
-Fixes are committed before the next round because the review range compares
-commits only (zerobull-consulting/dagger#193).
+unfiltered publish-run query), and no PR needed a third Copilot review. Each
+block is one round, and another round is the lead's call: a loop ("go back to
+Review, five rounds, then ask") is where sessions get lost, and the lead
+already sees every finding. Copilot's findings go to the lead right before
+block 2, so its fixes get a self-review before the one push. Every round goes
+through the lead so the session's instruction stays the same each time: sort,
+hand over, do what the lead says. Block 1 runs before the draft so CI only
+spends on reviewed code. Fixes are committed before the next round because the
+review range compares commits only (zerobull-consulting/dagger#193).
 
 **Why the check-ins.** A review can land without waking the session. Three
 sessions in that round went idle beside a review that had already arrived
