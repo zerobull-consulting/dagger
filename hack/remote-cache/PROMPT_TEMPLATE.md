@@ -650,8 +650,8 @@ instead of copying it.
 - A change to section 12 changes every prompt from then on. Put the reason in
   "Why the steps look like this".
 - There's no version marker. Every PR carries its full prompt, section 12
-  included, in its description, so each PR already records the exact process
-  it followed.
+  included, in its description (a follow-up PR links to the one that does),
+  so each PR already records the exact process it followed.
 - The draft in zerobull-consulting/dagger#95's body and the working
   agreement's comments on zerobull-consulting/dagger#1 are history; this file
   supersedes them.
