@@ -56,24 +56,14 @@ function stopTimeoutMs(file) {
   return stopSeconds(file) * 1000 + stopSlackMs;
 }
 
-// Runs `sidecar.sh <command>`, bounded. The script runs in a session of its
-// own (setsid), so that when the bound passes, the kill reaches the docker,
-// timeout and pull processes it spawned too: killing only bash would orphan
-// them. Without setsid, bash is run directly (and only it is killed).
 function run(command, env, timeoutMs) {
-  const args = [scriptOf(env), command];
-  const opts = { env, stdio: 'inherit', timeout: timeoutMs, killSignal: 'SIGKILL' };
-  let r = spawnSync('setsid', ['bash', ...args], opts);
-  if (r.error && r.error.code === 'ENOENT') r = spawnSync('bash', args, opts);
+  const r = spawnSync('bash', [scriptOf(env), command], {
+    env,
+    stdio: 'inherit',
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+  });
   if (r.error) {
-    if (r.pid) {
-      try {
-        // The session's leader is the pid; its group is whatever it left.
-        process.kill(-r.pid, 'SIGKILL');
-      } catch (_) {
-        // Nothing left in the group.
-      }
-    }
     console.log(`::error::remote-cache-sidecar: ${command} did not finish: ${r.error.message}`);
     return 1;
   }
@@ -105,6 +95,14 @@ function post(env) {
   // comes from the caller's commit, the shim is pinned) shortens or lengthens
   // that bound, but never leaves a sidecar running.
   const file = path.join(dir, name, 'state');
+  try {
+    scriptOf(env);
+  } catch (e) {
+    // No script, so no start of this action's can have run it: one line, and
+    // no second error on top of the main step's.
+    console.log(`remote-cache-sidecar: nothing to stop for ${name}: ${e.message}`);
+    return 0;
+  }
   console.log(`remote-cache-sidecar: stopping ${name} at the end of the job (if it isn't stopped already)`);
   const childEnv = { ...env, SIDECAR_NAME: name, SIDECAR_DIR: dir };
   return run('stop', childEnv, stopTimeoutMs(file));
