@@ -461,6 +461,81 @@ func TestTrackerLoopedFlushesDontRushFailures(t *testing.T) {
 	}
 }
 
+// A failed root whose wait no flush cuts short (see
+// TestTrackerLoopedFlushesDontRushFailures) is due at the next flush once
+// its value changed: the failures counted were the old value's.
+func TestTrackerFlushRetriesChangedValueAfterFlushFailure(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	fail := func(now time.Time) int {
+		end := tr.StartFlush("c", now)
+		defer end()
+		bs := tr.Due(now)
+		for _, b := range bs {
+			tr.Done(b, Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, now)
+		}
+		return len(bs)
+	}
+	// The first flush's try fails, the second flush cuts its wait short,
+	// and that try fails too: the third flush leaves the wait it started.
+	if n := fail(t0) + fail(t0); n != 2 {
+		t.Fatalf("%d tries, want 2", n)
+	}
+	if n := fail(t0); n != 0 {
+		t.Fatal("the flush cut short a wait a flush's try started")
+	}
+	o := state(1, 10, fsPart)
+	o.Replacements = 1
+	tr.Observe(o, t0)
+	end := tr.StartFlush("c", t0)
+	defer end()
+	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("the changed value isn't due at the flush: %v", got)
+	}
+}
+
+// A flush's try given back before it ran (Requeue, or Interrupted with the
+// root unsettled) is still the flush's when it runs: if it fails, the next
+// flush leaves the wait it started.
+func TestTrackerFlushTryGivenBackStaysTheFlushs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		giveBack func(*Tracker, Batch, time.Time)
+	}{
+		{"requeued", func(tr *Tracker, b Batch, now time.Time) { tr.Requeue(b, now.Add(time.Hour)) }},
+		{"interrupted", func(tr *Tracker, b Batch, now time.Time) { tr.Interrupted(b, Result{}, now, now.Add(time.Hour)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTestTracker()
+			tr.Observe(state(1, 10, fsPart), t0)
+			failed := Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}
+			// A try of its own, failed: a wait no flush caused.
+			b := tr.All("c", t0)
+			tr.Done(b[0], failed, t0)
+			// A flush cuts it short; its try is given back to wait for
+			// the engine, which then connects.
+			end := tr.StartFlush("c", t0)
+			bs := tr.Due(t0)
+			if len(bs) != 1 {
+				t.Fatalf("not due at the flush: %d batches", len(bs))
+			}
+			tc.giveBack(tr, bs[0], t0)
+			end()
+			tr.WakeEngineWait("c", 1, t0)
+			bs = tr.Due(t0)
+			if len(bs) != 1 {
+				t.Fatalf("not due once the engine connected: %d batches", len(bs))
+			}
+			tr.Done(bs[0], failed, t0)
+			end = tr.StartFlush("c", t0)
+			defer end()
+			if got := roots(tr.Due(t0)); len(got) != 0 {
+				t.Fatalf("the flush cut short the wait its own try started: %v", got)
+			}
+		})
+	}
+}
+
 func TestTrackerFailuresBackOffThenStop(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)

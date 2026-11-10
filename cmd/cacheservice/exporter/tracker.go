@@ -173,14 +173,9 @@ type trackedEntry struct {
 	failures     int
 	// failedValue is the value failures counts for.
 	failedValue *exportedValue
-	// flushReset is set when a flush cut short the entry's wait after a
-	// failed try (StartFlush), until its next try; flushTry is set during
-	// that try. flushFailed is set when that try failed: the wait it
-	// started is the backoff's, and no flush cuts it short. A try after it
-	// clears it, so each failure wait is cut short by a flush at most once
-	// in a row, and a caller that loops flushes can't make a failing root
-	// reach MaxFailures at its own rate.
-	flushReset, flushTry, flushFailed bool
+	// flushRetry is where the entry is in a flush's retry of a failed
+	// root (see StartFlush and flushRetry).
+	flushRetry flushRetry
 	// inFlight is set while a batch holds the entry.
 	inFlight bool
 	// recheck is set when a newer generation cleared the entry's
@@ -200,6 +195,28 @@ type trackedEntry struct {
 	changedAt time.Time
 	busyAt    time.Time
 }
+
+// flushRetry is how a flush's retry of a failed root stands. A flush cuts
+// short a failed root's wait (flushRetryCut) unless a try that a flush made
+// due started it (flushRetryFailed): so each failure wait is cut short by a
+// flush at most once in a row, and a caller that loops flushes can't make a
+// failing root reach MaxFailures at its own rate.
+type flushRetry uint8
+
+const (
+	// flushRetryNone: the entry's wait, if any, wasn't cut short by a
+	// flush, and wasn't started by a try a flush made due.
+	flushRetryNone flushRetry = iota
+	// flushRetryCut: a flush cut short the wait after a failed try; the
+	// entry's next try is the flush's.
+	flushRetryCut
+	// flushRetryTrying: the flush's try is in flight.
+	flushRetryTrying
+	// flushRetryFailed: the flush's try failed, for the value it is
+	// waiting with. No flush cuts the wait it started short; one does
+	// once the value changed.
+	flushRetryFailed
+)
 
 // exportedValue is the state of a value an export covered.
 type exportedValue struct {
@@ -896,7 +913,11 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 // now, so it is no longer dirty. A change from now on makes it dirty again.
 func (t *Tracker) claimLocked(e *trackedEntry) {
 	e.inFlight = true
-	e.flushTry, e.flushReset, e.flushFailed = e.flushReset, false, false
+	if e.flushRetry == flushRetryCut {
+		e.flushRetry = flushRetryTrying
+	} else {
+		e.flushRetry = flushRetryNone
+	}
 	e.retryAt, e.engineWaitAt, e.recheck = time.Time{}, time.Time{}, false
 	e.dirtySince, e.accel, e.busyAt = time.Time{}, false, time.Time{}
 }
@@ -1058,7 +1079,9 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		e.failures++
 		if e.failures < t.cfg.MaxFailures {
 			e.retryAt, e.engineWaitAt = now.Add(t.backoff(e.failures-1)), time.Time{}
-			e.flushFailed = e.flushTry
+			if e.flushRetry == flushRetryTrying {
+				e.flushRetry = flushRetryFailed
+			}
 		}
 	}
 	for _, f := range res.Failed {
@@ -1070,6 +1093,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 			if !interruptedRetry.IsZero() {
 				if e := c.entries[n]; e != nil {
 					e.retryAt, e.engineWaitAt = interruptedRetry, interruptedRetry
+					e.flushRetry = givenBack(e.flushRetry)
 				}
 			} else {
 				failed(n)
@@ -1080,6 +1104,10 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 			continue
 		}
 		e.inFlight = false
+		if e.flushRetry == flushRetryTrying {
+			// Stored, refused, gone, busy, or failed for the last time.
+			e.flushRetry = flushRetryNone
+		}
 		// The value may have changed since the snapshot exported, or been
 		// stored or refused for it. A value that changed in flight is
 		// dirty again, and is due once it settles, or MaxDelay after the
@@ -1120,6 +1148,15 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 		}
 	}
 	return b, nil
+}
+
+// givenBack is a flush retry's state once its try was given back before it
+// ran (Requeue, Interrupted): the try that runs later is still the flush's.
+func givenBack(r flushRetry) flushRetry {
+	if r == flushRetryTrying {
+		return flushRetryCut
+	}
+	return r
 }
 
 func (t *Tracker) backoff(n int) time.Duration {
@@ -1220,6 +1257,7 @@ func (t *Tracker) Requeue(b Batch, at time.Time) {
 		if e := c.entries[n]; e != nil {
 			e.inFlight = false
 			e.retryAt, e.engineWaitAt = at, at
+			e.flushRetry = givenBack(e.flushRetry)
 			t.soonLocked(at)
 		}
 	}
@@ -1332,8 +1370,8 @@ func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain boo
 // as in a drain; and every root of it waiting for another try is due now,
 // once. Retries after that wait their normal backoff. A failed root whose
 // wait began with a try a flush made due, and that failed again, isn't due
-// at once: it waits out that backoff, and a flush after its next try may cut
-// its wait short again. So looped flushes retry a failing root at most
+// at once: it waits out that backoff, and a flush after its next try, or
+// once its value changed, may cut its wait short again. So looped flushes retry a failing root at most
 // once per backoff of its own, and it reaches MaxFailures at most twice as
 // fast as its backoff alone would take it there; a busy root, which doesn't count toward MaxFailures, or one
 // waiting for its engine, is due at every flush. Unlike StartDrain, it
@@ -1347,11 +1385,14 @@ func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
 	t.flushing[cacheID]++
 	if c := t.caches[cacheID]; c != nil {
 		for _, e := range c.entries {
-			if e.inFlight || !e.retryAt.After(now) || e.flushFailed {
+			if e.inFlight || !e.retryAt.After(now) || (e.flushRetry == flushRetryFailed && e.failedValue.covers(e)) {
 				continue
 			}
 			// A wait after a failed try: neither busy nor for the engine.
-			e.flushReset = e.busyAt.IsZero() && e.engineWaitAt.IsZero() && e.failures > 0
+			e.flushRetry = flushRetryNone
+			if e.busyAt.IsZero() && e.engineWaitAt.IsZero() && e.failures > 0 {
+				e.flushRetry = flushRetryCut
+			}
 			e.retryAt, e.engineWaitAt = now, time.Time{}
 		}
 	}
