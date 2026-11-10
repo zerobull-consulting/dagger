@@ -368,7 +368,7 @@ func (s *state) s3Faults(t *testing.T) {
 // reconnect with their backoff, the new service rebuilds what it needs from
 // S3, merges every stored bundle into B again once (accepted: #12's first
 // comment), and exports A's new sessions. The export cut short is lost until
-// a session names its entries again (known gap).
+// a session names its entries again (accepted, #45).
 func (s *state) serviceRestart(t *testing.T) {
 	env, a, b := s.env, s.a, s.b
 	cacheA := a.CacheID()
@@ -462,7 +462,7 @@ func (s *state) serviceRestart(t *testing.T) {
 		}
 	}
 
-	// The known gap: the export cut short isn't tried again, since the new
+	// Accepted (#45): the export cut short isn't tried again, since the new
 	// service never saw the spans that named its entries.
 	time.Sleep(2*noEngineWait + time.Second)
 	lost := true
@@ -498,9 +498,9 @@ func (s *state) serviceRestart(t *testing.T) {
 		len(live), len(mergedBefore), merges, len(redone.Values), redo.Round(time.Millisecond))
 	Check(t, ownBack == 0, "nothing of A's own was merged back into A (%d)", ownBack)
 	if lost {
-		t.Logf("GAP   the export in flight at the restart was not tried again by the new service %s after it: its entries wait for a session to name them (known gap #45)", 2*noEngineWait+time.Second)
+		t.Logf("GAP   the export in flight at the restart was not tried again by the new service %s after it: its entries wait for a session to name them (accepted, #45)", 2*noEngineWait+time.Second)
 	} else {
-		t.Logf("ok    the export in flight at the restart was stored by the new service on its own: the known gap may be fixed")
+		t.Logf("ok    the export in flight at the restart was stored by the new service on its own: the accepted limit of #45 may have changed")
 	}
 	Check(t, rerun == want && len(holding) > 0,
 		"exports resumed: A's next session of the pipeline (a local hit, same output) was exported and stored, with the layer that was in flight (bundles %v)", shorts(holding))

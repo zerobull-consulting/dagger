@@ -1346,7 +1346,7 @@ garbage collection expires. An export that fails as a whole (S3 down) counts a f
 roots, which are tried again with backoff (2s doubling), up to 5 times per
 value.
 
-**Known gaps.** Without `-tokens-file`, nothing is authenticated: the
+**Known gaps and decided limits.** Without `-tokens-file`, nothing is authenticated: the
 WebSocket takes any token, and the OTLP receivers take any request, so anyone
 who can reach the service can forge spans, which make it export (or stop
 exporting) a connected engine's entries, or connect as an engine and offer it
@@ -2006,8 +2006,9 @@ bytes).
 An engine sends its token as the HTTP Basic username, from
 `DAGGER_CLOUD_TOKEN`. The engine's config can't set it: that would be a
 change to the engine, which this fork doesn't carry
-([#13](https://github.com/zerobull-consulting/dagger/issues/13)). On the WebSocket, an unknown or missing token is refused with
-401 before the upgrade, so it never gets a protocol message. A token is
+([#13](https://github.com/zerobull-consulting/dagger/issues/13)). On the
+WebSocket, an unknown or missing token is refused with 401 before the
+upgrade, so it never gets a protocol message. A token is
 checked again when its connection says `hello`, against the tokens of that
 moment.
 

@@ -385,8 +385,8 @@ func TestServiceRestartMergesPrunedEntriesAgainOnce(t *testing.T) {
 	}
 }
 
-// Accepted, not planned to change (#45; #12, case 3): the export path learns entries only from session
-// spans, and keeps them in memory. An export pending or in flight when the
+// Accepted, not planned to change (#45; #12, case 3): the export path learns
+// entries only from session spans, and keeps them in memory. An export pending or in flight when the
 // service stops without a drain (a crash, SIGKILL, or -drain-timeout 0) is
 // lost: the restarted service doesn't know the entries, and exports them
 // only once a later session's spans name them again. What was stored is not
@@ -416,10 +416,10 @@ func TestServiceRestartForgetsPendingExport(t *testing.T) {
 	// Long enough for many scheduler ticks (10ms) and a retry.
 	time.Sleep(500 * time.Millisecond)
 	if n := indexEntries(t, meta); n != 0 {
-		t.Fatalf("the index has %d entries: the gap is fixed; update this test, the README's known gaps, and the issue", n)
+		t.Fatalf("the index has %d entries: a stop without a drain no longer loses them, against the decision in #45; update this test, the README, and the issue", n)
 	}
 	if entries, err := svc.Entries(conn.id); err != nil || len(entries) != 0 {
-		t.Fatalf("the restarted service tracks %+v (%v): the gap is fixed; update this test", entries, err)
+		t.Fatalf("the restarted service tracks %+v (%v): the tracker is now kept across a restart, against the decision in #45; update this test", entries, err)
 	}
 
 	// A later session that touches the entries exports them.
