@@ -1367,8 +1367,8 @@ later session names its entries. That is accepted, not planned to change
 `TestServiceRestartForgetsPendingExport`). An entry is exported once
 `-export-settle` has passed with no cache span naming it, or at the latest
 `-export-max-delay` after it changed, so what a stop without a drain can lose
-is what changed within those bounds, plus an export in flight. A clean stop
-drains first and stores the rest (see
+is what changed within those bounds, plus an export in flight or waiting
+out a retry. A clean stop drains first and stores the rest (see
 [Stopping and draining](#stopping-and-draining)).
 
 ## Import path
@@ -4017,7 +4017,7 @@ timeouts, a restart with state to compare) or would cost minutes.
 | --- | --- | --- | --- |
 | Connection lost mid-upload | both | e2e `disconnect`; `TestConnectionLostMidUpload`, `TestExportHookInterruptedNotFailed`, engine's `TestExportReleasedWhenTheConnectionDrops` | The real engine shows the release and the reconnect; the fake one checks the chains are released before the retry. |
 | Engine restart, new generation | real engines (export side) | e2e `engine-restart`; import side: `TestSyncStaleGeneration`, `TestOfferPendingStaleGeneration`, `TestTrackerGenerationFence`, `TestRecordFencesOlderGenerations` | Whether entry numbers survive a restart is the engine's: only a real one shows the cut export runs again under the same numbers. |
-| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap of a stop without a drain exactly. |
+| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the accepted limit of a stop without a drain exactly. |
 | Clean stop (drain) | both, and the binary | e2e `drain`; `TestDrain*`, `TestDrainedRestartStoresPendingExport`, `TestMinIODrain`, `TestMinIOBinaryDrainsOnSIGTERM`, `TestMinIOBinarySecondSIGTERMStopsAtOnce` | The real engine shows it stays connected and finishes its upload while the service drains; the fake engine controls the timing (quiet sessions, late spans, deadlines, disconnects); only the built command shows the signal wiring. |
 | S3 throttling, 5xx, outage | real engines | e2e `s3-faults`; `TestExportRetriesFailedUploads`, `TestExportGivesUpOnFailingUploads`, `TestExportBlobStoreFailureReleases`, `TestUpdateIndexRetriesOnAFreshIndex` | Who retries what is split between the engine's PUTs and the service's AWS SDK client, which only the real pair shows. |
 | Oversized messages | fake engine, and MinIO | `TestImportBundleNearMergeLimit` (and `TestMinIO…`), `TestExportSplitsBundleTooLargeToImport`, `TestExportOneRootBundleTooLargeToImport`, `TestMergeSizeBoundsBuildMerge`; splitting: `TestExportSplitsTooLarge`, `TestSyncTooLarge`, `TestSyncSplitsLargeOffers` | A real bundle near 64 MiB would take minutes to build and move; the limit is a setting, lowered in tests. |
