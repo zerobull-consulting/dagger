@@ -551,7 +551,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	res.Stored = append(res.Stored, survivors...)
 	res.Bundles = append(res.Bundles, rec.BundleID)
-	x.logStoredRoots(eng.CacheID(), survivors)
+	x.logStoredRoots(eng.CacheID(), eng.Generation(), survivors)
 	x.log.Info("export stored", "cacheID", eng.CacheID(), "roots", len(survivors),
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
@@ -559,20 +559,23 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 }
 
 // maxLoggedRoots bounds the root numbers one "export stored roots" record
-// lists (a batch has at most 1,000 roots).
+// lists (a batch has at most 1,000 roots); a record that omits some says how
+// many.
 const maxLoggedRoots = 1000
 
 // logStoredRoots logs which roots an export stored, at debug level: the
 // e2e reads when each value was first stored (zerobull-consulting/dagger#154).
-func (x *Exporter) logStoredRoots(cacheID string, roots []uint64) {
-	if len(roots) > maxLoggedRoots {
-		roots = roots[:maxLoggedRoots]
+func (x *Exporter) logStoredRoots(cacheID string, generation uint64, roots []uint64) {
+	if !x.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
 	}
+	omitted := max(len(roots)-maxLoggedRoots, 0)
+	roots = roots[:len(roots)-omitted]
 	nums := make([]string, len(roots))
 	for i, n := range roots {
 		nums[i] = strconv.FormatUint(n, 10)
 	}
-	x.log.Debug("export stored roots", "cacheID", cacheID, "numbers", strings.Join(nums, ","))
+	x.log.Debug("export stored roots", "cacheID", cacheID, "generation", generation, "numbers", strings.Join(nums, ","), "omitted", omitted)
 }
 
 // checkGeneration returns the index's ErrStaleGeneration refusal of the

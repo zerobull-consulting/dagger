@@ -25,7 +25,7 @@ func spanRec(after time.Duration, cache string, n string, call bool, retained bo
 }
 
 func storedRec(after time.Duration, cacheID, numbers string) LogRecord {
-	return LogRecord{Time: leadsT0.Add(after), Msg: "export stored roots", Attrs: map[string]string{"cacheID": cacheID, "numbers": numbers}}
+	return LogRecord{Time: leadsT0.Add(after), Msg: "export stored roots", Attrs: map[string]string{"cacheID": cacheID, "generation": "1", "numbers": numbers}}
 }
 
 func TestDepsAfterStoreSeesGrowthAtTheSameCount(t *testing.T) {
@@ -36,7 +36,7 @@ func TestDepsAfterStoreSeesGrowthAtTheSameCount(t *testing.T) {
 		spanRec(5*time.Second, "c1/1", "7", false, true, "1", "3"), // grew after the store
 		spanRec(6*time.Second, "c1/1", "7", false, true, "1", "3"), // not again
 	}
-	stored, growth := depsAfterStore(recs)
+	stored, growth, _ := depsAfterStore(recs)
 	if stored != 1 || len(growth) != 1 {
 		t.Fatalf("stored %d, growth %+v; want 1 stored value and one growth", stored, growth)
 	}
@@ -56,7 +56,7 @@ func TestDepsAfterStoreIgnoresWhatIsNotGrowth(t *testing.T) {
 		spanRec(5*time.Second, "c1/1", "8", false, true, "1", "5"), // never stored
 		spanRec(6*time.Second, "c1/1", "7", false, true, "3", "9"), // the new value's deps, unchanged
 	}
-	stored, growth := depsAfterStore(recs)
+	stored, growth, _ := depsAfterStore(recs)
 	if stored != 1 {
 		t.Errorf("stored %d values; want 1 (entry 8 was never stored)", stored)
 	}
@@ -72,7 +72,7 @@ func TestDepsAfterStoreMatchesTheCacheID(t *testing.T) {
 		storedRec(time.Second, "c2", "7"),
 		spanRec(2*time.Second, "c1/1", "7", false, true, "1", "4"),
 	}
-	if stored, growth := depsAfterStore(recs); stored != 0 || len(growth) != 0 {
+	if stored, growth, _ := depsAfterStore(recs); stored != 0 || len(growth) != 0 {
 		t.Errorf("stored %d, growth %+v; want neither", stored, growth)
 	}
 }
@@ -111,12 +111,41 @@ func TestLazyToCallGaps(t *testing.T) {
 	}
 }
 
-func TestFirstStoredKeepsTheFirstTimeAndSkipsJunk(t *testing.T) {
-	at := firstStored([]LogRecord{
-		storedRec(time.Second, "c1", "7,x,,9"),
-		storedRec(2*time.Second, "c1", "7"),
-	})
-	if !at["c1"][7].Equal(leadsT0.Add(time.Second)) || at["c1"][9].IsZero() || len(at["c1"]) != 2 {
-		t.Errorf("firstStored: %v", at)
+// A value stored again at a higher replacement count: growth the second
+// export covered is not growth after a store, and growth after the second is.
+func TestDepsAfterStoreRestored(t *testing.T) {
+	recs := []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "1", "1"),
+		storedRec(time.Second, "c1", "7"),
+		spanRec(2*time.Second, "c1/1", "7", true, true, "2", "1"),
+		spanRec(3*time.Second, "c1/1", "7", false, true, "2", "3"), // before the second store
+		storedRec(4*time.Second, "c1", "7"),
+		spanRec(5*time.Second, "c1/1", "7", false, true, "2", "4"), // after it
+	}
+	stored, growth, _ := depsAfterStore(recs)
+	if stored != 1 || len(growth) != 1 || growth[0].before != 3 || growth[0].after != 4 || growth[0].storedAt != leadsT0.Add(4*time.Second) {
+		t.Fatalf("stored %d, growth %+v; want one growth, 3 -> 4 after the second store", stored, growth)
+	}
+}
+
+// Entry numbers are reused across generations: a store of generation 1 says
+// nothing of generation 2's entry.
+func TestDepsAfterStoreKeysByGeneration(t *testing.T) {
+	recs := []LogRecord{
+		spanRec(0, "c1/2", "7", true, true, "1", "1"),
+		storedRec(time.Second, "c1", "7"), // generation 1
+		spanRec(2*time.Second, "c1/2", "7", false, true, "1", "4"),
+	}
+	if stored, growth, _ := depsAfterStore(recs); stored != 0 || len(growth) != 0 {
+		t.Errorf("stored %d, growth %+v; want neither", stored, growth)
+	}
+}
+
+func TestStoresByEntryKeepsEveryStoreAndCountsOmitted(t *testing.T) {
+	a := storedRec(time.Second, "c1", "7,x,,9")
+	a.Attrs["omitted"] = "3"
+	stores, omitted := storesByEntry([]LogRecord{a, storedRec(2*time.Second, "c1", "7")})
+	if omitted != 3 || len(stores[entryKey{"c1/1", 7}]) != 2 || len(stores[entryKey{"c1/1", 9}]) != 1 || len(stores) != 2 {
+		t.Errorf("stores %v, omitted %d", stores, omitted)
 	}
 }

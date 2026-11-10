@@ -61,29 +61,29 @@ func spansByEntry(recs []LogRecord) map[entryKey][]entrySpan {
 	return out
 }
 
-// firstStored returns, per cache ID (the cache attribute before its "/"),
-// when each root was first stored, from the "export stored roots" records.
-func firstStored(recs []LogRecord) map[string]map[uint64]time.Time {
-	out := map[string]map[uint64]time.Time{}
+// storesByEntry returns, per cache attribute as the spans carry it (cache ID
+// and generation) and root, when each export stored the root, in order, from
+// the "export stored roots" records. omitted counts roots the records left
+// out, which the measurement can't see.
+func storesByEntry(recs []LogRecord) (stores map[entryKey][]time.Time, omitted int) {
+	stores = map[entryKey][]time.Time{}
 	for _, r := range recs {
 		if r.Msg != "export stored roots" {
 			continue
 		}
-		id := r.Attr("cacheID")
+		o, _ := strconv.Atoi(r.Attr("omitted"))
+		omitted += o
+		cache := r.Attr("cacheID") + "/" + r.Attr("generation")
 		for _, s := range strings.Split(r.Attr("numbers"), ",") {
 			n, err := strconv.ParseUint(s, 10, 64)
 			if err != nil {
 				continue
 			}
-			if out[id] == nil {
-				out[id] = map[uint64]time.Time{}
-			}
-			if _, ok := out[id][n]; !ok {
-				out[id][n] = r.Time
-			}
+			k := entryKey{cache, n}
+			stores[k] = append(stores[k], r.Time)
 		}
 	}
-	return out
+	return stores, omitted
 }
 
 // depsGrowth is a span that reported a longer deps list than any before it
@@ -99,50 +99,44 @@ type depsGrowth struct {
 
 // depsAfterStore measures lead 1 for one service: how many values it stored
 // (that the spans name), and the spans that reported a longer deps list at
-// the replacement count the value had when it was first stored. The tracker
-// keeps the highest replacement count seen and the longest deps list for it,
-// and ignores a span of an older count, so these do the same.
-func depsAfterStore(recs []LogRecord) (stored int, growth []depsGrowth) {
+// the replacement count the value had when an export stored it, after that
+// store and before the entry's next. The tracker keeps the highest
+// replacement count seen and the longest deps list for it, and ignores a
+// span of an older count, so these do the same. It also returns how many
+// roots the records omitted.
+func depsAfterStore(recs []LogRecord) (stored int, growth []depsGrowth, omitted int) {
 	spans := spansByEntry(recs)
-	at := firstStored(recs)
+	stores, omitted := storesByEntry(recs)
 	for k, ss := range spans {
-		id, _, _ := strings.Cut(k.cache, "/")
-		storedAt, ok := at[id][k.number]
-		if !ok {
+		times := stores[k]
+		if len(times) == 0 {
 			continue
 		}
 		stored++
-		var repl uint64
-		deps := 0
-		for _, s := range ss {
-			if s.at.After(storedAt) {
-				break
-			}
-			if s.replacements > repl {
-				repl, deps = s.replacements, 0
-			}
-			if s.replacements == repl {
-				deps = max(deps, s.deps)
-			}
-		}
-		for _, s := range ss {
-			if !s.at.After(storedAt) {
-				continue
+		var repl, storedRepl uint64
+		var lastStore time.Time
+		deps, next := 0, 0
+		for _, sp := range ss {
+			// Stores up to this span: they cover what was seen before it.
+			for ; next < len(times) && !times[next].After(sp.at); next++ {
+				lastStore, storedRepl = times[next], repl
 			}
 			switch {
-			case s.replacements > repl:
-				// A new value: it is stored for itself.
-				repl, deps = s.replacements, s.deps
-			case s.replacements == repl && s.deps > deps:
-				growth = append(growth, depsGrowth{k, storedAt, deps, s.deps, s.at.Sub(storedAt)})
-				deps = s.deps
+			case sp.replacements > repl:
+				// A new value: reset what belonged to the old one.
+				repl, deps = sp.replacements, sp.deps
+			case sp.replacements == repl && sp.deps > deps:
+				if !lastStore.IsZero() && storedRepl == repl {
+					growth = append(growth, depsGrowth{k, lastStore, deps, sp.deps, sp.at.Sub(lastStore)})
+				}
+				deps = sp.deps
 			}
 		}
 	}
 	slices.SortFunc(growth, func(a, b depsGrowth) int {
 		return cmp.Or(cmp.Compare(a.cache, b.cache), cmp.Compare(a.number, b.number), a.storedAt.Compare(b.storedAt))
 	})
-	return stored, growth
+	return stored, growth, omitted
 }
 
 // lazyGap is the time from an entry's last lazy-evaluation span to its next
@@ -189,13 +183,14 @@ const leadsBound = exporter.DefaultForgetAfter
 // leadsBound or more before the call span of an entry the engine didn't yet
 // keep.
 func (s *state) leads(t *testing.T) {
-	var stored, total int
+	var stored, total, omitted int
 	var growth []depsGrowth
 	var gaps []lazyGap
 	for _, svc := range s.env.Services() {
 		recs := svc.Logs.Since(0, "", nil)
-		n, g := depsAfterStore(recs)
+		n, g, o := depsAfterStore(recs)
 		stored += n
+		omitted += o
 		growth = append(growth, g...)
 		gaps = append(gaps, lazyToCall(recs)...)
 		for _, r := range recs {
@@ -204,16 +199,17 @@ func (s *state) leads(t *testing.T) {
 			}
 		}
 	}
-	reportLeads(t, total, stored, growth, gaps)
+	reportLeads(t, total, stored, omitted, growth, gaps)
 }
 
 // reportLeads logs the measurements and checks them.
-func reportLeads(t *testing.T, spans, stored int, growth []depsGrowth, gaps []lazyGap) {
+func reportLeads(t *testing.T, spans, stored, omitted int, growth []depsGrowth, gaps []lazyGap) {
 	t.Helper()
 	t.Logf("lead 1: %d cache spans; %d stored values named by them; %d later spans reported a longer deps list at the stored replacement count", spans, stored, len(growth))
 	for _, g := range growth {
 		t.Logf("lead 1: entry %d of %s: deps %d -> %d, %s after the value was stored", g.number, g.cache, g.before, g.after, g.late.Round(time.Millisecond))
 	}
+	Check(t, omitted == 0, "lead 1: every stored root was logged (%d omitted)", omitted)
 	Check(t, stored > 0, "lead 1: the run stored values the spans name (%d), so the measurement saw something", stored)
 	Check(t, len(growth) == 0, "lead 1: no stored value's deps grew at its replacement count (%d did)", len(growth))
 
