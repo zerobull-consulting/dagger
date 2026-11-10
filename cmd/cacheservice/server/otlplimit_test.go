@@ -1128,7 +1128,7 @@ func TestOTLPRequestOverHeaderLimit(t *testing.T) {
 	}
 }
 
-// Known gap: a request refused for its token (401) before decodeOTLP has
+// Known gap, zerobull-consulting/dagger#219: a request refused for its token (401) before decodeOTLP has
 // reserved nothing, not even its headers, though net/http holds them while it
 // reads and discards the body, up to the read timeout. Measured: 200 such
 // requests with 60 KiB headers and a stalled body grew the heap by 18 MB

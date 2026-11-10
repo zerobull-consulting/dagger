@@ -1706,7 +1706,8 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   it reads and discards the body, up to the read timeout. 200 such requests
   with 60 KiB headers and a stalled body grew the heap by 18 MB. It is the
   same for the 16 KiB each request is reserved for, which a refused one isn't
-  (`TestOTLPRefusedTokenHeadersNotInBudgetKnownGap`).
+  ([zerobull-consulting/dagger#219](https://github.com/zerobull-consulting/dagger/issues/219),
+  `TestOTLPRefusedTokenHeadersNotInBudgetKnownGap`).
 
 - Idle keep-alive connections aren't bounded
   ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
