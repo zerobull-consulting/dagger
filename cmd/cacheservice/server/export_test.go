@@ -48,8 +48,9 @@ type exportHarness struct {
 	// ends it.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// cancelPaths ends the service's paths alone (a child of ctx), the
-	// engines staying connected, as the stop does before CloseEngines.
+	// cancelPaths ends the export and import paths alone (a child of ctx),
+	// the engines staying connected, as the stop does before CloseEngines.
+	// A GC path a test enables on ctx runs on.
 	cancelPaths context.CancelFunc
 }
 

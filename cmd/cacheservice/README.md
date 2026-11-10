@@ -2691,7 +2691,8 @@ waits for, up to its deadline (logged as `drain: waiting for explicit
 requests`). A drain called once the export path's context already ended
 (the stop began) has nothing to export either: it logs `drain: nothing to
 export (the service is stopping)`, reports what is left, and returns at
-once, `complete` when nothing is left and no explicit request runs,
+once: `complete` when nothing is left that it could export (an export in
+flight, or a root of a connected engine) and no explicit request runs,
 otherwise `deadline` if its own deadline passed and `canceled` if not
 ([zerobull-consulting/dagger#74](https://github.com/zerobull-consulting/dagger/issues/74)). A second
 call to `Drain` returns `canceled` at once and doesn't end the first: only
@@ -3093,7 +3094,7 @@ paths record into them through their metadata store. All are prefixed
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
 | `export_enabled` | | 1 when the export path is on, 0 when it is off: a read-only instance (`-export=false`), or no bucket |
 | `draining` | | 1 once the service started draining (SIGTERM), 0 before |
-| `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed, with work left) or `canceled` (a second signal, or a drain that began after the export path stopped, with work left) |
+| `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed) or `canceled` (a second signal, or a drain that began after the export path stopped): both cut short, usually with work left, which the drain report's `left` and `drain_unexported_roots_total` count |
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |

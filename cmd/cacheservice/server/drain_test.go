@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -835,8 +836,11 @@ func TestDrainPathsStoppedDoesNotWaitForExplicit(t *testing.T) {
 
 // A drain that begins once the paths stopped has nothing to export, and
 // says the service is stopping. It reports what is left, and is complete
-// when nothing is, whatever its ctx says, as the flush is. With roots left,
-// it was cut short: deadline once its ctx expired, canceled otherwise.
+// when nothing is left that it could have exported (an export in flight,
+// or a root of a connected engine), whatever its ctx says. A session that
+// hasn't ended, with no root left, doesn't count. With a root left, it was
+// cut short: deadline once its ctx expired, or the export path's clock
+// passed its deadline, canceled otherwise.
 // (zerobull-consulting/dagger#74, point 2.)
 func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
 	live := func() (context.Context, context.CancelFunc) {
@@ -850,31 +854,84 @@ func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
 		cancel()
 		return ctx, cancel
 	}
+	// short ends before retryLater's retries are due (BusyBackoff).
+	short := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 10*time.Second)
+	}
+	// openRoots leaves the roots of a session that hasn't ended, waiting
+	// to settle.
+	openRoots := func(t *testing.T, h *exportHarness) {
+		h.build()
+		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+		waitUntil(t, 5*time.Second, "the roots to be tracked", func() bool {
+			left := h.svc.drainLeft(time.Now(), time.Time{})
+			return len(left) == 1 && left[0].Roots() == 2
+		})
+	}
+	// openSession leaves a session that hasn't ended, with its roots
+	// already stored: no root left.
+	openSession := func(t *testing.T, h *exportHarness) {
+		h.build()
+		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+		waitUntil(t, 10*time.Second, "the export", func() bool {
+			return indexHas(t, h, 10, 11) && len(h.svc.drainLeft(time.Now(), time.Time{})) == 0
+		})
+		h.postSpans("session-2", cacheSpan(10))
+		waitUntil(t, 5*time.Second, "the open session to be tracked", func() bool {
+			left := h.svc.drainLeft(time.Now(), time.Time{})
+			return len(left) == 1 && left[0].Sessions == 1 && left[0].Roots() == 0
+		})
+	}
+	// retryLater leaves roots whose export failed, waiting on a retry due
+	// after the drain's deadline (DrainState.Later).
+	retryLater := func(t *testing.T, h *exportHarness) {
+		digests := h.build()
+		h.cache.CorruptUploads(digests[1], 3)
+		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+		waitUntil(t, 10*time.Second, "the export to fail", func() bool {
+			left := h.svc.drainLeft(time.Now(), time.Now().Add(time.Second))
+			return len(left) == 1 && left[0].Later == 2
+		})
+	}
 	for _, tc := range []struct {
-		name string
-		left bool
-		ctx  func() (context.Context, context.CancelFunc)
-		want string
+		name  string
+		setup func(*testing.T, *exportHarness)
+		ctx   func() (context.Context, context.CancelFunc)
+		// skew moves the export path's clock an hour on once the paths
+		// stopped: past the drain's deadline, before ctx's timer fires.
+		skew  bool
+		want  string
+		roots int
+		// later is how many of the roots left are due after the deadline.
+		later int
 	}{
-		{"nothing left, live", false, live, metrics.DrainComplete},
-		{"nothing left, deadline passed", false, expired, metrics.DrainComplete},
-		{"nothing left, canceled", false, canceled, metrics.DrainComplete},
-		{"roots left, live", true, live, metrics.DrainCanceled},
-		{"roots left, deadline passed", true, expired, metrics.DrainDeadline},
-		{"roots left, canceled", true, canceled, metrics.DrainCanceled},
+		{"nothing left, live", nil, live, false, metrics.DrainComplete, 0, 0},
+		{"nothing left, deadline passed", nil, expired, false, metrics.DrainComplete, 0, 0},
+		{"nothing left, canceled", nil, canceled, false, metrics.DrainComplete, 0, 0},
+		{"open session with no root left, canceled", openSession, canceled, false, metrics.DrainComplete, 0, 0},
+		{"roots left, live", openRoots, live, false, metrics.DrainCanceled, 2, 0},
+		{"roots left, deadline passed", openRoots, expired, false, metrics.DrainDeadline, 2, 0},
+		{"roots left, canceled", openRoots, canceled, false, metrics.DrainCanceled, 2, 0},
+		{"roots left, export clock past the deadline", openRoots, live, true, metrics.DrainDeadline, 2, 0},
+		{"retry due after the deadline, live", retryLater, short, false, metrics.DrainCanceled, 2, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h, rec := newDrainHarness(t, nil)
-			if tc.left {
-				// A session that hasn't ended: its roots wait to settle.
-				h.build()
-				h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
-				waitUntil(t, 5*time.Second, "the roots to be tracked", func() bool {
-					return len(h.svc.drainLeft(time.Now(), time.Time{})) == 1
-				})
+			var skewed atomic.Bool
+			h, rec := newDrainHarness(t, func(c *ExportConfig) {
+				c.Tracker.BusyBackoff = testQuiet
+				c.Now = func() time.Time {
+					if skewed.Load() {
+						return time.Now().Add(time.Hour)
+					}
+					return time.Now()
+				}
+			})
+			if tc.setup != nil {
+				tc.setup(t, h)
 			}
 			// The stop began: the paths end, the engine stays connected.
 			h.cancelPaths()
+			skewed.Store(tc.skew)
 			ctx, cancel := tc.ctx()
 			defer cancel()
 			start := time.Now()
@@ -882,14 +939,11 @@ func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
 			if took := time.Since(start); took > time.Second {
 				t.Fatalf("the drain took %s", took)
 			}
-			if rep.Outcome != tc.want || rep.Explicit != 0 {
-				t.Fatalf("report %+v, want outcome %q", rep, tc.want)
+			if rep.Outcome != tc.want || rep.Explicit != 0 || rep.LeftRoots() != tc.roots {
+				t.Fatalf("report %+v, want outcome %q with %d roots left", rep, tc.want, tc.roots)
 			}
-			if tc.left != (len(rep.Left) == 1) {
+			if tc.roots > 0 && (len(rep.Left) != 1 || rep.Left[0].CacheID != h.cache.ID || !rep.Left[0].Connected || rep.Left[0].Later != tc.later) {
 				t.Fatalf("report left %+v", rep.Left)
-			}
-			if tc.left && (rep.Left[0].CacheID != h.cache.ID || !rep.Left[0].Connected || rep.LeftRoots() != 2) {
-				t.Fatalf("report left %+v, %d roots", rep.Left, rep.LeftRoots())
 			}
 			if len(rec.find("drain: nothing to export (the service is stopping)")) != 1 {
 				t.Fatal("the drain didn't log that the service is stopping")
@@ -897,7 +951,7 @@ func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
 			if len(rec.find("drain: nothing to export (the export path is off)")) != 0 {
 				t.Fatal("the drain logged that the export path is off")
 			}
-			if n := len(rec.find("drain: left unexported")); tc.left != (n == 1) {
+			if n := len(rec.find("drain: left unexported")); (tc.roots > 0) != (n == 1) {
 				t.Fatalf("logged %d left unexported", n)
 			}
 		})
