@@ -49,7 +49,9 @@ export DIGITALOCEAN_TOKEN=... GITHUB_TOKEN=... TF_WORKSPACE=dagger
 only what differs. It needs:
 
 - `terraform` 1.5 or later (or `TF=tofu`);
-- one DigitalOcean API token, with read and write scopes;
+- one DigitalOcean API token, with read and write scopes, as `do_token`:
+  `DIGITALOCEAN_TOKEN` or `TF_VAR_do_token` in the environment, or in a
+  `terraform.tfvars` here (git-ignored, loaded by Terraform itself);
 - `go`, since Terraform runs `cacheservice provision` from this checkout with
   `go run` (set `cacheservice_command` to a built binary's path to skip
   that);

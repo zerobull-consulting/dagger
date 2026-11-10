@@ -16,9 +16,10 @@
 #   export TF_WORKSPACE=dagger
 #   spaces.sh up -var-file=dagger.tfvars
 #
-# Needs terraform (or tofu via TF=tofu), one DigitalOcean API token in
-# DIGITALOCEAN_TOKEN (or TF_VAR_do_token), go (Terraform runs `cacheservice
-# provision` with go run, unless cacheservice_command names a binary), and,
+# Needs terraform (or tofu via TF=tofu), one DigitalOcean API token as do_token
+# (DIGITALOCEAN_TOKEN, TF_VAR_do_token, or a terraform.tfvars here), go
+# (Terraform runs `cacheservice provision` with go run, unless
+# cacheservice_command names a binary), and,
 # with github_repository set, a GitHub token with admin rights on it in
 # GITHUB_TOKEN. lifecycle builds ./cmd/cacheservice with go unless
 # CACHESERVICE names a binary, and runs it in the directory spaces.sh was run
@@ -44,9 +45,13 @@ for k, v in sorted(json.load(sys.stdin).items()):
     print("export %s=%s" % (k, shlex.quote(v)))'
 }
 
+# The DigitalOcean token: DIGITALOCEAN_TOKEN when set, else whatever
+# Terraform finds (TF_VAR_do_token, terraform.tfvars, -var); Terraform says
+# when there is none.
 need() {
-	export TF_VAR_do_token="${TF_VAR_do_token:-${DIGITALOCEAN_TOKEN:-}}"
-	[[ -n "$TF_VAR_do_token" ]] || die "set DIGITALOCEAN_TOKEN (or TF_VAR_do_token)"
+	if [[ -z "${TF_VAR_do_token:-}" && -n "${DIGITALOCEAN_TOKEN:-}" ]]; then
+		export TF_VAR_do_token="$DIGITALOCEAN_TOKEN"
+	fi
 }
 
 # has_namespace_flag <flags>: whether they already choose the namespaces.
