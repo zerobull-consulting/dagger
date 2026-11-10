@@ -3252,7 +3252,7 @@ for once the stop began answers 503 too
 [#202](https://github.com/zerobull-consulting/dagger/issues/202)). An
 import sync waits for the one under way of the same engine cache only as
 long as its context lives: one whose context is done, before it waits or
-while it does, returns the context's error without waiting
+while it does, returns the context's cause without waiting
 (`TestImportSyncCanceledDoesNotWaitForSyncLock`,
 [#240](https://github.com/zerobull-consulting/dagger/issues/240)). Pinned by
 `TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,

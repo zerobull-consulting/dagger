@@ -165,10 +165,19 @@ func TestExplicitHooksRefusedOnceThePathsStopped(t *testing.T) {
 // An import sync whose context is done doesn't wait for the engine cache's
 // sync lock (importer.Importer.Sync) while another sync holds it, as a sync
 // loop's sync or an explicit import admitted during another one could: it
-// returns the context's error, and the held import finishes normally.
+// returns the context's cause, and the held import finishes normally.
 func TestImportSyncCanceledDoesNotWaitForSyncLock(t *testing.T) {
 	h, done, release := newHeldImportHarness(t)
-	defer release()
+	drained := false
+	defer func() {
+		release()
+		if !drained {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}()
 	c, err := h.svc.conn(h.engine.id)
 	if err != nil {
 		t.Fatal(err)
@@ -196,6 +205,7 @@ func TestImportSyncCanceledDoesNotWaitForSyncLock(t *testing.T) {
 	release()
 	select {
 	case err := <-done:
+		drained = true
 		if err != nil {
 			t.Fatalf("the held import: %v", err)
 		}

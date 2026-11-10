@@ -175,10 +175,12 @@ func New(cfg Config) (*Importer, error) {
 // cacheState is what the importer knows of one engine cache, at one
 // generation.
 type cacheState struct {
-	// sync serializes syncs of the cache, from any of its connections: a
-	// one-slot semaphore, so a sync waits for it only as long as its context
-	// lives. Made with the state (stateLocked, the only constructor): a nil
-	// channel would block forever.
+	// sync serializes syncs that hold this state, from any of its
+	// connections: a one-slot semaphore, so a sync waits for it only as long
+	// as its context lives. Forget drops the state, so a sync after a Forget
+	// has a new one and doesn't wait for a sync still running on the old
+	// (TestKnownGapSyncAfterForgetOverlapsRunningSync). Made with the state
+	// (stateLocked, the only constructor): a nil channel would block forever.
 	sync chan struct{}
 
 	// The fields below are guarded by Importer.mu.
@@ -368,7 +370,8 @@ func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 }
 
 // lockSync takes the cache's sync lock, waiting for the sync that holds it
-// only while ctx lives. A ctx already done returns its cause without taking
+// only while ctx lives, and returns the context's cause when it ends. A ctx
+// already done returns its cause without taking
 // the lock, even a free one, so the result doesn't depend on select's choice.
 func (st *cacheState) lockSync(ctx context.Context) error {
 	if ctx.Err() != nil {
