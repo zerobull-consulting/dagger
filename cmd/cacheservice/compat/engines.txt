@@ -28,3 +28,4 @@ base v1.0.0-beta.25
 
 accept v1.0.0-beta.25 sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834 verified: https://github.com/zerobull-consulting/dagger/actions/runs/42292529981
 accept v1.0.0-beta.24 sha256:3ad2b0b80942bb5044e57c1765710a5fab0b913557b6ab7d7f4e81700ac4da35 verified: https://github.com/zerobull-consulting/dagger/actions/runs/42292583215
+reject v1.0.0-beta.26 zerobull-consulting/dagger#227
