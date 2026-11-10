@@ -408,8 +408,10 @@ func (x *Exporter) export(ctx context.Context, eng Engine, roots []uint64, outpu
 type retryReason uint8
 
 const (
+	// retryNone: no root is tried again.
+	retryNone retryReason = iota
 	// retryUpload: blobs failed to upload.
-	retryUpload retryReason = iota
+	retryUpload
 	// retryCollected: GC's fence refused the index write.
 	retryCollected
 	// retryHeld: the bundle had held rows, and was released unmerged.
@@ -490,7 +492,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	select {
 	case slots <- struct{}{}:
 	case <-ctx.Done():
-		return res, nil, retryUpload, context.Cause(ctx)
+		return res, nil, retryNone, context.Cause(ctx)
 	}
 	defer func() { <-slots }()
 
@@ -500,13 +502,13 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// The engine gave up its remote-cache work while it captured the
 		// export: no root's failure.
 		res.Paused = append(res.Paused, roots...)
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 	if errors.Is(err, errEngineCut) && ctx.Err() == nil {
 		return res, roots, retryCut, nil
 	}
 	if err != nil {
-		return res, nil, retryUpload, err
+		return res, nil, retryNone, err
 	}
 	for _, s := range exported.Skipped {
 		switch s.Reason {
@@ -525,7 +527,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		}
 	}
 	if exported.Bundle == nil {
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 	survivors := survivingRoots(roots, exported.Skipped)
 
@@ -535,18 +537,25 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	if held := heldRows(exported.Bundle); held > 0 {
 		x.log.Debug("export: the bundle has held rows; asking again for them in full", "cacheID", eng.CacheID(),
 			"roots", len(survivors), "values", len(exported.Bundle.Values), "held", held)
-		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, retryUpload, rerr
+		// A release that failed made the engine forget nothing: asked
+		// again, it would send the same held rows, try after try.
+		if _, rerr := x.requestUpload(ctx, eng, exported.ExportID, nil); rerr != nil {
+			if ctx.Err() != nil {
+				return res, nil, retryNone, rerr
+			}
+			x.log.Warn("export: release of a bundle with held rows failed", "exportID", exported.ExportID, "error", rerr)
+			res.fail(survivors, fmt.Errorf("release of a bundle with held rows: %w", rerr))
+			return res, nil, retryNone, nil
 		}
 		return res, survivors, retryHeld, nil
 	}
 	// Each output gets a chain of its own, so the bundle stands on its own.
 	if err := dagql.ResolveChainPrefixes(exported.Bundle); err != nil {
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, retryUpload, rerr
+			return res, nil, retryNone, rerr
 		}
 		res.fail(survivors, fmt.Errorf("invalid bundle: %w", err))
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 
 	// A stale generation's export the index would refuse uploads nothing
@@ -555,10 +564,10 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	// generation can be recorded in between.
 	if err := x.checkGeneration(ctx, eng, exported.Bundle); err != nil {
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, retryUpload, rerr
+			return res, nil, retryNone, rerr
 		}
 		x.refuseStale(eng, survivors, err, "before upload", &res)
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 
 	stripVolatile(exported.Bundle)
@@ -566,9 +575,9 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// Not stored: release the chains, and let the caller split the
 		// roots.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, retryUpload, rerr
+			return res, nil, retryNone, rerr
 		}
-		return Result{}, nil, retryUpload, err
+		return Result{}, nil, retryNone, err
 	}
 
 	blobs, err := neededBlobs(exported.Bundle)
@@ -595,13 +604,13 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	if err != nil {
 		// Release the chains; the export isn't stored.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, retryUpload, rerr
+			return res, nil, retryNone, rerr
 		}
 		if ctx.Err() != nil {
-			return res, nil, retryUpload, context.Cause(ctx)
+			return res, nil, retryNone, context.Cause(ctx)
 		}
 		res.fail(survivors, err)
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 	for _, b := range blobs {
 		if _, asked := urls[b.Digest]; !asked {
@@ -614,21 +623,21 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// Our own upload request is too large to send: release the chains
 		// and let the caller split the roots.
 		if rerr := x.release(ctx, eng, exported.ExportID); rerr != nil {
-			return res, nil, retryUpload, rerr
+			return res, nil, retryNone, rerr
 		}
-		return Result{}, nil, retryUpload, errTooLarge
+		return Result{}, nil, retryNone, errTooLarge
 	}
 	if errors.Is(err, errEnginePaused) {
 		// As above, while it uploaded: the chains are released.
 		res.Paused = append(res.Paused, survivors...)
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 	if errors.Is(err, errEngineCut) && ctx.Err() == nil {
 		// The engine dropped the export before the upload reached it.
 		return res, survivors, retryCut, nil
 	}
 	if err != nil {
-		return res, nil, retryUpload, err
+		return res, nil, retryNone, err
 	}
 	// An engine that gives up its remote-cache work during an upload still
 	// answers it: the blobs that arrived done, those it never sent failed
@@ -646,7 +655,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	done, err := x.promote(ctx, eng, stage, blobs, urls, uploaded.Done, &res)
 	if err != nil {
-		return res, nil, retryUpload, err
+		return res, nil, retryNone, err
 	}
 	var missing int
 	for d := range urls {
@@ -660,7 +669,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		x.log.Info("export: the engine gave up its remote-cache work during the upload", "cacheID", eng.CacheID(),
 			"roots", len(survivors), "blobs", len(urls), "missing", missing)
 		res.Paused = append(res.Paused, survivors...)
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 	if missing > 0 && cut {
 		return res, survivors, retryCut, nil
@@ -672,7 +681,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	rec, err := x.cfg.Meta.RecordFenced(ctx, x.cfg.Scope, exported.Bundle, eng.CacheID(), eng.Generation(), fence)
 	if err != nil {
 		if ctx.Err() != nil {
-			return res, nil, retryUpload, context.Cause(ctx)
+			return res, nil, retryNone, context.Cause(ctx)
 		}
 		if errors.Is(err, metastore.ErrCollected) {
 			// GC deleted, or is deleting, an object this try found
@@ -687,10 +696,10 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			// A newer generation was recorded after the early check
 			// (checkGeneration), or that check couldn't read the index.
 			x.refuseStale(eng, survivors, err, "index update", &res)
-			return res, nil, retryUpload, nil
+			return res, nil, retryNone, nil
 		}
 		res.fail(survivors, fmt.Errorf("publish: %w", err))
-		return res, nil, retryUpload, nil
+		return res, nil, retryNone, nil
 	}
 	res.Stored = append(res.Stored, survivors...)
 	res.Bundles = append(res.Bundles, rec.BundleID)
@@ -698,7 +707,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	x.log.Info("export stored", "cacheID", eng.CacheID(), "roots", len(survivors),
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
-	return res, nil, retryUpload, nil
+	return res, nil, retryNone, nil
 }
 
 // maxLoggedRoots bounds the root numbers one "export try roots" or "export
@@ -973,6 +982,12 @@ var errEnginePaused = errors.New(EnginePausedMessage)
 // then refuses its roots (retryCut).
 var errEngineCut = errors.New("the engine cut the export off")
 
+// engineNoExportPrefix starts the engine's error reply to an upload that
+// names no export it holds (engine/remotecache's handleUpload), as when it
+// dropped the export on giving up its remote-cache work.
+// TestEngineCutMessagesMatchEngine pins it to the engine's source.
+const engineNoExportPrefix = "no export "
+
 // replyError is the error of an error reply, nil for any other. An error
 // reply saying the reply was too large is errTooLarge, one that carries
 // EnginePausedMessage is errEnginePaused, and one of a canceled context or
@@ -991,7 +1006,7 @@ func replyError(env protocol.Envelope) error {
 	if strings.Contains(e.Message, EnginePausedMessage) {
 		return errEnginePaused
 	}
-	if strings.Contains(e.Message, context.Canceled.Error()) || strings.HasPrefix(e.Message, "no export ") {
+	if strings.Contains(e.Message, context.Canceled.Error()) || strings.HasPrefix(e.Message, engineNoExportPrefix) {
 		return fmt.Errorf("%w: %s", errEngineCut, e.Message)
 	}
 	return errors.New(e.Message)

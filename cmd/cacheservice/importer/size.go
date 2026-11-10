@@ -42,6 +42,9 @@ const (
 // the message limit is never imported. The export path checks a bundle with
 // this before storing it, and splits an export whose bundle is over.
 func MergeSize(bundle *dagql.ValueBundle, addressBytes int, renewalKey string) (int, error) {
+	// ShareChainLayers encodes each layer of each output's chain to find
+	// those it lists once: accepted as the cost of bounding the merge as it
+	// is sent (see the README, "Known limits, accepted").
 	shared, err := dagql.ShareChainLayers(*bundle)
 	if err != nil {
 		return 0, err

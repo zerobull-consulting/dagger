@@ -1045,3 +1045,23 @@ func TestTrackerPausedRootsAreLeftByFlushAndDrain(t *testing.T) {
 		t.Fatalf("due after the open: %v, want [1]", got)
 	}
 }
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): the engine
+// lists in a settle every ended session no Settled has covered, however
+// long ago it ended, and the tracker remembers a session it stopped
+// tracking only for seenSessionRetention (and not across a restart of the
+// service). A session listed after that counts as never seen, so a settle
+// waits its marker wait (5s of the engine's 20s) for spans that came long
+// ago. Closing it means remembering sessions until a Settled covers them.
+func TestKnownGapUnseenSessionsForgetsLongEndedSessions(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 1, t0)
+	if got := tr.UnseenSessions("c", []string{"s1"}); got != 0 {
+		t.Fatalf("just ended: %d unseen, want 0", got)
+	}
+	tr.Due(t0.Add(seenSessionRetention))
+	if got := tr.UnseenSessions("c", []string{"s1"}); got != 1 {
+		t.Fatalf("after the retention: %d unseen, want 1: the gap is closed, update the README", got)
+	}
+}

@@ -63,6 +63,11 @@ type fakeEngine struct {
 	paused     bool
 	// requests counts the requests received, by type.
 	requests map[protocol.Type]int
+	// hangUploads leaves every upload that asks for blobs unanswered.
+	hangUploads bool
+	// tooLargeAfter, when set, answers the export request after that many
+	// with TooLargeMessage, once.
+	tooLargeAfter int
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -89,7 +94,14 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 		}
 	}
 	paused := e.paused
+	tooLarge := typ == protocol.TypeExport && e.tooLargeAfter > 0 && e.requests[typ] == e.tooLargeAfter+1
+	if tooLarge {
+		e.tooLargeAfter = 0
+	}
 	e.mu.Unlock()
+	if tooLarge {
+		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: protocol.TooLargeMessage})
+	}
 	if replyErr != "" {
 		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: replyErr})
 	}
@@ -150,13 +162,17 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 			e.inFlight--
 		}
 		e.uploads = append(e.uploads, req.URLs)
-		onUpload, cut := e.onUpload, e.cutUploads
+		onUpload, cut, hang := e.onUpload, e.cutUploads, e.hangUploads
 		if cut != "" && e.pauseAfter {
 			e.paused = true
 		}
 		e.mu.Unlock()
 		if onUpload != nil && len(req.URLs) > 0 {
 			onUpload()
+		}
+		if hang && len(req.URLs) > 0 {
+			<-ctx.Done()
+			return protocol.Envelope{}, ctx.Err()
 		}
 		if !ok {
 			return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: "no export " + req.ExportID})
@@ -1188,5 +1204,187 @@ func TestEnginePausedMessageMatchesEngine(t *testing.T) {
 	if string(m[1]) != EnginePausedMessage {
 		t.Fatalf("the engine refuses roots with %q once it has given up its remote-cache work, and EnginePausedMessage is %q: "+
 			"the service would settle those roots as refused for good", m[1], EnginePausedMessage)
+	}
+}
+
+// The texts replyError takes for an export the engine cut off are the
+// engine's own, which it doesn't export: a reworded one would make a pause
+// that cuts an export count as its roots' failure again, with every other
+// test still passing.
+func TestEngineCutMessagesMatchEngine(t *testing.T) {
+	src, err := os.ReadFile("../../../engine/remotecache/session.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`replyError\(env, fmt\.Errorf\("([^"%]*)%q", req\.ExportID\)\)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("engine/remotecache/session.go's handleUpload no longer answers an upload that names no export with fmt.Errorf of a literal and the export's ID: " +
+			"find its reply, and update engineNoExportPrefix and this test")
+	}
+	if string(m[1]) != engineNoExportPrefix {
+		t.Fatalf("the engine answers an upload that names no export with %q, and engineNoExportPrefix is %q", m[1], engineNoExportPrefix)
+	}
+	// The other text is the standard library's, which the engine's capture
+	// and uploads end with when their context is canceled.
+	if err := replyError(mustError(t, "upload: "+context.Canceled.Error())); !errors.Is(err, errEngineCut) {
+		t.Fatalf("a canceled context's error reply is %v, want errEngineCut", err)
+	}
+	if err := replyError(mustError(t, fmt.Sprintf(engineNoExportPrefix+"%q", "x-1"))); !errors.Is(err, errEngineCut) {
+		t.Fatalf("the engine's no-export reply is %v, want errEngineCut", err)
+	}
+}
+
+func mustError(t *testing.T, message string) protocol.Envelope {
+	t.Helper()
+	env, err := protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: message})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// heldFirst makes the engine's first bundle carry a held row, as after a
+// merge of the service's landed on it.
+func heldFirst(e *testEnv, then func()) {
+	first := true
+	e.eng.mangle = func(c *fakeengine.Capture) {
+		if !first {
+			return
+		}
+		first = false
+		c.Bundle.Values[0].Held = digest.FromString("held")
+		if then != nil {
+			then()
+		}
+	}
+}
+
+// A release that fails made the engine forget nothing, so asking again
+// would get the same held rows: the roots fail, and nothing is asked again.
+func TestExportHeldRowsReleaseFails(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	heldFirst(e, func() {
+		e.eng.mu.Lock()
+		e.eng.errOnce = map[protocol.Type]string{protocol.TypeUpload: "boom"}
+		e.eng.mu.Unlock()
+	})
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failed) != 2 || !strings.Contains(res.Failed[0].Error, "release of a bundle with held rows") || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if got := e.eng.requests[protocol.TypeExport]; got != 1 {
+		t.Fatalf("%d export requests, want 1: the export was asked again after its release failed", got)
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): an upload
+// the engine never answers holds its export, and with it the cache's export
+// slot, until UploadTimeout (an hour by default). An engine that gives up
+// its remote-cache work at the instant the upload reaches it can drop it so
+// (engine/remotecache's handleUpload hands it to an export that is already
+// ending). Nothing ends the wait sooner: the service can't tell such an
+// upload from a slow one. Closing it needs the engine to answer every
+// upload it takes.
+func TestKnownGapUnansweredUploadHoldsExportUntilUploadTimeout(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	e := newTestEnv(t, func(c *Config) { c.UploadTimeout = timeout })
+	e.addBuild()
+	e.eng.hangUploads = true
+	start := time.Now()
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if took := time.Since(start); took < timeout {
+		t.Fatalf("the export ended after %s, before UploadTimeout: the gap is closed, update the README", took)
+	}
+	if err == nil || len(res.Stored) != 0 {
+		t.Fatalf("an export whose upload got no answer: %+v, %v; want an error", res, err)
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): an export
+// whose first try came back with held rows keeps that try's skipped roots,
+// and when the next try, with the rows in full, is too large, the split
+// asks for the first try's roots again. A root both tries skipped is
+// settled twice: here busy twice, which the tracker's Done counts as two
+// busy answers, so its backoff doubles once more than it should. Nothing is
+// stored wrong. Closing it means splitting only the roots still unsettled.
+func TestKnownGapSplitAfterHeldRowsSettlesRootTwice(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.cache.Add(fakeengine.Entry{Number: 20, Busy: true})
+	heldFirst(e, func() {
+		e.eng.mu.Lock()
+		// The upload that releases the held bundle is answered; the export
+		// after it is too large.
+		e.eng.errOnce = map[protocol.Type]string{}
+		e.eng.tooLargeAfter = e.eng.requests[protocol.TypeExport]
+		e.eng.mu.Unlock()
+	})
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11, 20}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{10, 11}) {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if len(res.Busy) != 2 || res.Busy[0].Number != 20 || res.Busy[1].Number != 20 {
+		t.Fatalf("root 20 is busy %d times in the result, want 2: the gap is closed, update the README", len(res.Busy))
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): the bound
+// on a bundle (MaxMergeBytes) is on its merge as sent, which lists each
+// layer once, but a bundle is stored with every output's chain in full, so
+// that it stands on its own. Outputs that build on each other, as a
+// Dockerfile's steps do, make the stored bundle larger than its merge by
+// about half the chain's depth, and no bound holds it: every engine's
+// import path reads and keeps it. Closing it means storing the bundle with
+// its layers listed once, or bounding the stored size too.
+func TestKnownGapStoredBundleLargerThanItsMerge(t *testing.T) {
+	const depth = 60
+	e := newTestEnv(t, nil)
+	e.cache.ChainPrefixes = true
+	var layers [][]byte
+	var roots []uint64
+	for i := range depth {
+		n := uint64(100 + i)
+		layers = append(layers, layer(fmt.Sprintf("step-%d", i)))
+		entry := fakeengine.Entry{Number: n, Layers: slices.Clone(layers)}
+		if i > 0 {
+			entry.Deps = []uint64{n - 1}
+		}
+		e.cache.Add(entry)
+		roots = append(roots, n)
+	}
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: roots[depth-1:], Outputs: fsOutputs(roots...)})
+	if err != nil || len(res.Bundles) != 1 {
+		t.Fatalf("export: %+v, %v", res, err)
+	}
+	stored, err := e.meta.GetBundle(ctx, "team", res.Bundles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merge, err := importer.MergeSize(stored, e.x.addressSize(ctx), "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := 0
+	for _, o := range stored.Outputs {
+		listed += len(o.Chain.Layers)
+	}
+	t.Logf("%d outputs on a chain %d deep: the stored bundle lists %d layers in %d bytes; its merge is bounded at %d bytes", len(stored.Outputs), depth, listed, len(data), merge)
+	if listed != depth*(depth+1)/2 {
+		t.Fatalf("the stored bundle lists %d layers, want every chain in full (%d)", listed, depth*(depth+1)/2)
+	}
+	if len(data) <= merge {
+		t.Fatalf("the stored bundle is %d bytes, within its merge's %d: the gap is closed, update the README", len(data), merge)
 	}
 }

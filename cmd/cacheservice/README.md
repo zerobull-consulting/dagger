@@ -193,7 +193,9 @@ bundle is merged whole into any engine, so the service stores neither
   whole merge as stale. So the exporter releases an export with held rows,
   with an `upload` that doesn't say `merged`, which makes the engine forget
   that the service holds them, and asks for the same roots again at once:
-  that bundle carries them in full. A held row stands for everything below
+  that bundle carries them in full (a release that fails ends the export
+  instead, as a failure of its roots: the engine forgot nothing, and would
+  send the same held rows again). A held row stands for everything below
   it in an export that selects no parts, so such an export takes one try
   per level of merged rows under its roots (at most 256); a try is one
   round trip and uploads nothing. The rows the engine imported still keep
@@ -263,6 +265,39 @@ the index names a bundle only once all its blobs are stored, and the blobs
 a cut upload did store are either named by a later export or deleted by GC
 as any unreferenced blob.
 Sessions that overlap keep the engine from asking to settle at all.
+
+**Known limits, accepted.** Each is pinned by a test that fails when the
+behavior changes, so that this list is then updated
+([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)):
+
+- **A stored bundle can be much larger than its merge.** The bound on a
+  bundle (the 64 MiB message limit, by `importer.MergeSize`) is on
+  the merge as sent, which lists each layer once. The bundle is stored with
+  every output's chain in full, so that it stands on its own: outputs that
+  build on each other make it larger by about half the chain's depth (9
+  times for 60 outputs on a chain 60 deep), and every engine's import path
+  reads and keeps it. Earlier engines sent every chain in full, so the
+  message limit bounded the stored bundle too; a closure whose full form
+  is over it was split then, and is stored whole now
+  (`TestKnownGapStoredBundleLargerThanItsMerge`).
+- **An upload the engine never answers holds its cache's exports for
+  `UploadTimeout`** (1h). An engine that gives up its remote-cache work at
+  the instant an upload reaches it can drop it without a reply. Until the
+  timeout, or the engine's connection ends, nothing else of that cache is
+  exported, and a drain waits for it up to its deadline
+  (`TestKnownGapUnansweredUploadHoldsExportUntilUploadTimeout`).
+- **A settle can wait 5s for a session whose spans came long ago.** The
+  engine lists every ended session no `settled` has covered; the service
+  remembers one it is done with for 2m, and not across its own restart
+  (`TestKnownGapUnseenSessionsForgetsLongEndedSessions`).
+- **A root can be settled twice by one export**, when a try with held rows
+  is followed by one too large for a message: the split asks again for
+  the roots the first try had already skipped. A busy root then backs off
+  one step further than it should; nothing is stored wrong
+  (`TestKnownGapSplitAfterHeldRowsSettlesRootTwice`).
+- **Sizing a merge encodes each output's layers**, to find those it lists
+  once (`dagql.ShareChainLayers`), on every try of an export. It is paid
+  per export, not per merge, and hasn't been measured as a cost.
 
 **The engine downloads what it is offered at once.** An offered part's
 blobs are fetched when the merge offers it, ahead of any read, so the blob
