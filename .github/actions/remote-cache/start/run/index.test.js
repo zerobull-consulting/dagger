@@ -2,7 +2,7 @@
 // Tests of the shim against a fake sidecar.sh: node --test <this directory>
 const test = require('node:test');
 const assert = require('node:assert');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -108,25 +108,78 @@ test('the post step stops a sidecar whose state is not where the shim looks', (t
   assert.ok(/^stop /m.test(log()), log());
 });
 
-// zerobull-consulting/dagger#174, lead 3: a run past its bound is killed with
-// SIGKILL, which reaches only bash; the processes it spawned (docker, timeout,
-// a pull) go on. Pinned as it is today. A fix (a session of its own, killed by
-// group) changes what a cancelled job does, which no run here shows yet.
-test('known gap: a run past its bound leaves the processes it spawned running', (t) => {
+// The state of a process: its /proc status letter, or 'gone'. A zombie (Z) is
+// dead, waiting for its new parent to reap it.
+function procState(pid) {
+  try {
+    return /^State:\s*(\S)/m.exec(fs.readFileSync(`/proc/${pid}/status`, 'utf8'))[1];
+  } catch (_) {
+    return 'gone';
+  }
+}
+const dead = (pid) => ['gone', 'Z', 'X'].includes(procState(pid));
+
+// Waits, at most ms, for cond(); returns its last value.
+async function waitFor(cond, ms) {
+  const end = Date.now() + ms;
+  while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  return cond();
+}
+
+// zerobull-consulting/dagger#174, lead 3, and zerobull-consulting/dagger#209:
+// a run past its bound used to SIGKILL only bash, and the processes it spawned
+// (docker, timeout, a pull) went on. The bound kills the script's whole
+// process group now: a background job, and its own child, die with it.
+test('a run past its bound leaves nothing it spawned running', async (t) => {
   const { dir, env } = setup(t);
-  const pidFile = path.join(dir, 'child.pid');
-  fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\nsleep 300 &\necho $! >"$CHILD_PID"\nwait\n', { mode: 0o755 });
-  const code = require(shim).run('stop', { ...env, CHILD_PID: pidFile }, 3000);
+  const pids = path.join(dir, 'pids');
+  fs.writeFileSync(
+    env.SIDECAR_SCRIPT,
+    '#!/usr/bin/env bash\nsleep 300 &\necho $! >>"$PIDS"\nbash -c \'sleep 300 & echo $! >>"$PIDS"; wait\' &\necho $! >>"$PIDS"\nwait\n',
+    { mode: 0o755 },
+  );
+  const read = () => (fs.existsSync(pids) ? fs.readFileSync(pids, 'utf8').trim().split('\n').filter(Boolean).map(Number) : []);
+  // Read here, not in the hook: setup's own hook, which runs first, removes dir.
+  let spawned = [];
+  t.after(() => {
+    for (const pid of spawned) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch (_) {}
+    }
+  });
+  const started = Date.now();
+  const code = await require(shim).run('stop', { ...env, PIDS: pids }, 1500);
   assert.strictEqual(code, 1);
-  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-  let state = 'gone';
-  try {
-    state = /^State:\s*(\S)/m.exec(fs.readFileSync(`/proc/${pid}/status`, 'utf8'))[1];
-  } catch (_) {}
-  try {
-    process.kill(pid, 'SIGKILL');
-  } catch (_) {}
-  assert.ok(state !== 'gone' && state !== 'Z', `the spawned sleep ${pid} was ${state}: the gap is closed, so turn this into a test of the fix`);
+  assert.ok(Date.now() - started < 10000, 'the run was not cut off at its bound');
+  spawned = read();
+  assert.strictEqual(spawned.length, 3, `the script did not get to spawn everything: ${spawned}`);
+  await waitFor(() => spawned.every(dead), 3000);
+  for (const pid of spawned) assert.ok(dead(pid), `${pid} the script spawned is still running (${procState(pid)})`);
+});
+
+// The script is in a process group of its own, so a cancel's signal to the
+// shim reaches it only because the shim passes it on.
+test('a SIGTERM to the shim reaches the script, and the step fails', async (t) => {
+  const { dir, env } = setup(t);
+  const ready = path.join(dir, 'ready');
+  const got = path.join(dir, 'got');
+  fs.writeFileSync(
+    env.SIDECAR_SCRIPT,
+    '#!/usr/bin/env bash\ntrap \'echo TERM >"$GOT"; exit 143\' TERM\ntouch "$READY"\nfor i in $(seq 300); do sleep 0.1; done\n',
+    { mode: 0o755 },
+  );
+  const child = spawn('node', [shim], { env: { ...env, READY: ready, GOT: got }, stdio: 'ignore' });
+  const exited = new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
+  t.after(() => child.kill('SIGKILL'));
+  assert.ok(await waitFor(() => fs.existsSync(ready), 10000), 'the script never started');
+  child.kill('SIGTERM');
+  const result = await Promise.race([exited, new Promise((r) => setTimeout(() => r('timeout'), 10000))]);
+  assert.notStrictEqual(result, 'timeout', 'the shim did not exit after SIGTERM');
+  assert.ok(fs.existsSync(got), 'the script never got the SIGTERM');
+  assert.strictEqual(fs.readFileSync(got, 'utf8').trim(), 'TERM');
+  // The shim outlives the signal to report the script's own exit: 143 fails the step.
+  assert.deepStrictEqual(result, { code: 143, signal: null });
 });
 
 // A start that never had a script to run leaves the post step nothing to stop.
