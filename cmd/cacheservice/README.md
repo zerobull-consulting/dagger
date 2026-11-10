@@ -2837,6 +2837,19 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
   them at its own rate. The scheduler runs the exports, one
   at a time per engine cache: the flush starts none of its own. Other
   caches are scheduled as usual.
+- **It can't wait for spans it hasn't heard of.** A session holds a flush
+  only once the service has seen at least one of its spans. A flush that
+  comes before any span of a session reaches the service doesn't wait for
+  it: with nothing else left, it returns `complete` at once, and the
+  session's spans, arriving after, wait for `-export-settle` as usual
+  (`TestKnownGapFlushDoesNotWaitForUnseenSession`). Closing this needs the
+  engine's OTLP batching to hold back every span of a session until after
+  its client returned, a change to the engine. On a real engine
+  (`TestRealEngines/flush`, in
+  [zerobull-consulting/dagger#157](https://github.com/zerobull-consulting/dagger/pull/157)),
+  the flush right after the CLI returned found and exported all three
+  roots
+  ([zerobull-consulting/dagger#160](https://github.com/zerobull-consulting/dagger/issues/160)).
 - **It isn't a drain.** New engines, sessions and spans are taken as usual.
   An engine still running builds can keep a flush busy until its timeout.
 - **When it returns:** once nothing of the cache is dirty, waiting for

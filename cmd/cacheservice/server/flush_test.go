@@ -342,6 +342,35 @@ func TestFlushWaitsOnExportPathClock(t *testing.T) {
 	}
 }
 
+// Known gap: a flush can't wait for a session it hasn't heard of. A
+// session's spans hold a flush only once the service has seen one of them,
+// so a flush that comes before any span of a session reaches the service
+// finds nothing left, and returns complete at once; the session's spans,
+// arriving after it returned, wait for Settle as usual. Closing it needs the
+// engine to hold back every span of a session until after its client
+// returned (zerobull-consulting/dagger#160).
+func TestKnownGapFlushDoesNotWaitForUnseenSession(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	start := time.Now()
+	rep := h.flush("10s")
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the flush took %s: it waited for a session it hadn't heard of", took)
+	}
+	if rep.Outcome != metrics.FlushComplete || rep.Stored != 0 || rep.Left != (FlushLeft{}) {
+		t.Fatalf("report %+v", rep)
+	}
+	// The session's spans arrive once the flush returned: the flush that
+	// would have waited for them is over, and they wait for Settle.
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+	waitUntil(t, 5*time.Second, "the late session's roots to be tracked", func() bool {
+		return len(h.ns().tracker.Entries(h.cache.ID)) == 2
+	})
+	if indexHas(t, h, 10) || h.cache.Exports() != 0 {
+		t.Fatal("the late session was exported before Settle: the gap is closed, update the README")
+	}
+}
+
 // The timeout passes with an export in flight: the flush returns timeout,
 // with it counted in flight, and the export isn't canceled: it runs on, and
 // stores its roots once released, with no second try.
