@@ -1235,6 +1235,41 @@ func TestOTLPRequestOverTrailerLimit(t *testing.T) {
 	}
 }
 
+// A refused request doesn't hold its headers while its stalled body is
+// drained: net/http reads what it can of an unread body after the handler,
+// up to the read deadline (30s for an OTLP body), and the request, headers
+// included, stays alive meanwhile. Measured: 200 requests refused by the
+// header cap with 40 KiB headers and stalled bodies held 12.7 MB for 30s with
+// nothing reserved. A refusal cuts the wait to otlpRefusalDrain: the answer
+// comes at once, and the connection closes within a couple of seconds.
+func TestOTLPRefusedStalledBodyConnectionClosed(t *testing.T) {
+	svc, _, _ := limitedService(t, 4*testOTLPLimit)
+	conn, err := net.Dial("tcp", headerServer(t, svc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	// The read timeout is 30s: a server that kept draining would outlast this.
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nX-Pad: %s\r\nContent-Length: 100000\r\n\r\nx", strings.Repeat("a", 40<<10))
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	io.Copy(io.Discard, resp.Body)
+	start := time.Now()
+	if _, err := br.ReadByte(); !errors.Is(err, io.EOF) && !isConnReset(err) {
+		t.Fatalf("the connection stayed open after the refusal: %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("closed %s after the answer", took)
+	}
+}
+
 // Known gap, zerobull-consulting/dagger#219: a request refused for its token (401) before decodeOTLP has
 // reserved nothing, not even its headers, though net/http holds them while it
 // reads and discards the body, up to the read timeout. Measured: 200 such

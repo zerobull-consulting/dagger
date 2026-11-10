@@ -83,6 +83,12 @@ const (
 	// holds at least 2,600 such requests.
 	MaxOTLPHeaderReserve = 32 << 10
 
+	// otlpRefusalDrain bounds how long net/http may go on reading what it can
+	// of an unread body after a refusal: it holds the request, headers
+	// included, while it does, up to the read deadline. The refusal closes the
+	// connection anyway, so the wait buys nothing.
+	otlpRefusalDrain = time.Second
+
 	// otlpRetryAfter is the Retry-After of a 503 for a full budget, in
 	// seconds.
 	otlpRetryAfter = 1
@@ -323,6 +329,7 @@ func otlpRefusal(err error) (int, string) {
 // the log; the others at debug level. The metrics count every one.
 func (s *Service) refuseOTLP(w http.ResponseWriter, r *http.Request, route otlpRoute, status int, reason string, err error) {
 	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(otlpRefusalDrain))
 	if status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", strconv.Itoa(otlpRetryAfter))
 	}

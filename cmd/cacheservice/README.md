@@ -1591,7 +1591,12 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     reserves anything (`TestOTLPHeaderReserveCap`). The most one request
     holds while it waits on its body is then its headers' 32 KiB, its 16 KiB
     and its first buffer: about 49 KiB, so the budget holds at least 2,600
-    stalled requests, not the 90 that 1.4 MB each would allow;
+    stalled requests, not the 90 that 1.4 MB each would allow. A refused
+    request's unread body is drained for at most 1s (`otlpRefusalDrain`),
+    not until the 30s read timeout: net/http holds the request, headers
+    included, while it drains, and 200 refused requests with 40 KiB headers
+    and stalled bodies held 12.7 MB for the whole timeout, with nothing
+    reserved (`TestOTLPRefusedStalledBodyConnectionClosed`);
   - a gzipped body's **decompressor**, 64 KiB, before it is built
     (`TestOTLPGzipDecompressorReserved`);
   - the body's **buffer**, doubling from 512 bytes up to the limit as the
