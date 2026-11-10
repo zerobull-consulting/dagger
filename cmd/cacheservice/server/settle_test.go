@@ -127,18 +127,58 @@ func TestSettleStale(t *testing.T) {
 	}
 }
 
-// A settle the engine gave up on, held back by a root it refuses, ends at
-// the service's own bound, with an error reply the engine doesn't take for
-// settled.
+// A settle held back by an export that gets no answer ends at the service's
+// own bound, with an error reply the engine doesn't take for settled.
 func TestSettleGivesUpAtItsBound(t *testing.T) {
 	h, _ := newMemExportHarness(t, nil)
 	h.svc.maxSettleWait.Store(int64(300 * time.Millisecond))
-	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Refused: exporter.EnginePausedMessage})
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	release := h.cache.Hold()
+	defer release()
 	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
 	start := time.Now()
 	err := h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: 0, Sessions: []protocol.SettleSession{{ID: "session-1", Marker: true}}})
 	if !errors.Is(err, errSettleTimeout) {
 		t.Fatalf("settle: %v after %s, want its timeout", err, time.Since(start))
+	}
+}
+
+// A root whose next try is due past the settle's retry wait doesn't hold the
+// settle back: an engine that hears no settled gives up, and then refuses
+// that try and every other export. One due within it is waited for.
+func TestSettleDoesNotWaitForLateRetries(t *testing.T) {
+	h, _ := newMemExportHarness(t, func(c *ExportConfig) { c.Tracker.BusyBackoff = time.Hour })
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Busy: true})
+	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
+	waitUntil(t, 10*time.Second, "the busy root to wait out its backoff", func() bool {
+		return h.ns().tracker.FlushStatus(h.cache.ID, time.Now(), time.Now().Add(time.Minute)).Later == 1
+	})
+	start := time.Now()
+	if err := h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: 0}); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the settle took %s: it waited for a retry due in an hour", took)
+	}
+	// The same retry, within the wait, holds it.
+	h.svc.settleRetryWait.Store(int64(2 * time.Hour))
+	h.svc.maxSettleWait.Store(int64(300 * time.Millisecond))
+	if err := h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: 0}); !errors.Is(err, errSettleTimeout) {
+		t.Fatalf("settle with the retry due inside its wait: %v, want its timeout", err)
+	}
+}
+
+// Roots the engine refused as paused don't hold a settle back either: the
+// engine has given up on it.
+func TestSettleDoesNotWaitForPausedRoots(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Refused: exporter.EnginePausedMessage})
+	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
+	waitUntil(t, 10*time.Second, "the root to be paused", func() bool {
+		return h.ns().tracker.FlushStatus(h.cache.ID, time.Now(), time.Time{}).Paused == 1
+	})
+	if err := h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: 0}); err != nil {
+		t.Fatalf("settle: %v", err)
 	}
 }
 
@@ -260,5 +300,8 @@ func TestNewServiceSettleBounds(t *testing.T) {
 	}
 	if got := time.Duration(svc.maxSettleWait.Load()); got != MaxSettleWait {
 		t.Fatalf("settle bound %s, want %s", got, MaxSettleWait)
+	}
+	if got := time.Duration(svc.settleRetryWait.Load()); got != DefaultSettleRetryWait {
+		t.Fatalf("retry wait %s, want %s", got, DefaultSettleRetryWait)
 	}
 }

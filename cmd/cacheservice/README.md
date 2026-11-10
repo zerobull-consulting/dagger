@@ -228,7 +228,7 @@ the prefix (`cacheservice wipe`) or use a new one.
 | --- | --- | --- |
 | `open` | `opened` | A session started on an engine with none live, which begins a new idle period. The roots the engine refused while it had given up (below) are due at once. |
 | `claims` | `claimed` | Nothing: the Dagger Cloud claim of each session, which this service has no use for. |
-| `settle` | `settled`, or the error `stale settle` | No session is live, and the engine asks the service to finish what it wants of it. The service answers once it has nothing left to export for the engine's cache: no root dirty, in flight or waiting for another try, and no session whose spans may still come. A listed session whose engine sent its completion marker, and of which no span reached the service yet, is waited for up to 5s (`DefaultSettleMarkerWait`): spans reach the service through the session's client, so the settle can come first. A settle for a period that is no longer the connection's is stale, and one not settled within 2m (`MaxSettleWait`, far past the engine's own 20s) gets an error. With the export path off, it answers at once. |
+| `settle` | `settled`, or the error `stale settle` | No session is live, and the engine asks the service to finish what it wants of it. The service answers once it has nothing left to export for the engine's cache now: no root dirty, in flight, or waiting for another try due within 10s of the settle (`DefaultSettleRetryWait`), and no session whose spans may still come. A root whose try is due later, as after several busy answers, isn't waited for: an engine that hears no `settled` gives up and then refuses that try and every other export, while one that settled still takes the try when it comes due. Nor is a root the engine already refused as paused. A listed session whose engine sent its completion marker, and of which no span reached the service yet, is waited for up to 5s (`DefaultSettleMarkerWait`): spans reach the service through the session's client, so the settle can come first. A settle for a period that is no longer the connection's is stale, and one not settled within 2m (`MaxSettleWait`, far past the engine's own 20s) gets an error. With the export path off, it answers at once. |
 | `lookup` | `lookedUp`, every miss `unknown` | Nothing: the calls the engine's cache missed. This service keeps no index of its values by call, and merges every stored root into every engine anyway (see [Import path](#import-path)), so it looks nothing up and sends no merge for a lookup. |
 
 **An engine that isn't answered gives up.** 20s after its last session
@@ -247,6 +247,21 @@ next export uploads only the rest. The engine doesn't always say why it
 cut an export off (one waiting for its upload is dropped without a word),
 so the exporter asks once more for an export that ended so: a paused
 engine then refuses its roots, and any other goes on.
+
+**What a paused engine holds is left, and may be lost.** Only a new session
+on the engine ends its pause; nothing the service does can. So a flush or a
+drain neither waits for the paused roots nor asks for them again: it
+finishes at once what it can, counts them apart (`paused`, in the flush's
+and the drain's reports, and `export_roots_total{result="paused"}`), and
+ends. They aren't a failure of the flush or the drain. Where the engine
+doesn't outlive its job, as with the
+[sidecar](../../.github/actions/remote-cache/README.md), there is no next
+session: **what the engine hadn't finished exporting about 20s after the
+job's last `dagger` call is not stored by that job**, and a later job that
+builds the same values exports them. The store is left whole either way:
+the index names a bundle only once all its blobs are stored, and the blobs
+a cut upload did store are either named by a later export or deleted by GC
+as any unreferenced blob.
 Sessions that overlap keep the engine from asking to settle at all.
 
 **The engine downloads what it is offered at once.** An offered part's
@@ -2921,7 +2936,16 @@ the first call's context cancels a drain.
    ended with some of its counted spans missing is waited for (`sessions`)
    until they are in, or `-export-settle` (at most 2s) passed with none of them. Roots
    waiting for another try (busy, failed, interrupted, or waiting for their
-   engine) are due at once too. The drain runs those exports, one at a time
+   engine to connect) are due at once too. Roots an engine refused because
+   it has given up its remote-cache work until its next session
+   (`paused`, see
+   [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)) are neither
+   waited for nor asked for again: one found so during the drain is asked
+   for once. They are reported apart from what the drain left unexported
+   (`pausedRoots` in `drain: done`, a `drain: left for an engine that gave
+   up its remote-cache work` line per cache, and `paused` in
+   `GET /debug/drain`), and a drain that left only those is `complete`. The
+   drain runs those exports, one at a time
    per engine cache as the scheduler does, and waits for them, their uploads,
    verification and index writes included.
 3. **It starts nothing past its deadline.** Each pass checks the deadline,
@@ -3057,7 +3081,10 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
 - **It isn't a drain.** New engines, sessions and spans are taken as usual.
   An engine still running builds can keep a flush busy until its timeout.
 - **When it returns:** once nothing of the cache is dirty, waiting for
-  spans, in flight or due for a retry before the timeout (`complete`); once
+  spans, in flight or due for a retry before the timeout (`complete`, or
+  `paused` when roots are left that the engine refuses because it has given
+  up its remote-cache work until its next session: the flush tries a dirty
+  root once, and neither waits for a paused one nor asks for it again); once
   the timeout passes, or only retries due after it are left (`timeout`; such
   a retry isn't waited for, and is counted `later`); at once, with what is
   left, when the cache's engine isn't connected or disconnects
@@ -3085,14 +3112,16 @@ only for auth, bad requests and refusals. The report:
 }
 ```
 
-- `outcome`: `complete` (nothing left), `timeout`, `not_connected` or
-  `canceled`.
+- `outcome`: `complete` (nothing left), `paused` (only roots of a paused
+  engine left), `timeout`, `not_connected` or `canceled`.
 - `stored`: the roots stored by exports of the cache that ended during the
   flush.
 - `left`, as the drain counts them: `dirty` (worth exporting, not in flight
   or waiting for a retry), `waitingSpans` (sessions still waited
   for), `inFlight`, `retrying` (a retry due before the timeout), `later` (a
-  retry due after it).
+  retry due after it), and `paused` (roots the engine refuses until its next
+  session; left out when 0, and not among the roots `flush: done` and
+  `flush_unexported_roots_total` count as left).
 
 Each flush logs one `flush: done` line, with the outcome and these counts,
 and is counted in `flush_total{outcome}`, `flush_duration_seconds` and
@@ -3307,7 +3336,7 @@ paths record into them through their metadata store. All are prefixed
 | `import_sync_duration_seconds` | | Time per import sync |
 | `export_batches_total` | `scope`, `outcome` | Export batches: `ok`, `error` or `interrupted` |
 | `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
-| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
+| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused`, `failed` or `paused` (refused by an engine that gave up its remote-cache work until its next session) |
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
 | `export_roots_waiting` | `scope` | Roots due for export and waiting, as the scheduler last saw them: for their engine cache's export in flight to end, or for the next batch |
@@ -3333,7 +3362,7 @@ paths record into them through their metadata store. All are prefixed
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
-| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `paused`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
 | `flush_duration_seconds` | | Time of each flush |
 | `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry. Each flush adds what it left, so overlapping flushes of one cache each count the same roots: a count per flush, not of the roots lost |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |

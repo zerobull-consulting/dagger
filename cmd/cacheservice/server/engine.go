@@ -109,6 +109,9 @@ type Service struct {
 	settleMarkerWait atomic.Int64
 	// maxSettleWait is MaxSettleWait, in nanoseconds; tests change it.
 	maxSettleWait atomic.Int64
+	// settleRetryWait is DefaultSettleRetryWait, in nanoseconds; tests
+	// change it.
+	settleRetryWait atomic.Int64
 
 	// otlp bounds the OTLP bodies (otlplimit.go); otlpRefusals rate-limits
 	// the warnings of the requests it refuses, by route and reason.
@@ -147,6 +150,7 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 	}
 	s.settleMarkerWait.Store(int64(DefaultSettleMarkerWait))
 	s.maxSettleWait.Store(int64(MaxSettleWait))
+	s.settleRetryWait.Store(int64(DefaultSettleRetryWait))
 	return s
 }
 

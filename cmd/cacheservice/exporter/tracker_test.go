@@ -1016,3 +1016,32 @@ func TestTrackerUnseenSessions(t *testing.T) {
 		t.Fatalf("after the retention: %d unseen, want 2", got)
 	}
 }
+
+// A root its engine refused as paused is counted apart (DrainState.Paused):
+// a flush doesn't make it due, a drain neither makes it due nor lets its
+// own wait do so, and the engine's open still does.
+func TestTrackerPausedRootsAreLeftByFlushAndDrain(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Paused: []uint64{1}}, t0)
+	if st := tr.FlushStatus("c", t0, t0.Add(time.Hour)); st.Paused != 1 || st.Roots() != 0 {
+		t.Fatalf("status %+v, want one paused root and none other", st)
+	}
+	end := tr.StartFlush("c", t0)
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("a flush made a paused root due: %v", got)
+	}
+	end()
+	tr.StartDrain(t0.Add(time.Second))
+	if got := roots(tr.DrainDue(t0.Add(2 * DefaultPausedWait))); len(got) != 0 {
+		t.Fatalf("a drain made a paused root due: %v", got)
+	}
+	if st := tr.DrainStatus(t0.Add(2*DefaultPausedWait), time.Time{}); len(st) != 1 || st[0].Paused != 1 || st[0].Roots() != 0 {
+		t.Fatalf("drain status %+v, want one paused root", st)
+	}
+	tr.Opened("c", 1, t0.Add(3*DefaultPausedWait))
+	if got := roots(tr.DrainDue(t0.Add(3 * DefaultPausedWait))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after the open: %v, want [1]", got)
+	}
+}

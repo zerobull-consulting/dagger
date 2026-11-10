@@ -253,7 +253,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		exportRoots: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_roots_total",
-			Help: "Roots of export batches, by result: stored, gone, busy, refused or failed.",
+			Help: "Roots of export batches, by result: stored, gone, busy, refused, failed or paused (refused by an engine that gave up its remote-cache work until its next session).",
 		}, []string{"result"}),
 		exportBlobs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_blobs_total",
@@ -372,7 +372,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"kind"}),
 		flushes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "flush_total",
-			Help: "Flushes of one engine cache (POST /v1/engines/{cacheID}/flush), by outcome: complete (nothing left), timeout (something left when its timeout passed, or only retries due after it), not_connected (its engine wasn't connected) or canceled (the request or the export path ended).",
+			Help: "Flushes of one engine cache (POST /v1/engines/{cacheID}/flush), by outcome: complete (nothing left), timeout (something left when its timeout passed, or only retries due after it), not_connected (its engine wasn't connected), paused (only roots its engine refuses until its next session were left) or canceled (the request or the export path ended).",
 		}, []string{"outcome"}),
 		flushDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: ns, Name: "flush_duration_seconds",
@@ -583,6 +583,9 @@ type ExportBatch struct {
 	// Roots is how many roots the batch asked for.
 	Roots                               int
 	Stored, Gone, Busy, Refused, Failed int
+	// Paused are the roots the engine refused because it has given up its
+	// remote-cache work until its next session.
+	Paused int
 	// Uploaded and Present are blobs stored (uploaded and verified, or
 	// already there), Rejected uploads that failed verification.
 	Uploaded, Present, Rejected int
@@ -603,6 +606,7 @@ func (m *Metrics) ExportBatch(b ExportBatch) {
 	m.exportBatchRoots.Observe(float64(b.Roots))
 	for result, n := range map[string]int{
 		"stored": b.Stored, "gone": b.Gone, "busy": b.Busy, "refused": b.Refused, "failed": b.Failed,
+		"paused": b.Paused,
 	} {
 		if n > 0 {
 			m.exportRoots.WithLabelValues(result).Add(float64(n))
@@ -855,6 +859,9 @@ const (
 	FlushTimeout = "timeout"
 	// FlushNotConnected found its cache's engine not connected.
 	FlushNotConnected = "not_connected"
+	// FlushPaused left only roots its cache's engine refuses because it
+	// has given up its remote-cache work until its next session.
+	FlushPaused = "paused"
 	// FlushCanceled ended because its request was canceled, or the export
 	// path stopped.
 	FlushCanceled = "canceled"

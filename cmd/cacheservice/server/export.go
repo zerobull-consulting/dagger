@@ -277,6 +277,7 @@ func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.B
 		Busy:     len(res.Busy),
 		Refused:  len(res.Refused),
 		Failed:   len(res.Failed),
+		Paused:   len(res.Paused),
 		Uploaded: len(res.Uploaded),
 		Present:  len(res.Present),
 		Rejected: len(res.Rejected),

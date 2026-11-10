@@ -102,11 +102,24 @@ type DrainReport struct {
 	Explicit int `json:"explicit,omitempty"`
 }
 
-// LeftRoots is how many roots were left unexported.
+// LeftRoots is how many roots were left unexported that the service could
+// still have exported: not those of a paused engine (PausedRoots).
 func (r DrainReport) LeftRoots() int {
 	n := 0
 	for _, l := range r.Left {
 		n += l.Roots()
+	}
+	return n
+}
+
+// PausedRoots is how many roots were left because their engine refuses
+// them: it has given up its remote-cache work until its next session, so
+// the drain neither waited for them nor tried them again
+// (exporter.DrainState.Paused).
+func (r DrainReport) PausedRoots() int {
+	n := 0
+	for _, l := range r.Left {
+		n += l.Paused
 	}
 	return n
 }
@@ -529,6 +542,11 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		s.logger.Info("drain: stored", "namespace", st.Namespace, "cacheID", st.CacheID, "roots", st.Roots)
 	}
 	for _, l := range left {
+		if l.Paused > 0 {
+			// Not a failure of the drain: nothing it could do stores them.
+			s.logger.Info("drain: left for an engine that gave up its remote-cache work", "namespace", l.Namespace, "cacheID", l.CacheID,
+				"roots", l.Paused, "connected", l.Connected)
+		}
 		if l.Roots() == 0 {
 			continue
 		}
@@ -540,7 +558,7 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		level = s.logger.Warn
 	}
 	level("drain: done", "outcome", outcome, "took", took.Round(time.Millisecond),
-		"storedRoots", rep.StoredRoots(), "leftRoots", rep.LeftRoots(),
+		"storedRoots", rep.StoredRoots(), "leftRoots", rep.LeftRoots(), "pausedRoots", rep.PausedRoots(),
 		"refusedConnections", rep.Refused[metrics.DrainRefusedConnection], "refusedSpans", rep.Refused[metrics.DrainRefusedSpan],
 		"engines", rep.Engines, "explicitLeft", rep.Explicit)
 	return rep

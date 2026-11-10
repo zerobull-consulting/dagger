@@ -200,8 +200,12 @@ type trackedEntry struct {
 	// connect (Requeue, Interrupted), not for a backoff: Connected makes it
 	// due. Every other write of retryAt clears it.
 	engineWaitAt time.Time
-	busy         int
-	failures     int
+	// paused is set while the wait is for an engine that refused the root
+	// because it has given up its remote-cache work (Result.Paused); see
+	// isPaused.
+	paused   bool
+	busy     int
+	failures int
 	// failedValue is the value failures counts for.
 	failedValue *exportedValue
 	// flushRetry is where the entry is in a flush's retry of a failed
@@ -225,6 +229,14 @@ type trackedEntry struct {
 	// engine last answered busy for it: zero unless retryAt is a busy wait.
 	changedAt time.Time
 	busyAt    time.Time
+}
+
+// isPaused reports whether the entry waits for an engine that has given up
+// its remote-cache work until its next session: only the engine's open or
+// a new connection ends that, so a drain or a flush neither waits for the
+// entry nor tries it (DrainState.Paused).
+func (e *trackedEntry) isPaused() bool {
+	return e.paused && !e.engineWaitAt.IsZero()
 }
 
 // flushRetry is how a flush's retry of a failed root stands. A flush cuts
@@ -703,7 +715,9 @@ func (t *Tracker) wakeEngineWaitLocked(c *trackedCache, now time.Time) {
 	c.engineWakes++
 	woke := false
 	for _, e := range c.entries {
-		if !e.engineWaitAt.IsZero() && e.retryAt.After(now) {
+		// A paused entry's own wait may have passed with a drain leaving
+		// it be: it is due now all the same.
+		if !e.engineWaitAt.IsZero() && (e.retryAt.After(now) || e.paused) {
 			e.retryAt, e.engineWaitAt = now, time.Time{}
 			woke = true
 		}
@@ -857,6 +871,12 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 				}
 				continue
 			}
+			if t.draining && e.isPaused() {
+				// A drain asks a paused engine nothing more: its answer
+				// is known, and only its open or a new connection, which
+				// make the entry due, change it.
+				continue
+			}
 			at, ok := t.dueAtLocked(e, now, urgent)
 			if !ok {
 				// Worth exporting with nothing scheduled: treated as
@@ -968,7 +988,7 @@ func (t *Tracker) claimLocked(e *trackedEntry) {
 	} else {
 		e.flushRetry = flushRetryNone
 	}
-	e.retryAt, e.engineWaitAt, e.recheck = time.Time{}, time.Time{}, false
+	e.retryAt, e.engineWaitAt, e.recheck, e.paused = time.Time{}, time.Time{}, false, false
 	e.dirtySince, e.accel, e.busyAt = time.Time{}, false, time.Time{}
 }
 
@@ -1119,7 +1139,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 				e.retryAt, e.engineWaitAt = now, time.Time{}
 			} else {
 				at := now.Add(t.cfg.PausedWait)
-				e.retryAt, e.engineWaitAt = at, at
+				e.retryAt, e.engineWaitAt, e.paused = at, at, true
 			}
 			e.flushRetry = givenBack(e.flushRetry)
 		}
@@ -1343,7 +1363,7 @@ func (t *Tracker) StartDrain(now time.Time) {
 	t.draining = true
 	for _, c := range t.caches {
 		for _, e := range c.entries {
-			if !e.inFlight && e.retryAt.After(now) {
+			if !e.inFlight && e.retryAt.After(now) && !e.isPaused() {
 				e.retryAt, e.engineWaitAt = now, time.Time{}
 			}
 		}
@@ -1371,9 +1391,16 @@ type DrainState struct {
 	// deadline, and Later those whose try is due after it.
 	Retrying int `json:"retrying"`
 	Later    int `json:"later"`
+	// Paused are the roots the cache's engine refused because it has given
+	// up its remote-cache work until its next session (Result.Paused). A
+	// drain or a flush neither waits for them nor tries them again: they
+	// are left, and are lost if the engine stops before a session starts
+	// on it. They aren't among Roots.
+	Paused int `json:"paused,omitempty"`
 }
 
-// Roots is how many roots the cache has left to export.
+// Roots is how many roots the cache has left that the service can still
+// export: all but Paused.
 func (s DrainState) Roots() int { return s.Pending + s.InFlight + s.Retrying + s.Later }
 
 // DrainStatus returns what each cache has left to export at now, for a drain
@@ -1384,7 +1411,7 @@ func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
 	var out []DrainState
 	for _, cacheID := range slices.Sorted(maps.Keys(t.caches)) {
 		st := t.leftLocked(t.caches[cacheID], now, deadline, true)
-		if st.Sessions > 0 || st.Roots() > 0 {
+		if st.Sessions > 0 || st.Roots() > 0 || st.Paused > 0 {
 			out = append(out, st)
 		}
 	}
@@ -1407,6 +1434,8 @@ func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain boo
 		case e.inFlight:
 			st.InFlight++
 		case !t.wantedLocked(c, n, e, now):
+		case e.isPaused():
+			st.Paused++
 		case e.recheck && e.retryAt.IsZero():
 			// Due at the next Due or DrainDue (see cache).
 			st.Retrying++
@@ -1465,7 +1494,8 @@ func (t *Tracker) UnseenSessions(cacheID string, sessions []string) int {
 // once its value changed, may cut its wait short again. So looped flushes retry a failing root at most
 // once per backoff of its own, and it reaches MaxFailures at most twice as
 // fast as its backoff alone would take it there; a busy root, which doesn't count toward MaxFailures, or one
-// waiting for its engine, is due at every flush. Unlike StartDrain, it
+// waiting for its engine to connect, is due at every flush. One its engine
+// refused as paused isn't (DrainState.Paused). Unlike StartDrain, it
 // changes nothing else: spans, session ends and other caches are taken and
 // scheduled as usual, and the scheduler runs the exports (Due), one at a
 // time per cache. Flushes of one cache may overlap: the cache is flushing
@@ -1476,7 +1506,7 @@ func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
 	t.flushing[cacheID]++
 	if c := t.caches[cacheID]; c != nil {
 		for _, e := range c.entries {
-			if e.inFlight || !e.retryAt.After(now) || (e.flushRetry == flushRetryFailed && e.failedValue.covers(e)) {
+			if e.inFlight || !e.retryAt.After(now) || e.isPaused() || (e.flushRetry == flushRetryFailed && e.failedValue.covers(e)) {
 				continue
 			}
 			// A wait after a failed try: neither busy nor for the engine.

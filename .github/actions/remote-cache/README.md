@@ -275,6 +275,17 @@ where cancelled jobs matter. The shim passes a SIGINT, SIGTERM or SIGHUP it
 gets on to the script's whole process group, and `sidecar.sh` traps none, so
 a start or stop that gets one ends at once, its cleanup with it.
 
+**What the stop can't store.** Since `v1.0.0-beta.26` an engine gives up
+its remote-cache work 20s after its last session ended, if an export is
+still running then, and takes it up again only when a session starts. In a
+job there is none after the last `dagger` call, so what the engine hadn't
+finished exporting by then, such as a large layer on a slow link, is not
+stored by this job: the drain doesn't wait for it, logs
+`drain: left for an engine that gave up its remote-cache work` with the
+count, and still ends `complete`. The store is left whole, and a later job
+that builds the same values exports them (see
+[Engines from v1.0.0-beta.26](../../../cmd/cacheservice/README.md#engines-from-v100-beta26)).
+
 ## stop
 
 ```yaml

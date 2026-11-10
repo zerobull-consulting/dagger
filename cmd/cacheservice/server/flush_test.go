@@ -801,3 +801,39 @@ func TestTrackerStartFlush(t *testing.T) {
 		t.Fatal("still flushing after the flush ended")
 	}
 }
+
+// An engine that has given up its remote-cache work refuses every root
+// until its next session: a flush tries what is dirty once, then neither
+// waits for those roots nor tries them again, and says so. An open makes
+// them due, and the next flush stores them.
+func TestFlushPausedEngine(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	paused := fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Refused: exporter.EnginePausedMessage}
+	h.cache.Add(paused)
+	h.postSpans("session-1", cacheSpan(10))
+	start := time.Now()
+	rep := h.flush("1m")
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("the flush took %s: it waited for a paused engine", took)
+	}
+	if rep.Outcome != metrics.FlushPaused || rep.Left.Paused != 1 || rep.Left.Roots() != 0 || rep.Stored != 0 {
+		t.Fatalf("report %+v", rep)
+	}
+	// Again: the root is known paused, and isn't tried.
+	if rep = h.flush("1m"); rep.Outcome != metrics.FlushPaused || rep.Left.Paused != 1 {
+		t.Fatalf("second flush: report %+v", rep)
+	}
+	if rep = h.flush("0s"); rep.Outcome != metrics.FlushPaused || rep.Left.Paused != 1 {
+		t.Fatalf("timeout=0: report %+v", rep)
+	}
+	if asked := metricstest.Read(t, h.svc.registry, "cacheservice_export_roots_total", map[string]string{"result": "paused"}); asked.Value != 1 {
+		t.Fatalf("the paused engine was asked for the root %v times, want once", asked.Value)
+	}
+
+	paused.Refused = ""
+	h.cache.Add(paused)
+	h.ns().tracker.Opened(h.cache.ID, h.cache.Generation, time.Now())
+	if rep = h.flush("1m"); rep.Outcome != metrics.FlushComplete || rep.Left.Paused != 0 || !indexHas(t, h, 10) {
+		t.Fatalf("after the open: report %+v", rep)
+	}
+}

@@ -37,10 +37,20 @@ import (
 // It leaves most of the engine's 20s for the exports.
 const DefaultSettleMarkerWait = 5 * time.Second
 
+// DefaultSettleRetryWait is how far ahead, from its arrival, a settle waits
+// for a root's next try (after a busy answer or a failed export). A root
+// whose try is due later doesn't hold the settle back: an engine that hears
+// no settled gives up, and then refuses that try and every other export
+// until its next session, while one that settled still takes the try when
+// it comes due. Half the engine's 20s, so the tries waited for can still
+// end inside it.
+const DefaultSettleRetryWait = 10 * time.Second
+
 // MaxSettleWait bounds a settle's wait. An engine gives up a settle it sent
-// 20s after its last session ended, without saying so, and what then holds
-// the wait back are the roots the engine refuses meanwhile: the bound, far
-// past the engine's, only ends a wait nothing is listening for.
+// 20s after its last session ended, without saying so, and cancels the
+// export that held the wait back: the bound, far past the engine's, only
+// ends a wait nothing is listening for, as for an export that got no
+// answer.
 const MaxSettleWait = 2 * time.Minute
 
 var (
@@ -166,7 +176,10 @@ func (c *engineConn) serveSettle(ctx context.Context, env protocol.Envelope) {
 //   - no session of the cache is waited for, as a flush waits for them: one
 //     still sending spans, or ended with some of its counted spans missing,
 //     until the tracker's Settle (at most 2s) passed since its last span;
-//   - no root of the cache is dirty, in flight or waiting for another try.
+//   - no root of the cache is dirty, in flight, or waiting for another try
+//     due within DefaultSettleRetryWait of the settle's arrival. A root
+//     whose try is due later, or that the engine refused as paused, isn't
+//     waited for (exporter.DrainState.Later, Paused).
 //
 // Unlike a flush, it makes nothing due sooner: the scheduler exports the
 // cache's entries as it would anyway, a session's once its carrier came
@@ -177,9 +190,7 @@ func (c *engineConn) serveSettle(ctx context.Context, env protocol.Envelope) {
 // errStaleSettle when the period isn't the connection's, or a later one
 // opens meanwhile, ctx's error when the connection ends first, and
 // errSettleTimeout once it waited MaxSettleWait, on its own clock: the
-// engine abandons a settle it gave up on without saying so, and what then
-// holds this back are the roots the engine refuses (exporter.Result.Paused),
-// until its next open ends it as stale.
+// engine abandons a settle it gave up on without saying so.
 func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle) error {
 	period, _ := c.period.current()
 	if req.Period > period {
@@ -204,6 +215,7 @@ func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle
 		}
 	}
 	markerDeadline := p.now().Add(time.Duration(s.settleMarkerWait.Load()))
+	retryDeadline := p.now().Add(time.Duration(s.settleRetryWait.Load()))
 
 	p.changedWaiters.Add(1)
 	defer p.changedWaiters.Add(-1)
@@ -219,12 +231,12 @@ func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle
 			return errStaleSettle
 		}
 		now := p.now()
-		st := tracker.FlushStatus(cacheID, now, time.Time{})
+		st := tracker.FlushStatus(cacheID, now, retryDeadline)
 		unseen := 0
 		if now.Before(markerDeadline) {
 			unseen = tracker.UnseenSessions(cacheID, marked)
 		}
-		if flushEmpty(st) && unseen == 0 {
+		if st.Pending == 0 && st.InFlight == 0 && st.Retrying == 0 && st.Sessions == 0 && unseen == 0 {
 			return nil
 		}
 		select {
