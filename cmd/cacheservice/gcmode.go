@@ -32,7 +32,10 @@ func resolveGCMode(mode string, interval time.Duration, exports bool, set map[st
 	if interval < 0 {
 		return "", fmt.Errorf("-gc-interval=%s: negative; want a positive interval (a schedule needs -gc-mode=service, the default)", interval)
 	}
-	if set["gc-interval"] && interval == 0 {
+	// A zero interval with an explicit batch or off is the interval-with-mode
+	// refusal below: pointing it at the mode it already has would go in a circle.
+	explicitNoSchedule := exports && set["gc-mode"] && m != server.GCModeService
+	if set["gc-interval"] && interval == 0 && !explicitNoSchedule {
 		if !exports {
 			return "", fmt.Errorf("-gc-interval=0 and -export=false: a zero interval no longer means 'only POST /debug/gc', and a read-only instance never runs garbage collection, which deletes from the bucket; drop -gc-interval (a read-only instance is -gc-mode=%s already)", server.GCModeOff)
 		}

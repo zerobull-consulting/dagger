@@ -31,7 +31,11 @@ func TestResolveGCMode(t *testing.T) {
 
 		{name: "interval 0", mode: def, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=0", "-gc-mode=batch", "-gc-mode=off"}},
 		{name: "read-only, interval 0", mode: def, noExport: true, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=0", "-export=false", "drop -gc-interval", "-gc-mode=off"}, wantNot: []string{"-gc-mode=batch"}},
-		{name: "interval 0 with batch", mode: "batch", set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=0", "-gc-mode"}},
+		// The mode is already what the message would suggest: it names the
+		// interval and the mode, and doesn't point at them again.
+		{name: "interval 0 with batch", mode: "batch", set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=0s", "-gc-mode=batch", "no schedule"}, wantNot: []string{"no longer means", "use -gc-mode=batch"}},
+		{name: "interval 0 with off", mode: "off", set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=0s", "-gc-mode=off", "no schedule"}, wantNot: []string{"no longer means", "use -gc-mode=batch"}},
+		{name: "interval 0 with service", mode: "service", set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=0", "no longer means", "-gc-mode=batch"}},
 		{name: "negative interval", mode: def, interval: -time.Second, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=-1s", "negative"}},
 		{name: "interval with batch", mode: "batch", interval: time.Hour, set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=1h0m0s", "-gc-mode=batch"}},
 		{name: "interval with off", mode: "off", interval: time.Hour, set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=1h0m0s", "-gc-mode=off"}},

@@ -853,6 +853,9 @@ check "debug-port: its file is readable by the service's UID" [ "$(stat -c %a "$
 check "debug-port: its directory only by this user" [ "$(stat -c %a "$dbg_dir")" = 700 ]
 check "debug-port: the service gets the file, read-only" grep -qxF -- "$dbg_dir/debug-token:/run/secrets/debug-token:ro" <<<"$dbg_args"
 check "debug-port: and -debug-token-file" grep -qxF -- "-debug-token-file" <<<"$dbg_args"
+# The args files are there (a flag that is absent proves nothing when no
+# service was started): each has the flags every start passes.
+check "writer: the service was started, with its -scope" grep -qxF -- "-scope" <<<"$dbg_args"
 check "writer: the service gets -gc-mode=batch" grep -qxF -- "-gc-mode=batch" <<<"$dbg_args"
 check "writer: and no -gc-interval" not grep -q -- "-gc-interval" <<<"$dbg_args"
 # Its own bin directory (a copy of the same fake docker), so it leaves the
@@ -861,6 +864,7 @@ mkdir -p "$tmp/robin"
 cp "$tmp/dbgbin/docker" "$tmp/robin/docker"
 fake_start robin SIDECAR_ROLE=read-only >/dev/null
 ro_args="$(cat "$tmp/robin.fake/service.args" 2>/dev/null)"
+check "read-only: the service was started, with its -scope" grep -qxF -- "-scope" <<<"$ro_args"
 check "read-only: the service gets -export=false" grep -qxF -- "-export=false" <<<"$ro_args"
 check "read-only: and neither -gc-mode nor -gc-interval" not grep -qE -- "^-gc-(mode|interval)" <<<"$ro_args"
 check "start passes the linger the stop's bounds assume" grep -qx -- "-drain-linger" <<<"$dbg_args"

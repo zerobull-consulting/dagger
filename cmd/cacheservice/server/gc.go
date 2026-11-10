@@ -57,8 +57,10 @@ type GCConfig struct {
 
 // gcPath is garbage collection, when it is on.
 type gcPath struct {
-	cfg       gc.Config
-	mode      GCMode
+	cfg  gc.Config
+	mode GCMode
+	// collector is nil in GCModeOff, which builds none: a reader of it
+	// checks mode first (CollectGarbage does).
 	collector *gc.Collector
 	// ctx runs every GC run, scheduled or asked for; stop ends it, and
 	// with it the run under way, when the service starts draining.

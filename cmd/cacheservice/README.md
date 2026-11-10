@@ -2286,7 +2286,10 @@ read-only instance (`-export=false`) is `off`; an explicit `service` or
 `batch` is refused at startup (see [Read-only instances](#read-only-instances)).
 The startup log says the mode (`msg=mode ... gc=service`, and `gc on
 mode=service`, or the warning `gc off`), and so does `POST /debug/gc`'s
-answer (`"mode"`). Without limits (`-max-age` and `-max-bytes` are 0
+answer (`"mode"`).
+
+`-gc-dry-run`, `-gc-grace`, `-gc-staging-age` and `-gc-max-deletes` apply to
+`service` and `batch`. With `off` they are accepted and unused. Without limits (`-max-age` and `-max-bytes` are 0
 by default, and no namespaces file), it expires only what engines gave an
 expiry, and deletes only what nothing names: bundles and blobs of exports
 that were never recorded or were superseded, and staged uploads. So an
