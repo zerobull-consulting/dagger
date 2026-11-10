@@ -1571,13 +1571,17 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     (`TestOTLPStalledRequestsBounded`);
   - its **headers**, with it, before any of the body is read: net/http has
     parsed and holds them while the handler runs. They are estimated from
-    the request (`otlpHeaderReserve`): the bytes of every key and value plus
-    64 for each value, the host, and the request URI twice. Real engines'
-    come to 0.4 to 3 KiB (see **Headers are bounded**, below), so this is
-    small beside the 16 KiB; but a client sending 48 KiB of headers and then
-    stalling its body now holds that much of the budget, not 16 KiB
+    the request (`otlpHeaderReserve`): the bytes of every key and value, 112
+    per key and 32 per value (measured against the heap of parsed requests:
+    `TestOTLPHeaderReserveCoversParsedHeaders`), the host, and the request URI
+    twice. Real engines' come to about 1.5 to 3.2 KiB (see **Headers are
+    bounded**, below), small beside the 16 KiB; but a client sending 48 KiB
+    of headers and then stalling its body holds that much of the budget, not
+    16 KiB
     ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
-    `TestOTLPRequestHeadersInBudget`, `TestOTLPHeaderReserve`);
+    `TestOTLPRequestHeadersInBudget`, `TestOTLPHeaderReserve`). The estimate
+    is not bounded by `MaxHeaderBytes`: 68 KB of 5-byte headers reserves up
+    to about 1.4 MB, which is also about what they hold;
   - a gzipped body's **decompressor**, 64 KiB, before it is built
     (`TestOTLPGzipDecompressorReserved`);
   - the body's **buffer**, doubling from 512 bytes up to the limit as the
@@ -1640,14 +1644,13 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     bearer token: a few hundred bytes. A browser's cookies could add more,
     but a debug client is not a browser, and 64 KiB is far over it.
 
-  64 KiB is over 30 times the largest of these. The e2e's `otlp-sizes`
+  64 KiB is over 30 times the largest of these on the wire (1,811 bytes), and
+  about 20 times the largest reserve (3.2 KiB: the 1,811 bytes, nine headers
+  at 144 bytes each, and the host and URI). The e2e's `otlp-sizes`
   scenario logs the headers' reserve of every OTLP request the real engines
   sent (`headerBytes` in the `otlp request accepted` record) and fails if the
   largest is within a tenth of `MaxHeaderBytes`; every real engine's
   WebSocket upgrade also has to pass the limit for the run to connect at all.
-  The reserve is an estimate of the headers parsed, not their bytes on the
-  wire, so it is a little larger than the figures above (the per-value cost
-  adds about 0.6 KiB for the usual ten headers).
 - **A read timeout.** Each body must arrive within 30s of its handler
   starting (`server.OTLPReadTimeout`), a read deadline on the OTLP routes
   alone, set before the token is checked (`http.ResponseController`, per
@@ -1697,6 +1700,13 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   [Metrics](#metrics)), to check the limits against real traffic.
 
 **Known gaps**, each pinned by a test:
+
+- A request refused for its token (401) before the budget is reserved holds
+  nothing in it, though net/http holds its headers (up to about 68 KiB) while
+  it reads and discards the body, up to the read timeout. 200 such requests
+  with 60 KiB headers and a stalled body grew the heap by 18 MB. It is the
+  same for the 16 KiB each request is reserved for, which a refused one isn't
+  (`TestOTLPRefusedTokenHeadersNotInBudgetKnownGap`).
 
 - Idle keep-alive connections aren't bounded
   ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),

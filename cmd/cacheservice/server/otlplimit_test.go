@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -974,13 +976,21 @@ func TestOTLPDecodedSizeEstimate(t *testing.T) {
 // connection and a handler for the price of a 512-byte buffer: past what the
 // budget holds, the next is refused with 503 at once.
 func TestOTLPStalledRequestsBounded(t *testing.T) {
-	svc, _, srv := limitedService(t, 2*(otlpRequestReserve+otlpMinBuffer)+1024)
+	// Each request also reserves its headers (otlpHeaderReserve), which
+	// slowPost writes as below, so the budget has that much more per request.
+	parsed, err := http.ReadRequest(bufio.NewReader(strings.NewReader(
+		"POST /v1/metrics HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-protobuf\r\nContent-Length: 1000\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	each := otlpRequestReserve + otlpMinBuffer + otlpHeaderReserve(parsed)
+	svc, _, srv := limitedService(t, 2*each+1024)
 	body := encodeOTLP(t, otlpCases()[2].build(""), false)
 	for range 2 {
 		slowPost(t, srv, "/v1/metrics", 1000, body[:1])
 	}
 	waitUntil(t, 5*time.Second, "two stalled requests to be reserved", func() bool {
-		return svc.otlp.budget.inUse() >= 2*(otlpRequestReserve+otlpMinBuffer)
+		return svc.otlp.budget.inUse() >= 2*each
 	})
 	_, br := slowPost(t, srv, "/v1/metrics", 1000, body[:1])
 	if resp := readResponse(t, br); resp.StatusCode != http.StatusServiceUnavailable {
@@ -1027,7 +1037,7 @@ func TestOTLPRequestHeadersInBudget(t *testing.T) {
 }
 
 // The header charge is the bytes of every key and value, plus a cost for each
-// value, the host and the request URI twice.
+// key and each value, the host and the request URI twice.
 func TestOTLPHeaderReserve(t *testing.T) {
 	r, err := http.NewRequest("POST", "http://example.test/v1/traces", nil)
 	if err != nil {
@@ -1035,9 +1045,46 @@ func TestOTLPHeaderReserve(t *testing.T) {
 	}
 	r.RequestURI = "/v1/traces"
 	r.Header = http.Header{"A": {"bb", "c"}, "Dd": {"e"}}
-	want := int64(len("example.test")+2*len("/v1/traces")) + (1 + 2 + 64) + (1 + 1 + 64) + (2 + 1 + 64)
+	want := int64(len("example.test")+2*len("/v1/traces")) +
+		(1 + otlpHeaderKeyCost + 2 + otlpHeaderValueCost + 1 + otlpHeaderValueCost) +
+		(2 + otlpHeaderKeyCost + 1 + otlpHeaderValueCost)
 	if got := otlpHeaderReserve(r); got != want {
 		t.Fatalf("reserve %d, want %d", got, want)
+	}
+}
+
+// The reserve covers what net/http's parsed headers hold, for the two shapes
+// that cost most per wire byte, each at the size the listener allows:
+// thousands of tiny distinct keys (a map slot and a slice each) and one key
+// repeated (a string header per value). The heap figures are what
+// http.ReadRequest held for these requests, measured with the GC before and
+// after (9,244 keys: 967,022 bytes; 13,916 values: 277,624 bytes); the
+// reserve may not be under them, and is not more than twice them.
+func TestOTLPHeaderReserveCoversParsedHeaders(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		line func(i int) string
+		heap int64
+	}{
+		{"distinct keys", func(i int) string { return fmt.Sprintf("%x:b\r\n", i) }, 967022},
+		{"one key repeated", func(int) string { return "a:b\r\n" }, 277624},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var b strings.Builder
+			b.WriteString("POST /v1/traces HTTP/1.1\r\nHost: t\r\n")
+			for i := 0; b.Len() < MaxHeaderBytes+4<<10-20; i++ {
+				b.WriteString(c.line(i))
+			}
+			b.WriteString("\r\n")
+			r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(b.String())))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := otlpHeaderReserve(r)
+			if got < c.heap*99/100 || got > 2*c.heap {
+				t.Fatalf("reserve %d for headers that held %d", got, c.heap)
+			}
+		})
 	}
 }
 
@@ -1078,6 +1125,40 @@ func TestOTLPRequestOverHeaderLimit(t *testing.T) {
 	}
 	if used := svc.otlp.budget.inUse(); used != 0 {
 		t.Fatalf("%d bytes still reserved", used)
+	}
+}
+
+// Known gap: a request refused for its token (401) before decodeOTLP has
+// reserved nothing, not even its headers, though net/http holds them while it
+// reads and discards the body, up to the read timeout. Measured: 200 such
+// requests with 60 KiB headers and a stalled body grew the heap by 18 MB
+// with nothing reserved. MaxHeaderBytes bounds each at about 68 KiB, 15 times
+// less than net/http's default. When the reserve moves ahead of the token
+// check, this test changes with it.
+func TestOTLPRefusedTokenHeadersNotInBudgetKnownGap(t *testing.T) {
+	svc, rec, _ := limitedService(t, 4*testOTLPLimit)
+	tokens := filepath.Join(t.TempDir(), "tokens")
+	if err := os.WriteFile(tokens, []byte("good-token ns1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UseTokensFile(tokens); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", headerServer(t, svc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nAuthorization: Basic YmFkOg==\r\nX-Pad: %s\r\nContent-Length: 100000\r\n\r\nx", strings.Repeat("a", 48<<10))
+	// The handler has refused the token. The answer isn't written until
+	// net/http has read what it will of the unfinished body, which a stalled
+	// client holds to the read timeout: the request still holds its headers,
+	// and the budget holds none of them.
+	waitUntil(t, 5*time.Second, "the token to be refused", func() bool {
+		return len(rec.find("request refused: unknown token")) > 0
+	})
+	if used := svc.otlp.budget.inUse(); used != 0 {
+		t.Fatalf("%d bytes reserved: the refused request's headers are counted now; update the known gap", used)
 	}
 }
 

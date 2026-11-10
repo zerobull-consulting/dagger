@@ -183,23 +183,32 @@ const (
 // however little each has sent.
 const otlpRequestReserve = 16 << 10
 
-// otlpHeaderEntryCost is what each header value costs in the parsed request
-// beyond its bytes: the map slot, the []string and the string headers, about
-// 100 bytes; rounded to 64 here since the bytes of key and value are counted
-// separately and the strings share their backing array.
-const otlpHeaderEntryCost = 64
+// What the parsed headers cost beyond their bytes, measured by parsing
+// requests with http.ReadRequest and comparing the heap before and after:
+// each distinct key takes a map slot, its []string and the key's string
+// header, about 100 bytes (68 KB of tiny distinct headers: 9,244 keys,
+// 967 KB of heap); each value takes a string header in that slice, 16 bytes,
+// 32 with the slice's room to grow (68 KB of one key repeated: 13,916
+// values, 278 KB). Rounded up so the estimate is never under what was
+// measured.
+const (
+	otlpHeaderKeyCost   = 112
+	otlpHeaderValueCost = 32
+)
 
 // otlpHeaderReserve estimates what the request line and headers net/http
-// parsed hold while the handler runs: the bytes of each key and value plus
-// otlpHeaderEntryCost per value, the host, and the request URI twice (as sent
-// and as parsed into r.URL). A request over MaxHeaderBytes never gets here,
-// so it is at most about MaxHeaderBytes, plus otlpHeaderEntryCost for each of
-// the fewest-byte headers that fit.
+// parsed hold while the handler runs: the bytes of each key and value,
+// otlpHeaderKeyCost per key and otlpHeaderValueCost per value, the host, and
+// the request URI twice (as sent and as parsed into r.URL). A request over
+// MaxHeaderBytes never gets here, but the reserve is not bounded by it: 68 KB
+// of 5-byte headers is 14,000 values, or 9,000 keys, and reserves up to about
+// 1.4 MB, which is also about what they hold.
 func otlpHeaderReserve(r *http.Request) int64 {
 	n := int64(len(r.Host) + 2*len(r.RequestURI))
 	for k, vs := range r.Header {
+		n += int64(len(k)) + otlpHeaderKeyCost
 		for _, v := range vs {
-			n += int64(len(k)+len(v)) + otlpHeaderEntryCost
+			n += int64(len(v)) + otlpHeaderValueCost
 		}
 	}
 	return n
