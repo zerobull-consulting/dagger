@@ -833,6 +833,86 @@ func TestDrainPathsStoppedDoesNotWaitForExplicit(t *testing.T) {
 	}
 }
 
+// A drain that begins once the paths stopped has nothing to export, and
+// says the service is stopping. It reports from its own ctx: deadline once
+// that expired, canceled once it was canceled, complete only while it runs.
+// (zerobull-consulting/dagger#74, point 2.)
+func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want string
+	}{
+		{"live", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), time.Minute)
+		}, metrics.DrainComplete},
+		{"deadline passed", func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, metrics.DrainDeadline},
+		{"canceled", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}, metrics.DrainCanceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, rec := newDrainHarness(t, nil)
+			h.cancel()
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			start := time.Now()
+			rep := h.svc.Drain(ctx)
+			if took := time.Since(start); took > time.Second {
+				t.Fatalf("the drain took %s", took)
+			}
+			if rep.Outcome != tc.want || rep.LeftRoots() != 0 || rep.Explicit != 0 {
+				t.Fatalf("report %+v, want outcome %q", rep, tc.want)
+			}
+			if len(rec.find("drain: nothing to export (the service is stopping)")) != 1 {
+				t.Fatal("the drain didn't log that the service is stopping")
+			}
+			if len(rec.find("drain: nothing to export (the export path is off)")) != 0 {
+				t.Fatal("the drain logged that the export path is off")
+			}
+		})
+	}
+}
+
+// A second Drain returns canceled at once, and doesn't end the first: only
+// the first call's ctx cancels a drain, and the first still ends with its
+// own outcome. (zerobull-consulting/dagger#74, point 3.)
+func TestDrainSecondCallDoesNotCancelFirst(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	release := h.cache.Hold()
+	defer release()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitUntil(t, 5*time.Second, "the export to be held", func() bool { return h.cache.InFlight() == 1 })
+	done := startDrain(t, h.svc, time.Minute)
+
+	start := time.Now()
+	second := drainFor(h.svc, time.Minute)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the second Drain took %s", took)
+	}
+	if second.Outcome != metrics.DrainCanceled {
+		t.Fatalf("the second Drain's report %+v", second)
+	}
+	if st := h.svc.DrainStatus(); !st.Draining || st.Report != nil {
+		t.Fatalf("the second Drain ended the first: %+v", st)
+	}
+	drainRunning(t, done, "after a second Drain")
+
+	release()
+	rep := waitDrain(t, done, 10*time.Second)
+	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.LeftRoots() != 0 {
+		t.Fatalf("the first Drain's report %+v", rep)
+	}
+	if st := h.svc.DrainStatus(); st.Report == nil || st.Report.Outcome != metrics.DrainComplete {
+		t.Fatalf("drain status after the first Drain %+v", st)
+	}
+}
+
 // startExplicitExport exports root of h's engine with Service.Export, in
 // the background; the channel gets its error.
 func startExplicitExport(h *exportHarness, root uint64) <-chan error {

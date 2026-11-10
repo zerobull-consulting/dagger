@@ -152,7 +152,10 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 // that follows (CloseEngines, the end of the export path's context and
 // Wait), and publishes nothing.
 //
-// Call it once, before CloseEngines and Wait; a second call returns at once.
+// Call it once, before CloseEngines and Wait. A second call returns a
+// canceled report at once, and doesn't end the first: only the first call's
+// ctx cancels a drain, which then reports canceled, or deadline once ctx's
+// deadline passed.
 // The goroutines it starts are exports, which Wait waits for.
 func (s *Service) Drain(ctx context.Context) DrainReport {
 	start := time.Now()
@@ -197,7 +200,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 
 	p := s.export
-	if p == nil || p.ctx.Err() != nil {
+	if p == nil {
 		why := "the export path is off"
 		if s.readOnly {
 			why = "read-only: -export=false"
@@ -206,11 +209,19 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		if n := s.explicitRunning(); n > 0 {
 			s.logger.Info("drain: waiting for explicit requests", "running", n, "deadline", deadline)
 		}
-		paths := context.Background()
-		if p != nil {
-			paths = p.ctx
+		return s.endDrain(start, s.waitExplicit(ctx, context.Background(), deadline, explicitEnded), nil)
+	}
+	if p.ctx.Err() != nil {
+		// The paths stopped before the drain began: the service is
+		// stopping, and an explicit request still running is cut off with
+		// them (canceled). With none, the drain's own ctx says whether it
+		// was cut short: canceled or deadline, complete only while it runs.
+		s.logger.Info("drain: nothing to export (the service is stopping)")
+		outcome := s.waitExplicit(ctx, p.ctx, deadline, explicitEnded)
+		if o, ok := drainEnded(ctx, context.Background(), time.Now(), deadline); ok && outcome == metrics.DrainComplete {
+			outcome = o
 		}
-		return s.endDrain(start, s.waitExplicit(ctx, paths, deadline, explicitEnded), nil)
+		return s.endDrain(start, outcome, nil)
 	}
 	// Namespaces created from now on drain from their first span
 	// (trackSpans).
