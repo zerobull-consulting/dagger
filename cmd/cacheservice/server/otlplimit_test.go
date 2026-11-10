@@ -1257,6 +1257,64 @@ func TestOTLPUnknownFieldsEstimateCoversDecodePeak(t *testing.T) {
 	}
 }
 
+// proto.Unmarshal keeps an unknown field byte for byte, and a varint can be
+// padded (protowire accepts up to 10 bytes), so the estimate charges the
+// bytes consumed, not the canonical size of the tag and length. Tiny fields
+// with a padded length prefix are the case the 16-byte floor didn't cover:
+// 12 bytes kept per field, at 3 times the 3-byte canonical size.
+func TestOTLPPaddedVarintsChargedAsConsumed(t *testing.T) {
+	pad := func(b []byte, v uint64, n int) []byte {
+		for range n - 1 {
+			b = append(b, byte(v&0x7f)|0x80)
+			v >>= 7
+		}
+		return append(b, byte(v))
+	}
+	tag := uint64(99<<3 | uint64(protowire.BytesType))
+	for _, c := range []struct {
+		name           string
+		tagN, lenN, sz int
+	}{
+		{"canonical", 2, 1, 0},
+		{"padded length", 2, 10, 0},
+		{"padded tag", 10, 1, 0},
+		{"padded both", 10, 10, 0},
+		{"padded length, 64 bytes", 2, 10, 64},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			field := pad(nil, tag, c.tagN)
+			field = pad(field, uint64(c.sz), c.lenN)
+			field = append(field, make([]byte, c.sz)...)
+			const n = 10000
+			body := bytes.Repeat(field, n)
+			m := &commonpb.AnyValue{}
+			if err := proto.Unmarshal(body, m); err != nil {
+				t.Fatal(err)
+			}
+			kept := len(m.ProtoReflect().GetUnknown())
+			est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The simulated peak of appending what the decoder kept: the
+			// bytes it keeps are the ones the estimate must charge.
+			var sim []byte
+			var peak int64
+			for range n {
+				before := cap(sim)
+				sim = append(sim, make([]byte, kept/n)...)
+				if cap(sim) != before {
+					peak = max(peak, int64(before+cap(sim)))
+				}
+			}
+			if est < peak {
+				t.Fatalf("estimate %d is under the %d bytes the decode holds at its peak: the decoder kept %d bytes for %d on the wire",
+					est, peak, kept, len(body))
+			}
+		})
+	}
+}
+
 // Known fields of the right wire type are decoded into the message, not kept
 // as unknown bytes, so they aren't charged for append's growth.
 func TestOTLPKnownScalarsNotChargedForGrowth(t *testing.T) {

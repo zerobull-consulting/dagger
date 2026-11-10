@@ -75,6 +75,9 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 		if n < 0 {
 			return 0, protowire.ParseError(n)
 		}
+		// The decoder keeps an unknown field byte for byte, so charge the
+		// bytes consumed, not the canonical encoding: a varint can be padded.
+		tagLen := int64(n)
 		b = b[n:]
 		fd := fields.ByNumber(num)
 		if typ != protowire.BytesType {
@@ -88,7 +91,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 				return 0, protowire.ParseError(n)
 			}
 			b = b[n:]
-			wire := int64(protowire.SizeTag(num) + n)
+			wire := tagLen + int64(n)
 			if fd == nil || !otlpWireTypeOK(fd, typ) {
 				// Kept as unknown bytes, which append grows.
 				size += otlpUnknownCost(wire)
@@ -107,7 +110,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 			// A field the message doesn't know, or of the wrong wire type for
 			// its number: kept as raw bytes, tag and length included, in the
 			// message's unknown fields, which append grows.
-			size += otlpUnknownCost(int64(protowire.SizeTag(num) + protowire.SizeBytes(len(v))))
+			size += otlpUnknownCost(tagLen + int64(n))
 		case fd.Message() != nil:
 			sub, err := otlpProtoSize(v, fd.Message(), depth+1)
 			if err != nil {
