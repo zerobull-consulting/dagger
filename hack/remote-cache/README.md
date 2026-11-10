@@ -1021,6 +1021,10 @@ accept branch anyway, [zerobull-consulting/dagger#152](https://github.com/zerobu
 and the run's branch isn't checked, since the release check dispatches on
 `RELEASE_CHECK_BRANCH`, on `RELEASE_CHECK_TEST_REF` in a dry run, and on
 `release-check/rebuild/<version>` for B, and a hand-added line may cite any.
+It reads only the run's overall result, not its jobs: a run whose
+`real engines (e2e)` and `sidecar demo` jobs were skipped but which ended
+successfully would pass
+([zerobull-consulting/dagger#223](https://github.com/zerobull-consulting/dagger/issues/223)).
 The run must come from a ref whose `remote-cache-tests.yml` has that
 `run-name`, or its title is GitHub's default and the check fails (closed,
 with the title it saw in the message). The forgery above needs write access.
