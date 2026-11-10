@@ -1337,15 +1337,12 @@ func TestOTLPRefusedStalledBodyConnectionClosed(t *testing.T) {
 	}
 }
 
-// Known gap, zerobull-consulting/dagger#219: a request refused for its token (401) before decodeOTLP has
-// reserved nothing, not even its headers, though net/http holds them while it
-// reads and discards the body, up to the read timeout. Measured: 200 such
-// requests with 60 KiB headers and a stalled body grew the heap by 18 MB
-// with nothing reserved. MaxHeaderBytes bounds each at about 68 KiB, 15 times
-// less than net/http's default. When the reserve moves ahead of the token
-// check, this test changes with it.
-func TestOTLPRefusedTokenHeadersNotInBudgetKnownGap(t *testing.T) {
-	svc, rec, _ := limitedService(t, 4*testOTLPLimit)
+// tokenRefusalService is a service with tokens, its OTLP limits set as
+// limitedService sets them, served by NewHTTPServer (the listener's header
+// limits and timeouts).
+func tokenRefusalService(t *testing.T, budget int64) (*Service, *logRecorder, string) {
+	t.Helper()
+	svc, rec, _ := limitedService(t, budget)
 	tokens := filepath.Join(t.TempDir(), "tokens")
 	if err := os.WriteFile(tokens, []byte("good-token ns1\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1353,21 +1350,120 @@ func TestOTLPRefusedTokenHeadersNotInBudgetKnownGap(t *testing.T) {
 	if err := svc.UseTokensFile(tokens); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := net.Dial("tcp", headerServer(t, svc))
+	return svc, rec, headerServer(t, svc)
+}
+
+// tokenRefusals counts the requests refused for their token, missing or
+// unknown.
+func tokenRefusals(rec *logRecorder) int {
+	return len(rec.find("request refused: no token")) + len(rec.find("request refused: unknown token"))
+}
+
+// stalledPost sends a POST to path on addr with auth (a whole header line,
+// or "") and pad bytes of X-Pad, declaring a body of 100,000 bytes and
+// sending one, and returns the answer and how long it took to come.
+func stalledPost(t *testing.T, addr, path, auth string, pad int) (*http.Response, time.Duration) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nAuthorization: Basic YmFkOg==\r\nX-Pad: %s\r\nContent-Length: 100000\r\n\r\nx", strings.Repeat("a", 48<<10))
-	// The handler has refused the token. The answer isn't written until
-	// net/http has read what it will of the unfinished body, which a stalled
-	// client holds to the read timeout: the request still holds its headers,
-	// and the budget holds none of them.
-	waitUntil(t, 5*time.Second, "the token to be refused", func() bool {
-		return len(rec.find("request refused: unknown token")) > 0
-	})
+	// The read timeout is 30s: an answer held until it passed would fail
+	// here rather than hang.
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	start := time.Now()
+	fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: test\r\n%sX-Pad: %s\r\nContent-Length: 100000\r\n\r\nx", path, auth, strings.Repeat("a", pad))
+	resp := readResponse(t, bufio.NewReader(conn))
+	return resp, time.Since(start)
+}
+
+// A request refused for its token (401) holds its headers, and the request
+// itself, in the decode budget while its handler runs
+// (zerobull-consulting/dagger#219): otlpAdmit reserves them before the token
+// is checked, and gives them back on the refusal. Its connection's read
+// deadline is then cut to otlpRefusalDrain, so net/http's drain of the
+// stalled body, which holds the headers outside the budget after the
+// handler, ends within about a second rather than at the 30s read timeout.
+// Before: nothing reserved, and the headers held until the read timeout.
+func TestOTLPRefusedTokenHeadersInBudget(t *testing.T) {
+	const pad = 24 << 10
+	for _, path := range []string{"/v1/logs", "/v1/traces", "/v1/metrics"} {
+		for _, auth := range []string{"", "Authorization: Basic YmFkOg==\r\n"} {
+			svc, rec, addr := tokenRefusalService(t, 4*testOTLPLimit)
+			resp, took := stalledPost(t, addr, path, auth, pad)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("%s, auth %q: status %d", path, auth, resp.StatusCode)
+			}
+			if tokenRefusals(rec) != 1 {
+				t.Fatalf("%s, auth %q: the token refusal wasn't logged", path, auth)
+			}
+			// net/http writes the answer once its drain of the body ends:
+			// at the cut deadline, not the read timeout.
+			if took > 5*time.Second {
+				t.Fatalf("%s, auth %q: answered after %s", path, auth, took)
+			}
+			if peak := svc.otlp.budget.peakUse(); peak < otlpRequestReserve+pad {
+				t.Fatalf("%s, auth %q: %d bytes reserved at most, want at least %d: the refused request's headers weren't in the budget",
+					path, auth, peak, otlpRequestReserve+pad)
+			}
+			if used := svc.otlp.budget.inUse(); used != 0 {
+				t.Fatalf("%s, auth %q: %d bytes still reserved after the refusal", path, auth, used)
+			}
+		}
+	}
+}
+
+// Many refused requests at once are bounded by the budget like any others:
+// with the budget full, a request is answered 503, as decodeOTLP answers a
+// full budget, before its token is checked, and holds nothing. Once the
+// budget frees, the same request is checked, and refused for its token.
+func TestOTLPFullBudgetRefusedBeforeToken(t *testing.T) {
+	svc, rec, addr := tokenRefusalService(t, 4*testOTLPLimit)
+	size := svc.otlp.budget.size
+	if !svc.otlp.budget.reserve(size) {
+		t.Fatal("couldn't fill the budget")
+	}
+	for _, path := range []string{"/v1/logs", "/v1/traces", "/v1/metrics"} {
+		resp, _ := stalledPost(t, addr, path, "Authorization: Basic YmFkOg==\r\n", 1<<10)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("%s with the budget full: status %d, want 503", path, resp.StatusCode)
+		}
+		if resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("%s: a 503 with no Retry-After", path)
+		}
+	}
+	if n := tokenRefusals(rec); n != 0 {
+		t.Fatalf("%d token refusals logged: the token was checked with the budget full", n)
+	}
+	if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedBusy); got != 1 {
+		t.Fatalf("busy %v, want 1", got)
+	}
+	if used := svc.otlp.budget.inUse(); used != size {
+		t.Fatalf("%d bytes reserved, want the %d filled", used, size)
+	}
+	svc.otlp.budget.release(size)
+	if resp, _ := stalledPost(t, addr, "/v1/metrics", "Authorization: Basic YmFkOg==\r\n", 1<<10); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("with the budget free: status %d, want 401", resp.StatusCode)
+	}
 	if used := svc.otlp.budget.inUse(); used != 0 {
-		t.Fatalf("%d bytes reserved: the refused request's headers are counted now; update the known gap", used)
+		t.Fatalf("%d bytes still reserved", used)
+	}
+}
+
+// Headers that would reserve more than MaxOTLPHeaderReserve are answered 431
+// before the token is checked, and reserve nothing.
+func TestOTLPHeaderReserveCapBeforeToken(t *testing.T) {
+	svc, rec, addr := tokenRefusalService(t, 4*testOTLPLimit)
+	resp, _ := stalledPost(t, addr, "/v1/metrics", "Authorization: Basic YmFkOg==\r\n", MaxOTLPHeaderReserve+1)
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("status %d, want 431", resp.StatusCode)
+	}
+	if n := tokenRefusals(rec); n != 0 {
+		t.Fatalf("%d token refusals logged", n)
+	}
+	if peak := svc.otlp.budget.peakUse(); peak != 0 {
+		t.Fatalf("%d bytes reserved", peak)
 	}
 }
 
