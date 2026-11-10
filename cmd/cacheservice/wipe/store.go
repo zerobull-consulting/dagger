@@ -199,7 +199,7 @@ func (s *S3Store) Delete(ctx context.Context, keys []string) ([]Failure, error) 
 		}
 		if err := s.deleteOne(ctx, k); err != nil {
 			if ctx.Err() != nil {
-				return nil, err
+				return failed, err
 			}
 			failed = append(failed, Failure{Key: k, Reason: err.Error()})
 		}

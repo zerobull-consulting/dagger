@@ -24,10 +24,15 @@ type stubS3 struct {
 	denyBatch   bool
 	batchErrors map[string]bool
 	oneKeys     []string
-	batchKeys   []string
+	// onOne, when set, runs for each DeleteObject, without the lock.
+	onOne     func(key string, r *http.Request)
+	batchKeys []string
 }
 
 func (s *stubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete && s.onOne != nil {
+		s.onOne(strings.TrimPrefix(r.URL.Path, "/bkt/"), r)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	deny := func() {
@@ -112,5 +117,31 @@ func TestS3DeleteCollectsBothKindsOfFailure(t *testing.T) {
 	}
 	if len(failed) != 2 || failed[0].Key != "cache/\x01a" || failed[1].Key != "cache/ok2" {
 		t.Fatalf("failures %+v", failed)
+	}
+}
+
+// The context ending during a later single-key delete: the earlier
+// single-key failure still comes back with the error.
+func TestS3DeleteContextEndKeepsKeyFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stub := &stubS3{denyOne: map[string]bool{"cache/\x01a": true}, onOne: func(key string, r *http.Request) {
+		if key == "cache/\x02b" {
+			cancel()
+			<-r.Context().Done()
+		}
+	}}
+	st := newStubStore(t, stub)
+	failed, err := st.Delete(ctx, []string{"cache/\x01a", "cache/\x02b", "cache/ok"})
+	if err == nil {
+		t.Fatal("no error")
+	}
+	if len(failed) != 1 || failed[0].Key != "cache/\x01a" {
+		t.Fatalf("failures %+v, want the first single-key one", failed)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.batchKeys) != 0 {
+		t.Fatalf("a batch request went out after the context ended: %v", stub.batchKeys)
 	}
 }

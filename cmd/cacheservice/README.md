@@ -378,8 +378,8 @@ exit 1, since that store's keys may be under the prefix
 (`TestAncestorClaimedDuringWipeStops`, `TestAncestorClaimedBeforeAbortsStops`).
 So does a writer that claims the prefix itself after the wipe deleted its
 marker: the new marker, and the keys written after it, are left alone, and it
-exits 1 (`TestMarkerReclaimedAfterStep1Stops`,
-`TestMarkerReclaimedBetweenPagesStops`, `TestMarkerReclaimedBeforeAbortsStops`).
+exits 1 (`TestMarkerReclaimedAfterStep1Stops`, `TestMarkerReclaimedBetweenPagesStops`,
+`TestMarkerReclaimedBeforeAbortsStops`, `TestMarkerReclaimedBetweenUploadPagesStops`).
 This only narrows what a mistake costs: the check is one request before each
 delete request, so a writer that claims the prefix in the moment between the
 two is not caught. Never run a writer on a prefix being wiped.
@@ -418,13 +418,17 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   If the marker can't be read (a dry run too) or deleted, nothing else is
   deleted, and it exits 1.
 - **Checked again before each delete request:** before each page of objects
-  and before the uploads are aborted, the wipe reads the ancestors' markers
+  and before each page of uploads to abort, the wipe reads the ancestors' markers
   again, then the prefix's own. An ancestor's marker, or the prefix's own
   marker back after the wipe deleted it, is a writer's: the wipe stops with
   nothing more deleted, says a writer claimed the prefix during the wipe and
   that its marker and what it wrote were left alone, and exits 1. A marker
   it can't read stops it too: when it can't tell, it doesn't delete. This
-  costs one more GET per page of 1,000 keys, beside the ancestor reads.
+  costs one more GET per page of 1,000 keys or uploads, beside the ancestor
+  reads. When a delete request fails, the count in "deleted N objects" is
+  reported as "at least": the keys of that page deleted one by one before the
+  failure (those XML can't carry, below) aren't in it
+  (`TestBatchRequestFailureKeepsKeyFailures`).
 - **Not inside another store:** a prefix under one whose ancestor (the
   bucket's top included) holds an ownership marker is refused, by a dry run
   and a wipe, naming that marker: wiping it would delete part of that store.
