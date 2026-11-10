@@ -355,7 +355,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"scope"}),
 		drains: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "drain_duration_seconds",
-			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal).",
+			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal, or a drain that began after the export path stopped): both cut short, usually with work left, which the drain report's left and drain_unexported_roots_total count.",
 			Buckets: promotionBuckets,
 		}, []string{"outcome"}),
 		drainStoredRoots: prometheus.NewCounter(prometheus.CounterOpts{
@@ -381,11 +381,11 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		flushLeftRoots: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: ns, Name: "flush_unexported_roots_total",
-			Help: "Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry.",
+			Help: "Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry. Each flush adds what it left, so overlapping flushes of one cache each count the same roots: a count per flush, not of the roots lost.",
 		}),
 		otlpRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "otlp_refused_total",
-			Help: "OTLP requests refused for their body, by route (traces, logs, metrics) and reason: too_large (413, over the route's limit as received or decoded, or decoding to a message the decode budget could never hold), busy (503, the decode budget full) or timeout (408, not received within the read timeout). Nothing of a refused request is recorded.",
+			Help: "OTLP requests refused for their body, by route (traces, logs, metrics) and reason: too_large (413, over the route's limit as received or decoded, or decoding to a message the decode budget could never hold), busy (503, the decode budget full), timeout (408, not received within the read timeout) or too_deep (400, nested past the limit). Nothing of a refused request is recorded.",
 		}, []string{"route", "reason"}),
 		otlpRequestBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "otlp_request_bytes",
@@ -837,10 +837,12 @@ func (m *Metrics) ExportCollected(scope string) {
 const (
 	// DrainComplete left nothing it could export.
 	DrainComplete = "complete"
-	// DrainDeadline ended at its deadline (-drain-timeout).
+	// DrainDeadline was cut short at its deadline (-drain-timeout),
+	// usually with work left.
 	DrainDeadline = "deadline"
-	// DrainCanceled ended because its context was canceled (a second
-	// signal).
+	// DrainCanceled was cut short because its context was canceled (a
+	// second signal), or it began after the export path stopped, usually
+	// with work left.
 	DrainCanceled = "canceled"
 )
 
@@ -950,6 +952,9 @@ const (
 	// OTLPRefusedTimeout is a body not received within the read timeout
 	// (408).
 	OTLPRefusedTimeout = "timeout"
+	// OTLPRefusedTooDeep is a body that nests messages (or, for JSON,
+	// objects and arrays) deeper than the service decodes (400).
+	OTLPRefusedTooDeep = "too_deep"
 )
 
 // OTLPRefused records an OTLP request refused on route, one of the

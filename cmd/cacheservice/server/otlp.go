@@ -24,8 +24,10 @@ import (
 // entries their calls touched, under the token of the session's client.
 // With tokens, each POST must carry a known token as its HTTP Basic
 // username, and feeds only its namespace's paths (see otlpAuth), which is
-// checked before any of its body is read. Each body is then bounded (see
-// decodeOTLP), and a request refused for it records nothing.
+// checked before any of its body is read, and once the request and its
+// headers are reserved from the decode budget (see otlpAdmit). Each body is
+// then bounded (see decodeOTLP), and a request refused for it records
+// nothing.
 func (s *Service) otlpRoutes(mux *http.ServeMux) {
 	// Before taking over a session's telemetry, the engine probes the Cloud
 	// URL with HEAD /v1/traces, with no credentials; any answer will do.
@@ -34,12 +36,12 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 		s.logger.Info("otlp probe", "method", r.Method, "path", r.URL.Path, "userAgent", r.UserAgent())
 	})
 	mux.HandleFunc("POST /v1/logs", s.otlpDeadline(func(w http.ResponseWriter, r *http.Request) {
-		ns, key, ok := s.otlpAuth(w, r)
+		ns, key, held, ok := s.otlpAdmit(w, r, s.otlp.logs)
 		if !ok {
 			return
 		}
 		var req collogspb.ExportLogsServiceRequest
-		release, ok := s.decodeOTLP(w, r, s.otlp.logs, &req)
+		release, ok := s.decodeOTLP(w, r, s.otlp.logs, held, &req)
 		if !ok {
 			return
 		}
@@ -48,12 +50,12 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 		writeOTLP(w, r, &collogspb.ExportLogsServiceResponse{})
 	}))
 	mux.HandleFunc("POST /v1/traces", s.otlpDeadline(func(w http.ResponseWriter, r *http.Request) {
-		ns, _, ok := s.otlpAuth(w, r)
+		ns, _, held, ok := s.otlpAdmit(w, r, s.otlp.traces)
 		if !ok {
 			return
 		}
 		var req coltracepb.ExportTraceServiceRequest
-		release, ok := s.decodeOTLP(w, r, s.otlp.traces, &req)
+		release, ok := s.decodeOTLP(w, r, s.otlp.traces, held, &req)
 		if !ok {
 			return
 		}
@@ -63,11 +65,12 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 		writeOTLP(w, r, &coltracepb.ExportTraceServiceResponse{})
 	}))
 	mux.HandleFunc("POST /v1/metrics", s.otlpDeadline(func(w http.ResponseWriter, r *http.Request) {
-		if _, _, ok := s.otlpAuth(w, r); !ok {
+		_, _, held, ok := s.otlpAdmit(w, r, s.otlp.metrics)
+		if !ok {
 			return
 		}
 		var req colmetricspb.ExportMetricsServiceRequest
-		release, ok := s.decodeOTLP(w, r, s.otlp.metrics, &req)
+		release, ok := s.decodeOTLP(w, r, s.otlp.metrics, held, &req)
 		if !ok {
 			return
 		}
@@ -88,8 +91,9 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 // after its headers, by the handler or by net/http after it, ends by then.
 // A request refused before its body is read (401) still has net/http read up
 // to 256 KiB of it after the handler, and discard it, to reuse the
-// connection; the deadline bounds how long a client can hold the handler
-// that way. The server clears the deadline before reading the next request.
+// connection; otlpAdmit cuts the deadline to otlpRefusalDrain for it, which
+// bounds how long a client can hold the request that way. The server clears
+// the deadline before reading the next request.
 func (s *Service) otlpDeadline(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.otlp.readTimeout)); err != nil {
@@ -97,6 +101,47 @@ func (s *Service) otlpDeadline(h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// otlpAdmit reserves what an OTLP request holds before its body is read, the
+// request itself and its parsed headers (otlpRequestReserve and
+// otlpHeaderReserve), and then checks its token (otlpAuth), so a request
+// refused for its token counts against the budget while its handler runs,
+// like any other request (zerobull-consulting/dagger#219). Headers over
+// MaxOTLPHeaderReserve are answered 431, and a full budget 503, as decodeOTLP
+// answers them, before the token is checked. A request refused for its token
+// gives its reservation back, and its connection's read deadline is cut to
+// otlpRefusalDrain, as refuseOTLP does: net/http's drain of a stalled body,
+// after the handler and outside the budget, then holds the headers for at
+// most that long rather than the read timeout. With ok true, held is what was
+// reserved, which decodeOTLP takes over.
+func (s *Service) otlpAdmit(w http.ResponseWriter, r *http.Request, route otlpRoute) (ns *namespace, key tokenKey, held int64, ok bool) {
+	// No Connection: close on a 401, unlike refuseOTLP: an engine whose
+	// token was removed keeps retrying, and a small body it sent whole is
+	// drained at once, so its connection can be reused. A stalled body is
+	// still cut off at otlpRefusalDrain.
+	refuse := func(err error) (*namespace, tokenKey, int64, bool) {
+		status, reason := otlpRefusal(err)
+		s.refuseOTLP(w, r, route, status, reason, err)
+		return nil, tokenKey{}, 0, false
+	}
+	headers := otlpHeaderReserve(r)
+	if headers > MaxOTLPHeaderReserve {
+		return refuse(errOTLPHeadersTooLarge)
+	}
+	held = otlpRequestReserve + headers
+	if !s.otlp.budget.reserve(held) {
+		return refuse(errOTLPBusy)
+	}
+	ns, key, ok = s.otlpAuth(w, r)
+	if !ok {
+		s.otlp.budget.release(held)
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(otlpRefusalDrain)); err != nil {
+			s.logger.Debug("otlp request: no read deadline", "error", err)
+		}
+		return nil, tokenKey{}, 0, false
+	}
+	return ns, key, held, true
 }
 
 func (s *Service) logRecords(ns *namespace, key tokenKey, req *collogspb.ExportLogsServiceRequest) {
@@ -145,6 +190,8 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 					"outcome", cutString(stringAttr(span.Attributes, telemetryattrs.CacheOutcomeAttr), 200),
 					"type", cutString(stringAttr(span.Attributes, telemetryattrs.CacheTypeAttr), 200),
 					"retained", cutString(stringAttr(span.Attributes, telemetryattrs.CacheRetainedAttr), 200),
+					"replacements", cutString(stringAttr(span.Attributes, telemetryattrs.CacheReplacementsAttr), 200),
+					"endUnixNano", span.EndTimeUnixNano,
 					"deps", arrayLen(span.Attributes, telemetryattrs.CacheDepsAttr),
 					"parts", arrayLen(span.Attributes, telemetryattrs.CachePartsAttr))
 			}
@@ -159,19 +206,21 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 // limited separately, so a gzip bomb stops at the limit however well it
 // compresses. A body over either limit is answered 413, one that doesn't fit
 // in the budget 503 with Retry-After, and one too slow 408; with ok false,
-// nothing of the request may be recorded. With ok true, release gives its
-// bytes back to the budget: call it once the request is recorded.
-func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpRoute, msg proto.Message) (release func(), ok bool) {
+// nothing of the request may be recorded. held is what otlpAdmit reserved
+// for the request and its headers, which decodeOTLP takes over: with ok
+// false it is already given back, and with ok true release gives it back
+// with the rest of the request's bytes: call it once the request is recorded.
+func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpRoute, held int64, msg proto.Message) (release func(), ok bool) {
 	s.logger.Debug("otlp request", "path", r.URL.Path, "userAgent", r.UserAgent(),
 		"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
 		"contentLength", r.ContentLength)
 	lim := s.otlp
 	// The read deadline is the route's (otlpDeadline). Everything the
 	// request holds is reserved before it is allocated, and given back by
-	// release: the request itself (its goroutine and the server's buffers),
-	// a gzipped body's decompressor, the body's buffer, and the decoded
-	// message.
-	var held int64
+	// release: the request itself (its goroutine and the server's buffers)
+	// and its headers (otlpAdmit, before the token was checked), a gzipped
+	// body's decompressor, the body's buffer, and the decoded message.
+	headers := held - otlpRequestReserve
 	release = func() { lim.budget.release(held) }
 	refuse := func(err error) (func(), bool) {
 		release()
@@ -179,10 +228,6 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 		s.refuseOTLP(w, r, route, status, reason, err)
 		return nil, false
 	}
-	if !lim.budget.reserve(otlpRequestReserve) {
-		return refuse(errOTLPBusy)
-	}
-	held = otlpRequestReserve
 	received := &countingReader{r: http.MaxBytesReader(w, r.Body, route.limit)}
 	var body io.Reader = received
 	if r.Header.Get("Content-Encoding") == "gzip" {
@@ -202,10 +247,22 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	if err != nil {
 		return refuse(err)
 	}
+	// The walk and the decode recurse once per level of the body, on the
+	// stack: reserve it before the walk, so a body nested to the limit holds
+	// its stack in the budget while it is estimated as well as while it is
+	// decoded.
+	stack := int64(otlpDecodeStack)
+	if isJSON(r) {
+		stack = otlpJSONDecodeStack
+	}
+	if !lim.budget.reserve(stack) {
+		return refuse(errOTLPBusy)
+	}
+	held += stack
 	// The message decoded from the body can take far more than the body
 	// (otlpDecodedSize): it is estimated, and reserved, before it is
 	// decoded. One that could never fit in the budget is too large.
-	estimate, err := otlpDecodedSize(data, msg, isJSON(r))
+	estimate, nesting, err := otlpDecodedSizeDepth(data, msg, isJSON(r))
 	if err != nil {
 		return refuse(err)
 	}
@@ -226,7 +283,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "messageBytes", estimate, "budgetPeak", lim.budget.peakUse())
+		"decodedBytes", len(data), "messageBytes", estimate, "nestingDepth", nesting, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 

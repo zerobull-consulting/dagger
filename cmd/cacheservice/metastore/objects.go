@@ -23,7 +23,8 @@ import (
 // Objects is the small part of an object store the metadata store needs:
 // whole-object reads and conditional whole-object writes.
 type Objects interface {
-	// Get returns an object's body and ETag, or ErrNotFound.
+	// Get returns an object's body and ETag, or ErrNotFound, or ErrDenied
+	// when the key may not read it.
 	Get(ctx context.Context, key string) (body []byte, etag string, err error)
 	// Put writes an object if cond holds, and returns its new ETag. When
 	// cond doesn't hold, it returns ErrPreconditionFailed and writes
@@ -44,6 +45,11 @@ type Condition struct {
 var (
 	// ErrNotFound is an object that doesn't exist.
 	ErrNotFound = errors.New("object not found")
+	// ErrDenied is a request the store refused the key: a 403, or an
+	// AccessDenied code (s3util.Denied). A 403 isn't always about
+	// permissions, so its text says only that; the store's own error,
+	// kept alongside it, says why.
+	ErrDenied = errors.New("refused (403)")
 	// ErrPreconditionFailed is a conditional write that lost: the object
 	// exists (IfNoneMatch), or has changed (IfMatch).
 	ErrPreconditionFailed = errors.New("precondition failed")
@@ -69,6 +75,9 @@ func (o *S3Objects) Get(ctx context.Context, key string) ([]byte, string, error)
 	if err != nil {
 		if s3util.HTTPStatus(err) == http.StatusNotFound {
 			return nil, "", fmt.Errorf("get %s: %w", key, ErrNotFound)
+		}
+		if s3util.Denied(err) {
+			return nil, "", fmt.Errorf("get %s: %w: %w", key, ErrDenied, err)
 		}
 		return nil, "", fmt.Errorf("get %s: %w", key, err)
 	}

@@ -108,12 +108,9 @@ func (s *Service) removeFlushRun(r *flushRun) {
 }
 
 // flushStored counts roots stored by an export of a namespace's cache, for
-// each flush of it under way. It runs before the tracker hears of the
+// each flush of it under way (see exportStored). It runs before the tracker hears of the
 // export, so a flush that then sees nothing in flight has counted it.
 func (s *Service) flushStored(ns *namespace, cacheID string, roots int) {
-	if roots == 0 {
-		return
-	}
 	s.flushes.mu.Lock()
 	defer s.flushes.mu.Unlock()
 	for r := range s.flushes.runs {
@@ -166,8 +163,10 @@ func (s *Service) flushRefusal() error {
 //
 //   - It makes every dirty entry of the cache due now, without waiting for
 //     it to settle, and every root of it waiting out a retry's backoff due
-//     now, once; a retry after that waits its normal backoff. Entries that
-//     become dirty during the flush are due at once too.
+//     now, once; a retry after that waits its normal backoff. A failed root
+//     whose wait began with a flush's try that failed is left to wait it
+//     out, unless its value changed (see exporter.Tracker.StartFlush).
+//     Entries that become dirty during the flush are due at once too.
 //   - It waits for the cache's sessions whose spans may still come: not
 //     ended, or ended with some of the spans their carrier counted missing,
 //     until Settle (at most 2s) passed since their last span; their late
@@ -183,7 +182,9 @@ func (s *Service) flushRefusal() error {
 // the cache's engine isn't connected or disconnects (not_connected); and
 // when ctx is canceled or the export path stops (canceled). It never
 // cancels an export: one in flight when it returns runs on. A timeout of 0
-// makes nothing due, and only reports.
+// makes nothing due, and only reports. The timeout is measured on the
+// export path's clock, which the tracker's retries and session waits use
+// too, so what the report counts as due before it is what was waited for.
 //
 // The error is a refusal: flushRefusal's.
 func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, timeout time.Duration) (FlushReport, error) {
@@ -214,12 +215,17 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 
 	endFlush := tracker.StartFlush(cacheID, p.now())
 	defer endFlush()
-	tctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// The deadline and the wait are on one clock, the export path's, as
+	// the tracker's retries are: the wait ends when that clock reaches the
+	// deadline, checked at each wake (a timer set to what is left of it,
+	// the poll, or a kick), never on a wall-clock timeout of its own.
 	p.changedWaiters.Add(1)
 	defer p.changedWaiters.Add(-1)
 	poll := time.NewTicker(min(p.tick, maxDrainPoll))
 	defer poll.Stop()
+	// left fires when what is left of the deadline passed, as last seen.
+	left := time.NewTimer(timeout)
+	defer left.Stop()
 	for {
 		// Before the status: a kick after it wakes the wait below.
 		changed := p.changed()
@@ -241,16 +247,15 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		case !now.Before(deadline):
 			return end(metrics.FlushTimeout), nil
 		}
+		left.Reset(deadline.Sub(now))
 		select {
 		case <-changed:
 		case <-poll.C:
+		case <-left.C:
 		case <-p.ctx.Done():
 			return end(metrics.FlushCanceled), nil
-		case <-tctx.Done():
-			if ctx.Err() != nil {
-				return end(metrics.FlushCanceled), nil
-			}
-			return end(metrics.FlushTimeout), nil
+		case <-ctx.Done():
+			return end(metrics.FlushCanceled), nil
 		}
 	}
 }

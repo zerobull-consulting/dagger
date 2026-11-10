@@ -210,6 +210,9 @@ type engineConn struct {
 	// versionAccepted is set when the hello's version is on an accept line;
 	// it is unset for an engine welcomed by -allow-engine-version-mismatch.
 	versionAccepted bool
+	// firstSyncDone is set once the sync loop's first import sync ended
+	// (LogImportFirstSync).
+	firstSyncDone atomic.Bool
 
 	mu sync.Mutex
 	// stopImports ends the import sync loop; set once it starts.
@@ -312,7 +315,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// The cache ID keys the tracker's, the importer's and the namespace's
 	// state, as a span's does (parseEngineCache).
 	if !validEngineID(c.hello.CacheID) {
-		c.svc.refusedEngineIDs(metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
+		c.svc.refusedEngineIDs(c.logger.With("remote", c.remote), metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
 		_ = c.replyError(ctx, env, "invalid cache ID")
 		return errors.New("hello: invalid cache ID")
 	}
@@ -353,7 +356,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// The engine reports in at its generation: a newer one clears the
 	// cache's stale-generation refusals, to be exported from it (#129).
 	if c.ns.tracker != nil {
-		c.ns.tracker.Connected(c.hello.CacheID, c.hello.Generation)
+		c.ns.tracker.Connected(c.hello.CacheID, c.hello.Generation, c.svc.export.now())
 	}
 	// The import sync loop ends with the connection.
 	importCtx, stopImports := context.WithCancel(ctx)
@@ -742,6 +745,10 @@ type EngineInfo struct {
 	// welcomed by -allow-engine-version-mismatch.
 	VersionAccepted bool   `json:"versionAccepted"`
 	EngineName      string `json:"engineName"`
+	// FirstSyncDone is set once the connection's first import sync ended,
+	// even when it merged nothing (LogImportFirstSync); it stays unset
+	// with the import path off.
+	FirstSyncDone bool `json:"firstSyncDone"`
 }
 
 // serveIdentity answers with the service's identity: its base release (or

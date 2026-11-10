@@ -74,9 +74,15 @@ D4):
 
 So the service can be a newer build than the action's commit. The action
 passes the service only flags every build has kept (`-scope`,
-`-drain-timeout`, `-drain-linger`, `-gc-interval`, `-export`, `-v`,
-`-debug-listen`, `-debug-token-file`); removing or renaming one of them is
-a breaking change for pinned actions. To run one exact build, set
+`-drain-timeout`, `-drain-linger`, `-export`, `-v`, `-debug-listen`,
+`-debug-token-file`); removing or renaming one of them is a breaking change
+for pinned actions. The exception is `role: writer`, which also passes
+`-gc-mode=batch`: it needs a service image built at or after
+zerobull-consulting/dagger#248, with no backwards compatibility. The
+version's floating tag is one once the publish workflow has moved it to a
+build with that change (`.github/workflows/cacheservice-publish.yml`,
+"engine-tags"); a `service-image` pinned to an older commit is not. (The
+action has not been run against an older image.) To run one exact build, set
 `service-image` to `dagger-remote-cache:<commit SHA>`, such as the action's
 own commit.
 
@@ -104,6 +110,19 @@ neither line 10s after the engine connected, the start goes on with a
 warning that it can't tell whether the engine was refused (a refusal comes
 within milliseconds of the connection, so one is still caught).
 
+**Then the start waits for the first import sync.** The service merges
+what is stored as the engine connects, and logs `import sync: first done`
+once that first sync ends, even when it merged nothing; a build that started
+before it could miss entries not merged yet
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
+The start waits for that line, in both roles, for up to 30s
+(`SIDECAR_FIRST_SYNC_TIMEOUT` overrides it for a local run of `sidecar.sh`),
+and then goes on with a warning: a `service-image` from before the line
+never logs it.
+A first sync that failed is a warning too, not a failure: the job's builds
+run without what it didn't merge, as they would against a bucket the
+service can't read. An image from before the welcome line isn't waited for.
+
 **Overrides:**
 
 - `service-image` replaces the service image, such as one built in the job
@@ -120,7 +139,7 @@ of its own.
 
 | Input | Required | Default | What it is |
 | --- | --- | --- | --- |
-| `role` | yes | | `writer`: exports what the job builds, with `-gc-interval=0` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
+| `role` | yes | | `writer`: exports what the job builds, with `-gc-mode=batch` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
 | `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.25`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the CLI, the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
 | `service-image` | no | `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>` | Overrides the service image. The step fails if it refuses the engine. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
@@ -252,7 +271,9 @@ work plus `drain-timeout` (10m) plus 2 minutes: the drain's wait, the
 engine's stop (cut off at 90s), then the cleanup. A job cancelled while the
 sidecar drains gets the runner's cancellation grace (about 5 minutes) for the
 stop, so a long drain can be cut off then; set a shorter `drain-timeout`
-where cancelled jobs matter.
+where cancelled jobs matter. The shim passes a SIGINT, SIGTERM or SIGHUP it
+gets on to the script's whole process group, and `sidecar.sh` traps none, so
+a start or stop that gets one ends at once, its cleanup with it.
 
 ## stop
 
@@ -313,9 +334,7 @@ pin the images to the action's commit, as above.
 | any | Still running past the stop's bound, `drain-timeout` plus 25s: the stop stopped it. | fails |
 | any | The service had exited before the stop. | fails |
 
-Known gaps of the action: a read-only start doesn't wait for the service's first merge
-([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)),
-and the leads in
+Known gaps of the action: the leads in
 [zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
 
 The stop's step summary has the exit code, and its log the drain's and the

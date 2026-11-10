@@ -61,6 +61,7 @@ func (s *Service) Engines() []EngineInfo {
 			EngineVersion:   c.hello.EngineVersion,
 			VersionAccepted: c.versionAccepted,
 			EngineName:      c.hello.EngineName,
+			FirstSyncDone:   c.firstSyncDone.Load(),
 		})
 	}
 	s.mu.Unlock()
@@ -103,18 +104,21 @@ func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 // for the export of that cache in flight to end, and the scheduler starts
 // none for it while Export waits or runs (zerobull-consulting/dagger#135).
 // The wait ends with ctx, whose error it then returns.
-func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request) (exporter.Result, error) {
+func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request) (_ exporter.Result, err error) {
 	p := s.export
 	if p == nil {
 		return exporter.Result{}, s.exportOff()
 	}
 	// New work: the drain runs what is pending itself. One admitted before
-	// the drain started is waited for (zerobull-consulting/dagger#72).
-	done, err := s.admitExplicit()
+	// the drain started is waited for (zerobull-consulting/dagger#72). The
+	// stop cancels it with the export path, and Wait waits for it
+	// (zerobull-consulting/dagger#202).
+	ctx, done, err := s.admitExplicit(ctx, p.ctx)
 	if err != nil {
 		return exporter.Result{}, err
 	}
 	defer done()
+	defer func() { err = stoppedCause(ctx, err) }()
 	c, err := s.conn(conn)
 	if err != nil {
 		return exporter.Result{}, err
@@ -168,17 +172,21 @@ func (s *Service) Imports(conn uint64) (importer.State, error) {
 
 // Import merges and offers now what a connection's engine lacks, and
 // returns what was merged, failed and offered.
-func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, error) {
+func (s *Service) Import(ctx context.Context, conn uint64) (_ importer.Result, err error) {
 	if s.imports == nil {
 		return importer.Result{}, ErrImportOff
 	}
 	// A drain that starts once it was admitted waits for it
-	// (zerobull-consulting/dagger#72).
-	done, err := s.admitExplicit()
+	// (zerobull-consulting/dagger#72). The stop cancels it, and Wait waits
+	// for it (zerobull-consulting/dagger#202): it runs on the context the
+	// import path was enabled with, which the stop ends, not on the sync
+	// loops' own, which the drain ends.
+	ctx, done, err := s.admitExplicit(ctx, s.imports.svcCtx)
 	if err != nil {
 		return importer.Result{}, err
 	}
 	defer done()
+	defer func() { err = stoppedCause(ctx, err) }()
 	c, err := s.conn(conn)
 	if err != nil {
 		return importer.Result{}, err
@@ -205,7 +213,7 @@ func writeDebugError(w http.ResponseWriter, err error) {
 		http.Error(w, "no such engine", http.StatusNotFound)
 	case errors.Is(err, ErrDraining), errors.Is(err, ErrStopping):
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-	case errors.Is(err, ErrExportOff), errors.Is(err, ErrReadOnly), errors.Is(err, ErrImportOff), errors.Is(err, ErrGCReadOnly), errors.As(err, &conflict):
+	case errors.Is(err, ErrExportOff), errors.Is(err, ErrReadOnly), errors.Is(err, ErrImportOff), errors.Is(err, ErrGCReadOnly), errors.Is(err, ErrGCModeOff), errors.As(err, &conflict):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:
 		http.Error(w, err.Error(), http.StatusBadGateway)

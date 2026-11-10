@@ -51,6 +51,8 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,6 +136,9 @@ type Exporter struct {
 	// epoch is the last fence read, when epochOK (see fence).
 	epoch   metastore.Fence
 	epochOK bool
+	// epochGen counts forgetEpoch calls: a fence read keeps its epoch only
+	// if none happened since the read began.
+	epochGen uint64
 }
 
 const (
@@ -413,6 +418,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	defer func() { <-slots }()
 
+	x.logRoots("export try roots", eng.CacheID(), eng.Generation(), roots)
 	exported, err := x.requestExport(ctx, eng, roots, outputs)
 	if err != nil {
 		return res, nil, false, err
@@ -546,10 +552,32 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	res.Stored = append(res.Stored, survivors...)
 	res.Bundles = append(res.Bundles, rec.BundleID)
+	x.logRoots("export stored roots", eng.CacheID(), eng.Generation(), survivors)
 	x.log.Info("export stored", "cacheID", eng.CacheID(), "roots", len(survivors),
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, false, nil
+}
+
+// maxLoggedRoots bounds the root numbers one "export try roots" or "export
+// stored roots" record lists (a batch has at most 1,000 roots); a record that
+// omits some says how many.
+const maxLoggedRoots = 1000
+
+// logRoots logs, at debug level, which roots an export try started with
+// ("export try roots") or stored ("export stored roots"): the e2e reads when
+// each value was first exported and stored (zerobull-consulting/dagger#154).
+func (x *Exporter) logRoots(msg, cacheID string, generation uint64, roots []uint64) {
+	if !x.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	omitted := max(len(roots)-maxLoggedRoots, 0)
+	roots = roots[:len(roots)-omitted]
+	nums := make([]string, len(roots))
+	for i, n := range roots {
+		nums[i] = strconv.FormatUint(n, 10)
+	}
+	x.log.Debug(msg, "cacheID", cacheID, "generation", generation, "numbers", strings.Join(nums, ","), "omitted", omitted)
 }
 
 // checkGeneration returns the index's ErrStaleGeneration refusal of the
@@ -618,10 +646,13 @@ func (x *Exporter) checkOffered(ctx context.Context, bundle *dagql.ValueBundle, 
 // The fence is read at most once per epochTTL, and kept: a fence read
 // earlier is still read before this try's checks, so it is as safe, and at
 // worst older, which only refuses more. A refused export forgets it
-// (forgetEpoch), so its next try reads a fresh one.
+// (forgetEpoch), so its next try reads a fresh one; a read that began before
+// the forgetting isn't kept, or it would hand that try the older epoch; nor
+// is one that read an older epoch than the kept fence, which a slower
+// concurrent read would otherwise overwrite it with.
 func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 	x.mu.Lock()
-	f, ok := x.epoch, x.epochOK
+	f, ok, gen := x.epoch, x.epochOK, x.epochGen
 	x.mu.Unlock()
 	if ok && x.cfg.Meta.Now().Sub(f.Started) < epochTTL {
 		return f
@@ -634,7 +665,9 @@ func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 	}
 	f = metastore.Fence{Epoch: epoch, Started: started}
 	x.mu.Lock()
-	x.epoch, x.epochOK = f, true
+	if x.epochGen == gen && (!x.epochOK || f.Epoch >= x.epoch.Epoch) {
+		x.epoch, x.epochOK = f, true
+	}
 	x.mu.Unlock()
 	return f
 }
@@ -643,6 +676,7 @@ func (x *Exporter) fence(ctx context.Context) metastore.Fence {
 func (x *Exporter) forgetEpoch() {
 	x.mu.Lock()
 	x.epochOK = false
+	x.epochGen++
 	x.mu.Unlock()
 }
 

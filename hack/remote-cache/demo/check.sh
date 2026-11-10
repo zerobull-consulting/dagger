@@ -135,19 +135,19 @@ read_only() {
 
 	grep -q 'msg=mode export=off import=on gc=off readOnly=true' <<<"$(service_log "$service")" &&
 		ok "the service is read-only (-export=false)" || fail "the service isn't read-only: no 'readOnly=true' mode line"
-	# The service merges what is stored as the engine connects; wait for it,
-	# so the demo doesn't race it.
-	local deadline=$((SECONDS + timeout_s)) merged=0
-	while :; do
-		merged="$(service_log "$service" | sed -nE 's/.*msg="import sync" .* merged=([0-9]+).*/\1/p' | awk '{n += $1} END {print n + 0}')"
-		((merged >= 1)) && break
-		if ((SECONDS >= deadline)); then
-			break
-		fi
-		sleep 1
-	done
-	((merged >= 1)) && ok "the service merged $merged stored bundle(s) into the engine" ||
-		fail "the service merged nothing into the engine within ${timeout_s}s: did the writer store an export, under the same prefix and namespace?"
+	# The service merges what is stored as the engine connects, and the
+	# action's start waits for that first sync (zerobull-consulting/dagger#103):
+	# its line is already in the log, and the build below doesn't race it.
+	local first merged
+	first="$(service_log "$service" | grep -m1 'msg="import sync: first done"' || true)"
+	merged="$(sed -nE 's/.* merged=([0-9]+).*/\1/p' <<<"$first")"
+	if [[ -z "$first" ]]; then
+		fail "the service logged no first import sync before the start returned: the action's start didn't wait for it"
+	elif ((merged >= 1)); then
+		ok "the service's first import sync merged $merged stored bundle(s) into the engine, before the start returned"
+	else
+		fail "the service's first import sync merged nothing into the engine: did the writer store an export, under the same prefix and namespace? ($first)"
+	fi
 
 	step "$service" build 1
 	[[ "$caches" != - && ",$caches," != *",$writer_cache,"* ]] && ok "the engine is fresh: cache $caches, the writer's was $writer_cache" ||

@@ -5,8 +5,10 @@ package s3util
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -18,6 +20,22 @@ func HTTPStatus(err error) int {
 		return re.HTTPStatusCode()
 	}
 	return 0
+}
+
+// ErrorCode is an S3 error's code, such as AccessDenied, or "" when err
+// carries none.
+func ErrorCode(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode()
+	}
+	return ""
+}
+
+// Denied reports an error of a key that isn't allowed the request: a 403,
+// or an AccessDenied error code.
+func Denied(err error) bool {
+	return HTTPStatus(err) == http.StatusForbidden || ErrorCode(err) == "AccessDenied"
 }
 
 // HasStatus reports whether err carries an HTTP response with status.

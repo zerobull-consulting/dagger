@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,7 +83,7 @@ func enableGC(t *testing.T, svc *Service, st *gcStores, modify func(*gc.Config))
 	if modify != nil {
 		modify(&cfg)
 	}
-	if err := svc.EnableGC(context.Background(), GCConfig{Collector: cfg}); err != nil {
+	if err := svc.EnableGC(context.Background(), GCConfig{Mode: GCModeBatch, Collector: cfg}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -478,17 +480,162 @@ func TestDebugGC(t *testing.T) {
 	}
 }
 
-// A negative GC interval is refused: only 0 turns the schedule off, and a
-// typo must not leave retention off without a word.
-func TestEnableGCRefusesNegativeInterval(t *testing.T) {
+// A GC interval the mode can't use is refused, and leaves GC off: a
+// service with a zero or negative interval would otherwise have no schedule
+// without a word, and an interval with batch or off would do nothing.
+func TestEnableGCRefusesIntervalMismatch(t *testing.T) {
 	st := newGCStores(t, nil)
-	svc := New(slog.New(slog.DiscardHandler), "")
-	err := svc.EnableGC(context.Background(), GCConfig{Interval: -time.Second, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta}})
-	if err == nil || !strings.Contains(err.Error(), "negative interval") {
-		t.Fatalf("EnableGC: %v", err)
+	for _, tc := range []struct {
+		name string
+		cfg  GCConfig
+		want string
+	}{
+		{"negative interval", GCConfig{Mode: GCModeService, Interval: -time.Second}, "interval -1s in mode service"},
+		{"service, no interval", GCConfig{Mode: GCModeService}, "interval 0s in mode service"},
+		{"batch, interval", GCConfig{Mode: GCModeBatch, Interval: time.Hour}, "interval 1h0m0s in mode batch"},
+		{"off, interval", GCConfig{Mode: GCModeOff, Interval: time.Hour}, "interval 1h0m0s in mode off"},
+		{"no mode", GCConfig{Interval: time.Hour}, "unknown mode"},
+		{"unknown mode", GCConfig{Mode: "sometimes"}, "unknown mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := New(slog.New(slog.DiscardHandler), "")
+			tc.cfg.Collector = gc.Config{Bucket: st.bucket, Meta: st.meta}
+			err := svc.EnableGC(context.Background(), tc.cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("EnableGC: %v, want %q", err, tc.want)
+			}
+			if _, err := svc.CollectGarbage(context.Background(), true); !errors.Is(err, ErrGCOff) {
+				t.Fatalf("GC on after a refused config: %v", err)
+			}
+		})
 	}
-	if _, err := svc.CollectGarbage(context.Background(), true); !errors.Is(err, ErrGCOff) {
-		t.Fatalf("GC on after a refused config: %v", err)
+}
+
+// listCounter counts the collector's listings of the bucket: one per run.
+type listCounter struct {
+	gc.Bucket
+	n atomic.Int64
+}
+
+func (b *listCounter) ListLevel(ctx context.Context, prefix string) ([]string, []gc.Object, error) {
+	b.n.Add(1)
+	return b.Bucket.ListLevel(ctx, prefix)
+}
+
+// Each mode: what runs, what POST /debug/gc (and ?dry-run) answers, and what
+// the log says.
+func TestGCModes(t *testing.T) {
+	post := func(t *testing.T, url, query string) (int, string, GCMode) {
+		t.Helper()
+		resp, err := http.Post(url+"/debug/gc"+query, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var out struct {
+			Mode GCMode `json:"mode"`
+		}
+		_ = json.Unmarshal(body, &out)
+		return resp.StatusCode, string(body), out.Mode
+	}
+	for _, tc := range []struct {
+		mode     GCMode
+		interval time.Duration
+		status   int
+		// scheduled: the schedule runs GC with nobody asking.
+		scheduled bool
+	}{
+		{GCModeService, 50 * time.Millisecond, http.StatusOK, true},
+		{GCModeBatch, 0, http.StatusOK, false},
+		{GCModeOff, 0, http.StatusConflict, false},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			st := newGCStores(t, nil)
+			bucket := &listCounter{Bucket: st.bucket}
+			logs := &logRecorder{}
+			svc := New(slog.New(logs), "")
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(func() { cancel(); svc.waitGC() })
+			if err := svc.EnableGC(ctx, GCConfig{Mode: tc.mode, Interval: tc.interval, Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+				t.Fatal(err)
+			}
+			debug := httptest.NewServer(svc.DebugHandler())
+			t.Cleanup(debug.Close)
+
+			// The log says which mode, and off warns.
+			if tc.mode == GCModeOff {
+				if len(logs.find("gc off")) != 1 {
+					t.Errorf("no gc off warning: %v", logs.find("gc off"))
+				}
+			} else if on := logs.find("gc on"); len(on) != 1 || on[0]["mode"] != string(tc.mode) {
+				t.Errorf("gc on log: %v, want mode=%s", on, tc.mode)
+			}
+			logs.mu.Lock()
+			for _, r := range logs.records {
+				if r.Message == "gc off" && r.Level != slog.LevelWarn {
+					t.Errorf("gc off logged at %s, want WARN", r.Level)
+				}
+			}
+			logs.mu.Unlock()
+
+			// The schedule: a run with nobody asking, or none.
+			if tc.scheduled {
+				deadline := time.Now().Add(10 * time.Second)
+				for bucket.n.Load() == 0 {
+					if time.Now().After(deadline) {
+						t.Fatal("the schedule never ran GC")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			} else {
+				time.Sleep(300 * time.Millisecond)
+				if n := bucket.n.Load(); n != 0 {
+					t.Fatalf("%d GC runs with no schedule and nobody asking", n)
+				}
+			}
+
+			// POST /debug/gc, and a dry run, answer as the mode says.
+			for _, q := range []string{"", "?dry-run"} {
+				code, body, mode := post(t, debug.URL, q)
+				if code != tc.status {
+					t.Fatalf("POST /debug/gc%s: %d %q, want %d", q, code, body, tc.status)
+				}
+				if tc.mode == GCModeOff {
+					if !strings.Contains(body, "-gc-mode=off") || strings.Contains(body, "read-only") {
+						t.Errorf("POST /debug/gc%s: %q, want a reason that names -gc-mode=off, not read-only", q, body)
+					}
+				} else if mode != tc.mode {
+					t.Errorf("POST /debug/gc%s reports mode %q, want %q", q, mode, tc.mode)
+				}
+			}
+		})
+	}
+}
+
+// The read-only reason and the off reason differ.
+func TestGCOffReasonDiffersFromReadOnly(t *testing.T) {
+	if ErrGCModeOff.Error() == ErrGCReadOnly.Error() || strings.Contains(ErrGCModeOff.Error(), "read-only") {
+		t.Fatalf("off reason %q, read-only reason %q", ErrGCModeOff, ErrGCReadOnly)
+	}
+}
+
+func TestParseGCMode(t *testing.T) {
+	for _, m := range GCModes {
+		if got, err := ParseGCMode(string(m)); err != nil || got != m {
+			t.Errorf("ParseGCMode(%q) = %q, %v", m, got, err)
+		}
+	}
+	for _, bad := range []string{"", "Service", "on", "interval", "0"} {
+		_, err := ParseGCMode(bad)
+		if err == nil {
+			t.Fatalf("ParseGCMode(%q) taken", bad)
+		}
+		for _, m := range GCModes {
+			if !strings.Contains(err.Error(), string(m)) {
+				t.Errorf("error %q doesn't list %s", err, m)
+			}
+		}
 	}
 }
 
@@ -633,5 +780,43 @@ func TestDebugGCRequiresToken(t *testing.T) {
 	}
 	if counterSum(t, svc, "gc_runs_total") == runs {
 		t.Fatal("the debug token's request ran no collection")
+	}
+}
+
+// A drain, Running and Wait leave no nil in the GC path, in every mode and
+// on a read-only instance (which has no GC path at all): the drain stops the
+// path, and a GC run asked for after it is refused.
+func TestGCModesDrain(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     GCMode
+		interval time.Duration
+		readOnly bool
+		wantErr  error
+	}{
+		{"service", GCModeService, time.Hour, false, ErrDraining},
+		{"batch", GCModeBatch, 0, false, ErrDraining},
+		{"off", GCModeOff, 0, false, ErrGCModeOff},
+		{"read-only", "", 0, true, ErrGCReadOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newGCStores(t, nil)
+			svc := New(slog.New(slog.DiscardHandler), "")
+			if tc.readOnly {
+				if err := svc.SetReadOnly(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := svc.EnableGC(context.Background(), GCConfig{Mode: tc.mode, Interval: tc.interval, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+				t.Fatal(err)
+			}
+			drainFor(svc, 10*time.Second)
+			svc.Wait()
+			if r := svc.Running(); r.GC != 0 {
+				t.Errorf("Running after Wait: %+v", r)
+			}
+			if _, err := svc.CollectGarbage(context.Background(), true); !errors.Is(err, tc.wantErr) {
+				t.Errorf("CollectGarbage after the drain: %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }
