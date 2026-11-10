@@ -22,14 +22,20 @@ func HTTPStatus(err error) int {
 	return 0
 }
 
+// ErrorCode is an S3 error's code, such as AccessDenied, or "" when err
+// carries none.
+func ErrorCode(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode()
+	}
+	return ""
+}
+
 // Denied reports an error of a key that isn't allowed the request: a 403,
 // or an AccessDenied error code.
 func Denied(err error) bool {
-	if HTTPStatus(err) == http.StatusForbidden {
-		return true
-	}
-	var ae smithy.APIError
-	return errors.As(err, &ae) && ae.ErrorCode() == "AccessDenied"
+	return HTTPStatus(err) == http.StatusForbidden || ErrorCode(err) == "AccessDenied"
 }
 
 // HasStatus reports whether err carries an HTTP response with status.

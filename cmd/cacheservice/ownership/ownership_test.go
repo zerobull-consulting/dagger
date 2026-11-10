@@ -5,15 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/aws/smithy-go"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -381,25 +377,20 @@ func TestWriterRefusesPrefixWithUpload(t *testing.T) {
 }
 
 // failGets answers GETs of some keys with an error, as a key allowed only
-// its own prefix gets 403 above it, or as a store that fails.
+// its own prefix gets metastore.ErrDenied above it, or as a store that
+// fails. gets counts every GET, failed ones included.
 type failGets struct {
 	*counting
 	fail map[string]error
+	gets int
 }
 
 func (d *failGets) Get(ctx context.Context, key string) ([]byte, string, error) {
+	d.gets++
 	if err, ok := d.fail[key]; ok {
 		return nil, "", fmt.Errorf("get %s: %w", key, err)
 	}
 	return d.counting.Get(ctx, key)
-}
-
-// s3Error is an S3 error as the SDK returns it: an HTTP status and a code.
-func s3Error(status int, code string) error {
-	return &smithyhttp.ResponseError{
-		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
-		Err:      &smithy.GenericAPIError{Code: code, Message: code},
-	}
 }
 
 // A prefix inside one that holds a marker belongs to the service there:
@@ -429,13 +420,10 @@ func TestNestedPrefixRefused(t *testing.T) {
 			}
 		}
 	}
-	// An ancestor's marker the key may not read: skipped, whether the error
-	// says so by its status or by its code.
-	for _, denied := range []error{s3Error(http.StatusForbidden, "AccessDenied"), s3Error(http.StatusForbidden, "SignatureDoesNotMatch"), s3Error(0, "AccessDenied")} {
-		st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": denied}}
-		if state, _, err := Check(ctx, st, "cache", true, now); err != nil || state != Claimed {
-			t.Fatalf("an ancestor the key may not read (%v): %v, %v; want claimed", denied, state, err)
-		}
+	// An ancestor's marker the key may not read: skipped.
+	st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": metastore.ErrDenied}}
+	if state, _, err := Check(ctx, st, "cache", true, now); err != nil || state != Claimed {
+		t.Fatalf("an ancestor the key may not read: %v, %v; want claimed", state, err)
 	}
 	// A sibling's marker isn't an ancestor's.
 	st2 := newCounting()
@@ -479,18 +467,23 @@ func (c *claimBeforeUploads) ListUploadKeys(ctx context.Context, prefix string, 
 // or access denied (a 5xx, a timeout, a dropped connection) refuses the
 // prefix, for both kinds of instance: the check can't tell whether a
 // service owns the ancestor. The error names the ancestor's key and wraps
-// the store's, and nothing is written. Ancestors after it aren't read.
+// the store's, and nothing is written. Ancestors after it aren't read: the
+// marker's own GET, then one per ancestor up to the one that failed, from
+// the bucket's top down.
 func TestAncestorUnreadRefused(t *testing.T) {
 	ctx := context.Background()
 	for name, cause := range map[string]error{
-		"5xx":        s3Error(http.StatusInternalServerError, "InternalError"),
-		"503":        s3Error(http.StatusServiceUnavailable, "SlowDown"),
+		"5xx":        errors.New("InternalError: status 500"),
+		"503":        errors.New("SlowDown: status 503"),
 		"timeout":    context.DeadlineExceeded,
 		"connection": errors.New("connection reset by peer"),
 	} {
-		for _, tc := range []struct{ prefix, fail string }{
-			{"cache/team", "cacheservice.json"},
-			{"cache/team", "cache/cacheservice.json"},
+		for _, tc := range []struct {
+			prefix, fail string
+			gets         int
+		}{
+			{"cache/team", "cacheservice.json", 2},
+			{"cache/team", "cache/cacheservice.json", 3},
 		} {
 			for _, writer := range []bool{true, false} {
 				st := &failGets{counting: newCounting(), fail: map[string]error{tc.fail: cause}}
@@ -502,15 +495,51 @@ func TestAncestorUnreadRefused(t *testing.T) {
 				if !strings.Contains(err.Error(), tc.fail) || !strings.Contains(err.Error(), "cache/team/") {
 					t.Fatalf("%s: the error doesn't name the ancestor's key and the prefix: %v", name, err)
 				}
-				if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 {
-					t.Fatalf("%s, writer %v: requests %v", name, writer, c)
+				if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 || c["list"] != 1 || st.gets != tc.gets {
+					t.Fatalf("%s at %s, writer %v: %d GETs, want %d; requests %v", name, tc.fail, writer, st.gets, tc.gets, c)
 				}
 			}
 		}
 	}
-	// A missing marker at one ancestor and a 403 at another: both skipped.
-	st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": s3Error(http.StatusForbidden, "AccessDenied")}}
+	// A missing marker at one ancestor and a denied one at another: both
+	// skipped.
+	st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": metastore.ErrDenied}}
 	if state, _, err := Check(ctx, st, "cache/team", true, now); err != nil || state != Claimed {
-		t.Fatalf("403 then not found: %v, %v; want claimed", state, err)
+		t.Fatalf("denied then not found: %v, %v; want claimed", state, err)
 	}
+}
+
+// A check whose context has ended while it reads an ancestor's marker
+// returns the context's error, not ErrAncestorUnread: the caller stopped
+// it (an interrupt, a deadline of its own), not the store. Nothing is
+// written.
+func TestAncestorCheckCancelled(t *testing.T) {
+	for _, writer := range []bool{true, false} {
+		ctx, cancel := context.WithCancel(context.Background())
+		st := &cancelAtGet{failGets: &failGets{counting: newCounting()}, key: "cacheservice.json", cancel: cancel}
+		_, _, err := Check(ctx, st, "cache/team", writer, now)
+		var unread *ErrAncestorUnread
+		if !errors.Is(err, context.Canceled) || errors.As(err, &unread) || !strings.Contains(err.Error(), "cacheservice.json") {
+			t.Fatalf("writer %v: %v; want context.Canceled, naming the key, and no ErrAncestorUnread", writer, err)
+		}
+		if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 {
+			t.Fatalf("writer %v: requests %v", writer, c)
+		}
+	}
+}
+
+// cancelAtGet cancels the caller's context during the GET of key, which
+// then fails with the context's error, as the SDK's does.
+type cancelAtGet struct {
+	*failGets
+	key    string
+	cancel context.CancelFunc
+}
+
+func (c *cancelAtGet) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if key == c.key {
+		c.cancel()
+		return nil, "", fmt.Errorf("get %s: %w", key, ctx.Err())
+	}
+	return c.failGets.Get(ctx, key)
 }

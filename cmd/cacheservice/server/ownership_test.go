@@ -5,14 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/aws/smithy-go"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -196,7 +192,7 @@ func TestStartupAncestorMarkerErrors(t *testing.T) {
 		return stores.objs, err
 	}
 	for name, cause := range map[string]error{
-		"5xx":     &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusInternalServerError}}, Err: &smithy.GenericAPIError{Code: "InternalError"}},
+		"5xx":     errors.New("InternalError: status 500"),
 		"timeout": context.DeadlineExceeded,
 	} {
 		for _, writer := range []bool{true, false} {
@@ -209,9 +205,8 @@ func TestStartupAncestorMarkerErrors(t *testing.T) {
 			}
 		}
 	}
-	denied := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusForbidden}}, Err: &smithy.GenericAPIError{Code: "AccessDenied"}}
 	for _, writer := range []bool{true, false} {
-		objs, err := start(t, writer, denied)
+		objs, err := start(t, writer, metastore.ErrDenied)
 		if err != nil {
 			t.Fatalf("403, writer %v: %v; want it skipped", writer, err)
 		}

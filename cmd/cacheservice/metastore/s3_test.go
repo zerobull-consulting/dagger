@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 )
 
 // fakeS3 serves GetObject and PutObject for one bucket from MemObjects,
@@ -26,9 +27,18 @@ type fakeS3 struct {
 	mu       sync.Mutex
 	conflict map[string]int
 	headers  []http.Header
+	// getErr answers GETs of a key with an S3 error: a status and a code.
+	getErr map[string]s3Err
 }
 
-func newFakeS3() *fakeS3 { return &fakeS3{mem: NewMemObjects(), conflict: map[string]int{}} }
+type s3Err struct {
+	status int
+	code   string
+}
+
+func newFakeS3() *fakeS3 {
+	return &fakeS3{mem: NewMemObjects(), conflict: map[string]int{}, getErr: map[string]s3Err{}}
+}
 
 func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	const bucket = "/cache/"
@@ -39,6 +49,10 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, bucket)
 	switch r.Method {
 	case http.MethodGet:
+		if e, ok := f.getErr[key]; ok {
+			s3Error(w, e.status, e.code)
+			return
+		}
 		body, etag, err := f.mem.Get(r.Context(), key)
 		if errors.Is(err, ErrNotFound) {
 			s3Error(w, http.StatusNotFound, "NoSuchKey")
@@ -114,6 +128,21 @@ func TestS3ObjectsErrors(t *testing.T) {
 
 	if _, _, err := o.Get(ctx, "team/missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing key: %v, want ErrNotFound", err)
+	}
+	// A 403, whatever its code, is ErrDenied, and keeps the store's error;
+	// another error is neither ErrDenied nor ErrNotFound. (A 500 is retried
+	// by the SDK first, with its backoff.)
+	f.getErr["denied"] = s3Err{http.StatusForbidden, "AccessDenied"}
+	f.getErr["archived"] = s3Err{http.StatusForbidden, "InvalidObjectState"}
+	f.getErr["failing"] = s3Err{http.StatusBadRequest, "InvalidRequest"}
+	for key, code := range map[string]string{"denied": "AccessDenied", "archived": "InvalidObjectState"} {
+		_, _, err := o.Get(ctx, key)
+		if !errors.Is(err, ErrDenied) || s3util.ErrorCode(err) != code || !strings.Contains(err.Error(), key) {
+			t.Fatalf("403 %s: %v, want ErrDenied wrapping %s", key, err, code)
+		}
+	}
+	if _, _, err := o.Get(ctx, "failing"); err == nil || errors.Is(err, ErrDenied) || errors.Is(err, ErrNotFound) || s3util.ErrorCode(err) != "InvalidRequest" {
+		t.Fatalf("400: %v, want the store's error alone", err)
 	}
 	etag, err := o.Put(ctx, "team/k", []byte("1"), Condition{IfNoneMatch: true})
 	if err != nil {

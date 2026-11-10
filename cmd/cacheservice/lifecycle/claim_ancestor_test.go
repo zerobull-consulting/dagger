@@ -13,9 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
 
@@ -71,12 +75,24 @@ func (f *ancestorS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// counts is how many times the ancestor's marker was asked for, and the
+// keys PUT, read under the lock: a hung request's handler may still run.
+func (f *ancestorS3) counts() (int, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ancestorGets, append([]string(nil), f.puts...)
+}
+
 func s3Err(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>%s</Message></Error>`, code, code)
 }
 
+// ancestorStore is an S3Store on f with the client the command uses, but
+// for its retries, which wait for nothing (still 3 attempts), and an HTTP
+// client that gives up on a request after 200ms, as a store that
+// doesn't answer times out.
 func ancestorStore(t *testing.T, f *ancestorS3) *S3Store {
 	t.Helper()
 	srv := httptest.NewServer(f)
@@ -86,57 +102,76 @@ func ancestorStore(t *testing.T, f *ancestorS3) *S3Store {
 		Region:      "us-east-1",
 		PathStyle:   true,
 		Credentials: credentials.NewStaticCredentialsProvider("AKID", "SECRET", ""),
+		HTTPClient:  &http.Client{Timeout: 200 * time.Millisecond},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	noWait := retry.NewStandard(func(o *retry.StandardOptions) {
+		o.MaxAttempts = 3
+		o.Backoff = retry.BackoffDelayerFunc(func(int, error) (time.Duration, error) { return 0, nil })
+		o.RateLimiter = ratelimit.None
+	})
+	client = s3.New(client.Options(), func(o *s3.Options) { o.Retryer = noWait })
 	return &S3Store{Client: client, Bucket: "bkt"}
+}
+
+// claimAncestor runs claim of cache/team on f.
+func claimAncestor(t *testing.T, f *ancestorS3) (int, string) {
+	t.Helper()
+	o := opts("claim")
+	o.Prefix, o.Confirm = "cache/team", "bkt/cache/team"
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	var out bytes.Buffer
+	code := Run(ctx, o, ancestorStore(t, f), &out, &out)
+	return code, out.String()
 }
 
 // claim of cache/team, with the S3 client the command uses, refuses when
 // the bucket's top marker (an ancestor's) can't be read for a 5xx or a
-// timeout: exit 1, the ancestor's key named, nothing written. The SDK's
-// own retries run first (the 5xx is asked again). A 404 or a 403 there
-// is skipped, and the claim goes ahead.
+// request that times out: exit 1, the ancestor's key named, nothing
+// written. The SDK's own retries run first (each is asked 3 times). A 404
+// or a 403 there is skipped, and the claim goes ahead.
 func TestClaimAncestorMarkerErrors(t *testing.T) {
-	claim := func(t *testing.T, f *ancestorS3, timeout time.Duration) (int, string) {
-		t.Helper()
-		o := opts("claim")
-		o.Prefix, o.Confirm = "cache/team", "bkt/cache/team"
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		var out bytes.Buffer
-		code := Run(ctx, o, ancestorStore(t, f), &out, &out)
-		return code, out.String()
+	for name, f := range map[string]*ancestorS3{
+		"5xx":     {status: http.StatusInternalServerError, code: "InternalError"},
+		"timeout": {hang: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, out := claimAncestor(t, f)
+			gets, puts := f.counts()
+			if code != ExitError || len(puts) != 0 || !strings.Contains(out, "can't read cacheservice.json") || !strings.Contains(out, "nothing claimed") {
+				t.Fatalf("%d, puts %v\n%s", code, puts, out)
+			}
+			if gets != 3 {
+				t.Fatalf("the ancestor's marker was asked for %d times, want 3: the SDK's retries", gets)
+			}
+		})
 	}
-	t.Run("5xx", func(t *testing.T) {
-		f := &ancestorS3{status: http.StatusInternalServerError, code: "InternalError"}
-		code, out := claim(t, f, time.Minute)
-		if code != ExitError || len(f.puts) != 0 || !strings.Contains(out, "can't read cacheservice.json") || !strings.Contains(out, "nothing claimed") {
-			t.Fatalf("%d, puts %v\n%s", code, f.puts, out)
-		}
-		if f.ancestorGets < 2 {
-			t.Fatalf("the ancestor's marker was asked for %d times: the SDK didn't retry", f.ancestorGets)
-		}
-	})
-	t.Run("timeout", func(t *testing.T) {
-		f := &ancestorS3{hang: true}
-		code, out := claim(t, f, 2*time.Second)
-		if code != ExitError || len(f.puts) != 0 || !strings.Contains(out, "can't read cacheservice.json") || !strings.Contains(out, "nothing claimed") {
-			t.Fatalf("%d, puts %v\n%s", code, f.puts, out)
-		}
-	})
 	for _, tc := range []struct {
 		status int
 		code   string
 	}{{http.StatusNotFound, "NoSuchKey"}, {http.StatusForbidden, "AccessDenied"}} {
 		t.Run(tc.code, func(t *testing.T) {
 			f := &ancestorS3{status: tc.status, code: tc.code}
-			code, out := claim(t, f, time.Minute)
-			if code != ExitOK || len(f.puts) != 1 || f.puts[0] != "cache/team/cacheservice.json" {
-				t.Fatalf("%d, puts %v\n%s", code, f.puts, out)
+			code, out := claimAncestor(t, f)
+			if _, puts := f.counts(); code != ExitOK || len(puts) != 1 || puts[0] != "cache/team/cacheservice.json" {
+				t.Fatalf("%d, puts %v\n%s", code, puts, out)
 			}
 		})
+	}
+}
+
+// Known gap: a 403 is "access denied", whatever its code, so an ancestor's
+// marker that exists but that a store answers with a 403 of another code
+// (InvalidObjectState here) is skipped, and the nested claim goes ahead.
+// This pins today's behaviour (see the README, "Bucket ownership").
+func TestClaimAncestorInvalidObjectStateSkippedKnownGap(t *testing.T) {
+	f := &ancestorS3{status: http.StatusForbidden, code: "InvalidObjectState"}
+	code, out := claimAncestor(t, f)
+	if _, puts := f.counts(); code != ExitOK || len(puts) != 1 || puts[0] != "cache/team/cacheservice.json" {
+		t.Fatalf("%d, puts %v\n%s", code, puts, out)
 	}
 }
 
@@ -145,7 +180,7 @@ func TestClaimAncestorErrorType(t *testing.T) {
 	f := &ancestorS3{status: http.StatusServiceUnavailable, code: "SlowDown"}
 	_, _, err := ancestorStore(t, f).Claim(context.Background(), "cache/team")
 	var unread *ownership.ErrAncestorUnread
-	if !errors.As(err, &unread) || unread.Key != "cacheservice.json" || errorCode(err) != "SlowDown" {
+	if !errors.As(err, &unread) || unread.Key != "cacheservice.json" || s3util.ErrorCode(err) != "SlowDown" {
 		t.Fatalf("%v; want ErrAncestorUnread of cacheservice.json, wrapping SlowDown", err)
 	}
 }

@@ -2,14 +2,12 @@ package lifecycle
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -59,7 +57,7 @@ func (s *S3Store) GetLifecycle(ctx context.Context) (Config, error) {
 	defer cancel()
 	out, err := s.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: &s.Bucket})
 	if err != nil {
-		if errorCode(err) == "NoSuchLifecycleConfiguration" {
+		if s3util.ErrorCode(err) == "NoSuchLifecycleConfiguration" {
 			return Config{}, nil
 		}
 		return Config{}, err
@@ -121,15 +119,6 @@ func (t timedObjects) ListUploadKeys(ctx context.Context, prefix string, max int
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
 	return t.Store.ListUploadKeys(ctx, prefix, max)
-}
-
-// errorCode is an S3 error's code, such as AccessDenied.
-func errorCode(err error) string {
-	var ae smithy.APIError
-	if errors.As(err, &ae) {
-		return ae.ErrorCode()
-	}
-	return ""
 }
 
 // denied reports an error of a key that isn't allowed the request.

@@ -31,7 +31,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 )
@@ -298,12 +297,14 @@ func (e *ErrAncestorUnread) Unwrap() error { return e.Err }
 
 // checkAncestors refuses a prefix whose ancestors hold a marker, of any
 // content: one GET per ancestor, made only when the prefix has none of its
-// own. An ancestor whose marker is not found, or that the key may not read
-// (a key allowed only its own prefix gets 403 there), is skipped, since a
-// nested claim costs no data, only the ancestor's GC, which then stops on
-// this prefix's keys. Any other error (a 5xx, a timeout) refuses, with
-// ErrAncestorUnread: the store didn't say, so the check doesn't guess. The
-// store's client retries; this adds no retries of its own.
+// own. An ancestor whose marker is not found (metastore.ErrNotFound), or
+// that the key may not read (metastore.ErrDenied: a key allowed only its
+// own prefix gets 403 there), is skipped, since a nested claim costs no
+// data, only the ancestor's GC, which then stops on this prefix's keys. Any
+// other error (a 5xx, a timeout) refuses, with ErrAncestorUnread: the store
+// didn't say, so the check doesn't guess. The store's client retries; this
+// adds no retries of its own. When ctx has ended (the caller cancelled, or
+// its deadline passed), the error is ctx's, not the store's.
 func checkAncestors(ctx context.Context, st Store, prefix string) error {
 	p := strings.Trim(prefix, "/")
 	if p == "" {
@@ -317,8 +318,10 @@ func checkAncestors(ctx context.Context, st Store, prefix string) error {
 		switch {
 		case err == nil:
 			return &ErrNestedPrefix{Prefix: p, Ancestor: anc}
-		case errors.Is(err, metastore.ErrNotFound), s3util.Denied(err):
+		case errors.Is(err, metastore.ErrNotFound), errors.Is(err, metastore.ErrDenied):
 			continue
+		case ctx.Err() != nil:
+			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
 		default:
 			return &ErrAncestorUnread{Prefix: p, Key: key, Err: err}
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -67,5 +68,43 @@ func TestSleepCtxCanceled(t *testing.T) {
 				t.Fatalf("SleepCtx(canceled, %v) = %v, want context.Canceled", d, err)
 			}
 		}
+	}
+}
+
+// apiErr is an S3 error as the SDK returns it: a status and a code.
+func apiErr(status int, code string) error {
+	return &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      &smithy.GenericAPIError{Code: code, Message: code},
+	}
+}
+
+// ErrorCode reads the code through wrapping; Denied is a 403, or the code
+// AccessDenied with any status.
+func TestErrorCodeAndDenied(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		code   string
+		denied bool
+	}{
+		{"nil", nil, "", false},
+		{"non-S3", errors.New("boom"), "", false},
+		{"403 AccessDenied", fmt.Errorf("get k: %w", apiErr(http.StatusForbidden, "AccessDenied")), "AccessDenied", true},
+		{"403, another code", apiErr(http.StatusForbidden, "SignatureDoesNotMatch"), "SignatureDoesNotMatch", true},
+		{"403, no code", respErr(http.StatusForbidden), "", true},
+		{"AccessDenied, no status", &smithy.GenericAPIError{Code: "AccessDenied"}, "AccessDenied", true},
+		{"500", apiErr(http.StatusInternalServerError, "InternalError"), "InternalError", false},
+		{"404", apiErr(http.StatusNotFound, "NoSuchKey"), "NoSuchKey", false},
+		{"401", apiErr(http.StatusUnauthorized, "Unauthorized"), "Unauthorized", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ErrorCode(tc.err); got != tc.code {
+				t.Errorf("ErrorCode = %q, want %q", got, tc.code)
+			}
+			if got := Denied(tc.err); got != tc.denied {
+				t.Errorf("Denied = %v, want %v", got, tc.denied)
+			}
+		})
 	}
 }

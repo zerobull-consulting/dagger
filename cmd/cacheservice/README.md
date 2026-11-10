@@ -293,13 +293,23 @@ checks the prefix:
   - **access denied** (403, for a key allowed only its own prefix):
     skipped. A nested claim it misses costs no data, only the ancestor's
     GC, which stops on the nested prefix's keys.
-  - **any other error** (a 5xx, a timeout, a dropped connection): refused,
-    after the S3 client's own retries, with `can't read <key>, an
-    ancestor's ownership marker position, to check that prefix <prefix>/
-    isn't inside another service's: <the store's error>`. The check
-    doesn't guess, and adds no retries of its own: start again once the
-    store answers (`TestAncestorUnreadRefused`,
-    `TestStartupAncestorMarkerErrors`, `TestClaimAncestorMarkerErrors`).
+  - **any other answer or error** (a 5xx, a 401, a store-specific code, a
+    timeout error, a dropped connection): refused, after the S3 client's
+    own retries, with `can't read <key>, an ancestor's ownership marker
+    position, to check that prefix <prefix>/ isn't inside another
+    service's: <the store's error>`. The check doesn't guess, and adds no
+    retries of its own: start again once the store answers
+    (`TestAncestorUnreadRefused`, `TestStartupAncestorMarkerErrors`,
+    `TestClaimAncestorMarkerErrors`).
+
+  Only those two answers are skipped, so a key allowed only its own prefix
+  must be denied the ancestors' markers with a 403: one a store answers
+  with a 401 or a code of its own can't start or claim there. Any 403
+  counts as denied, whatever its code: a marker that exists but that a
+  store answers with a 403 of another code (`InvalidObjectState`, say) is
+  skipped too (`TestClaimAncestorInvalidObjectStateSkippedKnownGap`). An
+  interrupt, or the caller's own deadline, ending the check while it reads
+  an ancestor's marker stops it with that error, not this refusal.
 - **An upload in progress counts too.** An object listing doesn't show
   multipart uploads, so a writer about to claim an empty prefix also lists
   them, and refuses one with any, after reading the marker once more, since a
@@ -600,7 +610,8 @@ shell, in this order:
    (`<prefix>/cacheservice.json`); on a fresh bucket, that is the admin key.
    `s3:GetObject` on each ancestor prefix's marker is optional (see the keys
    table): on a 403, the nested-prefix check skips that ancestor. Any other
-   error reading it (a 5xx, a timeout) refuses the claim; run `claim` again.
+   error reading it (a 5xx, a timeout error) refuses the claim; run `claim`
+   again.
 2. `lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>` (on
    MinIO, with `-abort-rule=false`).
 3. `lifecycle check -tokens-file tokens`: exit 0.
