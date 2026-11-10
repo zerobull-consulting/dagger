@@ -202,11 +202,10 @@ func (s *Service) startBatches(ctx context.Context, ns *namespace, batches []exp
 // runBatch exports one batch of a namespace on the engine connected there
 // with its cache.
 func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch) {
-	p := s.export
 	eng := s.engineFor(ns, b.CacheID)
 	if eng == nil {
 		s.logger.Debug("export: engine not connected; waiting", "namespace", ns.name, "cacheID", b.CacheID, "roots", len(b.Request.Roots))
-		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+		s.requeueForEngine(ns, b)
 		return
 	}
 	if eng.Generation() < b.Generation() {
@@ -215,10 +214,23 @@ func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch)
 		// generation's hello rather than export from an older one.
 		s.logger.Debug("export: engine connected at an older generation; waiting", "namespace", ns.name, "cacheID", b.CacheID,
 			"generation", eng.Generation(), "batchGeneration", b.Generation(), "roots", len(b.Request.Roots))
-		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+		s.requeueForEngine(ns, b)
 		return
 	}
 	_, _ = s.exportBatch(ctx, eng, b)
+}
+
+// requeueForEngine puts a batch back to wait for its engine, up to
+// NoEngineWait, which the engine's hello cuts short (Tracker.Connected). A
+// hello that registered after runBatch chose its connection, and ran Connected
+// before the requeue marked the wait, woke nothing: so the connection is chosen
+// again after the requeue, and a suitable one wakes the batch.
+func (s *Service) requeueForEngine(ns *namespace, b exporter.Batch) {
+	p := s.export
+	ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+	if eng := s.engineFor(ns, b.CacheID); eng != nil && eng.Generation() >= b.Generation() {
+		ns.tracker.Connected(b.CacheID, eng.Generation(), p.now())
+	}
 }
 
 // exportBatch exports b on eng, records its result in the tracker, and

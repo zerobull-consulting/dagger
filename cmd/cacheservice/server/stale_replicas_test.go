@@ -248,8 +248,8 @@ func TestNewerGenerationBatchExportsAtHello(t *testing.T) {
 		return false
 	})
 
-	start := time.Now()
 	h.connectEngine(restarted)
+	start := time.Now()
 	waitFor(t, "the export from the newer generation", func() bool { return restarted.Exports() > 0 })
 	// Without the wake the export comes at the end of the wait; the bound
 	// is half of it, far above what a loaded runner needs.
@@ -257,5 +257,33 @@ func TestNewerGenerationBatchExportsAtHello(t *testing.T) {
 	t.Logf("exported %s after the hello (NoEngineWait %s)", d, wait)
 	if d > wait/2 {
 		t.Fatalf("exported %s after the hello, want at once (the wait is %s)", d, wait)
+	}
+}
+
+// A hello that ran Connected before a batch was requeued woke nothing: the
+// requeue then chooses the connection again, and a batch whose engine is there
+// is due at once (zerobull-consulting/dagger#225, the interleaving of runBatch
+// choosing the old connection, the newer engine's hello, and the requeue).
+func TestRequeueForEngineRechecksConnection(t *testing.T) {
+	const wait = time.Hour
+	blobs, meta := newMemStores(t)
+	h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = wait })
+	restarted := fakeengine.New("cache-a", 5)
+	restarted.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	h.postSpansOf(restarted, "session-5", cacheSpan(10))
+	// The batch is claimed by hand, as runBatch holds it, at generation 5.
+	now := h.svc.export.now()
+	batches := h.ns().tracker.All("cache-a", now)
+	if len(batches) != 1 || batches[0].Generation() != 5 {
+		t.Fatalf("setup: batches %+v", batches)
+	}
+	// The newer engine says hello, and Connected runs, with nothing waiting.
+	h.connectEngine(restarted)
+	waitEngines(t, h.svc, 2)
+	h.ns().tracker.Connected("cache-a", 5, now)
+
+	h.svc.requeueForEngine(h.ns(), batches[0])
+	if got := h.ns().tracker.Due(h.svc.export.now()); len(got) != 1 {
+		t.Fatalf("%d batches due after the requeue, want the one whose engine is connected", len(got))
 	}
 }
