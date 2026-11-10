@@ -472,7 +472,7 @@ func TestMinIOBinarySecondSIGTERMStopsAtOnce(t *testing.T) {
 }
 
 // -drain-timeout 0 is today's stop: no drain, so the quiet session isn't
-// stored (the known gap, #45, for an undrained stop).
+// stored (accepted, #45, for an undrained stop).
 func TestMinIOBinaryNoDrain(t *testing.T) {
 	b := startBinary(t, "-export-quiet", "10m", "-drain-timeout", "0")
 	b.build()

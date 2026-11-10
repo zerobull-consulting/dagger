@@ -770,8 +770,9 @@ func TestSpansTakenFromAnyTokenOfNamespace(t *testing.T) {
 // cache ID becomes that cache's latest connection: the service then routes
 // A's exports to it, and takes engine events about A from its token. The
 // namespace is the trust boundary; within it, a cache ID isn't bound to a
-// token. Known gap: #51.
-func TestKnownGapSameNamespaceTokenClaimsCacheID(t *testing.T) {
+// token, by design (#51): engines that don't trust each other get different
+// namespaces.
+func TestSameNamespaceTokenClaimsCacheID(t *testing.T) {
 	h := newAuthHarness(t)
 	a := fakeengine.New("cache-a", 1)
 	authBuild(a, "a")
@@ -794,7 +795,7 @@ func TestKnownGapSameNamespaceTokenClaimsCacheID(t *testing.T) {
 	}
 	for _, en := range nsA.tracker.Entries("cache-a") {
 		if en.Number == 10 && en.Retained {
-			t.Fatal("the gap is closed: update this test and #51")
+			t.Fatal("the claiming token's prune of cache-a wasn't taken: a cache ID is now bound to a token, against the decision in #51")
 		}
 	}
 }
