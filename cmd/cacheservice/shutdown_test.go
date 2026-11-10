@@ -387,8 +387,8 @@ func TestShutdownCancelsExplicitExport(t *testing.T) {
 	}
 	select {
 	case code := <-answered:
-		if code == http.StatusOK {
-			t.Fatal("the canceled explicit export answered 200")
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("the explicit export the stop canceled answered %d, want 503", code)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the explicit export didn't answer")

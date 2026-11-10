@@ -103,7 +103,7 @@ func (s *Service) Entries(conn uint64) ([]exporter.EntryState, error) {
 // for the export of that cache in flight to end, and the scheduler starts
 // none for it while Export waits or runs (zerobull-consulting/dagger#135).
 // The wait ends with ctx, whose error it then returns.
-func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request) (exporter.Result, error) {
+func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request) (_ exporter.Result, err error) {
 	p := s.export
 	if p == nil {
 		return exporter.Result{}, s.exportOff()
@@ -117,6 +117,7 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 		return exporter.Result{}, err
 	}
 	defer done()
+	defer func() { err = stoppedCause(ctx, err) }()
 	c, err := s.conn(conn)
 	if err != nil {
 		return exporter.Result{}, err
@@ -170,7 +171,7 @@ func (s *Service) Imports(conn uint64) (importer.State, error) {
 
 // Import merges and offers now what a connection's engine lacks, and
 // returns what was merged, failed and offered.
-func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, error) {
+func (s *Service) Import(ctx context.Context, conn uint64) (_ importer.Result, err error) {
 	if s.imports == nil {
 		return importer.Result{}, ErrImportOff
 	}
@@ -184,6 +185,7 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 		return importer.Result{}, err
 	}
 	defer done()
+	defer func() { err = stoppedCause(ctx, err) }()
 	c, err := s.conn(conn)
 	if err != nil {
 		return importer.Result{}, err

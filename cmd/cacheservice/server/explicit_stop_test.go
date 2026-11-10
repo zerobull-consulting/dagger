@@ -65,8 +65,9 @@ func newStopHoldHarness(t *testing.T) (h *exportHarness, hold *stopHoldReads, re
 
 // An explicit export or import (POST /debug/engines/{conn}/export, or
 // .../import) blocked in a store read when the stop starts is canceled by
-// the paths' context ending, and Wait returns only once it ended; one asked
-// for once Wait began is refused, 503 on the debug server.
+// the paths' context ending, with ErrStopping (503 on the debug server),
+// and Wait returns only once it ended. One asked for once Wait began is
+// refused, 503, even before the paths' context ended.
 // zerobull-consulting/dagger#202.
 func TestStopCancelsAndWaitsForExplicitHooks(t *testing.T) {
 	for _, hook := range []string{"export", "import"} {
@@ -92,19 +93,35 @@ func TestStopCancelsAndWaitsForExplicitHooks(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatalf("the explicit %s didn't reach its index read", hook)
 			}
-			// The stop: the paths' context ends, then Wait.
+			// Wait begins first, while the paths still run: it waits for
+			// the hook, and admits none from then on.
+			waited := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				waited <- h.svc.WaitContext(ctx)
+			}()
+			waitUntil(t, 5*time.Second, "Wait to begin", func() bool {
+				h.svc.drain.mu.Lock()
+				defer h.svc.drain.mu.Unlock()
+				return h.svc.drain.explicitClosed
+			})
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Post(h.debug.URL+"/debug/engines/"+strconv.FormatUint(h.engine.id, 10)+"/"+hook, "application/json", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("an explicit %s asked for once Wait began: %s, want 503", hook, resp.Status)
+			}
+			// Then the paths' context ends.
 			h.cancelPaths()
 			select {
 			case <-hold.unwinding:
 			case <-time.After(5 * time.Second):
 				t.Fatalf("the paths' context ending didn't cancel the explicit %s", hook)
 			}
-			waited := make(chan error, 1)
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				waited <- h.svc.WaitContext(ctx)
-			}()
 			// Shows Wait doesn't return while the hook unwinds: it would
 			// return within a few milliseconds if it didn't wait for it.
 			select {
@@ -115,16 +132,6 @@ func TestStopCancelsAndWaitsForExplicitHooks(t *testing.T) {
 			if r := h.svc.Running(); r.Explicit != 1 {
 				t.Fatalf("running %+v: the explicit %s isn't counted", r, hook)
 			}
-			// Once Wait began, a hook asked for is refused.
-			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Post(h.debug.URL+"/debug/engines/"+strconv.FormatUint(h.engine.id, 10)+"/"+hook, "application/json", strings.NewReader("{}"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Fatalf("an explicit %s asked for once Wait began: %s, want 503", hook, resp.Status)
-			}
 			release()
 			select {
 			case err := <-waited:
@@ -134,8 +141,8 @@ func TestStopCancelsAndWaitsForExplicitHooks(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatalf("Wait didn't return once the explicit %s ended", hook)
 			}
-			if err := <-ran; err == nil {
-				t.Fatalf("the canceled explicit %s reported no error", hook)
+			if err := <-ran; !errors.Is(err, ErrStopping) {
+				t.Fatalf("the explicit %s the stop canceled returned %v, want ErrStopping (503)", hook, err)
 			}
 		})
 	}
@@ -152,5 +159,38 @@ func TestExplicitHooksRefusedOnceThePathsStopped(t *testing.T) {
 	}
 	if _, err := h.svc.Import(context.Background(), h.engine.id); !errors.Is(err, ErrStopping) {
 		t.Fatalf("an explicit import after the paths stopped: %v", err)
+	}
+}
+
+// Known gap: an import sync waits for the engine cache's sync lock
+// (importer.Importer.Sync, st.sync.Lock) whatever its context says, so a
+// sync whose context is already canceled waits for the sync under way to
+// end. Explicit imports asked for once the stop began are refused before
+// they reach it (admitExplicit), but a sync loop's sync, or an explicit
+// import admitted while another one is held, still waits there.
+func TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx(t *testing.T) {
+	h, done, release := newHeldImportHarness(t)
+	defer func() { release(); <-done }()
+	c, err := h.svc.conn(h.engine.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	synced := make(chan error, 1)
+	go func() {
+		_, err := h.svc.syncMeasured(ctx, c)
+		synced <- err
+	}()
+	select {
+	case err := <-synced:
+		t.Fatalf("the sync with a canceled context returned (%v) while another held the sync lock: the gap is closed, update this test", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-synced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sync didn't return once the held one ended")
 	}
 }

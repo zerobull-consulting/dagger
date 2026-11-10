@@ -342,7 +342,7 @@ func (s *Service) Running() Running {
 	if p := s.gc; p != nil {
 		r.GC = p.wg.Running()
 	}
-	r.Explicit = s.drain.explicitWG.Running()
+	r.Explicit = s.drain.explicit.Running()
 	r.Held = s.testHeld.Running()
 	s.mu.Lock()
 	r.Engines = len(s.conns)
