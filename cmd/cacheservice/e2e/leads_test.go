@@ -29,6 +29,9 @@ type entrySpan struct {
 	retained     bool
 	replacements uint64
 	deps         int
+	// session and name are for reading a result: which session sent the
+	// span, and its span name.
+	session, name string
 }
 
 // entryKey names an entry: the span's cache attribute (cache ID and
@@ -55,7 +58,7 @@ func spansByEntry(recs []LogRecord) map[entryKey][]entrySpan {
 		k := entryKey{r.Attr("cache"), n}
 		out[k] = append(out[k], entrySpan{
 			at: r.Time, call: r.Attr("outcome") != "", retained: r.Attr("retained") == "true",
-			replacements: repl, deps: deps,
+			replacements: repl, deps: deps, session: r.Attr("session"), name: r.Attr("name"),
 		})
 	}
 	return out
@@ -143,12 +146,18 @@ func depsAfterStore(recs []LogRecord) (stored int, growth []depsGrowth, omitted 
 // call span.
 type lazyGap struct {
 	entryKey
-	gap time.Duration
+	gap        time.Duration
+	lazy, call entrySpan
 	// unretained is whether the engine didn't yet keep the entry when the
-	// lazy span came (no call span before it said retained): only then does a
-	// gap past ForgetAfter lose the entry's parts.
+	// lazy span came (no call span before it said retained).
 	unretained bool
 }
+
+// atRisk is whether the gap can lose the entry's parts: the engine didn't
+// keep the entry when the lazy span came, and the call span then says it
+// does, so the entry is worth exporting only from there. A call span that
+// says the entry isn't retained has nothing to lose.
+func (g lazyGap) atRisk() bool { return g.unretained && g.call.retained }
 
 // lazyToCall measures lead 2 for one service: for each call span preceded
 // by lazy-evaluation spans with no call span between, the gap from the last
@@ -156,20 +165,21 @@ type lazyGap struct {
 func lazyToCall(recs []LogRecord) []lazyGap {
 	var out []lazyGap
 	for k, ss := range spansByEntry(recs) {
-		var lastLazy time.Time
+		var lastLazy entrySpan
 		retained := false
 		for _, s := range ss {
 			if !s.call {
-				lastLazy = s.at
+				lastLazy = s
 				continue
 			}
-			if !lastLazy.IsZero() {
-				out = append(out, lazyGap{k, s.at.Sub(lastLazy), !retained})
-				lastLazy = time.Time{}
+			if !lastLazy.at.IsZero() {
+				out = append(out, lazyGap{k, s.at.Sub(lastLazy.at), lastLazy, s, !retained})
+				lastLazy = entrySpan{}
 			}
 			retained = s.retained
 		}
 	}
+	slices.SortFunc(out, func(a, b lazyGap) int { return cmp.Or(-cmp.Compare(a.gap, b.gap), cmp.Compare(a.number, b.number)) })
 	return out
 }
 
@@ -217,13 +227,19 @@ func reportLeads(t *testing.T, spans, stored, omitted int, growth []depsGrowth, 
 	open := 0
 	for _, g := range gaps {
 		maxAll = max(maxAll, g.gap)
-		if g.unretained {
+		if g.atRisk() {
 			open++
 			maxOpen = max(maxOpen, g.gap)
 		}
+		if g.gap >= time.Second {
+			t.Logf("lead 2: gap %s, entry %d of %s: lazy %q at %s (session %s, retained %v) -> call %q at %s (session %s, retained %v, replacements %d); engine didn't yet keep it: %v",
+				g.gap.Round(time.Millisecond), g.number, g.cache,
+				g.lazy.name, g.lazy.at.UTC().Format("15:04:05.000"), g.lazy.session, g.lazy.retained,
+				g.call.name, g.call.at.UTC().Format("15:04:05.000"), g.call.session, g.call.retained, g.call.replacements, g.unretained)
+		}
 	}
-	t.Logf("lead 2: %d lazy-evaluation-to-call gaps (%d of entries the engine didn't yet keep); largest %s overall, %s for those; ForgetAfter %s",
+	t.Logf("lead 2: %d lazy-evaluation-to-call gaps (%d at risk: the engine didn't yet keep the entry, and the call span says it does); largest %s overall, %s for those at risk; ForgetAfter %s",
 		len(gaps), open, maxAll.Round(time.Millisecond), maxOpen.Round(time.Millisecond), leadsBound)
-	Check(t, open > 0, "lead 2: the run had lazy-evaluation spans before a call span (%d), so the measurement saw something", open)
-	Check(t, maxOpen < leadsBound, "lead 2: the largest gap from a lazy-evaluation span to the call span of an entry the engine didn't yet keep is %s, under ForgetAfter %s", maxOpen.Round(time.Millisecond), leadsBound)
+	Check(t, open > 0, "lead 2: the run had lazy-evaluation spans before the call span that retained their entry (%d), so the measurement saw something", open)
+	Check(t, maxOpen < leadsBound, "lead 2: the largest gap from a lazy-evaluation span to the call span that retained an entry the engine didn't yet keep is %s, under ForgetAfter %s", maxOpen.Round(time.Millisecond), leadsBound)
 }

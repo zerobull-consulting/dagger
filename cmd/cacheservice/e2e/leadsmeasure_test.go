@@ -88,19 +88,26 @@ func TestLazyToCallGaps(t *testing.T) {
 		// already kept.
 		spanRec(20*time.Second, "c1/1", "7", false, true, "1", "1"),
 		spanRec(50*time.Second, "c1/1", "7", true, true, "1", "1"),
+		// Entry 9: lazy spans, then a call span that says it isn't retained,
+		// 40s later: nothing to lose.
+		spanRec(0, "c1/1", "9", false, false, "1", "0"),
+		spanRec(40*time.Second, "c1/1", "9", true, false, "1", "0"),
 		// Entry 8: a call span with no lazy span before it.
 		spanRec(60*time.Second, "c1/1", "8", true, true, "1", "0"),
 	}
 	gaps := lazyToCall(recs)
-	if len(gaps) != 2 {
-		t.Fatalf("gaps %+v; want 2", gaps)
+	if len(gaps) != 3 {
+		t.Fatalf("gaps %+v; want 3", gaps)
 	}
 	var open, kept *lazyGap
 	for i := range gaps {
-		if gaps[i].unretained {
+		switch {
+		case gaps[i].atRisk():
 			open = &gaps[i]
-		} else {
+		case gaps[i].number == 7:
 			kept = &gaps[i]
+		case gaps[i].number != 9 || gaps[i].gap != 40*time.Second || gaps[i].call.retained:
+			t.Errorf("unexpected gap %+v", gaps[i])
 		}
 	}
 	if open == nil || open.gap != 12*time.Second || open.number != 7 {
