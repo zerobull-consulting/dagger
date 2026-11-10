@@ -35,7 +35,6 @@ variable "key_name_prefix" {
 }
 # Where the gh_secret_set_write and _read outputs put the settings. One
 # state (directory or workspace) per repository: see README.md, "Into GitHub".
-# workspace) per repository and environment: see README.md, "Into GitHub".
 
 variable "github_repository" {
   description = "owner/name the gh_secret_set_write and _read outputs target (gh's --repo). Null: the repository gh finds in the current directory."
