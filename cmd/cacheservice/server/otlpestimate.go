@@ -91,9 +91,10 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 			wire := int64(protowire.SizeTag(num) + n)
 			if fd == nil || !otlpWireTypeOK(fd, typ) {
 				// Kept as unknown bytes, which append grows.
-				wire *= otlpUnknownGrowth
+				size += otlpUnknownCost(wire)
+			} else {
+				size += max(wire, otlpFieldCost)
 			}
-			size += max(wire, otlpFieldCost)
 			continue
 		}
 		v, n := protowire.ConsumeBytes(b)
@@ -106,7 +107,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 			// A field the message doesn't know, or of the wrong wire type for
 			// its number: kept as raw bytes, tag and length included, in the
 			// message's unknown fields, which append grows.
-			size += max(otlpUnknownGrowth*int64(protowire.SizeTag(num)+protowire.SizeBytes(len(v))), otlpFieldCost)
+			size += otlpUnknownCost(int64(protowire.SizeTag(num) + protowire.SizeBytes(len(v))))
 		case fd.Message() != nil:
 			sub, err := otlpProtoSize(v, fd.Message(), depth+1)
 			if err != nil {
@@ -131,9 +132,18 @@ func otlpBytesKind(fd protoreflect.FieldDescriptor) bool {
 	return fd.IsList() || fd.Message() != nil || fd.Kind() == protoreflect.StringKind || fd.Kind() == protoreflect.BytesKind
 }
 
+// otlpUnknownCost is what a field the decoder keeps as unknown bytes adds to
+// the estimate: wire bytes, tag and length included, times otlpUnknownGrowth,
+// or the header if that is more.
+func otlpUnknownCost(wire int64) int64 {
+	return max(otlpUnknownGrowth*wire, otlpFieldCost)
+}
+
 // otlpWireTypeOK says whether a known field of wire type typ (not bytes) is
 // read into the message: a scalar of that wire type, or an element of a list
-// of them. Anything else is kept as unknown bytes.
+// of them. Anything else, a kind not listed below (a group, which no OTLP
+// message has) included, is kept as unknown bytes: charged as unknown, so it
+// can only err high.
 func otlpWireTypeOK(fd protoreflect.FieldDescriptor, typ protowire.Type) bool {
 	switch fd.Kind() {
 	case protoreflect.BoolKind, protoreflect.EnumKind, protoreflect.Int32Kind, protoreflect.Int64Kind,

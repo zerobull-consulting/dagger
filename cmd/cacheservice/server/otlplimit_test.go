@@ -1231,8 +1231,11 @@ func TestOTLPUnknownFieldsEstimateCoversDecodePeak(t *testing.T) {
 
 	// The peak depends on where the body ends relative to append's growth
 	// steps, so sweep its length: every count of fields up to 300, for
-	// three field sizes.
-	for _, size := range []int{64, 1024, 64 << 10} {
+	// these field sizes. 3 makes 6-byte fields, whose 43rd lands the
+	// worst peak found over every size from 1 to 4096 bytes and every 997th
+	// above, 2.977 times the wire bytes (the least headroom under
+	// otlpUnknownGrowth = 3); 300 and 700 fall between the others.
+	for _, size := range []int{3, 64, 300, 700, 1024, 64 << 10} {
 		f := bytesField(size)
 		var body, sim []byte
 		var p int64
