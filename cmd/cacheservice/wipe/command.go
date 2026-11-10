@@ -12,6 +12,10 @@
 //  2. the objects, PageSize per request, each listed under the prefix;
 //  3. the incomplete multipart uploads under the prefix;
 //
+// before each request of 2 and 3 it checks again that no ancestor prefix and
+// not the prefix itself has a marker: one that appeared is a writer's, and
+// stops the wipe with what it wrote left alone;
+//
 // then lists the prefix again, and exits 0 only if it is empty. It never
 // reads engine data, and deletes only keys a listing under the prefix
 // returned (or the marker's own key). It refuses a prefix inside another
@@ -87,10 +91,12 @@ of any layout. By default a dry run: it reports the objects, their bytes, the
 incomplete multipart uploads and the ownership marker's layout, and deletes
 nothing. With -dry-run=false and -confirm repeating the bucket and the prefix,
 it deletes the marker, then the objects, then aborts the uploads, then lists
-the prefix again. Stop every writer on the prefix first. An empty prefix (the
+the prefix again, and stops if a marker appears meanwhile. Stop every writer
+on the prefix first. An empty prefix (the
 whole bucket) isn't supported, nor is a prefix inside another store's.
 
-Exit codes: 0 ok (a wipe: the prefix is empty), 1 error or refusal, 2 usage
+Exit codes: 0 ok (a wipe: the prefix is empty), 1 error, refusal or a marker
+that appeared during the wipe, 2 usage
 or confirmation, 3 the prefix isn't empty after the wipe (a writer is
 running).
 
@@ -292,16 +298,27 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		if err != nil {
 			return fail(ExitError, "delete the ownership marker %s: %v; nothing else deleted", markerKey, err)
 		}
-		fmt.Fprintf(out, "deleted the ownership marker %s\n", markerKey)
+		fmt.Fprintf(out, "deleted the ownership marker %s\n", printable(markerKey))
 	}
 
 	// 2. The objects.
-	// recheck stops the wipe if an ancestor prefix was claimed since it
-	// started: that store's keys may be under this prefix (wiping <a>/ns
-	// under a new store at <a>). Before each destructive request.
+	// recheck stops the wipe if, since it started, an ancestor prefix was
+	// claimed (that store's keys may be under this prefix: wiping <a>/ns
+	// under a new store at <a>), or the prefix's own marker is back (a
+	// writer claimed the emptied prefix: its marker and first exports are
+	// not the old store's). Before each destructive request. It reads each
+	// ancestor's marker, then this prefix's: one GET more than the ancestor
+	// check alone, per page. A marker it can't read stops the wipe too: when
+	// it can't tell, it doesn't delete.
 	recheck := func() error {
 		if err := checkAncestors(ctx, st, o.Prefix); err != nil {
 			return fmt.Errorf("stopped before the next delete: %w", err)
+		}
+		switch m, err := readMarker(ctx, st, o.Prefix); {
+		case err != nil:
+			return fmt.Errorf("stopped before the next delete: can't read the ownership marker %s: %w", markerKey, err)
+		case m.present:
+			return fmt.Errorf("stopped before the next delete: an ownership marker, %s, is back after the wipe deleted the old one: a writer claimed the prefix during the wipe; its marker and anything written after it were left alone", markerKey)
 		}
 		return nil
 	}
@@ -309,11 +326,12 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		if err := recheck(); err != nil {
 			return err
 		}
+		// The failures it collected count even when the request failed.
 		keyFailures, err := st.Delete(ctx, objKeys(objs))
+		failures.add(keyFailures...)
 		if err != nil {
 			return err
 		}
-		failures.add(keyFailures...)
 		bad := make(map[string]bool, len(keyFailures))
 		for _, f := range keyFailures {
 			bad[f.Key] = true
