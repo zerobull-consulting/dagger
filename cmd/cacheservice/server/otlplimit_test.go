@@ -1287,13 +1287,61 @@ func TestOTLPKnownScalarsNotChargedForGrowth(t *testing.T) {
 	}
 }
 
+// A known field number sent with the wrong wire type is kept as unknown bytes,
+// so it is charged like an unknown field: three times its wire size, at least
+// the header.
+func TestOTLPWrongWireTypeChargedAsUnknown(t *testing.T) {
+	// Each case sends 1000 copies of one field, the number and wire type
+	// being wrong for the message.
+	for _, c := range []struct {
+		name  string
+		field []byte
+	}{
+		// Span.parent_span_id (4) is bytes, sent as a varint.
+		{"varint for a bytes field", protowire.AppendVarint(protowire.AppendTag(nil, 4, protowire.VarintType), 1)},
+		// Span.events (11) is a message, sent as a fixed64.
+		{"fixed64 for a message field", protowire.AppendFixed64(protowire.AppendTag(nil, 11, protowire.Fixed64Type), 1)},
+		// Span.kind (6) is a varint, sent as a fixed64.
+		{"fixed64 for a varint field", protowire.AppendFixed64(protowire.AppendTag(nil, 6, protowire.Fixed64Type), 1)},
+		// Span.start_time_unix_nano (7) is a fixed64, sent as a varint.
+		{"varint for a fixed64 field", protowire.AppendVarint(protowire.AppendTag(nil, 7, protowire.VarintType), 1)},
+		// Span.kind (6) is a varint, sent as 100 bytes.
+		{"bytes for a varint field", protowire.AppendBytes(protowire.AppendTag(nil, 6, protowire.BytesType), make([]byte, 100))},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			body := bytes.Repeat(c.field, 1000)
+			empty, err := otlpDecodedSize(nil, &tracepb.Span{}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := otlpDecodedSize(body, &tracepb.Span{}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := max(otlpUnknownGrowth*int64(len(c.field)), otlpFieldCost)
+			if per := (got - empty) / 1000; per < want {
+				t.Fatalf("a %d-byte field is charged %d bytes, want at least %d", len(c.field), per, want)
+			}
+			// The decoder does keep them as unknown bytes.
+			m := &tracepb.Span{}
+			if err := proto.Unmarshal(body, m); err != nil {
+				t.Fatal(err)
+			}
+			if kept := len(m.ProtoReflect().GetUnknown()); kept != len(body) {
+				t.Fatalf("decoder kept %d of %d bytes as unknown", kept, len(body))
+			}
+		})
+	}
+}
+
 // Known gap: a repeated string or bytes field takes the packed-scalar branch,
 // so an element is charged its length times 16, and an empty one nothing,
 // though it decodes to a 16-byte string header in a growing slice.
 // EntityRef.id_keys (Resource.entity_refs, field 3) is the only such field in
-// OTLP's messages. Run for zerobull-consulting/dagger#204: 1,000,000 empty
-// elements, 2,000,012 bytes on the wire, estimated at 462 bytes, allocated
-// 88 MB in total and retained 15.8 MB.
+// OTLP's messages (zerobull-consulting/dagger#217 tracks the fix). A separate
+// run of 1,000,000 empty elements for zerobull-consulting/dagger#204, not
+// what this test builds (it uses n = 100000): 2,000,012 bytes on the wire,
+// estimated at 462 bytes, allocated 88 MB in total and retained 15.8 MB.
 func TestOTLPEmptyRepeatedStringsKnownGap(t *testing.T) {
 	const n = 100000
 	var ent []byte
