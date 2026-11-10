@@ -2007,8 +2007,8 @@ them in constant time, and logs only a short fingerprint (the hash's first 4
 bytes).
 
 An engine sends its token as the HTTP Basic username, from
-`DAGGER_CLOUD_TOKEN`. The engine's config can't set it: that would be a
-change to the engine, which this fork doesn't carry
+`DAGGER_CLOUD_TOKEN`. The engine's config can't set it, and that isn't
+planned: that would be a change to the engine, which this fork doesn't carry
 ([#13](https://github.com/zerobull-consulting/dagger/issues/13)). On the
 WebSocket, an unknown or missing token is refused with 401 before the
 upgrade, so it never gets a protocol message. A token is
@@ -3150,7 +3150,8 @@ whatever its context says (`TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx`).
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45)): the tracker
-keeps them only in memory. What was stored is never lost, and blobs uploaded
+keeps them only in memory. This is accepted, and what it loses is bounded
+(see [Export path](#export-path)). What was stored is never lost, and blobs uploaded
 by an export cut off are named by nothing, and GC deletes them.
 
 **A service that doesn't export** (no `CACHESERVICE_S3_BUCKET`) has nothing
