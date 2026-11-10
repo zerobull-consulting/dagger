@@ -164,8 +164,12 @@ type trackedEntry struct {
 	refusedMessage string
 	// retryAt is when a busy or failed root is due again; zero when it
 	// isn't waiting.
-	retryAt  time.Time
-	busy     int
+	retryAt time.Time
+	// engineWaitAt is the retryAt a Requeue set, while retryAt is still it:
+	// the entry waits for its generation's engine to connect, not for a
+	// backoff. Connected makes such an entry due.
+	engineWaitAt time.Time
+	busy         int
 	failures int
 	// failedValue is the value failures counts for.
 	failedValue *exportedValue
@@ -596,14 +600,31 @@ func (t *Tracker) Started(cacheID string, generation uint64, wipedCache string) 
 // as a span or event of that generation would. A newer generation clears the
 // cache's stale-generation refusals, which are exported again (see cache),
 // even when no span or event of that generation reaches this service, as
-// when it goes to another replica.
-func (t *Tracker) Connected(cacheID string, generation uint64) {
+// when it goes to another replica. An entry waiting for an engine of that
+// generation to connect (see Requeue) is due at now: not at the end of its
+// wait. A backoff after a failed or busy export is left to run.
+func (t *Tracker) Connected(cacheID string, generation uint64, now time.Time) {
 	if cacheID == "" {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.cache(cacheID, generation)
+	c := t.cache(cacheID, generation)
+	if c == nil {
+		// An older generation than the tracker's: the engine entries
+		// wait for is not this one.
+		return
+	}
+	woke := false
+	for _, e := range c.entries {
+		if !e.inFlight && !e.engineWaitAt.IsZero() && e.retryAt.Equal(e.engineWaitAt) && e.retryAt.After(now) {
+			e.retryAt, e.engineWaitAt = now, time.Time{}
+			woke = true
+		}
+	}
+	if woke {
+		t.soonLocked(now)
+	}
 }
 
 // ImportedValue is a stored value merged into an engine cache: the engine
@@ -1170,7 +1191,7 @@ func (t *Tracker) Requeue(b Batch, at time.Time) {
 	for n := range b.values {
 		if e := c.entries[n]; e != nil {
 			e.inFlight = false
-			e.retryAt = at
+			e.retryAt, e.engineWaitAt = at, at
 			t.soonLocked(at)
 		}
 	}

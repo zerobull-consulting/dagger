@@ -435,6 +435,61 @@ func TestTrackerRequeue(t *testing.T) {
 	}
 }
 
+// The hello of the generation a requeued root waits for makes it due at
+// once; a backoff, and the hello of an older generation, don't
+// (zerobull-consulting/dagger#132).
+func TestTrackerConnectedWakesEngineWait(t *testing.T) {
+	setup := func() (*Tracker, Batch) {
+		tr := newTestTracker()
+		o := state(1, 10, fsPart)
+		o.Generation = 2
+		tr.Observe(o, t0)
+		return tr, tr.All("c", t0)[0]
+	}
+	wait := t0.Add(10 * time.Second)
+	now := t0.Add(time.Second)
+
+	t.Run("newer generation's hello", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		tr.Connected("c", 2, now)
+		if got := roots(tr.Due(now)); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("not due at the hello: %v", got)
+		}
+	})
+	t.Run("older generation's hello", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		tr.Connected("c", 1, now)
+		if got := roots(tr.Due(now)); len(got) != 0 {
+			t.Fatalf("an older generation's hello made it due: %v", got)
+		}
+	})
+	t.Run("backoff", func(t *testing.T) {
+		tr, b := setup()
+		tr.Done(b, Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, t0)
+		retry := tr.Entries("c")[0].RetryAt
+		now := t0.Add(time.Millisecond) // inside the backoff
+		tr.Connected("c", 2, now)
+		if got := tr.Entries("c")[0].RetryAt; got != retry {
+			t.Fatalf("a hello moved a backoff: %s, was %s", got, retry)
+		}
+		if got := roots(tr.Due(now)); len(got) != 0 {
+			t.Fatalf("a hello made a backed-off root due: %v", got)
+		}
+	})
+	t.Run("in flight", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		b2 := tr.Due(wait)
+		tr.Connected("c", 2, wait.Add(time.Second))
+		tr.Done(b2[0], Result{Stored: []uint64{1}}, wait.Add(time.Second))
+		if got := roots(tr.Due(wait.Add(time.Minute))); len(got) != 0 {
+			t.Fatalf("stored root due again: %v", got)
+		}
+	})
+}
+
 func TestTrackerWipedCache(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)

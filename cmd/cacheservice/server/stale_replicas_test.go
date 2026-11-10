@@ -222,3 +222,38 @@ func TestOlderGenerationConnectingLaterDoesNotTakeExports(t *testing.T) {
 		t.Fatalf("the older engine exported %d times", n)
 	}
 }
+
+// A batch claimed at a newer generation than the cache's only connection waits
+// for that generation's hello (runBatch requeues it with NoEngineWait). When
+// the hello arrives, the batch is exported at once, not at the end of its
+// wait (zerobull-consulting/dagger#132).
+func TestNewerGenerationBatchExportsAtHello(t *testing.T) {
+	const wait = 4 * time.Second
+	blobs, meta := newMemStores(t)
+	h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = wait })
+	restarted := fakeengine.New("cache-a", 5)
+	restarted.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	restarted.Add(fakeengine.Entry{Number: 11, Deps: []uint64{10}, Layers: [][]byte{testLayer("base"), testLayer("exec")}})
+
+	// Generation 5's session ends before its hello reaches this service
+	// (another replica has it): the old engine, generation 4, is the only
+	// connection, so the batch is requeued to wait for the hello.
+	h.postSpansOf(restarted, "session-5", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitFor(t, "the batch to wait for the hello", func() bool {
+		for _, e := range h.ns().tracker.Entries(h.cache.ID) {
+			if e.RetryAt != "" {
+				return true
+			}
+		}
+		return false
+	})
+
+	start := time.Now()
+	h.connectEngine(restarted)
+	waitFor(t, "the export from the newer generation", func() bool { return restarted.Exports() > 0 })
+	if d := time.Since(start); d > wait/2 {
+		t.Fatalf("exported %s after the hello, want at once (the wait is %s)", d, wait)
+	} else {
+		t.Logf("exported %s after the hello (NoEngineWait %s)", d, wait)
+	}
+}
