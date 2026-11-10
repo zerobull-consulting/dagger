@@ -4,3 +4,5 @@
 *.tfstate.*
 *.tfvars
 crash.log
+# Tokens files (spaces.sh tokens): engine tokens, secrets.
+tokens/

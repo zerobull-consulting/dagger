@@ -1,9 +1,12 @@
-# Spaces test bucket (Terraform)
+# Spaces bucket for a repository (Terraform)
 
-Creates a dedicated DigitalOcean Spaces bucket and the three keys the remote
-cache service documents ([The keys](../../../cmd/cacheservice/README.md#the-keys)),
-for the tests of [Testing against a real bucket](../README.md#testing-against-a-real-bucket),
-and removes them again.
+Local utilities that set up a DigitalOcean Spaces bucket for the remote cache
+from scratch: the bucket and the three keys the service documents
+([The keys](../../../cmd/cacheservice/README.md#the-keys)), a tokens file,
+the lifecycle rules, and the GitHub Actions secrets and variables of a
+repository's environments. They also remove it again. One bucket per
+repository, or a throwaway one for the tests of
+[Testing against a real bucket](../README.md#testing-against-a-real-bucket).
 
 | Key | Spaces grant | Use |
 | --- | --- | --- |
@@ -13,6 +16,62 @@ and removes them again.
 
 The bucket is private and has `force_destroy`: **tear-down deletes its
 objects.** The name is generated, so it is a fresh bucket each time.
+
+## Set up a repository in one command
+
+`spaces.sh setup` does everything a repository's Actions jobs need, in order:
+creates the bucket and keys (`up`), claims the prefix and sets its lifecycle
+rules (`lifecycle claim`, `apply`, `check`, with the admin key), then stores
+the write and the read key's settings in the repository's environments
+(`github write`, `github read`). It is safe to run again: each step is a
+no-op when already done. Keep each repository's variables in a `.tfvars`
+file (git-ignored) and its state in a workspace of its own:
+
+```hcl
+# dagger.tfvars
+github_repository        = "zerobull-consulting/dagger"
+github_write_environment = "main"
+github_read_environment  = "pull-requests"
+github_read_name_prefix  = "CACHE_S3_"
+```
+
+```bash
+export DIGITALOCEAN_TOKEN=... TF_WORKSPACE=dagger
+./hack/remote-cache/spaces/spaces.sh setup -var-file=dagger.tfvars
+```
+
+It needs `terraform`, `go` and `gh` (logged in, with access to the
+repository's secrets). Without `github_repository`, it skips GitHub. If
+`apply` would remove a namespace's rule, `setup` stops there: run
+`lifecycle apply -allow-removals` yourself (see [Lifecycle rules](#lifecycle-rules)).
+
+Then the jobs only pick their environment, and read the same names
+whichever key it holds:
+
+```yaml
+jobs:
+  build:
+    # main for pushes to the default branch, pull-requests for pull requests
+    environment: ${{ github.event_name == 'pull_request' && 'pull-requests' || 'main' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: zerobull-consulting/dagger/.github/actions/remote-cache/start@<commit SHA>
+        with:
+          role: ${{ github.event_name == 'pull_request' && 'read-only' || 'writer' }}
+          s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
+          s3-region: ${{ vars.CACHE_S3_REGION }}
+          s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
+          s3-prefix: ${{ vars.CACHE_S3_PREFIX }}
+          s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
+```
+
+Restrict the `main` environment to the default branch (Settings,
+Environments, deployment branches), or any branch's workflow can take the
+write key.
+
+The sections below are the steps `setup` runs, one at a time.
 
 ## Use
 
@@ -116,29 +175,59 @@ In a workspace, the keys are named `dagger-rc-<workspace>-admin`, `-write`
 and `-read`, so the control panel says which is which (`key_name_prefix`
 overrides it).
 
+## Tokens
+
+The sidecar action doesn't use tokens: it runs the service with `-scope`
+(its `namespace` input, `default` by default) and takes any engine token.
+A tokens file matters for a service shared between runners, which turns on
+authentication with `-tokens-file`, and for the lifecycle rules: they are one
+per namespace, and `lifecycle` takes the namespaces from the tokens file
+([The tokens file](../../../cmd/cacheservice/README.md#the-tokens-file)).
+
+Each workspace has its own, `tokens/<workspace>.tokens` in this directory
+(git-ignored, mode 0600; `TOKENS_FILE` overrides it):
+
+```bash
+./hack/remote-cache/spaces/spaces.sh tokens add team-a      # prints the new token, once
+./hack/remote-cache/spaces/spaces.sh tokens list            # fingerprints and namespaces, no tokens
+./hack/remote-cache/spaces/spaces.sh tokens revoke 1a99fa0a # by fingerprint, or by namespace: all of its tokens
+./hack/remote-cache/spaces/spaces.sh tokens path
+```
+
+`add` generates a token as the service's README recommends (`openssl rand
+-hex 32`), checks the namespace by the service's rule, and prints the token
+on standard output (`tok="$(spaces.sh tokens add team-a)"`), the rest on
+standard error. The fingerprints are the ones the service logs. After `add`
+of a new namespace, run `lifecycle apply` (or `setup`) for its rule; after
+`revoke`, send the service `SIGHUP`.
+
 ## Lifecycle rules
 
 `spaces.sh lifecycle` runs [`cacheservice lifecycle`](../../../cmd/cacheservice/README.md#the-lifecycle-command)
 with the admin key, the only one Spaces lets read or write lifecycle rules.
-It sets the key in its own process for that one command, never in your
-shell. It builds `./cmd/cacheservice` with `go` first (set `CACHESERVICE` to
-a binary to skip that), and runs it in your current directory, so a
-relative `-tokens-file` works. Its flags go after the action, as for the
-command itself. It prints the bucket and prefix that `-confirm` must repeat.
+It sets the key in a subshell for that one command, never in your shell. It
+builds `./cmd/cacheservice` with `go` first (set `CACHESERVICE` to a binary
+to skip that), and runs it in your current directory, so a relative
+`-tokens-file` works. Its flags go after the action, as for the command
+itself. It prints the bucket and prefix that `-confirm` must repeat.
 
-A fresh bucket, in this order (with the workspace's `TF_WORKSPACE`):
+`plan`, `apply` and `check` take the namespaces from the workspace's tokens
+file when it exists and neither `-tokens-file` nor `-scope` is given;
+otherwise the one namespace is `default`, the sidecar action's. `claim`
+reads none. By hand, in this order (what `setup` runs):
 
 ```bash
 ./hack/remote-cache/spaces/spaces.sh lifecycle claim -confirm=<bucket>/<prefix>
-./hack/remote-cache/spaces/spaces.sh lifecycle plan -tokens-file tokens
-./hack/remote-cache/spaces/spaces.sh lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>
-./hack/remote-cache/spaces/spaces.sh lifecycle check -tokens-file tokens
+./hack/remote-cache/spaces/spaces.sh lifecycle plan
+./hack/remote-cache/spaces/spaces.sh lifecycle apply -confirm=<bucket>/<prefix>
+./hack/remote-cache/spaces/spaces.sh lifecycle check
 ```
 
 `claim` creates the prefix's ownership marker, which `apply` requires; a
-prefix a writer already started on doesn't need it. Without `-tokens-file`
-the one namespace is `default`. Run `apply` again when the tokens file's
-namespaces change.
+prefix a writer already started on doesn't need it. Run `apply` again when
+the namespaces change; one that would remove a rule needs
+`-allow-removals`. `setup` passes `-confirm` itself, since it only runs on
+the bucket its own state created; by hand you type it.
 
 ## Tear down
 

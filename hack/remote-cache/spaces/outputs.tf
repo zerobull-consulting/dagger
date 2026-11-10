@@ -17,6 +17,15 @@ output "endpoint" {
   value = local.endpoint
 }
 
+output "prefix" {
+  value = var.prefix
+}
+
+# Empty when unset, so spaces.sh setup can tell (it skips GitHub then).
+output "github_repository" {
+  value = var.github_repository == null ? "" : var.github_repository
+}
+
 # Secrets are sensitive: read them with `terraform output -json <name>`,
 # or use ./spaces.sh env <admin|write|read>.
 output "admin" {
