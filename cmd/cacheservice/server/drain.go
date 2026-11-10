@@ -36,8 +36,8 @@ type drainState struct {
 	started  time.Time
 	deadline time.Time
 	// stored are the roots stored by exports that ended while draining, by
-	// cache ID.
-	stored  map[string]int
+	// namespace and cache ID.
+	stored  map[drainCache]int
 	refused map[string]int
 	// engines is how many engine connections were welcomed when the drain
 	// started; it welcomes none after.
@@ -76,8 +76,9 @@ type DrainReport struct {
 	Outcome string        `json:"outcome,omitempty"`
 	Took    time.Duration `json:"took"`
 	// Stored are the roots stored by exports that ended while draining, by
-	// cache ID.
-	Stored map[string]int `json:"stored"`
+	// namespace and cache ID: one entry per engine cache that stored any,
+	// sorted as Left is.
+	Stored []DrainStored `json:"stored"`
 	// Left is what was left unexported, by cache.
 	Left []DrainLeft `json:"left"`
 	// Refused counts the new work refused: engine connections and spans.
@@ -101,6 +102,40 @@ func (r DrainReport) LeftRoots() int {
 		n += l.Roots()
 	}
 	return n
+}
+
+// StoredRoots is how many roots the drain's exports stored, of every cache.
+func (r DrainReport) StoredRoots() int {
+	n := 0
+	for _, st := range r.Stored {
+		n += st.Roots
+	}
+	return n
+}
+
+// StoredOf is how many roots the drain's exports stored of one namespace's
+// engine cache.
+func (r DrainReport) StoredOf(namespace, cacheID string) int {
+	for _, st := range r.Stored {
+		if st.Namespace == namespace && st.CacheID == cacheID {
+			return st.Roots
+		}
+	}
+	return 0
+}
+
+// DrainStored is what a drain's exports stored of one engine cache. Two
+// namespaces' engines may say hello with the same cache ID: they are two
+// caches, each with its own count.
+type DrainStored struct {
+	Namespace string `json:"namespace"`
+	CacheID   string `json:"cacheID"`
+	Roots     int    `json:"roots"`
+}
+
+// drainCache names an engine cache in a drain's counts.
+type drainCache struct {
+	namespace, cacheID string
 }
 
 // Draining reports whether the service is draining (Drain was called).
@@ -175,7 +210,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		return DrainReport{Outcome: metrics.DrainCanceled}
 	}
 	s.drain.started, s.drain.deadline = start, deadline
-	s.drain.stored = map[string]int{}
+	s.drain.stored = map[drainCache]int{}
 	explicitEnded := s.drain.explicitEnded
 	// A request that ended before the drain may have left a wake.
 	select {
@@ -443,7 +478,7 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 	rep := DrainReport{
 		Outcome:  outcome,
 		Took:     took,
-		Stored:   maps.Clone(s.drain.stored),
+		Stored:   drainStoredOf(s.drain.stored),
 		Left:     left,
 		Refused:  maps.Clone(s.drain.refused),
 		Engines:  s.drain.engines,
@@ -453,8 +488,8 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 	s.drain.mu.Unlock()
 	s.metrics.DrainEnded(outcome, took, rep.LeftRoots())
 
-	for _, id := range slices.Sorted(maps.Keys(rep.Stored)) {
-		s.logger.Info("drain: stored", "cacheID", id, "roots", rep.Stored[id])
+	for _, st := range rep.Stored {
+		s.logger.Info("drain: stored", "namespace", st.Namespace, "cacheID", st.CacheID, "roots", st.Roots)
 	}
 	for _, l := range left {
 		if l.Roots() == 0 {
@@ -468,20 +503,34 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		level = s.logger.Warn
 	}
 	level("drain: done", "outcome", outcome, "took", took.Round(time.Millisecond),
-		"storedRoots", sum(rep.Stored), "leftRoots", rep.LeftRoots(),
+		"storedRoots", rep.StoredRoots(), "leftRoots", rep.LeftRoots(),
 		"refusedConnections", rep.Refused[metrics.DrainRefusedConnection], "refusedSpans", rep.Refused[metrics.DrainRefusedSpan],
 		"engines", rep.Engines, "explicitLeft", rep.Explicit)
 	return rep
 }
 
-// drainStored counts roots stored by an export that ended while draining.
-func (s *Service) drainStored(cacheID string, roots int) {
+// drainStored counts roots stored by an export of a namespace's cache that
+// ended while draining.
+func (s *Service) drainStored(ns *namespace, cacheID string, roots int) {
 	s.metrics.DrainStored(roots)
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
 	if s.drain.stored != nil {
-		s.drain.stored[cacheID] += roots
+		s.drain.stored[drainCache{ns.name, cacheID}] += roots
 	}
+}
+
+// drainStoredOf is a drain's stored counts, sorted by namespace and cache
+// ID.
+func drainStoredOf(m map[drainCache]int) []DrainStored {
+	out := make([]DrainStored, 0, len(m))
+	for k, n := range m {
+		out = append(out, DrainStored{Namespace: k.namespace, CacheID: k.cacheID, Roots: n})
+	}
+	slices.SortFunc(out, func(a, b DrainStored) int {
+		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.CacheID, b.CacheID))
+	})
+	return out
 }
 
 // refusedSpan counts a span or session end dropped while draining.
@@ -558,12 +607,4 @@ func (s *Service) DrainStatus() DrainStatus {
 
 func (s *Service) serveDrain(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.DrainStatus())
-}
-
-func sum(m map[string]int) int {
-	n := 0
-	for _, v := range m {
-		n += v
-	}
-	return n
 }

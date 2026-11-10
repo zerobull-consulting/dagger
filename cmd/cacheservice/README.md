@@ -2953,8 +2953,10 @@ wait for), `deadline` or `canceled`. `GET /debug/drain` shows it under
 
 The drain logs, when it starts, what each engine cache (by cache ID, never
 the token) has pending, in flight and waiting for a retry, and when it ends,
-the roots stored by cache ID, and what was left unexported by cache ID and
-root count (`drain: left unexported`, a warning), with its outcome:
+the roots stored by namespace and cache ID (two namespaces whose engines
+say hello with the same cache ID are two caches), and what was left
+unexported by namespace, cache ID and root count (`drain: left
+unexported`, a warning), with its outcome:
 `complete`, `deadline` or `canceled`. `GET /debug/drain` shows the same while
 it runs, and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
 `drain_stored_roots_total`, `drain_unexported_roots_total` and
