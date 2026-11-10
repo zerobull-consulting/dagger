@@ -1569,6 +1569,15 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     anything is read, so the budget also bounds how many requests are read
     at once, stalled ones included: about 8,000
     (`TestOTLPStalledRequestsBounded`);
+  - its **headers**, with it, before any of the body is read: net/http has
+    parsed and holds them while the handler runs. They are estimated from
+    the request (`otlpHeaderReserve`): the bytes of every key and value plus
+    64 for each value, the host, and the request URI twice. Real engines'
+    come to 0.4 to 3 KiB (see **Headers are bounded**, below), so this is
+    small beside the 16 KiB; but a client sending 48 KiB of headers and then
+    stalling its body now holds that much of the budget, not 16 KiB
+    ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
+    `TestOTLPRequestHeadersInBudget`, `TestOTLPHeaderReserve`);
   - a gzipped body's **decompressor**, 64 KiB, before it is built
     (`TestOTLPGzipDecompressorReserved`);
   - the body's **buffer**, doubling from 512 bytes up to the limit as the
@@ -1605,6 +1614,40 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   one beside them; two at-limit requests at once may have one refused, and
   retried. Without the budget, N requests at the limit would hold N times
   the limit, and their messages more.
+- **Headers are bounded.** Every listener (`server.NewHTTPServer`: the
+  engine and OTLP listener, the debug listener and the metrics listener)
+  sets `MaxHeaderBytes` to 64 KiB (`server.MaxHeaderBytes`), where net/http's
+  default is 1 MiB. net/http allows 4 KiB more than that for its read buffer,
+  so a request line and headers of up to about 68 KiB are read; a larger one
+  is answered **431** before any handler runs, so it reserves nothing and
+  records nothing (`TestOTLPRequestOverHeaderLimit`). Before
+  ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85)),
+  up to 1 MiB of headers per request was held outside the budget, so about
+  8,000 requests stalled after their headers held about 8 GB it didn't count.
+  The limit was chosen from what real callers send, measured by running the
+  engine's own client code against a server that logged each request's raw
+  header block:
+  - the engine's OTLP exporters (`newCloudExporters`, `POST /v1/traces`;
+    `/v1/logs` and `/v1/metrics` send the same headers): **402 bytes** with
+    a Basic engine token (`Authorization`, `Content-Type`, `User-Agent`,
+    `X-Dagger-Export`, `X-Dagger-Org`, `Accept-Encoding`, `Content-Length`),
+    **1,811 bytes** with a 1.5 KiB bearer token (an OIDC or OAuth token,
+    which dominates the size);
+  - the engine's WebSocket upgrade (`remotecache.dialService`): **431
+    bytes** with a 64-character token (`Authorization`, and the
+    WebSocket upgrade headers);
+  - the debug API is called by operators with `curl` or a script, with a
+    bearer token: a few hundred bytes. A browser's cookies could add more,
+    but a debug client is not a browser, and 64 KiB is far over it.
+
+  64 KiB is over 30 times the largest of these. The e2e's `otlp-sizes`
+  scenario logs the headers' reserve of every OTLP request the real engines
+  sent (`headerBytes` in the `otlp request accepted` record) and fails if the
+  largest is within a tenth of `MaxHeaderBytes`; every real engine's
+  WebSocket upgrade also has to pass the limit for the run to connect at all.
+  The reserve is an estimate of the headers parsed, not their bytes on the
+  wire, so it is a little larger than the figures above (the per-value cost
+  adds about 0.6 KiB for the usual ten headers).
 - **A read timeout.** Each body must arrive within 30s of its handler
   starting (`server.OTLPReadTimeout`), a read deadline on the OTLP routes
   alone, set before the token is checked (`http.ResponseController`, per
@@ -1658,9 +1701,6 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
 - Idle keep-alive connections aren't bounded
   ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
   `TestIdleKeepAliveConnectionsUnbounded`).
-- A request's headers, up to net/http's 1 MiB default, aren't in the budget
-  ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
-  `TestOTLPRequestHeadersNotInBudget`).
 - Walking a deeply nested body (OTLP values nest) takes stack the budget
   doesn't count; its structs are counted
   ([zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86),

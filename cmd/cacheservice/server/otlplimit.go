@@ -60,17 +60,28 @@ const (
 	// which outlives any request timeout, is unaffected once upgraded.
 	ReadHeaderTimeout = 10 * time.Second
 
+	// MaxHeaderBytes bounds a request's line and headers on every listener
+	// (NewHTTPServer); net/http answers a larger one 431 before any handler
+	// runs. Real callers send well under 2 KiB: the engine's OTLP requests
+	// 0.4 to 1.8 KiB (a Basic token, or a 1.5 KiB bearer token), its
+	// WebSocket upgrade 0.4 KiB. This is over 30 times that, and 1/16 of
+	// net/http's default (1 MiB); net/http allows 4 KiB more than this for its
+	// read buffer. cmd/cacheservice's README, "OTLP limits",
+	// has the numbers.
+	MaxHeaderBytes = 64 << 10
+
 	// otlpRetryAfter is the Retry-After of a 503 for a full budget, in
 	// seconds.
 	otlpRetryAfter = 1
 )
 
 // NewHTTPServer is an http.Server for one of the service's handlers, with the
-// timeouts every listener sets: ReadHeaderTimeout, and no ReadTimeout or
-// WriteTimeout, which would cut off the engine WebSocket. The OTLP routes
-// bound their bodies themselves (OTLPReadTimeout).
+// limits every listener sets: ReadHeaderTimeout and MaxHeaderBytes, and no
+// ReadTimeout or WriteTimeout, which would cut off the engine WebSocket. The
+// OTLP routes bound their bodies themselves (OTLPReadTimeout), and count
+// their headers in the decode budget (otlpHeaderReserve).
 func NewHTTPServer(addr string, h http.Handler) *http.Server {
-	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout}
+	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout, MaxHeaderBytes: MaxHeaderBytes}
 }
 
 // otlpRoute is one OTLP POST route: its name, a constant used as its metric
@@ -171,6 +182,28 @@ const (
 // be read at once, stalled ones included: about 8,000 at the defaults,
 // however little each has sent.
 const otlpRequestReserve = 16 << 10
+
+// otlpHeaderEntryCost is what each header value costs in the parsed request
+// beyond its bytes: the map slot, the []string and the string headers, about
+// 100 bytes; rounded to 64 here since the bytes of key and value are counted
+// separately and the strings share their backing array.
+const otlpHeaderEntryCost = 64
+
+// otlpHeaderReserve estimates what the request line and headers net/http
+// parsed hold while the handler runs: the bytes of each key and value plus
+// otlpHeaderEntryCost per value, the host, and the request URI twice (as sent
+// and as parsed into r.URL). A request over MaxHeaderBytes never gets here,
+// so it is at most about MaxHeaderBytes, plus otlpHeaderEntryCost for each of
+// the fewest-byte headers that fit.
+func otlpHeaderReserve(r *http.Request) int64 {
+	n := int64(len(r.Host) + 2*len(r.RequestURI))
+	for k, vs := range r.Header {
+		for _, v := range vs {
+			n += int64(len(k)+len(v)) + otlpHeaderEntryCost
+		}
+	}
+	return n
+}
 
 // otlpGzipReserve is what a gzipped body's decompressor is reserved for,
 // before it is built: compress/flate's 32 KiB window, its Huffman tables and
