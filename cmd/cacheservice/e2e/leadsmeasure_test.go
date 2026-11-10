@@ -153,10 +153,10 @@ func TestDepsAfterStoreKeysByGeneration(t *testing.T) {
 	}
 }
 
-func TestStoresByEntryKeepsEveryStoreAndCountsOmitted(t *testing.T) {
+func TestRootsByEntryKeepsEveryStoreAndCountsOmitted(t *testing.T) {
 	a := storedRec(time.Second, "c1", "7,x,,9")
 	a.Attrs["omitted"] = "3"
-	stores, omitted := storesByEntry([]LogRecord{a, storedRec(2*time.Second, "c1", "7")})
+	stores, omitted := rootsByEntry([]LogRecord{a, storedRec(2*time.Second, "c1", "7")}, "export stored roots")
 	if omitted != 3 || len(stores[entryKey{"c1/1", 7}]) != 2 || len(stores[entryKey{"c1/1", 9}]) != 1 || len(stores) != 2 {
 		t.Errorf("stores %v, omitted %d", stores, omitted)
 	}
@@ -217,5 +217,68 @@ func TestRetainedFollowsTheLatestEndTime(t *testing.T) {
 	recs[1] = spanRecEnd(time.Second, "50", "c1/1", "7", true, true, "1", "1")
 	if gaps := lazyToCall(recs); len(gaps) != 1 || !gaps[0].atRisk() {
 		t.Errorf("gaps %+v; want one at risk", gaps)
+	}
+}
+
+func tryRec(after time.Duration, cacheID, numbers string) LogRecord {
+	r := storedRec(after, cacheID, numbers)
+	r.Msg = "export try roots"
+	return r
+}
+
+// The engine fixes a bundle's deps when the export try starts, so a span that
+// arrives after that and before the store is logged is not in the stored
+// value: growth, though it comes before the store.
+func TestDepsAfterStoreCountsFromTheStartOfTheTry(t *testing.T) {
+	recs := []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "1", "2"),
+		tryRec(time.Second, "c1", "7"),
+		spanRec(2*time.Second, "c1/1", "7", false, true, "1", "3"), // after the try started, before the store
+		storedRec(3*time.Second, "c1", "7"),
+	}
+	stored, growth, _ := depsAfterStore(recs)
+	if stored != 1 || len(growth) != 1 || growth[0].before != 2 || growth[0].after != 3 || growth[0].storedAt != leadsT0.Add(time.Second) {
+		t.Fatalf("stored %d, growth %+v; want one growth, 2 -> 3, counted from the try at 1s", stored, growth)
+	}
+	// A try that did not store the root, before the one that did.
+	recs = []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "1", "2"),
+		tryRec(time.Second, "c1", "7"), // busy: no store
+		spanRec(2*time.Second, "c1/1", "7", false, true, "1", "3"),
+		tryRec(3*time.Second, "c1", "7"),
+		storedRec(4*time.Second, "c1", "7"),
+	}
+	if _, growth, _ := depsAfterStore(recs); len(growth) != 0 {
+		t.Errorf("growth %+v; the try that stored the value started after the span", growth)
+	}
+	// Tries of other roots and caches don't count.
+	recs = []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "1", "2"),
+		tryRec(time.Second, "c1", "8,9"),
+		tryRec(time.Second, "c2", "7"),
+		spanRec(2*time.Second, "c1/1", "7", false, true, "1", "3"),
+		storedRec(3*time.Second, "c1", "7"),
+	}
+	if _, growth, _ := depsAfterStore(recs); len(growth) != 0 {
+		t.Errorf("growth %+v; no try named root 7 of cache c1", growth)
+	}
+}
+
+func TestQuietGaps(t *testing.T) {
+	recs := []LogRecord{
+		// Entry 7: two lazy spans 15s apart, then a call span that retains it,
+		// then a lazy span 40s later: that gap is of a retained entry.
+		spanRecEnd(0, "10", "c1/1", "7", false, false, "1", "0"),
+		spanRecEnd(15*time.Second, "20", "c1/1", "7", false, false, "1", "1"),
+		spanRecEnd(16*time.Second, "30", "c1/1", "7", true, true, "1", "1"),
+		spanRecEnd(56*time.Second, "40", "c1/1", "7", false, true, "1", "1"),
+		// Entry 9 is never retained: a call span that says not retained, then
+		// another span 2 minutes later.
+		spanRecEnd(0, "10", "c1/1", "9", true, false, "1", "0"),
+		spanRecEnd(120*time.Second, "20", "c1/1", "9", false, false, "1", "0"),
+	}
+	gaps := quietGaps(recs)
+	if len(gaps) != 3 || gaps[0].number != 9 || gaps[0].gap != 120*time.Second || gaps[1].gap != 15*time.Second || gaps[2].gap != time.Second {
+		t.Fatalf("gaps %+v; want entry 9's 120s, then entry 7's 15s and 1s (not its 40s, after it was retained)", gaps)
 	}
 }

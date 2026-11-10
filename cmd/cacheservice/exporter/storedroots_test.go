@@ -22,7 +22,7 @@ func TestExportLogsStoredRoots(t *testing.T) {
 	if err != nil || len(res.Stored) != 2 {
 		t.Fatalf("export: %+v, %v", res, err)
 	}
-	if out := buf.String(); !strings.Contains(out, `msg="export stored roots"`) || !strings.Contains(out, "numbers=10,11") || !strings.Contains(out, "generation=") || !strings.Contains(out, "omitted=0") {
+	if out := buf.String(); !strings.Contains(out, `msg="export try roots"`) || !strings.Contains(out, `msg="export stored roots"`) || !strings.Contains(out, "numbers=10,11") || !strings.Contains(out, "generation=") || !strings.Contains(out, "omitted=0") {
 		t.Errorf("log lacks the stored roots:\n%s", out)
 	}
 }
@@ -34,7 +34,7 @@ func TestLogStoredRootsBounded(t *testing.T) {
 	for i := range roots {
 		roots[i] = uint64(i + 1)
 	}
-	x.logStoredRoots("c", 4, roots)
+	x.logRoots("export stored roots", "c", 4, roots)
 	if n := strings.Count(buf.String(), ",") + 1; n != maxLoggedRoots {
 		t.Errorf("%d roots logged, want %d", n, maxLoggedRoots)
 	}
@@ -52,7 +52,7 @@ func TestLogStoredRootsSkippedWhenDebugOff(t *testing.T) {
 	for i := range roots {
 		roots[i] = uint64(i + 1)
 	}
-	if n := testing.AllocsPerRun(10, func() { x.logStoredRoots("c", 1, roots) }); n != 0 {
+	if n := testing.AllocsPerRun(10, func() { x.logRoots("export stored roots", "c", 1, roots) }); n != 0 {
 		t.Errorf("%v allocations with debug logging off, want 0", n)
 	}
 	if buf.Len() != 0 {

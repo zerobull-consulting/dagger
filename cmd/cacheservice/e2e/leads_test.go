@@ -21,6 +21,13 @@ import (
 //     before an entry's call span does its last lazy-evaluation span come,
 //     while the engine doesn't yet keep the entry?
 
+// The analysis mirrors the tracker's rules (tracker.go, Observe): spans of an
+// older generation than the newest seen for the cache are ignored, so are
+// spans of an older replacement count, the deps list kept is the longest for
+// the highest count, and an entry's retained flag is the one of the call span
+// with the latest end time. When Observe changes, change these with it; the
+// unit tests in leadsmeasure_test.go pin this mirror, not the tracker.
+
 // entrySpan is one "cache span" record naming an entry.
 type entrySpan struct {
 	at   time.Time
@@ -77,14 +84,14 @@ func spansByEntry(recs []LogRecord) map[entryKey][]entrySpan {
 	return out
 }
 
-// storesByEntry returns, per cache attribute as the spans carry it (cache ID
-// and generation) and root, when each export stored the root, in order, from
-// the "export stored roots" records. omitted counts roots the records left
-// out, which the measurement can't see.
-func storesByEntry(recs []LogRecord) (stores map[entryKey][]time.Time, omitted int) {
-	stores = map[entryKey][]time.Time{}
+// rootsByEntry returns, per cache attribute as the spans carry it (cache ID
+// and generation) and root, when the "export try roots" or "export stored
+// roots" records (msg) named the root, in order. omitted counts roots the
+// records left out, which the measurement can't see.
+func rootsByEntry(recs []LogRecord, msg string) (at map[entryKey][]time.Time, omitted int) {
+	at = map[entryKey][]time.Time{}
 	for _, r := range recs {
-		if r.Msg != "export stored roots" {
+		if r.Msg != msg {
 			continue
 		}
 		o, _ := strconv.Atoi(r.Attr("omitted"))
@@ -96,10 +103,37 @@ func storesByEntry(recs []LogRecord) (stores map[entryKey][]time.Time, omitted i
 				continue
 			}
 			k := entryKey{cache, n}
-			stores[k] = append(stores[k], r.Time)
+			at[k] = append(at[k], r.Time)
 		}
 	}
-	return stores, omitted
+	return at, omitted
+}
+
+// exportedAt returns, for each store of each root, when the export that
+// stored it started: the latest try that named the root at or before the
+// store. The engine fixes the bundle's deps when the try starts, so a span
+// that arrives after that is not in the stored value, though it comes before
+// the store is logged. A store with no try before it counts from the store.
+func exportedAt(recs []LogRecord) (map[entryKey][]time.Time, int) {
+	tries, o1 := rootsByEntry(recs, "export try roots")
+	stores, o2 := rootsByEntry(recs, "export stored roots")
+	out := map[entryKey][]time.Time{}
+	for k, sts := range stores {
+		for _, st := range sts {
+			start := st
+			var try time.Time
+			for _, tr := range tries[k] {
+				if !tr.After(st) && tr.After(try) {
+					try = tr
+				}
+			}
+			if !try.IsZero() {
+				start = try
+			}
+			out[k] = append(out[k], start)
+		}
+	}
+	return out, o1 + o2
 }
 
 // depsGrowth is a span that reported a longer deps list than any before it
@@ -122,7 +156,7 @@ type depsGrowth struct {
 // roots the records omitted.
 func depsAfterStore(recs []LogRecord) (stored int, growth []depsGrowth, omitted int) {
 	spans := spansByEntry(recs)
-	stores, omitted := storesByEntry(recs)
+	stores, omitted := exportedAt(recs)
 	for k, ss := range spans {
 		times := stores[k]
 		if len(times) == 0 {
@@ -202,6 +236,37 @@ func lazyToCall(recs []LogRecord) []lazyGap {
 	return out
 }
 
+// quietGap is the time between two consecutive spans of an entry (of any
+// kind) while the engine didn't keep it: the tracker forgets such an entry
+// ForgetAfter after its last span, with the deps and parts they reported.
+type quietGap struct {
+	entryKey
+	gap      time.Duration
+	from, to entrySpan
+}
+
+// quietGaps measures the gaps between consecutive spans of entries the
+// engine didn't keep (no call span with the latest end time said retained)
+// as of the earlier span, the largest first. It is logged only: entries such
+// as the Query root are never retained and see minutes between spans.
+func quietGaps(recs []LogRecord) []quietGap {
+	var out []quietGap
+	for k, ss := range spansByEntry(recs) {
+		retained := false
+		var stateEnd int64
+		for i, s := range ss {
+			if i > 0 && !retained {
+				out = append(out, quietGap{k, s.at.Sub(ss[i-1].at), ss[i-1], s})
+			}
+			if s.call && s.end >= stateEnd {
+				stateEnd, retained = s.end, s.retained
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b quietGap) int { return cmp.Or(-cmp.Compare(a.gap, b.gap), cmp.Compare(a.number, b.number)) })
+	return out
+}
+
 // leadsBound is how long a lazy-evaluation span may come before its entry's
 // call span while the engine doesn't keep the entry: the tracker forgets such
 // an entry ForgetAfter after its last span.
@@ -215,6 +280,7 @@ func (s *state) leads(t *testing.T) {
 	var stored, total, omitted int
 	var growth []depsGrowth
 	var gaps []lazyGap
+	var quiet []quietGap
 	for _, svc := range s.env.Services() {
 		recs := svc.Logs.Since(0, "", nil)
 		n, g, o := depsAfterStore(recs)
@@ -222,6 +288,7 @@ func (s *state) leads(t *testing.T) {
 		omitted += o
 		growth = append(growth, g...)
 		gaps = append(gaps, lazyToCall(recs)...)
+		quiet = append(quiet, quietGaps(recs)...)
 		for _, r := range recs {
 			if r.Msg == "cache span" {
 				total++
@@ -229,6 +296,7 @@ func (s *state) leads(t *testing.T) {
 		}
 	}
 	reportLeads(t, total, stored, omitted, growth, gaps)
+	reportQuietGaps(t, quiet)
 }
 
 // reportLeads logs the measurements and checks them.
@@ -263,4 +331,31 @@ func reportLeads(t *testing.T, spans, stored, omitted int, growth []depsGrowth, 
 	// something when it has gaps at all.
 	Check(t, len(gaps) > 0, "lead 2: the run had lazy-evaluation spans before call spans (%d gaps), so the measurement saw something", len(gaps))
 	Check(t, maxOpen < leadsBound, "lead 2: the largest gap from a lazy-evaluation span to the call span that retained an entry the engine didn't yet keep is %s, under ForgetAfter %s", maxOpen.Round(time.Millisecond), leadsBound)
+}
+
+// reportQuietGaps logs the gaps between consecutive spans of entries the
+// engine didn't keep. There is no bound: it is a number to read.
+func reportQuietGaps(t *testing.T, gaps []quietGap) {
+	t.Helper()
+	slices.SortFunc(gaps, func(a, b quietGap) int { return cmp.Or(-cmp.Compare(a.gap, b.gap), cmp.Compare(a.number, b.number)) })
+	over := 0
+	for _, g := range gaps {
+		if g.gap >= leadsBound {
+			over++
+		}
+	}
+	t.Logf("lead 2 (any span): %d gaps between consecutive spans of entries the engine didn't keep; %d of ForgetAfter (%s) or more", len(gaps), over, leadsBound)
+	for _, g := range gaps[:min(len(gaps), 5)] {
+		t.Logf("lead 2 (any span): gap %s, entry %d of %s: %s %q at %s (session %s) -> %s %q at %s (session %s, retained %v)",
+			g.gap.Round(time.Millisecond), g.number, g.cache,
+			kind(g.from), g.from.name, g.from.at.UTC().Format("15:04:05.000"), g.from.session,
+			kind(g.to), g.to.name, g.to.at.UTC().Format("15:04:05.000"), g.to.session, g.to.retained)
+	}
+}
+
+func kind(s entrySpan) string {
+	if s.call {
+		return "call"
+	}
+	return "lazy"
 }

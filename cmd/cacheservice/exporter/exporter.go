@@ -418,6 +418,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	defer func() { <-slots }()
 
+	x.logRoots("export try roots", eng.CacheID(), eng.Generation(), roots)
 	exported, err := x.requestExport(ctx, eng, roots, outputs)
 	if err != nil {
 		return res, nil, false, err
@@ -551,21 +552,22 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	res.Stored = append(res.Stored, survivors...)
 	res.Bundles = append(res.Bundles, rec.BundleID)
-	x.logStoredRoots(eng.CacheID(), eng.Generation(), survivors)
+	x.logRoots("export stored roots", eng.CacheID(), eng.Generation(), survivors)
 	x.log.Info("export stored", "cacheID", eng.CacheID(), "roots", len(survivors),
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, false, nil
 }
 
-// maxLoggedRoots bounds the root numbers one "export stored roots" record
-// lists (a batch has at most 1,000 roots); a record that omits some says how
-// many.
+// maxLoggedRoots bounds the root numbers one "export try roots" or "export
+// stored roots" record lists (a batch has at most 1,000 roots); a record that
+// omits some says how many.
 const maxLoggedRoots = 1000
 
-// logStoredRoots logs which roots an export stored, at debug level: the
-// e2e reads when each value was first stored (zerobull-consulting/dagger#154).
-func (x *Exporter) logStoredRoots(cacheID string, generation uint64, roots []uint64) {
+// logRoots logs, at debug level, which roots an export try started with
+// ("export try roots") or stored ("export stored roots"): the e2e reads when
+// each value was first exported and stored (zerobull-consulting/dagger#154).
+func (x *Exporter) logRoots(msg, cacheID string, generation uint64, roots []uint64) {
 	if !x.log.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
@@ -575,7 +577,7 @@ func (x *Exporter) logStoredRoots(cacheID string, generation uint64, roots []uin
 	for i, n := range roots {
 		nums[i] = strconv.FormatUint(n, 10)
 	}
-	x.log.Debug("export stored roots", "cacheID", cacheID, "generation", generation, "numbers", strings.Join(nums, ","), "omitted", omitted)
+	x.log.Debug(msg, "cacheID", cacheID, "generation", generation, "numbers", strings.Join(nums, ","), "omitted", omitted)
 }
 
 // checkGeneration returns the index's ErrStaleGeneration refusal of the
