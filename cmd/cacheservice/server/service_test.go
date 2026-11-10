@@ -788,9 +788,10 @@ func TestOTLPTraces(t *testing.T) {
 		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{kv(telemetryattrs.EngineCacheAttr, "cache-1")}},
 		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{
 			{Name: "plain"},
-			{Name: "cached", Attributes: []*commonpb.KeyValue{
+			{Name: "cached", EndTimeUnixNano: 1_700_000_000_123_456_789, Attributes: []*commonpb.KeyValue{
 				kv(telemetryattrs.CacheResultIDAttr, "42"),
 				kv(telemetryattrs.CacheOutcomeAttr, "hit"),
+				kv(telemetryattrs.CacheReplacementsAttr, "3"),
 				arrayKV(telemetryattrs.CacheDepsAttr, 2),
 				arrayKV(telemetryattrs.CachePartsAttr, 3),
 			}},
@@ -807,7 +808,7 @@ func TestOTLPTraces(t *testing.T) {
 	if len(spans) != 1 {
 		t.Fatalf("%d cache spans logged", len(spans))
 	}
-	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" {
+	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" || s["replacements"] != "3" || s["endUnixNano"] != "1700000000123456789" {
 		t.Fatalf("unexpected cache span log: %v", s)
 	}
 }
@@ -826,6 +827,7 @@ func TestOTLPTraceLogsBounded(t *testing.T) {
 			kv(telemetryattrs.CacheOutcomeAttr, long),
 			kv(telemetryattrs.CacheTypeAttr, long),
 			kv(telemetryattrs.CacheRetainedAttr, long),
+			kv(telemetryattrs.CacheReplacementsAttr, long),
 		}}}}},
 	}}}
 	if code := otlpPost(t, srv.URL+"/v1/traces", req, &coltracepb.ExportTraceServiceResponse{}, false, false); code != http.StatusOK {
@@ -835,7 +837,7 @@ func TestOTLPTraceLogsBounded(t *testing.T) {
 	if len(spans) != 1 {
 		t.Fatalf("%d cache spans logged", len(spans))
 	}
-	for field, limit := range map[string]int{"result": 200, "outcome": 200, "type": 200, "retained": 200, "cache": 200, "session": 200, "name": 120} {
+	for field, limit := range map[string]int{"result": 200, "outcome": 200, "type": 200, "retained": 200, "replacements": 200, "cache": 200, "session": 200, "name": 120} {
 		got := spans[0][field]
 		if len(got) == 0 || len(got) > limit || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
 			t.Errorf("%s logged as %d bytes: %.40q", field, len(got), got)
