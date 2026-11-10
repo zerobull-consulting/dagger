@@ -2826,8 +2826,9 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
 - **What it does.** Every dirty entry of the cache is due at once, without
   waiting for `-export-settle`, and stays so while the flush runs, so what
   becomes dirty meanwhile is exported too. Roots waiting out a retry's
-  backoff (busy, failed, interrupted) are due now, once; a retry after that
-  waits its normal backoff. A session whose spans may still come (one that
+  backoff (busy, failed, interrupted) are due now, once, except a failed
+  root whose wait a flush's own failed try started (below); a retry after
+  that waits its normal backoff. A session whose spans may still come (one that
   hasn't ended, or ended with some of the cache spans its carrier counted
   missing) is waited for until it ended with every span in, or
   `-export-settle` (at most 2s) passed since its last span: so a flush right
@@ -2836,7 +2837,7 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
   loops flushes doesn't retry a failing root at its own rate: a flush cuts
   short a failed root's wait only if a flush didn't cause the try that
   started it, so after a second failed try in a row the root waits out its
-  backoff, and reaches the last of its 5 failed tries (after which it isn't
+  backoff (or its value changes), and reaches the last of its 5 failed tries (after which it isn't
   tried again until its value changes) at most twice as fast as its
   backoff alone would take it there
   (`TestTrackerLoopedFlushesDontRushFailures`). A busy root, which doesn't
@@ -2977,7 +2978,11 @@ say hello with the same cache ID are two caches), and what was left
 unexported by namespace, cache ID and root count (`drain: left
 unexported`, a warning), with its outcome:
 `complete`, `deadline` or `canceled`. `GET /debug/drain` shows the same while
-it runs, and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
+it runs, and its report once it ended: `stored` is a list of `{"namespace",
+"cacheID", "roots"}`, one per engine cache that stored any, sorted by
+namespace and cache ID as `left` is (it was an object keyed by cache ID
+alone before
+[zerobull-consulting/dagger#160](https://github.com/zerobull-consulting/dagger/issues/160)), and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
 `drain_stored_roots_total`, `drain_unexported_roots_total` and
 `drain_refused_total` measure it.
 

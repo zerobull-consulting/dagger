@@ -466,7 +466,7 @@ func (s *Service) drainLeft(now, deadline time.Time) []DrainLeft {
 		}
 	}
 	slices.SortFunc(out, func(a, b DrainLeft) int {
-		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.CacheID, b.CacheID))
+		return compareCaches(a.Namespace, a.CacheID, b.Namespace, b.CacheID)
 	})
 	return out
 }
@@ -528,9 +528,15 @@ func drainStoredOf(m map[drainCache]int) []DrainStored {
 		out = append(out, DrainStored{Namespace: k.namespace, CacheID: k.cacheID, Roots: n})
 	}
 	slices.SortFunc(out, func(a, b DrainStored) int {
-		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.CacheID, b.CacheID))
+		return compareCaches(a.Namespace, a.CacheID, b.Namespace, b.CacheID)
 	})
 	return out
+}
+
+// compareCaches orders engine caches by namespace, then cache ID: the order
+// of a drain report's Stored and Left.
+func compareCaches(aNamespace, aCacheID, bNamespace, bCacheID string) int {
+	return cmp.Or(cmp.Compare(aNamespace, bNamespace), cmp.Compare(aCacheID, bCacheID))
 }
 
 // refusedSpan counts a span or session end dropped while draining.

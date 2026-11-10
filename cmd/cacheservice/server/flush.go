@@ -163,8 +163,10 @@ func (s *Service) flushRefusal() error {
 //
 //   - It makes every dirty entry of the cache due now, without waiting for
 //     it to settle, and every root of it waiting out a retry's backoff due
-//     now, once; a retry after that waits its normal backoff. Entries that
-//     become dirty during the flush are due at once too.
+//     now, once; a retry after that waits its normal backoff. A failed root
+//     whose wait began with a flush's try that failed is left to wait it
+//     out, unless its value changed (see exporter.Tracker.StartFlush).
+//     Entries that become dirty during the flush are due at once too.
 //   - It waits for the cache's sessions whose spans may still come: not
 //     ended, or ended with some of the spans their carrier counted missing,
 //     until Settle (at most 2s) passed since their last span; their late
@@ -221,6 +223,9 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 	defer p.changedWaiters.Add(-1)
 	poll := time.NewTicker(min(p.tick, maxDrainPoll))
 	defer poll.Stop()
+	// left fires when what is left of the deadline passed, as last seen.
+	left := time.NewTimer(timeout)
+	defer left.Stop()
 	for {
 		// Before the status: a kick after it wakes the wait below.
 		changed := p.changed()
@@ -242,19 +247,16 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		case !now.Before(deadline):
 			return end(metrics.FlushTimeout), nil
 		}
-		left := time.NewTimer(deadline.Sub(now))
+		left.Reset(deadline.Sub(now))
 		select {
 		case <-changed:
 		case <-poll.C:
 		case <-left.C:
 		case <-p.ctx.Done():
-			left.Stop()
 			return end(metrics.FlushCanceled), nil
 		case <-ctx.Done():
-			left.Stop()
 			return end(metrics.FlushCanceled), nil
 		}
-		left.Stop()
 	}
 }
 
