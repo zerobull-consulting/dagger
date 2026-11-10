@@ -2,11 +2,9 @@ package wipe
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +13,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 )
 
 // CallTimeout bounds each request to the store.
@@ -23,9 +22,6 @@ const CallTimeout = 30 * time.Second
 // PageSize is the most keys one listing returns and one delete takes:
 // S3's limit for both.
 const PageSize = 1000
-
-// ErrNotFound is a missing object.
-var ErrNotFound = errors.New("not found")
 
 // Object is an object as a listing shows it.
 type Object struct {
@@ -44,16 +40,23 @@ type Failure struct {
 }
 
 // Store is what the command needs of the bucket. Every method is one
-// request (ListUploads, with FilterAllUploads, a page of the bucket's).
+// request.
 type Store interface {
 	// List returns up to PageSize objects under prefix whose keys sort
 	// after startAfter, in key order, and whether there are more.
 	List(ctx context.Context, prefix, startAfter string) (objs []Object, more bool, err error)
-	// ListUploads returns a page of the incomplete multipart uploads under
-	// prefix, after the markers (both "" for the first), and the markers
-	// of the next page (both "" when there is none).
+	// ListUploads returns a page of the incomplete multipart uploads the
+	// store lists for prefix ("": the bucket's), after the markers (both
+	// "" for the first), and the markers of the next page (both "" when
+	// there is none).
 	ListUploads(ctx context.Context, prefix, keyMarker, idMarker string) (ups []Upload, nextKey, nextID string, err error)
-	// Get reads an object: ErrNotFound when it is missing.
+	// UploadsByExactKey reports a store that may list multipart uploads
+	// only by exact key (MinIO): when a listing by prefix finds none, the
+	// command lists the bucket's and keeps those under the prefix.
+	UploadsByExactKey() bool
+	// Get reads up to MaxMarkerBytes+1 bytes of an object:
+	// metastore.ErrNotFound when it is missing, metastore.ErrDenied when
+	// the key may not read it.
 	Get(ctx context.Context, key string) ([]byte, error)
 	// Delete deletes up to PageSize keys, and returns those the store
 	// reported failing.
@@ -78,11 +81,13 @@ func OpenS3(ctx context.Context, cfg blobstore.S3Config) (Store, error) {
 type S3Store struct {
 	Client *s3.Client
 	Bucket string
-	// FilterAllUploads lists the bucket's uploads and keeps those under the
-	// prefix: for S3-compatible stores (a custom endpoint) that list
-	// multipart uploads only by exact key, such as MinIO (gc.S3Bucket).
+	// FilterAllUploads is UploadsByExactKey: set for S3-compatible stores
+	// (a custom endpoint), some of which list multipart uploads only by
+	// exact key, such as MinIO (gc.S3Bucket).
 	FilterAllUploads bool
 }
+
+func (s *S3Store) UploadsByExactKey() bool { return s.FilterAllUploads }
 
 var _ Store = (*S3Store)(nil)
 
@@ -108,21 +113,23 @@ func (s *S3Store) ListUploads(ctx context.Context, prefix, keyMarker, idMarker s
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
 	in := &s3.ListMultipartUploadsInput{Bucket: &s.Bucket, MaxUploads: aws.Int32(PageSize)}
-	if !s.FilterAllUploads {
+	if prefix != "" {
 		in.Prefix = aws.String(prefix)
 	}
-	if keyMarker != "" || idMarker != "" {
-		in.KeyMarker, in.UploadIdMarker = aws.String(keyMarker), aws.String(idMarker)
+	// Each marker only when the last page gave it.
+	if keyMarker != "" {
+		in.KeyMarker = aws.String(keyMarker)
+	}
+	if idMarker != "" {
+		in.UploadIdMarker = aws.String(idMarker)
 	}
 	out, err := s.Client.ListMultipartUploads(ctx, in)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("list uploads under %s: %w", prefix, err)
 	}
-	var ups []Upload
+	ups := make([]Upload, 0, len(out.Uploads))
 	for _, u := range out.Uploads {
-		if k := aws.ToString(u.Key); strings.HasPrefix(k, prefix) {
-			ups = append(ups, Upload{Key: k, ID: aws.ToString(u.UploadId)})
-		}
+		ups = append(ups, Upload{Key: aws.ToString(u.Key), ID: aws.ToString(u.UploadId)})
 	}
 	if !aws.ToBool(out.IsTruncated) {
 		return ups, "", "", nil
@@ -136,7 +143,10 @@ func (s *S3Store) Get(ctx context.Context, key string) ([]byte, error) {
 	out, err := s.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.Bucket, Key: &key})
 	if err != nil {
 		if s3util.HTTPStatus(err) == http.StatusNotFound {
-			return nil, fmt.Errorf("get %s: %w", key, ErrNotFound)
+			return nil, fmt.Errorf("get %s: %w", key, metastore.ErrNotFound)
+		}
+		if s3util.Denied(err) {
+			return nil, fmt.Errorf("get %s: %w: %w", key, metastore.ErrDenied, err)
 		}
 		return nil, fmt.Errorf("get %s: %w", key, err)
 	}

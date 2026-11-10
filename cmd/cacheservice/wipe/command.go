@@ -8,17 +8,19 @@
 //
 //  1. the ownership marker, so that a wipe cut off halfway leaves keys and
 //     no marker, which every instance refuses (ownership.ErrNotOwned);
+//     a marker it can't read stops it;
 //  2. the objects, PageSize per request, each listed under the prefix;
 //  3. the incomplete multipart uploads under the prefix;
 //
 // then lists the prefix again, and exits 0 only if it is empty. It never
 // reads engine data, and deletes only keys a listing under the prefix
-// returned (or the marker's own key).
+// returned (or the marker's own key). It refuses a prefix inside another
+// store's (an ancestor prefix holds a marker), whose wipe would delete part
+// of that store.
 package wipe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,14 +32,17 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
 
 // Exit codes, as lifecycle's.
 const (
 	// ExitOK: a dry run reported, or a wipe left the prefix empty.
 	ExitOK = 0
-	// ExitError: a request or a key's delete failed; what was done so far
-	// is reported.
+	// ExitError: a request or a key's delete failed, or the prefix is
+	// refused (inside another store's, or its marker unreadable); what was
+	// done so far is reported.
 	ExitError = 1
 	// ExitUsage: bad flags, an empty prefix, or -confirm missing or wrong;
 	// nothing was read or deleted.
@@ -79,10 +84,11 @@ incomplete multipart uploads and the ownership marker's layout, and deletes
 nothing. With -dry-run=false and -confirm repeating the bucket and the prefix,
 it deletes the marker, then the objects, then aborts the uploads, then lists
 the prefix again. Stop every writer on the prefix first. An empty prefix (the
-whole bucket) isn't supported.
+whole bucket) isn't supported, nor is a prefix inside another store's.
 
-Exit codes: 0 ok (a wipe: the prefix is empty), 1 error, 2 usage or
-confirmation, 3 the prefix isn't empty after the wipe (a writer is running).
+Exit codes: 0 ok (a wipe: the prefix is empty), 1 error or refusal, 2 usage
+or confirmation, 3 the prefix isn't empty after the wipe (a writer is
+running).
 
 flags:
 `
@@ -162,6 +168,11 @@ type Summary struct {
 	Keys    []string // the first MaxShown
 	Uploads int
 	Upload  []string // the first MaxShown upload keys
+	// Nested counts the ownership markers under the prefix other than its
+	// own: stores nested in it, which a wipe deletes too. NestedKeys are
+	// the first MaxShown.
+	Nested     int
+	NestedKeys []string
 }
 
 // Empty reports whether nothing is under the prefix.
@@ -181,21 +192,17 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	root := layout.Root(o.Prefix)
 	fmt.Fprintf(out, "bucket %s, prefix %q\n", o.Bucket, root)
 
-	markerKey := layout.MarkerKey(o.Prefix)
-	marker, merr := readMarker(ctx, st, markerKey)
-	switch {
-	case merr == nil:
-		fmt.Fprintf(out, "ownership marker: %s, %s\n", markerKey, marker)
-	case errors.Is(merr, ErrNotFound):
-		fmt.Fprintf(out, "ownership marker: none at %s (layout 1, or not the service's)\n", markerKey)
-	default:
-		if !o.DryRun {
-			// The order (the marker first) is what makes a cut-off
-			// wipe safe: without knowing the marker is gone, stop.
-			return fail(ExitError, "can't read the ownership marker %s: %v; nothing deleted", markerKey, merr)
-		}
-		fmt.Fprintf(out, "ownership marker: can't read %s: %v\n", markerKey, merr)
+	if err := checkAncestors(ctx, st, o.Prefix); err != nil {
+		return fail(ExitError, "%v; nothing deleted", err)
 	}
+	markerKey := layout.MarkerKey(o.Prefix)
+	marker, err := readMarker(ctx, st, o.Prefix)
+	if err != nil {
+		// The order (the marker first) is what makes a cut-off wipe
+		// safe: without knowing whether there is one, stop.
+		return fail(ExitError, "can't read the ownership marker %s: %v; nothing deleted", markerKey, err)
+	}
+	fmt.Fprintf(out, "ownership marker: %s\n", marker.desc)
 
 	if o.DryRun {
 		s, err := survey(ctx, st, root)
@@ -203,6 +210,10 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 			return fail(ExitError, "%v", err)
 		}
 		printSummary(out, s)
+		if s.Nested > 0 {
+			fmt.Fprintf(out, "WARNING: %d ownership markers under the prefix, of stores nested in it, which the wipe deletes too:\n", s.Nested)
+			printKeys(out, s.NestedKeys, s.Nested)
+		}
 		if s.Empty() {
 			fmt.Fprintln(out, "dry run: the prefix is empty; nothing to wipe")
 			return ExitOK
@@ -212,9 +223,30 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		return ExitOK
 	}
 
-	var failures []Failure
+	var (
+		deleted, aborted int
+		bytes            int64
+		failures         []Failure
+	)
+	// progress reports what was done, every failure included (up to
+	// MaxShown), on every way out after the marker.
+	progress := func() {
+		fmt.Fprintf(out, "deleted %d objects, %d bytes; aborted %d incomplete multipart uploads; %d failed\n", deleted, bytes, aborted, len(failures))
+		for i, f := range failures {
+			if i == MaxShown {
+				fmt.Fprintf(out, "  ... and %d more failures\n", len(failures)-MaxShown)
+				break
+			}
+			fmt.Fprintf(out, "  FAILED %q: %s\n", f.Key, f.Reason)
+		}
+	}
+	stop := func(format string, a ...any) int {
+		progress()
+		return fail(ExitError, format, a...)
+	}
+
 	// 1. The marker.
-	if merr == nil {
+	if marker.present {
 		failed, err := st.Delete(ctx, []string{markerKey})
 		if err == nil && len(failed) > 0 {
 			err = errors.New(failed[0].Reason)
@@ -226,33 +258,10 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 
 	// 2. The objects.
-	var deleted int
-	var bytes int64
-	report := func() {
-		fmt.Fprintf(out, "deleted %d objects, %d bytes; %d failed\n", deleted, bytes, len(failures))
-	}
-	startAfter := ""
-	for page := 0; ; page++ {
-		if page == MaxPages {
-			report()
-			return fail(ExitError, "more than %d pages of objects under the prefix: stopped", MaxPages)
-		}
-		objs, more, err := st.List(ctx, root, startAfter)
-		if err == nil {
-			err = under(root, objKeys(objs))
-		}
+	err = walkObjects(ctx, st, root, func(objs []Object) error {
+		failed, err := st.Delete(ctx, objKeys(objs))
 		if err != nil {
-			report()
-			return fail(ExitError, "%v", err)
-		}
-		if len(objs) == 0 {
-			break
-		}
-		keys := objKeys(objs)
-		failed, err := st.Delete(ctx, keys)
-		if err != nil {
-			report()
-			return fail(ExitError, "%v", err)
+			return err
 		}
 		failures = append(failures, failed...)
 		bad := make(map[string]bool, len(failed))
@@ -265,51 +274,30 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 				bytes += ob.Size
 			}
 		}
-		startAfter = keys[len(keys)-1]
-		if !more {
-			break
-		}
+		return nil
+	})
+	if err != nil {
+		return stop("%v", err)
 	}
-	report()
 
 	// 3. The incomplete multipart uploads.
-	var aborted, abortFailures int
-	keyMarker, idMarker := "", ""
-	for page := 0; ; page++ {
-		if page == MaxPages {
-			return fail(ExitError, "more than %d pages of multipart uploads: stopped", MaxPages)
-		}
-		ups, nk, ni, err := st.ListUploads(ctx, root, keyMarker, idMarker)
-		if err == nil {
-			err = under(root, upKeys(ups))
-		}
-		if err != nil {
-			return fail(ExitError, "aborted %d uploads: %v", aborted, err)
-		}
+	err = walkUploads(ctx, st, root, func(ups []Upload) error {
 		for _, u := range ups {
 			if err := st.Abort(ctx, u); err != nil {
 				if ctx.Err() != nil {
-					return fail(ExitError, "aborted %d uploads: %v", aborted, context.Cause(ctx))
+					return context.Cause(ctx)
 				}
-				abortFailures++
 				failures = append(failures, Failure{Key: "upload:" + u.Key, Reason: err.Error()})
 				continue
 			}
 			aborted++
 		}
-		if nk == "" && ni == "" {
-			break
-		}
-		keyMarker, idMarker = nk, ni
+		return nil
+	})
+	if err != nil {
+		return stop("%v", err)
 	}
-	fmt.Fprintf(out, "aborted %d incomplete multipart uploads; %d failed\n", aborted, abortFailures)
-	for i, f := range failures {
-		if i == MaxShown {
-			fmt.Fprintf(out, "  ... and %d more failures\n", len(failures)-MaxShown)
-			break
-		}
-		fmt.Fprintf(out, "  FAILED %q: %s\n", f.Key, f.Reason)
-	}
+	progress()
 
 	// 4. List again.
 	s, err := survey(ctx, st, root)
@@ -321,6 +309,8 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		printSummary(out, s)
 	}
 	switch {
+	case len(failures) > 0 && s.Empty():
+		return fail(ExitError, "%d deletes or aborts failed, though the prefix is empty now", len(failures))
 	case len(failures) > 0:
 		return fail(ExitError, "%d deletes or aborts failed; the prefix isn't empty", len(failures))
 	case !s.Empty():
@@ -330,85 +320,186 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	return ExitOK
 }
 
-// markerInfo is what the report says of a marker.
-type markerInfo struct {
-	layout int
-	ok     bool
+// checkAncestors refuses a prefix inside another store's: an ancestor
+// prefix (the bucket's top included) holding an ownership marker, of any
+// content, owns everything under it, so this wipe would delete part of
+// that store. As ownership's own check: an ancestor's marker not found, or
+// that the key may not read (metastore.ErrDenied), is skipped; any other
+// error refuses, since the store didn't say.
+func checkAncestors(ctx context.Context, st Store, prefix string) error {
+	p := strings.Trim(prefix, "/")
+	segs := strings.Split(p, "/")
+	for i := range segs {
+		anc := strings.Join(segs[:i], "/")
+		key := layout.MarkerKey(anc)
+		_, err := st.Get(ctx, key)
+		switch {
+		case err == nil:
+			where := "the bucket's top"
+			if anc != "" {
+				where = "prefix " + anc + "/"
+			}
+			return fmt.Errorf("prefix %s/ is inside %s, which holds an ownership marker (%s): wiping it would delete part of that store. "+
+				"Check %s, or wipe %s itself", p, where, key, blobstore.EnvPrefix, where)
+		case ctx.Err() != nil:
+			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
+		case errors.Is(err, metastore.ErrNotFound), errors.Is(err, metastore.ErrDenied):
+			continue
+		default:
+			return fmt.Errorf("can't read %s, an ancestor's ownership marker position, to check that prefix %s/ isn't inside another store: %v. "+
+				"Try again once the store answers", key, p, err)
+		}
+	}
+	return nil
 }
 
-func (m markerInfo) String() string {
-	if !m.ok {
-		return "not a marker the service wrote (no layout version)"
-	}
-	return fmt.Sprintf("layout %d", m.layout)
+// markerState is what the report says of the prefix's marker.
+type markerState struct {
+	present bool
+	desc    string
 }
 
-// readMarker reads the marker's layout version, and nothing else of it.
-func readMarker(ctx context.Context, st Store, key string) (markerInfo, error) {
-	body, err := st.Get(ctx, key)
-	if err != nil {
-		return markerInfo{}, err
+// readMarker reads the prefix's marker, and gives ownership.ReadMarker's
+// verdict on it: an error only when it can't be read.
+func readMarker(ctx context.Context, st Store, prefix string) (markerState, error) {
+	key := layout.MarkerKey(prefix)
+	g := &getter{st: st}
+	m, err := ownership.ReadMarker(ctx, g, prefix)
+	var other *ownership.ErrOtherLayout
+	switch {
+	case err == nil:
+		return markerState{true, fmt.Sprintf("%s, layout %d, the service's", key, m.Layout)}, nil
+	case errors.Is(err, ownership.ErrNoMarker):
+		return markerState{false, "none at " + key + " (layout 1, or not the service's)"}, nil
+	case g.err != nil:
+		return markerState{}, g.err
+	case errors.As(err, &other):
+		return markerState{true, fmt.Sprintf("%s, layout %d: another layout's, which this service refuses", key, other.Found)}, nil
 	}
-	var m struct {
-		Layout *int `json:"layout"`
+	// ErrBadMarker, or not JSON: every instance refuses it.
+	return markerState{true, fmt.Sprintf("%s, not one the service wrote, which every instance refuses: %v", key, err)}, nil
+}
+
+// getter is st as ownership.ReadMarker reads it, keeping the store's error
+// apart from the verdict on the content.
+type getter struct {
+	st  Store
+	err error
+}
+
+func (g *getter) Get(ctx context.Context, key string) ([]byte, string, error) {
+	b, err := g.st.Get(ctx, key)
+	if err != nil && !errors.Is(err, metastore.ErrNotFound) {
+		g.err = err
 	}
-	if len(body) > MaxMarkerBytes || json.Unmarshal(body, &m) != nil || m.Layout == nil {
-		return markerInfo{}, nil
-	}
-	return markerInfo{layout: *m.Layout, ok: true}, nil
+	return b, "", err
 }
 
 // survey lists everything under root.
 func survey(ctx context.Context, st Store, root string) (Summary, error) {
 	var s Summary
-	startAfter := ""
-	for page := 0; ; page++ {
-		if page == MaxPages {
-			return s, fmt.Errorf("more than %d pages of objects under the prefix: stopped", MaxPages)
-		}
-		objs, more, err := st.List(ctx, root, startAfter)
-		if err == nil {
-			err = under(root, objKeys(objs))
-		}
-		if err != nil {
-			return s, err
-		}
+	own := root + layout.MarkerName
+	err := walkObjects(ctx, st, root, func(objs []Object) error {
 		for _, ob := range objs {
 			s.Objects++
 			s.Bytes += ob.Size
 			if len(s.Keys) < MaxShown {
 				s.Keys = append(s.Keys, ob.Key)
 			}
+			if ob.Key != own && strings.HasSuffix(ob.Key, "/"+layout.MarkerName) {
+				s.Nested++
+				if len(s.NestedKeys) < MaxShown {
+					s.NestedKeys = append(s.NestedKeys, ob.Key)
+				}
+			}
 		}
-		if len(objs) == 0 || !more {
-			break
-		}
-		startAfter = objs[len(objs)-1].Key
+		return nil
+	})
+	if err != nil {
+		return s, err
 	}
-	keyMarker, idMarker := "", ""
-	for page := 0; ; page++ {
-		if page == MaxPages {
-			return s, fmt.Errorf("more than %d pages of multipart uploads: stopped", MaxPages)
-		}
-		ups, nk, ni, err := st.ListUploads(ctx, root, keyMarker, idMarker)
-		if err == nil {
-			err = under(root, upKeys(ups))
-		}
-		if err != nil {
-			return s, err
-		}
+	err = walkUploads(ctx, st, root, func(ups []Upload) error {
 		for _, u := range ups {
 			s.Uploads++
 			if len(s.Upload) < MaxShown {
 				s.Upload = append(s.Upload, u.Key)
 			}
 		}
+		return nil
+	})
+	return s, err
+}
+
+// walkObjects calls fn with each page of the objects under root, in key
+// order, at most MaxPages of them. A page is listed after the last key of
+// the one before, so a page fn deleted isn't listed again.
+func walkObjects(ctx context.Context, st Store, root string, fn func([]Object) error) error {
+	startAfter := ""
+	for page := 0; page < MaxPages; page++ {
+		objs, more, err := st.List(ctx, root, startAfter)
+		if err == nil {
+			err = under(root, objKeys(objs))
+		}
+		if err != nil {
+			return err
+		}
+		if len(objs) == 0 {
+			return nil
+		}
+		if err := fn(objs); err != nil {
+			return err
+		}
+		if !more {
+			return nil
+		}
+		startAfter = objs[len(objs)-1].Key
+	}
+	return fmt.Errorf("more than %d pages of objects under the prefix: stopped", MaxPages)
+}
+
+// walkUploads calls fn with each page of the incomplete multipart uploads
+// under root. On a store that may list them only by exact key, when the
+// listing by prefix finds none, it lists the bucket's and keeps those under
+// root, as gc does.
+func walkUploads(ctx context.Context, st Store, root string, fn func([]Upload) error) error {
+	found, err := walkUploadListing(ctx, st, root, root, fn)
+	if err != nil || found > 0 || !st.UploadsByExactKey() {
+		return err
+	}
+	_, err = walkUploadListing(ctx, st, "", root, fn)
+	return err
+}
+
+// walkUploadListing pages through the uploads the store lists for prefix
+// ("": the bucket's), at most MaxPages, and calls fn with those under root:
+// a listing by root's prefix that returns any other is refused.
+func walkUploadListing(ctx context.Context, st Store, prefix, root string, fn func([]Upload) error) (int, error) {
+	found := 0
+	keyMarker, idMarker := "", ""
+	for page := 0; page < MaxPages; page++ {
+		ups, nk, ni, err := st.ListUploads(ctx, prefix, keyMarker, idMarker)
+		if err != nil {
+			return found, err
+		}
+		if prefix != "" {
+			if err := under(root, upKeys(ups)); err != nil {
+				return found, err
+			}
+		} else {
+			ups = slices.DeleteFunc(ups, func(u Upload) bool { return !strings.HasPrefix(u.Key, root) })
+		}
+		found += len(ups)
+		if len(ups) > 0 {
+			if err := fn(ups); err != nil {
+				return found, err
+			}
+		}
 		if nk == "" && ni == "" {
-			break
+			return found, nil
 		}
 		keyMarker, idMarker = nk, ni
 	}
-	return s, nil
+	return found, fmt.Errorf("more than %d pages of multipart uploads: stopped", MaxPages)
 }
 
 // under refuses keys a listing returned outside root: the store's answer,
@@ -440,17 +531,18 @@ func upKeys(ups []Upload) []string {
 
 func printSummary(out io.Writer, s Summary) {
 	fmt.Fprintf(out, "objects: %d, %d bytes\n", s.Objects, s.Bytes)
-	for _, k := range s.Keys {
-		fmt.Fprintf(out, "  %q\n", k)
-	}
-	if s.Objects > len(s.Keys) {
-		fmt.Fprintf(out, "  ... and %d more\n", s.Objects-len(s.Keys))
-	}
+	printKeys(out, s.Keys, s.Objects)
 	fmt.Fprintf(out, "incomplete multipart uploads: %d\n", s.Uploads)
-	for _, k := range s.Upload {
+	printKeys(out, s.Upload, s.Uploads)
+}
+
+// printKeys prints keys quoted, so that a key can't write control
+// characters to the terminal, and how many of total it left out.
+func printKeys(out io.Writer, keys []string, total int) {
+	for _, k := range keys {
 		fmt.Fprintf(out, "  %q\n", k)
 	}
-	if s.Uploads > len(s.Upload) {
-		fmt.Fprintf(out, "  ... and %d more\n", s.Uploads-len(s.Upload))
+	if total > len(keys) {
+		fmt.Fprintf(out, "  ... and %d more\n", total-len(keys))
 	}
 }

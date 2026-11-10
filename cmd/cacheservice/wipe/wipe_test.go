@@ -40,7 +40,14 @@ type fakeStore struct {
 	abortErr       func(u Upload) error
 	// extraListed is a key a listing returns whatever the prefix.
 	extraListed string
+	// exactKey lists uploads as MinIO does: by prefix, only an upload at
+	// exactly that key.
+	exactKey bool
+	// listErr, when set, fails the listing of objects after startAfter.
+	listErr func(startAfter string) error
 }
+
+func (f *fakeStore) UploadsByExactKey() bool { return f.exactKey }
 
 func newFake() *fakeStore {
 	return &fakeStore{objects: map[string][]byte{}}
@@ -74,6 +81,11 @@ func (f *fakeStore) List(_ context.Context, prefix, startAfter string) ([]Object
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "list "+prefix)
+	if f.listErr != nil {
+		if err := f.listErr(startAfter); err != nil {
+			return nil, false, err
+		}
+	}
 	n := f.pageSize
 	if n == 0 {
 		n = PageSize
@@ -105,7 +117,11 @@ func (f *fakeStore) ListUploads(_ context.Context, prefix, keyMarker, idMarker s
 	slices.SortFunc(ups, func(a, b Upload) int { return strings.Compare(a.Key+"\x00"+a.ID, b.Key+"\x00"+b.ID) })
 	var out []Upload
 	for _, u := range ups {
-		if strings.HasPrefix(u.Key, prefix) && u.Key+"\x00"+u.ID > keyMarker+"\x00"+idMarker {
+		match := strings.HasPrefix(u.Key, prefix)
+		if f.exactKey && prefix != "" {
+			match = u.Key == prefix
+		}
+		if match && u.Key+"\x00"+u.ID > keyMarker+"\x00"+idMarker {
 			out = append(out, u)
 		}
 	}
@@ -127,7 +143,7 @@ func (f *fakeStore) Get(_ context.Context, key string) ([]byte, error) {
 	}
 	b, ok := f.objects[key]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, metastore.ErrNotFound
 	}
 	return b, nil
 }
@@ -178,7 +194,7 @@ func (f *fakeStore) Abort(_ context.Context, u Upload) error {
 
 // Objects outside the prefix "cache": a sibling prefix, one that shares its
 // name's start, the bucket's top, and a deeper "cache" elsewhere.
-var outside = []string{"cache2/ns/main/index.json", "cachex", "top.json", "cacheservice.json", "other/cache/blobs/x"}
+var outside = []string{"cache2/ns/main/index.json", "cache2/cacheservice.json", "cachex", "top.json", "other/cache/blobs/x"}
 
 // seed fills f with a store of the version (1: no marker) under "cache",
 // and keys and uploads outside it.
@@ -324,8 +340,8 @@ func TestWipeEmptiesPrefix(t *testing.T) {
 				if version == 1 && strings.Contains(out, "deleted the ownership marker") {
 					t.Errorf("reports deleting a marker on layout 1:\n%s", out)
 				}
-				want := fmt.Sprintf("deleted %d objects, %d bytes; 0 failed", 26, 25*100+7)
-				for _, s := range []string{want, "aborted 2 incomplete multipart uploads; 0 failed", "wipe: the prefix is empty"} {
+				want := fmt.Sprintf("deleted %d objects, %d bytes; aborted 2 incomplete multipart uploads; 0 failed", 26, 25*100+7)
+				for _, s := range []string{want, "wipe: the prefix is empty"} {
 					if !strings.Contains(out, s) {
 						t.Errorf("output lacks %q:\n%s", s, out)
 					}
@@ -470,9 +486,6 @@ type ownershipStore struct{ f *fakeStore }
 
 func (o ownershipStore) Get(ctx context.Context, key string) ([]byte, string, error) {
 	b, err := o.f.Get(ctx, key)
-	if errors.Is(err, ErrNotFound) {
-		return nil, "", metastore.ErrNotFound
-	}
 	return b, "etag", err
 }
 
@@ -520,29 +533,46 @@ func TestMarkerDeleteFailureStops(t *testing.T) {
 	}
 }
 
-// A marker it can't read: a wipe stops, a dry run reports it.
+// A marker it can't read is an error, for a wipe and a dry run: nothing is
+// listed or deleted.
 func TestMarkerUnreadable(t *testing.T) {
-	f := newFake()
-	seed(f, 2)
-	f.getErr = func(string) error { return errors.New("503 SlowDown") }
-	keys := f.keys()
-	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
-	if code != ExitError || !slices.Equal(f.keys(), keys) {
-		t.Fatalf("wipe: exit %d\n%s", code, out)
-	}
-	code, out = run(t, f, Options{Prefix: "cache", DryRun: true})
-	if code != ExitOK || !strings.Contains(out, "can't read cache/cacheservice.json") {
-		t.Fatalf("dry run: exit %d\n%s", code, out)
+	for _, dry := range []bool{false, true} {
+		f := newFake()
+		seed(f, 2)
+		f.getErr = func(key string) error {
+			if key == "cache/cacheservice.json" {
+				return errors.New("503 SlowDown")
+			}
+			return nil
+		}
+		keys := f.keys()
+		code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache", DryRun: dry})
+		if code != ExitError || !slices.Equal(f.keys(), keys) || !strings.Contains(out, "can't read the ownership marker cache/cacheservice.json") {
+			t.Fatalf("dry run %v: exit %d\n%s", dry, code, out)
+		}
+		for _, c := range f.calls {
+			if !strings.HasPrefix(c, "get ") {
+				t.Fatalf("dry run %v: made %s", dry, c)
+			}
+		}
 	}
 }
 
-// A marker that isn't JSON is reported as such, and wiped like any key.
-func TestMarkerNotJSON(t *testing.T) {
-	f := newFake()
-	f.objects["cache/cacheservice.json"] = []byte("<html>")
-	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
-	if code != ExitOK || !strings.Contains(out, "no layout version") || len(f.objects) != 0 {
-		t.Fatalf("exit %d, %v left\n%s", code, f.keys(), out)
+// A marker the service didn't write is reported with ownership's verdict,
+// and wiped like any key.
+func TestMarkerNotTheService(t *testing.T) {
+	for name, body := range map[string]string{
+		"not JSON":        "<html>",
+		"lacks its times": `{"layout":2}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFake()
+			f.objects["cache/cacheservice.json"] = []byte(body)
+			code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+			if code != ExitOK || !strings.Contains(out, "not one the service wrote, which every instance refuses") || len(f.objects) != 0 {
+				t.Fatalf("exit %d, %v left\n%s", code, f.keys(), out)
+			}
+		})
 	}
 }
 
@@ -580,7 +610,7 @@ func TestFailuresExit1(t *testing.T) {
 	if code != ExitError {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
-	for _, s := range []string{`FAILED "cache/ns/main/index.json"`, `FAILED "upload:cache/ns/main/staging/a"`, "deleted 25 objects, 2500 bytes; 1 failed", "aborted 1 incomplete multipart uploads; 1 failed"} {
+	for _, s := range []string{`FAILED "cache/ns/main/index.json"`, `FAILED "upload:cache/ns/main/staging/a"`, "deleted 25 objects, 2500 bytes; aborted 1 incomplete multipart uploads; 2 failed", "the prefix isn't empty"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("output lacks %q:\n%s", s, out)
 		}
@@ -642,4 +672,139 @@ func (blockingStore) Get(ctx context.Context, _ string) ([]byte, error) {
 func (blockingStore) List(ctx context.Context, _, _ string) ([]Object, bool, error) {
 	<-ctx.Done()
 	return nil, false, ctx.Err()
+}
+
+// A prefix inside another store's (an ancestor holds a marker, of any
+// content) is refused, by a dry run and a wipe, naming the ancestor's
+// marker: nothing is listed or deleted.
+func TestAncestorMarkerRefused(t *testing.T) {
+	for _, tc := range []struct{ prefix, ancestor, confirm string }{
+		{"cache/team", "cache/cacheservice.json", "bkt/cache/team"},
+		{"cache", "cacheservice.json", "bkt/cache"},
+		{"a/b/c", "a/cacheservice.json", "bkt/a/b/c"},
+	} {
+		for _, dry := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dry%v", tc.prefix, dry), func(t *testing.T) {
+				f := newFake()
+				f.put(tc.ancestor, 1)
+				f.put(tc.prefix+"/ns/main/index.json", 1)
+				f.uploads = []Upload{{Key: tc.prefix + "/ns/main/staging/x", ID: "1"}}
+				keys, ups := f.keys(), f.uploadKeys()
+				code, out := run(t, f, Options{Prefix: tc.prefix, Confirm: tc.confirm, DryRun: dry})
+				if code != ExitError || !strings.Contains(out, "holds an ownership marker ("+tc.ancestor+")") {
+					t.Fatalf("exit %d\n%s", code, out)
+				}
+				if !slices.Equal(f.keys(), keys) || !slices.Equal(f.uploadKeys(), ups) {
+					t.Fatal("the store changed")
+				}
+				for _, c := range f.calls {
+					if !strings.HasPrefix(c, "get ") {
+						t.Fatalf("made %s", c)
+					}
+				}
+			})
+		}
+	}
+}
+
+// An ancestor's marker position the key may not read (403) is skipped, as
+// ownership's check does; any other error refuses.
+func TestAncestorMarkerErrors(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want int
+	}{
+		"denied":   {fmt.Errorf("get: %w: 403", metastore.ErrDenied), ExitOK},
+		"5xx":      {errors.New("503 SlowDown"), ExitError},
+		"timeout":  {context.DeadlineExceeded, ExitError},
+		"notfound": {metastore.ErrNotFound, ExitOK},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFake()
+			seed(f, 2)
+			f.getErr = func(key string) error {
+				if key == "cacheservice.json" {
+					return tc.err
+				}
+				return nil
+			}
+			keys := f.keys()
+			code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+			if code != tc.want {
+				t.Fatalf("exit %d, want %d\n%s", code, tc.want, out)
+			}
+			if tc.want == ExitError && (!slices.Equal(f.keys(), keys) || !strings.Contains(out, "can't read cacheservice.json, an ancestor's ownership marker position")) {
+				t.Fatalf("changed the store, or doesn't say why:\n%s", out)
+			}
+		})
+	}
+}
+
+// A dry run warns about the ownership markers under the prefix: stores
+// nested in it, which the wipe deletes too.
+func TestDryRunWarnsNestedMarkers(t *testing.T) {
+	f := newFake()
+	seed(f, 2)
+	f.put("cache/team/cacheservice.json", 1)
+	f.put("cache/xcacheservice.json", 1)
+	_, out := run(t, f, Options{Prefix: "cache", DryRun: true})
+	if !strings.Contains(out, "WARNING: 1 ownership markers under the prefix") || !strings.Contains(out, `  "cache/team/cacheservice.json"`) {
+		t.Fatalf("no warning:\n%s", out)
+	}
+	f = newFake()
+	seed(f, 2)
+	if _, out := run(t, f, Options{Prefix: "cache", DryRun: true}); strings.Contains(out, "WARNING") {
+		t.Fatalf("a warning with only the prefix's own marker:\n%s", out)
+	}
+}
+
+// On a store that lists uploads only by exact key (MinIO), the uploads are
+// found through the bucket's listing, and those outside the prefix kept.
+func TestUploadsByExactKeyFallback(t *testing.T) {
+	f := newFake()
+	f.exactKey = true
+	seed(f, 1)
+	_, ups := f.keys(), f.uploadKeys()
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	if code != ExitOK || !strings.Contains(out, "aborted 2 incomplete multipart uploads") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	checkOutsideUntouched(t, f, f.keys(), ups)
+	if left := f.uploadKeys(); len(left) != 2 {
+		t.Fatalf("uploads left: %v", left)
+	}
+}
+
+// The failures so far are printed when a later request stops the wipe.
+func TestFailuresPrintedOnEarlyExit(t *testing.T) {
+	f := newFake()
+	f.pageSize = 4
+	seed(f, 1)
+	f.deleteFailures = map[string]bool{"cache/ns/main/blobs/sha256/01": true}
+	f.listErr = func(startAfter string) error {
+		if startAfter != "" {
+			return errors.New("connection reset")
+		}
+		return nil
+	}
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	if code != ExitError || !strings.Contains(out, `FAILED "cache/ns/main/blobs/sha256/01"`) || !strings.Contains(out, "deleted 3 objects") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// A failed abort whose upload is gone by the final listing: still exit 1,
+// and the message says the prefix is empty.
+func TestFailureButEmpty(t *testing.T) {
+	f := newFake()
+	seed(f, 1)
+	f.abortErr = func(u Upload) error {
+		f.uploads = slices.DeleteFunc(f.uploads, func(x Upload) bool { return x == u })
+		return errors.New("timeout, though it took")
+	}
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), Options{Bucket: "bkt", Prefix: "cache", Confirm: "bkt/cache"}, f, &out, &errOut)
+	if code != ExitError || !strings.Contains(errOut.String(), "though the prefix is empty now") {
+		t.Fatalf("exit %d\n%s%s", code, out.String(), errOut.String())
+	}
 }

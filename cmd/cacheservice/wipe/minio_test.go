@@ -218,7 +218,7 @@ func TestMinIOWipe(t *testing.T) {
 					t.Errorf("changed %q, outside the wiped prefix", k)
 				}
 			}
-			wants := []string{"deleted 6 objects, 507 bytes; 0 failed", "aborted 1 incomplete multipart uploads; 0 failed", "wipe: the prefix is empty"}
+			wants := []string{"deleted 6 objects, 507 bytes; aborted 1 incomplete multipart uploads; 0 failed", "wipe: the prefix is empty"}
 			if version == 2 {
 				wants = append(wants, "deleted the ownership marker")
 			}
@@ -298,5 +298,34 @@ func TestMinIOWipeManyPages(t *testing.T) {
 	}
 	if k, _ := e.listing(); !slices.Equal(k, []string{e.cfg.Prefix + "/cache2/x"}) {
 		t.Fatalf("left %v", k)
+	}
+}
+
+// A prefix inside another store's is refused on a real store, by a dry run
+// and a wipe: the scope's top holds a marker, and the target is under it.
+func TestMinIOAncestorMarkerRefused(t *testing.T) {
+	e := newMinIOEnv(t)
+	e.seed(1)
+	e.put("cacheservice.json", 3)
+	keys, ups := e.listing()
+	for _, args := range [][]string{nil, {"-dry-run=false", "-confirm=" + e.cfg.Bucket + "/" + e.target}} {
+		code, out := e.main(args...)
+		if code != ExitError || !strings.Contains(out, "holds an ownership marker ("+e.cfg.Prefix+"/cacheservice.json)") {
+			t.Fatalf("%q: exit %d\n%s", args, code, out)
+		}
+		if k, u := e.listing(); !slices.Equal(k, keys) || !slices.Equal(u, ups) {
+			t.Fatalf("%q: the bucket changed", args)
+		}
+	}
+}
+
+// A dry run on a real store warns about a store nested in the prefix.
+func TestMinIODryRunWarnsNestedMarkers(t *testing.T) {
+	e := newMinIOEnv(t)
+	e.seed(2)
+	e.put("cache/team/cacheservice.json", 3)
+	code, out := e.main()
+	if code != ExitOK || !strings.Contains(out, "WARNING: 1 ownership markers under the prefix") || !strings.Contains(out, e.target+"/team/cacheservice.json") {
+		t.Fatalf("exit %d\n%s", code, out)
 	}
 }

@@ -384,7 +384,10 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
 
 - **A dry run is the default.** It reports the object count, their bytes,
   the incomplete multipart uploads, up to 20 keys of each, and the ownership
-  marker's layout version, and deletes nothing.
+  marker's layout version (or why the service would refuse it), and deletes
+  nothing. It warns about any other ownership marker under the prefix: a
+  store nested in it, which the wipe deletes too
+  (`TestDryRunWarnsNestedMarkers`, `TestMinIODryRunWarnsNestedMarkers`).
 - **Deleting needs `-dry-run=false` and `-confirm=<bucket>/<prefix>`**,
   repeating exactly the bucket and the prefix (without surrounding slashes).
   A missing or wrong one exits 2 before any request. So does an empty
@@ -394,13 +397,21 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   (`TestInterruptedWipeLeavesRefusedPrefix`,
   `TestMinIOInterruptedWipeRefused`); then the objects, 1,000 per request;
   then the incomplete multipart uploads; then it lists the prefix again.
-  If the marker can't be read or deleted, nothing else is deleted.
+  If the marker can't be read (a dry run too) or deleted, nothing else is
+  deleted, and it exits 1.
+- **Not inside another store:** a prefix under one whose ancestor (the
+  bucket's top included) holds an ownership marker is refused, by a dry run
+  and a wipe, naming that marker: wiping it would delete part of that store.
+  As the service's own check, an ancestor's marker not found (404) or that
+  the key may not read (403) is skipped, and any other answer refuses
+  (`TestAncestorMarkerRefused`, `TestAncestorMarkerErrors`,
+  `TestMinIOAncestorMarkerRefused`).
 - **Only under the prefix:** it deletes only keys a listing under
   `<prefix>/` returned, so `cache2/` and the bucket's top are untouched when
   wiping `cache` (`TestWipeEmptiesPrefix`, `TestMinIOWipe`).
 - **Exit codes:** 0 a dry run reported, or the prefix is empty after the
-  wipe; 1 an error, or a key or upload that failed (each is listed); 2 usage
-  or confirmation; 3 every request succeeded but the prefix isn't empty
+  wipe; 1 an error, a refusal, or a key or upload that failed (up to 20 are
+  listed); 2 usage or confirmation; 3 every request succeeded but the prefix isn't empty
   after the wipe (a writer is running). `-timeout` (default 30m) bounds the
   run, and each request is bounded to 30s.
 
