@@ -14,8 +14,9 @@
 #       own version, the manifest's first accept line, in a manifest
 #       engines.sh takes, and the cited run is what the line says it is: a
 #       completed, successful workflow_dispatch run of remote-cache-tests.yml
-#       of this repository, titled for that version and digest (see
-#       verify_run; GH_TOKEN, GITHUB_TOKEN, actions: read).
+#       of this repository, titled for that version and digest, whose
+#       "real engines (e2e)" and "sidecar demo" jobs each completed
+#       successfully (see verify_run; GH_TOKEN, GITHUB_TOKEN, actions: read).
 #       Every other PR passes: it isn't auto-merged.
 #
 #   accept-line-only.sh fetch-head <PR number> <head sha> <head ref>
@@ -37,7 +38,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The workflow runs copies of the base branch's scripts, from elsewhere.
+# The workflow runs copies of the base branch's scripts, from elsewhere
+# (this one, engine-jobs.sh beside it, and engines.sh).
 engines="${ENGINES_SH:-$here/engines.sh}"
 manifest=cmd/cacheservice/compat/engines.txt
 repo="${GITHUB_REPOSITORY:-zerobull-consulting/dagger}"
@@ -46,6 +48,11 @@ digest_re='^sha256:[0-9a-f]{64}$'
 run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[0-9]+)?$'
 
 tests_wf=.github/workflows/remote-cache-tests.yml
+# The engine jobs (engine_jobs, engine_json, is_engine,
+# engine_jobs_unlisted), shared with release-check.sh. The workflow copies
+# this file next to this script.
+# shellcheck source=engine-jobs.sh
+source "$here/engine-jobs.sh"
 
 # fail <message>: an annotation. The message can hold text the PR or the
 # cited run controls, so %, CR and LF are escaped as workflow commands need,
@@ -69,7 +76,7 @@ fail() {
 # cite a run from any branch. A writer who edits the run-name on a branch
 # can still make a run look like this (zerobull-consulting/dagger#165).
 verify_run() {
-	local v="$1" d="$2" url="$3" path urlrepo id attempt run api_path got want
+	local v="$1" d="$2" url="$3" path urlrepo id attempt run api_path got want jobs why
 	path="${url#https://github.com/}"
 	# GitHub's names are case-insensitive.
 	urlrepo="${path%%/actions/*}"
@@ -96,6 +103,17 @@ verify_run() {
 	want="Remote cache tests: candidate $v $d"
 	got="$(field .display_title)"
 	[[ "$got" == "$want" ]] || fail "the cited run is titled '$got', not '$want': it didn't verify this version and digest"
+	# A run whose engine jobs were skipped still ends green, so the verdict
+	# is the engine jobs': each there once, completed, successful
+	# (zerobull-consulting/dagger#223). The same attempt's jobs as the run
+	# read above; without an attempt in the URL, the latest attempt's.
+	jobs="$(timeout 60 gh api "$api_path/jobs?per_page=100")" || fail "couldn't read the cited run $url's jobs"
+	why="$(engine_jobs_unlisted "$jobs")"
+	[[ -z "$why" ]] || fail "the cited run $url: $why"
+	jq -e --argjson e "$engine_json" '[.jobs[] | select('"$is_engine"')] | all(.status == "completed" and .conclusion == "success")' <<<"$jobs" >/dev/null || {
+		got="$(jq -r --argjson e "$engine_json" '[.jobs[] | select('"$is_engine"') | "\(.name): \(.status)/\(.conclusion)"] | join(", ")' <<<"$jobs")"
+		fail "the cited run's engine jobs aren't each completed/success: $got"
+	}
 }
 
 check() {

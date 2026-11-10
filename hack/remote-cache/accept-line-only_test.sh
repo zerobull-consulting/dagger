@@ -51,12 +51,16 @@ pr() {
 line="accept v1.0.0-beta.26 $d2 verified: $run2"
 first="sed -i 's|^accept v1.0.0-beta.25|$line\naccept v1.0.0-beta.25|' $m"
 # A fake gh: the cited run (FAKE_RUN, a JSON file; FAKE_RUN_FAIL=1: the read
-# fails), and the PR's auto-merge for disable-auto-merge.
+# fails), its jobs (FAKE_JOBS; FAKE_JOBS_FAIL=1: that read fails), and the
+# PR's auto-merge for disable-auto-merge.
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/gh" <<'G'
 #!/usr/bin/env bash
 echo "$*" >>"${FAKE_CALLS:-/dev/null}"
 case "$2" in
+repos/*/actions/runs/*/jobs\?*)
+	[[ -z "${FAKE_JOBS_FAIL:-}" ]] || { echo "HTTP 403" >&2; exit 1; }
+	cat "$FAKE_JOBS" ;;
 repos/*/actions/runs/*)
 	[[ -z "${FAKE_RUN_FAIL:-}" ]] || { echo "HTTP 404" >&2; exit 1; }
 	cat "$FAKE_RUN" ;;
@@ -79,6 +83,20 @@ run() {
 	export FAKE_RUN="$tmp/run.json"
 }
 run
+
+# jobs <jq edit>: the cited run's jobs, in the shape of a real listing (a
+# remote-cache-tests.yml candidate run has these four), all green, edited.
+jobs() {
+	jq -n '{total_count: 4, jobs: [
+		{name: "unit tests", status: "completed", conclusion: "success"},
+		{name: "S3 tests against MinIO", status: "completed", conclusion: "success"},
+		{name: "real engines (e2e)", status: "completed", conclusion: "success"},
+		{name: "sidecar demo", status: "completed", conclusion: "success"}]}' | jq "${1:-.}" >"$tmp/jobs.json"
+	export FAKE_JOBS="$tmp/jobs.json"
+}
+jobs
+# engine <name> <jq edit of that job>: jobs, with one job edited.
+engine() { jobs "(.jobs[] | select(.name == \"$1\")) |= ($2)"; }
 
 # verdict <head> [<ref>]: runs the check; status in $status.
 verdict() {
@@ -164,6 +182,55 @@ echo 'not json' >"$tmp/run.json"
 check "run: a reply that isn't JSON fails" fails "$okhead"
 run
 check "run: and a good run passes again" passes "$okhead"
+# The cited run's engine jobs (zerobull-consulting/dagger#223): a run whose
+# engine jobs were skipped still ends green.
+run
+jobs
+: >"$tmp/calls"
+check "jobs: both engine jobs succeeded passes" passes "$okhead"
+check "jobs: ... read from the run's jobs, one page of 100" grep -q "^api repos/o/r/actions/runs/2/jobs?per_page=100$" "$tmp/calls"
+check "jobs: an /attempts/N URL reads that attempt's jobs" passes "$(withrun $run2/attempts/2)"
+check "jobs: ... through the attempts endpoint" grep -q "^api repos/o/r/actions/runs/2/attempts/2/jobs?per_page=100$" "$tmp/calls"
+for j in "real engines (e2e)" "sidecar demo"; do
+	engine "$j" '.conclusion = "skipped"'
+	check "jobs: '$j' skipped fails" fails "$okhead"
+	check "jobs: ... and says so" grep -q "$j: completed/skipped" "$tmp/out"
+	engine "$j" '.conclusion = "failure"'
+	check "jobs: '$j' failed fails" fails "$okhead"
+	engine "$j" '.conclusion = "cancelled"'
+	check "jobs: '$j' cancelled fails" fails "$okhead"
+	engine "$j" '.status = "in_progress" | .conclusion = null'
+	check "jobs: '$j' still going fails" fails "$okhead"
+	engine "$j" '.status = "in_progress"'
+	check "jobs: '$j' not completed fails, whatever its conclusion reads" fails "$okhead"
+	jobs "del(.jobs[] | select(.name == \"$j\")) | .total_count = 3"
+	check "jobs: '$j' missing fails" fails "$okhead"
+	check "jobs: ... and says so" grep -q "no single '$j' job" "$tmp/out"
+	jobs ".jobs += [.jobs[] | select(.name == \"$j\")] | .total_count = 5"
+	check "jobs: '$j' listed twice fails" fails "$okhead"
+done
+jobs '(.jobs[] | select(.name == "unit tests")).conclusion = "failure"'
+check "jobs: another job failing doesn't decide (the run's own conclusion does)" passes "$okhead"
+jobs '.total_count = 101'
+check "jobs: more jobs than one page listed fails" fails "$okhead"
+check "jobs: ... and says so" grep -q "more jobs than were listed" "$tmp/out"
+jobs '.jobs = {}'
+check "jobs: a listing that isn't a list fails" fails "$okhead"
+echo 'not json' >"$tmp/jobs.json"
+check "jobs: a reply that isn't JSON fails" fails "$okhead"
+jobs
+export FAKE_JOBS_FAIL=1
+check "jobs: a jobs read that fails fails" fails "$okhead"
+check "jobs: ... and says so" grep -q "couldn't read the cited run .*'s jobs" "$tmp/out"
+unset FAKE_JOBS_FAIL
+jobs
+check "jobs: and good jobs pass again" passes "$okhead"
+# Text the cited run's jobs control can't start a workflow command either.
+engine "sidecar demo" '.conclusion = "x\n::stop-commands::tok"'
+verdict "$okhead"
+check "jobs: a conclusion with a newline still fails" test "$status" -ne 0
+check "jobs: ... and starts no command" not grep -q '^::stop' "$tmp/out"
+jobs
 # remote-cache-tests.yml titles a candidate's run the way verify_run reads it:
 # take the format string from the workflow, fill it in, and cite that title.
 fmt="$(sed -n "s/^run-name: .*format('\([^']*\)', inputs.candidate-version, inputs.candidate-digest).*/\1/p" "$here/../../.github/workflows/remote-cache-tests.yml")"
