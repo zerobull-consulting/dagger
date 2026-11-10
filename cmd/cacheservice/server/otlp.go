@@ -179,10 +179,17 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 		s.refuseOTLP(w, r, route, status, reason, err)
 		return nil, false
 	}
-	if !lim.budget.reserve(otlpRequestReserve) {
+	// The headers are already parsed and held (net/http read them before
+	// the handler ran), so they are reserved with the request, before any
+	// of the body is read.
+	headers := otlpHeaderReserve(r)
+	if headers > MaxOTLPHeaderReserve {
+		return refuse(errOTLPHeadersTooLarge)
+	}
+	if !lim.budget.reserve(otlpRequestReserve + headers) {
 		return refuse(errOTLPBusy)
 	}
-	held = otlpRequestReserve
+	held = otlpRequestReserve + headers
 	received := &countingReader{r: http.MaxBytesReader(w, r.Body, route.limit)}
 	var body io.Reader = received
 	if r.Header.Get("Content-Encoding") == "gzip" {
@@ -226,7 +233,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "messageBytes", estimate, "budgetPeak", lim.budget.peakUse())
+		"decodedBytes", len(data), "messageBytes", estimate, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 

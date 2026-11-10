@@ -60,17 +60,47 @@ const (
 	// which outlives any request timeout, is unaffected once upgraded.
 	ReadHeaderTimeout = 10 * time.Second
 
+	// MaxHeaderBytes bounds a request's line and headers on every listener
+	// (NewHTTPServer), where net/http's default is 1 MiB. net/http allows
+	// 4 KiB more than this for its read buffer, so up to about 68 KiB are
+	// read. Over HTTP/1 a larger request is answered 431 before any handler
+	// runs; over HTTP/2 the limit is advertised to clients. Real callers send
+	// well under 2 KiB: the engine's OTLP requests 0.4 to 1.8 KiB (a Basic
+	// token, or a 1.5 KiB bearer token), its WebSocket upgrade 0.4 KiB. This
+	// is over 30 times that, and 1/16 of net/http's default. The README,
+	// "OTLP limits", has the measurements.
+	MaxHeaderBytes = 64 << 10
+
+	// MaxOTLPHeaderReserve bounds what an OTLP request's headers may reserve
+	// from the decode budget (otlpHeaderReserve); a request over it is
+	// answered 431. The reserve is an estimate of the parsed headers, which
+	// can be many times their wire size when they are many and short: 68 KB
+	// of 5-byte headers would reserve over 1 MB, and about 90 of them stalled
+	// would fill the budget. Real engines reserve 1.2 KiB (3.2 KiB at worst,
+	// with a 1.5 KiB token): this is ten times that. The most one request
+	// holds of the budget while it waits on its body is this plus
+	// otlpRequestReserve and its first buffer: about 49 KiB, so the budget
+	// holds at least 2,600 such requests.
+	MaxOTLPHeaderReserve = 32 << 10
+
+	// otlpRefusalDrain bounds how long net/http may go on reading what it can
+	// of an unread body after a refusal: it holds the request, headers
+	// included, while it does, up to the read deadline. The refusal closes the
+	// connection anyway, so the wait buys nothing.
+	otlpRefusalDrain = time.Second
+
 	// otlpRetryAfter is the Retry-After of a 503 for a full budget, in
 	// seconds.
 	otlpRetryAfter = 1
 )
 
 // NewHTTPServer is an http.Server for one of the service's handlers, with the
-// timeouts every listener sets: ReadHeaderTimeout, and no ReadTimeout or
-// WriteTimeout, which would cut off the engine WebSocket. The OTLP routes
-// bound their bodies themselves (OTLPReadTimeout).
+// limits every listener sets: ReadHeaderTimeout and MaxHeaderBytes, and no
+// ReadTimeout or WriteTimeout, which would cut off the engine WebSocket. The
+// OTLP routes bound their bodies themselves (OTLPReadTimeout), and count
+// their headers in the decode budget (otlpHeaderReserve).
 func NewHTTPServer(addr string, h http.Handler) *http.Server {
-	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout}
+	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout, MaxHeaderBytes: MaxHeaderBytes}
 }
 
 // otlpRoute is one OTLP POST route: its name, a constant used as its metric
@@ -156,6 +186,9 @@ var (
 	// errOTLPDecodesTooLarge is a body whose decoded message, with what
 	// the request holds, could never fit in the decode budget.
 	errOTLPDecodesTooLarge = errors.New("request body decodes to too large a message")
+	// errOTLPHeadersTooLarge is a request whose headers would reserve more
+	// than MaxOTLPHeaderReserve.
+	errOTLPHeadersTooLarge = errors.New("request headers too large")
 )
 
 // otlpChunk bounds how much of a body is read at a time, and otlpMinBuffer
@@ -171,6 +204,43 @@ const (
 // be read at once, stalled ones included: about 8,000 at the defaults,
 // however little each has sent.
 const otlpRequestReserve = 16 << 10
+
+// What the parsed headers cost beyond their bytes, measured by parsing
+// requests with http.ReadRequest and comparing the heap before and after:
+// each distinct key takes a map slot, its []string and the key's string
+// header, about 100 bytes (68 KB of tiny distinct headers: 9,244 keys,
+// 967 KB of heap); each value takes a string header in that slice, 16 bytes,
+// 32 with the slice's room to grow (68 KB of one key repeated: 13,916
+// values, 278 KB). Rounded up so the estimate is never under what was
+// measured.
+const (
+	otlpHeaderKeyCost   = 112
+	otlpHeaderValueCost = 32
+)
+
+// otlpHeaderReserve estimates what the request line and headers net/http
+// parsed hold while the handler runs: the bytes of each key and value,
+// otlpHeaderKeyCost per key and otlpHeaderValueCost per value, the host, and
+// the request URI twice (as sent and as parsed into r.URL), and the names a
+// chunked request declares in its Trailer header, which net/http moves out of
+// r.Header into r.Trailer (68 KB of them took 1.5 MB). A request over
+// MaxHeaderBytes never gets here, but the reserve is not bounded by it: 68 KB
+// of 5-byte headers is 14,000 values, or 9,000 keys, and reserves up to about
+// 1.4 MB, which is also about what they hold. decodeOTLP refuses a request
+// whose reserve is over MaxOTLPHeaderReserve.
+func otlpHeaderReserve(r *http.Request) int64 {
+	n := int64(len(r.Host) + 2*len(r.RequestURI))
+	for k := range r.Trailer {
+		n += int64(len(k)) + otlpHeaderKeyCost
+	}
+	for k, vs := range r.Header {
+		n += int64(len(k)) + otlpHeaderKeyCost
+		for _, v := range vs {
+			n += int64(len(v)) + otlpHeaderValueCost
+		}
+	}
+	return n
+}
 
 // otlpGzipReserve is what a gzipped body's decompressor is reserved for,
 // before it is built: compress/flate's 32 KiB window, its Huffman tables and
@@ -242,6 +312,8 @@ func otlpRefusal(err error) (int, string) {
 	switch {
 	case errors.As(err, &maxBytes), errors.Is(err, errOTLPTooLarge), errors.Is(err, errOTLPDecodesTooLarge):
 		return http.StatusRequestEntityTooLarge, metrics.OTLPRefusedTooLarge
+	case errors.Is(err, errOTLPHeadersTooLarge):
+		return http.StatusRequestHeaderFieldsTooLarge, metrics.OTLPRefusedTooLarge
 	case errors.Is(err, errOTLPBusy):
 		return http.StatusServiceUnavailable, metrics.OTLPRefusedBusy
 	case errors.As(err, &netErr) && netErr.Timeout():
@@ -257,6 +329,7 @@ func otlpRefusal(err error) (int, string) {
 // the log; the others at debug level. The metrics count every one.
 func (s *Service) refuseOTLP(w http.ResponseWriter, r *http.Request, route otlpRoute, status int, reason string, err error) {
 	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(otlpRefusalDrain))
 	if status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", strconv.Itoa(otlpRetryAfter))
 	}

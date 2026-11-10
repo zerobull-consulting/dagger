@@ -222,19 +222,20 @@ func TestS3ProxyRewrite(t *testing.T) {
 func TestOTLPSizesOf(t *testing.T) {
 	rec := &LogRecorder{}
 	logger := slog.New(rec.Handler(nil))
-	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 100, "decodedBytes", 300, "messageBytes", 900, "budgetPeak", 300)
-	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 50, "decodedBytes", 50, "messageBytes", 100, "budgetPeak", 900)
+	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 100, "decodedBytes", 300, "messageBytes", 900, "headerBytes", 700, "budgetPeak", 300)
+	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 50, "decodedBytes", 50, "messageBytes", 100, "headerBytes", 800, "budgetPeak", 900)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", "x", "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "budgetPeak", 7)
 	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "budgetPeak", 7)
-	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", "x", "decodedBytes", 7, "messageBytes", 70, "budgetPeak", 7)
-	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "budgetPeak", 7, "headerBytes", 5)
 	logger.Warn("otlp request refused", "route", "traces", "reason", "too_large")
 	logger.Warn("undecodable otlp request", "path", "/v1/logs")
 	sizes := otlpSizesOf(rec)
 	tr, lg := sizes.largest["traces"], sizes.largest["logs"]
-	if tr == nil || tr.n != 2 || tr.received != 100 || tr.decoded != 300 || tr.message != 900 || lg == nil || lg.n != 1 || sizes.budgetPeak != 900 {
+	if tr == nil || tr.n != 2 || tr.received != 100 || tr.decoded != 300 || tr.message != 900 || tr.headers != 800 || lg == nil || lg.n != 1 || sizes.budgetPeak != 900 {
 		t.Fatalf("sizes %+v %+v, peak %d", tr, lg, sizes.budgetPeak)
 	}
-	if len(sizes.refused) != 2 || len(sizes.malformed) != 2 {
+	if len(sizes.refused) != 2 || len(sizes.malformed) != 3 {
 		t.Fatalf("%d refused, %d malformed", len(sizes.refused), len(sizes.malformed))
 	}
 }

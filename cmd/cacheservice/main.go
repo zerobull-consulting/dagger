@@ -383,10 +383,11 @@ func main() {
 	}
 	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", !exports)
 
-	// Every listener bounds reading a request's headers
-	// (server.ReadHeaderTimeout), and none sets a ReadTimeout, which would
-	// cut off the engine WebSocket; the OTLP routes bound their bodies
-	// themselves.
+	// Every listener bounds reading a request's headers in time
+	// (server.ReadHeaderTimeout) and in size (server.MaxHeaderBytes), and
+	// none sets a ReadTimeout, which would cut off the engine WebSocket; the
+	// OTLP routes bound their bodies themselves. Build a listener's server
+	// with server.NewHTTPServer: a bare http.Server allows 1 MiB of headers.
 	servers := []*http.Server{server.NewHTTPServer(listen, svc.Handler())}
 	names := []string{"engine"}
 	if debugListen != "" {
