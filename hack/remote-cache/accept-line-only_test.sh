@@ -205,6 +205,12 @@ check "jobs: an /attempts/N URL reads that attempt's jobs" passes "$(withrun $ru
 check "jobs: ... through the attempts endpoint" grep -q "^api repos/o/r/actions/runs/2/attempts/2/jobs?per_page=100$" "$tmp/calls"
 check "jobs: an /attempts/N URL the run read disagrees with fails" fails "$(withrun $run2/attempts/4)"
 check "jobs: ... and says so" grep -q "attempt reads as 2, not the URL's 4" "$tmp/out"
+check "jobs: an /attempts/N URL past the bound (six digits) fails" fails "$(withrun $run2/attempts/100000)"
+check "jobs: ... as a URL that isn't one, before any read" grep -q "is not a GitHub Actions run URL" "$tmp/out"
+check "jobs: an /attempts/0 URL fails" fails "$(withrun $run2/attempts/0)"
+run '.run_attempt = 100000'
+check "jobs: a run_attempt past the bound (six digits) fails" fails "$okhead"
+run '.run_attempt = 2'
 for a in 'del(.run_attempt)' '.run_attempt = null' '.run_attempt = "1; x"' '.run_attempt = 0' '.run_attempt = 1.5'; do
 	run "$a"
 	check "jobs: a run whose run_attempt is bad ($a) fails" fails "$okhead"

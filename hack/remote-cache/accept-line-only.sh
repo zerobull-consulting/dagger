@@ -45,7 +45,10 @@ manifest=cmd/cacheservice/compat/engines.txt
 repo="${GITHUB_REPOSITORY:-zerobull-consulting/dagger}"
 version_re='^v1\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
 digest_re='^sha256:[0-9a-f]{64}$'
-run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[0-9]+)?$'
+# An attempt is 1 to 99999, here and in verify_run's run_attempt check: it
+# becomes part of an API path, so it's bounded (GitHub allows far fewer
+# re-runs than that).
+run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[1-9][0-9]{0,4})?$'
 
 tests_wf=.github/workflows/remote-cache-tests.yml
 # Seconds between tries of a read of the cited run (three tries).
@@ -116,6 +119,8 @@ verify_run() {
 	# (zerobull-consulting/dagger#223). They're read from the attempt the
 	# run read above describes (its run_attempt), so a re-run started
 	# between the two reads can't swap in another attempt's jobs.
+	# Bounded like run_re's /attempts/N (1 to 99999): it becomes part of
+	# the jobs path.
 	n="$(field .run_attempt)"
 	[[ "$n" =~ ^[1-9][0-9]{0,4}$ ]] || fail "the cited run's attempt is '$n', not a number"
 	[[ -z "$attempt" || "$n" == "$attempt" ]] || fail "the cited run's attempt reads as $n, not the URL's $attempt"
