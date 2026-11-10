@@ -234,3 +234,38 @@ func TestKnownGapSyncAfterForgetOverlapsRunningSync(t *testing.T) {
 	close(g.released)
 	within(t, first, "held sync")
 }
+
+// flipCtx reports no error on its first Err call and context.Canceled from
+// then on, with a Done that never fires: the context ends between lockSync's
+// first check and the select, where the select can't see it.
+type flipCtx struct {
+	context.Context
+	calls atomic.Int32
+}
+
+func (c *flipCtx) Err() error {
+	if c.calls.Add(1) == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+// A context that ends while the lock is taken, with the slot free, gets its
+// cause, and the slot is given back.
+func TestSyncLockCanceledAfterTakingFreeSlot(t *testing.T) {
+	im, g := newGatedImporter(t, false)
+	eng := &scriptedEngine{cacheID: "c1", generation: 1}
+	if err := within(t, syncAsync(im, &flipCtx{Context: context.Background()}, eng), "sync with a context that ends at the lock"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if got := g.reads.Load(); got != 0 {
+		t.Fatalf("%d index reads: the sync ran on a done context", got)
+	}
+	// The slot is free: the next sync runs.
+	if err := within(t, syncAsync(im, context.Background(), eng), "next sync"); err != nil {
+		t.Fatal(err)
+	}
+	if g.reads.Load() == 0 {
+		t.Fatal("the next sync didn't run")
+	}
+}

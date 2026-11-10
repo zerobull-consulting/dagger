@@ -371,14 +371,20 @@ func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 
 // lockSync takes the cache's sync lock, waiting for the sync that holds it
 // only while ctx lives, and returns the context's cause when it ends. A ctx
-// already done returns its cause without taking
-// the lock, even a free one, so the result doesn't depend on select's choice.
+// already done when the call starts returns its cause without taking the
+// lock, even a free one. One that ends while the lock is taken may win the
+// select against a free slot, so ctx is checked again after, and the slot
+// given back.
 func (st *cacheState) lockSync(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
 	select {
 	case st.sync <- struct{}{}:
+		if ctx.Err() != nil {
+			<-st.sync
+			return context.Cause(ctx)
+		}
 		return nil
 	case <-ctx.Done():
 		return context.Cause(ctx)
