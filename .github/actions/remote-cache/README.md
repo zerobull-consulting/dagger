@@ -77,8 +77,11 @@ passes the service only flags every build has kept (`-scope`,
 `-drain-timeout`, `-drain-linger`, `-export`, `-v`, `-debug-listen`,
 `-debug-token-file`); removing or renaming one of them is a breaking change
 for pinned actions. The exception is `role: writer`, which also passes
-`-gc-mode=batch`: it needs a service image built after
-zerobull-consulting/dagger#248, with no backwards compatibility. (The
+`-gc-mode=batch`: it needs a service image built at or after
+zerobull-consulting/dagger#248, with no backwards compatibility. The
+version's floating tag is one once the publish workflow has moved it to a
+build with that change (`.github/workflows/cacheservice-publish.yml`,
+"engine-tags"); a `service-image` pinned to an older commit is not. (The
 action has not been run against an older image.) To run one exact build, set
 `service-image` to `dagger-remote-cache:<commit SHA>`, such as the action's
 own commit.

@@ -3496,7 +3496,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
 
-`-gc-mode` needs an image built after zerobull-consulting/dagger#248; the tag above is older than that.
+`-gc-mode` needs an image built at or after zerobull-consulting/dagger#248. The tag above is the floating `:<engine version>` tag, which carries it once the publish workflow has moved it to a build with that change; an image pinned to an older commit does not.
 
 - **No `-tokens-file`**: the service is unauthenticated, and every engine is
   in the `-scope` namespace. That is fine on a runner's private network, and
