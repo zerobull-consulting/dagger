@@ -39,6 +39,12 @@ import (
 // check's one listing asks for (one more, to tell "10" from "more").
 const MaxListed = 10
 
+// Getter reads whole objects: metastore.ErrNotFound for a missing one, and
+// metastore.ErrDenied for one the key may not read (metastore.Objects).
+type Getter interface {
+	Get(ctx context.Context, key string) (body []byte, etag string, err error)
+}
+
 // Store is what the check needs of the object store: whole-object reads
 // and conditional writes (metastore.Objects), and a bounded listing.
 type Store interface {
@@ -215,7 +221,7 @@ func Check(ctx context.Context, st Store, prefix string, writer bool, now time.T
 	}
 	// Not empty, if an ancestor prefix is a store's: everything under it
 	// is that service's, this prefix included.
-	if err := checkAncestors(ctx, st, prefix); err != nil {
+	if err := CheckAncestors(ctx, st, prefix); err != nil {
 		return 0, Marker{}, err
 	}
 	if !writer {
@@ -295,7 +301,7 @@ func (e *ErrAncestorUnread) Error() string {
 
 func (e *ErrAncestorUnread) Unwrap() error { return e.Err }
 
-// checkAncestors refuses a prefix whose ancestors hold a marker, of any
+// CheckAncestors refuses a prefix whose ancestors hold a marker, of any
 // content: one GET per ancestor, made only when the prefix has none of its
 // own. An ancestor whose marker is not found (metastore.ErrNotFound), or
 // that the key may not read (metastore.ErrDenied: a key allowed only its
@@ -305,7 +311,10 @@ func (e *ErrAncestorUnread) Unwrap() error { return e.Err }
 // didn't say, so the check doesn't guess. The store's client retries; this
 // adds no retries of its own. When ctx has ended (the caller cancelled, or
 // its deadline passed), the error is ctx's, not the store's.
-func checkAncestors(ctx context.Context, st Store, prefix string) error {
+//
+// The startup check runs it, and so does `cacheservice wipe`, which refuses
+// to wipe a prefix inside another store's.
+func CheckAncestors(ctx context.Context, st Getter, prefix string) error {
 	p := strings.Trim(prefix, "/")
 	if p == "" {
 		return nil

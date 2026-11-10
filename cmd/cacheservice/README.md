@@ -368,9 +368,77 @@ re-run the cache-warming job. The first writer claims the empty prefix, and
 the cache fills again. Pull-request jobs before that run start with nothing
 to import (see [Read-only instances](#read-only-instances)).
 
+**Stop every writer on the prefix, and on its ancestor prefixes, first.**
+The command can't see running services: a writer still exporting during the
+wipe leaves new keys behind, and the wipe then exits 3. A writer that claims
+an ancestor prefix during the wipe stops it before its next delete, with
+exit 1, since that store's keys may be under the prefix
+(`TestAncestorClaimedDuringWipeStops`, `TestAncestorClaimedBeforeAbortsStops`).
+
+`cacheservice wipe` empties the prefix, of any layout (layout 1 included,
+which has no marker). It reads the same `CACHESERVICE_S3_*` settings as the
+service, with a key that can list the prefix and its multipart uploads, and
+delete and abort there (a Read/Write/Delete key), and that should be able to
+read the bucket's versioning setting (see below):
+
 ```bash
-aws s3 rm --recursive s3://dagger-cache/cache/   # or: mc rm --recursive --force local/dagger-cache/cache/
+cacheservice wipe                                         # dry run: what the prefix holds, and the marker's layout
+cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
 ```
+
+- **A dry run is the default.** It reports the object count, their bytes,
+  the incomplete multipart uploads, up to 20 keys of each, and the ownership
+  marker's layout version (or why the service would refuse it), and deletes
+  nothing. It warns about any other ownership marker under the prefix: a
+  store nested in it, which the wipe deletes too
+  (`TestDryRunWarnsNestedMarkers`, `TestMinIODryRunWarnsNestedMarkers`).
+- **Deleting needs `-dry-run=false` and `-confirm=<bucket>/<prefix>`**,
+  repeating exactly the bucket and the prefix (without surrounding slashes).
+  A missing or wrong one exits 2 before any request. So does an empty
+  `CACHESERVICE_S3_PREFIX`: wiping a whole bucket isn't supported.
+- **Before deleting anything,** a wipe lists the prefix's objects and
+  uploads, read-only, as a dry run does: a listing the key isn't allowed
+  refuses it then, not halfway through (`TestUploadListingRefusedBeforeDelete`),
+  and it prints the same warning about nested stores
+  (`TestWipeWarnsNestedMarkers`).
+- **The order:** the ownership marker first, so a wipe cut off halfway leaves
+  keys without a marker, which every instance refuses
+  (`TestInterruptedWipeLeavesRefusedPrefix`,
+  `TestMinIOInterruptedWipeRefused`); then the objects, 1,000 per request;
+  then the incomplete multipart uploads; then it lists the prefix again.
+  If the marker can't be read (a dry run too) or deleted, nothing else is
+  deleted, and it exits 1.
+- **Not inside another store:** a prefix under one whose ancestor (the
+  bucket's top included) holds an ownership marker is refused, by a dry run
+  and a wipe, naming that marker: wiping it would delete part of that store.
+  As the service's own check, an ancestor's marker not found (404) or that
+  the key may not read (403) is skipped, and any other answer refuses
+  (`TestAncestorMarkerRefused`, `TestAncestorMarkerErrors`,
+  `TestMinIOAncestorMarkerRefused`).
+- **Only under the prefix:** it deletes only keys a listing under
+  `<prefix>/` returned, so `cache2/` and the bucket's top are untouched when
+  wiping `cache` (`TestWipeEmptiesPrefix`, `TestMinIOWipe`).
+- **Exit codes:** 0 a dry run reported, or the prefix is empty after the
+  wipe; 1 an error, a refusal, or a key or upload that failed (up to 20 are
+  listed); 2 usage or confirmation; 3 every request succeeded but the prefix isn't empty
+  after the wipe (a writer is running). `-timeout` (default 30m, room for
+  about one to two million keys) bounds the run, and each request is bounded
+  to 30s.
+- **Versioned buckets are refused:** a delete without a version ID leaves
+  the noncurrent versions, which the listings don't show, so before deleting
+  anything a wipe reads the bucket's versioning (`s3:GetBucketVersioning`)
+  and exits 1 if it is Enabled or Suspended. A key that may not read it (403)
+  gets a warning and the wipe goes on; any other error refuses. A dry run
+  reports it (`TestVersionedBucket`). Not run on a versioned bucket.
+- **Keys XML can't carry** (a control character such as U+0001, which MinIO
+  stores): the listings ask for URL-encoded keys, so a dry run names them,
+  and the wipe deletes each such key with a `DeleteObject` of its own, since
+  MinIO answers a `DeleteObjects` of one without an error and keeps it
+  (both seen on MinIO; `TestMinIOControlCharKeyDeleted`,
+  `TestMinIODeleteObjectsKeepsControlCharKey`).
+- **What the store answers is printed escaped:** keys are quoted, and errors
+  and failure reasons have their control characters escaped
+  (`TestStoreStringsEscaped`).
 
 **Later: import from one prefix, export to another.** Images are pinned by
 SHA, so an old image can still read the old prefix: run an engine with a

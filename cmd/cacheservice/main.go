@@ -117,6 +117,10 @@
 // `cacheservice lifecycle plan|claim|apply|check` is a one-shot subcommand, not
 // the service: it claims the prefix, sets or checks the bucket's lifecycle
 // rules, with the admin key (package lifecycle; README.md, "The lifecycle command").
+//
+// `cacheservice wipe` is another: it empties the prefix, of any layout, a dry
+// run unless given -dry-run=false and -confirm=<bucket>/<prefix> (package
+// wipe; README.md, "Changing layouts").
 package main
 
 import (
@@ -139,16 +143,19 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
+	"github.com/dagger/dagger/cmd/cacheservice/wipe"
 )
 
 // subcommands are the one-shot commands of the binary, by name: each reads
 // the CACHESERVICE_S3_* settings as the service does, and returns its exit
-// code. A later one, such as wipe (zerobull-consulting/dagger#94), follows
-// lifecycle's shape: plan by default, -confirm=<bucket>/<prefix> to change
-// anything, exit 2 on a mismatch.
+// code. Each reports by default, needs -confirm=<bucket>/<prefix> to change
+// anything, and exits 2 on a mismatch.
 var subcommands = map[string]func(ctx context.Context, args []string) int{
 	"lifecycle": func(ctx context.Context, args []string) int {
 		return lifecycle.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
+	},
+	"wipe": func(ctx context.Context, args []string) int {
+		return wipe.Main(ctx, args, os.Stdout, os.Stderr, wipe.OpenS3)
 	},
 }
 
