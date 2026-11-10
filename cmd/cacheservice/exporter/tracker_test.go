@@ -394,6 +394,73 @@ func TestTrackerSkippedRoots(t *testing.T) {
 	}
 }
 
+// A caller that loops flushes doesn't retry a failing root at its own rate:
+// a flush cuts short a failure wait only if a flush didn't cause the try
+// that started it, so the root waits out the backoff after a second failed
+// try, and a flush after its next try, the backoff's own, may cut it short
+// again. A busy root, which doesn't count toward MaxFailures, is due at
+// every flush (zerobull-consulting/dagger#160).
+func TestTrackerLoopedFlushesDontRushFailures(t *testing.T) {
+	tr := NewTracker(TrackerConfig{Settle: testSettle, MaxDelay: testMaxDelay, ForgetAfter: testForget,
+		BusyBackoff: time.Second, MaxBusyBackoff: 8 * time.Second, MaxFailures: 5})
+	tr.Observe(state(1, 10, fsPart), t0)
+	// loop flushes 20 times, 10ms apart, answering each try with answer,
+	// and returns the tries.
+	now := t0
+	loop := func(answer func(Batch) Result) int {
+		tries := 0
+		for range 20 {
+			end := tr.StartFlush("c", now)
+			for _, b := range tr.Due(now) {
+				tries++
+				tr.Done(b, answer(b), now)
+			}
+			end()
+			now = now.Add(10 * time.Millisecond)
+		}
+		return tries
+	}
+	fail := func(Batch) Result { return Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}} }
+	failures := func() int { return tr.Entries("c")[0].Failures }
+
+	// The first flush's try fails, and the second flush cuts its wait
+	// short; that try fails too, and no flush cuts the wait it started.
+	if tries := loop(fail); tries != 2 || failures() != 2 {
+		t.Fatalf("looped flushes: %d tries, %d failures, want 2 and 2", tries, failures())
+	}
+	// The backoff's own try (2s after the second): a flush may cut the
+	// wait after it short again, once.
+	now = now.Add(2 * time.Second)
+	if bs := tr.Due(now); len(bs) != 1 {
+		t.Fatalf("not due once its backoff passed: %d batches", len(bs))
+	} else {
+		tr.Done(bs[0], fail(bs[0]), now)
+	}
+	if tries := loop(fail); tries != 1 || failures() != 4 {
+		t.Fatalf("looped flushes after the backoff's try: %d tries, %d failures, want 1 and 4", tries, failures())
+	}
+
+	// A busy root is due at every flush.
+	tr.Observe(state(2, 10, fsPart), t0)
+	busy := func(b Batch) Result {
+		var res Result
+		for _, n := range b.Request.Roots {
+			if n == 2 {
+				res.Busy = append(res.Busy, protocol.SkippedRoot{Number: 2, Reason: protocol.SkipBusy})
+			} else {
+				res.Failed = append(res.Failed, FailedRoot{Number: n, Error: "upload"})
+			}
+		}
+		return res
+	}
+	if tries := loop(busy); tries != 20 {
+		t.Fatalf("looped flushes of a busy root: %d tries, want 20", tries)
+	}
+	if e := tr.Entries("c"); e[1].Failures != 0 || e[0].Failures != 4 {
+		t.Fatalf("entries %+v", e)
+	}
+}
+
 func TestTrackerFailuresBackOffThenStop(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)

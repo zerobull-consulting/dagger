@@ -173,6 +173,14 @@ type trackedEntry struct {
 	failures     int
 	// failedValue is the value failures counts for.
 	failedValue *exportedValue
+	// flushReset is set when a flush cut short the entry's wait after a
+	// failed try (StartFlush), until its next try; flushTry is set during
+	// that try. flushFailed is set when that try failed: the wait it
+	// started is the backoff's, and no flush cuts it short. A try after it
+	// clears it, so each failure wait is cut short by a flush at most once
+	// in a row, and a caller that loops flushes can't make a failing root
+	// reach MaxFailures at its own rate.
+	flushReset, flushTry, flushFailed bool
 	// inFlight is set while a batch holds the entry.
 	inFlight bool
 	// recheck is set when a newer generation cleared the entry's
@@ -888,6 +896,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 // now, so it is no longer dirty. A change from now on makes it dirty again.
 func (t *Tracker) claimLocked(e *trackedEntry) {
 	e.inFlight = true
+	e.flushTry, e.flushReset, e.flushFailed = e.flushReset, false, false
 	e.retryAt, e.engineWaitAt, e.recheck = time.Time{}, time.Time{}, false
 	e.dirtySince, e.accel, e.busyAt = time.Time{}, false, time.Time{}
 }
@@ -1049,6 +1058,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		e.failures++
 		if e.failures < t.cfg.MaxFailures {
 			e.retryAt, e.engineWaitAt = now.Add(t.backoff(e.failures-1)), time.Time{}
+			e.flushFailed = e.flushTry
 		}
 	}
 	for _, f := range res.Failed {
@@ -1320,7 +1330,13 @@ func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain boo
 // StartFlush starts a flush of one cache: until end is called, every
 // dirty entry of cacheID is due at once, without waiting for it to settle,
 // as in a drain; and every root of it waiting for another try is due now,
-// once. Retries after that wait their normal backoff. Unlike StartDrain, it
+// once. Retries after that wait their normal backoff. A failed root whose
+// wait began with a try a flush made due, and that failed again, isn't due
+// at once: it waits out that backoff, and a flush after its next try may cut
+// its wait short again. So looped flushes retry a failing root at most
+// once per backoff of its own, and it reaches MaxFailures at most twice as
+// fast as its backoff alone would take it there; a busy root, which doesn't count toward MaxFailures, or one
+// waiting for its engine, is due at every flush. Unlike StartDrain, it
 // changes nothing else: spans, session ends and other caches are taken and
 // scheduled as usual, and the scheduler runs the exports (Due), one at a
 // time per cache. Flushes of one cache may overlap: the cache is flushing
@@ -1331,9 +1347,12 @@ func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
 	t.flushing[cacheID]++
 	if c := t.caches[cacheID]; c != nil {
 		for _, e := range c.entries {
-			if !e.inFlight && e.retryAt.After(now) {
-				e.retryAt, e.engineWaitAt = now, time.Time{}
+			if e.inFlight || !e.retryAt.After(now) || e.flushFailed {
+				continue
 			}
+			// A wait after a failed try: neither busy nor for the engine.
+			e.flushReset = e.busyAt.IsZero() && e.engineWaitAt.IsZero() && e.failures > 0
+			e.retryAt, e.engineWaitAt = now, time.Time{}
 		}
 	}
 	// Due at once: wake the scheduler. It finds nothing to do for a cache

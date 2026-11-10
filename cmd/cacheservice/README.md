@@ -2832,11 +2832,17 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
   missing) is waited for until it ended with every span in, or
   `-export-settle` (at most 2s) passed since its last span: so a flush right
   after the client returned waits for its last spans and its carrier, which
-  are on their way. Its late spans are taken and exported. A flush starts
-  each failing root's retry at once: a caller that loops flushes retries
-  them at its own rate. The scheduler runs the exports, one
-  at a time per engine cache: the flush starts none of its own. Other
-  caches are scheduled as usual.
+  are on their way. Its late spans are taken and exported. A caller that
+  loops flushes doesn't retry a failing root at its own rate: a flush cuts
+  short a failed root's wait only if a flush didn't cause the try that
+  started it, so after a second failed try in a row the root waits out its
+  backoff, and reaches the last of its 5 failed tries (after which it isn't
+  tried again until its value changes) at most twice as fast as its
+  backoff alone would take it there
+  (`TestTrackerLoopedFlushesDontRushFailures`). A busy root, which doesn't
+  count toward that limit, is retried at every flush. The scheduler runs
+  the exports, one at a time per engine cache: the flush starts none of its
+  own. Other caches are scheduled as usual.
 - **It can't wait for spans it hasn't heard of.** A session holds a flush
   only once the service has seen at least one of its spans. A flush that
   comes before any span of a session reaches the service doesn't wait for
