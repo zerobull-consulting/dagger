@@ -788,7 +788,7 @@ func TestOTLPTraces(t *testing.T) {
 		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{kv(telemetryattrs.EngineCacheAttr, "cache-1")}},
 		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{
 			{Name: "plain"},
-			{Name: "cached", Attributes: []*commonpb.KeyValue{
+			{Name: "cached", EndTimeUnixNano: 1_700_000_000_123_456_789, Attributes: []*commonpb.KeyValue{
 				kv(telemetryattrs.CacheResultIDAttr, "42"),
 				kv(telemetryattrs.CacheOutcomeAttr, "hit"),
 				kv(telemetryattrs.CacheReplacementsAttr, "3"),
@@ -808,7 +808,7 @@ func TestOTLPTraces(t *testing.T) {
 	if len(spans) != 1 {
 		t.Fatalf("%d cache spans logged", len(spans))
 	}
-	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" || s["replacements"] != "3" {
+	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" || s["replacements"] != "3" || s["endUnixNano"] != "1700000000123456789" {
 		t.Fatalf("unexpected cache span log: %v", s)
 	}
 }

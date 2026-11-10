@@ -161,3 +161,61 @@ func TestStoresByEntryKeepsEveryStoreAndCountsOmitted(t *testing.T) {
 		t.Errorf("stores %v, omitted %d", stores, omitted)
 	}
 }
+
+// spanRecEnd is a span record with an end time.
+func spanRecEnd(after time.Duration, end string, cache, n string, call, retained bool, repl, deps string) LogRecord {
+	r := spanRec(after, cache, n, call, retained, repl, deps)
+	r.Attrs["endUnixNano"] = end
+	return r
+}
+
+// The tracker ignores a span of a generation older than the newest it has
+// seen for the cache, so growth reported by one is not growth.
+func TestSpansOfAnOlderGenerationAreIgnored(t *testing.T) {
+	recs := []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "1", "1"),
+		storedRec(time.Second, "c1", "7"),                          // generation 1
+		spanRec(2*time.Second, "c1/2", "8", true, true, "1", "1"),  // generation 2 reports in
+		spanRec(3*time.Second, "c1/1", "7", false, true, "1", "5"), // a late span of generation 1
+	}
+	if got := spansByEntry(recs); len(got[entryKey{"c1/1", 7}]) != 1 {
+		t.Errorf("spans of entry 7 of generation 1: %+v; want only the first", got[entryKey{"c1/1", 7}])
+	}
+	if stored, growth, _ := depsAfterStore(recs); stored != 1 || len(growth) != 0 {
+		t.Errorf("stored %d, growth %+v; want no growth from a stale generation's span", stored, growth)
+	}
+	// Another cache's newer generation says nothing of this one.
+	other := []LogRecord{
+		spanRec(0, "c2/2", "8", true, true, "1", "1"),
+		spanRec(time.Second, "c1/1", "7", true, true, "1", "1"),
+	}
+	if got := spansByEntry(other); len(got[entryKey{"c1/1", 7}]) != 1 {
+		t.Errorf("a span of cache c1 was dropped for cache c2's generation: %+v", got)
+	}
+}
+
+// The tracker keeps the retained flag of the call span with the latest end
+// time: a call span that ends earlier doesn't override it, however late it
+// arrives.
+func TestRetainedFollowsTheLatestEndTime(t *testing.T) {
+	recs := []LogRecord{
+		spanRecEnd(0, "100", "c1/1", "7", true, true, "1", "1"),
+		spanRecEnd(time.Second, "50", "c1/1", "7", true, false, "1", "1"), // ends earlier, arrives later
+		spanRecEnd(2*time.Second, "150", "c1/1", "7", false, true, "1", "1"),
+		spanRecEnd(32*time.Second, "200", "c1/1", "7", true, true, "1", "1"),
+	}
+	for _, g := range lazyToCall(recs) {
+		if g.atRisk() {
+			t.Errorf("gap %+v at risk: the entry was retained by the call span that ended last", g)
+		}
+	}
+	if gaps := lazyToCall(recs); len(gaps) != 1 || gaps[0].gap != 30*time.Second {
+		t.Errorf("gaps %+v; want one of 30s", gaps)
+	}
+	// With the later-ending span saying not retained, the entry is not kept.
+	recs[0] = spanRecEnd(0, "100", "c1/1", "7", true, false, "1", "1")
+	recs[1] = spanRecEnd(time.Second, "50", "c1/1", "7", true, true, "1", "1")
+	if gaps := lazyToCall(recs); len(gaps) != 1 || !gaps[0].atRisk() {
+		t.Errorf("gaps %+v; want one at risk", gaps)
+	}
+}
