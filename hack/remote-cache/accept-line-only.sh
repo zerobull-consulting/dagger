@@ -14,6 +14,13 @@
 #       own version, the manifest's first accept line, in a manifest
 #       engines.sh takes. Every other PR passes: it isn't auto-merged.
 #
+#   accept-line-only.sh fetch-head <PR number> <head sha>
+#       Checks out the PR's head, from refs/pull/<PR>/head of the base
+#       repository (where GitHub keeps every PR's head, a fork's too),
+#       fetched explicitly: the commit needn't be reachable from any branch
+#       the checkout fetched. Fails if that ref no longer holds the commit.
+#       (zerobull-consulting/dagger#165)
+#
 #   accept-line-only.sh disable-auto-merge <PR number>
 #       Turns the PR's auto-merge off if it's on (GH_TOKEN, GITHUB_TOKEN).
 #       The workflow runs it when the check fails.
@@ -71,6 +78,28 @@ check() {
 	echo "the PR adds only '$added': passes"
 }
 
+# fetch_head <PR> <head sha>: see the header. GH_TOKEN, if set, reaches git
+# through its environment, never its arguments (the checkout persists none).
+fetch_head() {
+	local pr="$1" head="$2" remote="${FETCH_REMOTE:-origin}" url auth
+	[[ "$pr" =~ ^[0-9]{1,9}$ ]] || fail "'$pr' is not a PR number"
+	[[ "$head" =~ ^[0-9a-f]{40}$ ]] || fail "the head must be a commit id"
+	url="$(git remote get-url "$remote")"
+	if [[ -n "${GH_TOKEN:-}" && "$url" == https://* ]]; then
+		auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+		export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.${url%/*/*}/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+	fi
+	timeout 300 git fetch -q --no-tags "$remote" "+refs/pull/$pr/head:refs/remotes/pull/$pr" ||
+		fail "fetching refs/pull/$pr/head failed"
+	# The ref has moved on if the PR got a newer push; its history still
+	# holds this head unless the push rewrote it, and then a newer run
+	# measures the newer head.
+	git cat-file -e "$head^{commit}" 2>/dev/null ||
+		fail "refs/pull/$pr/head is $(git rev-parse --short "refs/remotes/pull/$pr") and doesn't hold $head: the PR was pushed again"
+	git checkout -q --detach "$head"
+	echo "checked out $head from refs/pull/$pr/head"
+}
+
 disable() {
 	local pr="$1" info node
 	[[ "$pr" =~ ^[0-9]{1,9}$ ]] || { echo "accept-line-only.sh: '$pr' is not a PR number" >&2; exit 1; }
@@ -88,6 +117,7 @@ disable() {
 
 case "${1:-}" in
 check) [[ $# -eq 4 ]] || fail "usage: accept-line-only.sh check <base sha> <head sha> <head ref>"; check "$2" "$3" "$4" ;;
+fetch-head) [[ $# -eq 3 ]] || fail "usage: accept-line-only.sh fetch-head <PR> <head sha>"; fetch_head "$2" "$3" ;;
 disable-auto-merge) [[ $# -eq 2 ]] || exit 2; disable "$2" ;;
-*) echo "usage: accept-line-only.sh check <base> <head> <ref> | disable-auto-merge <PR>" >&2; exit 2 ;;
+*) echo "usage: accept-line-only.sh check <base> <head> <ref> | fetch-head <PR> <head> | disable-auto-merge <PR>" >&2; exit 2 ;;
 esac

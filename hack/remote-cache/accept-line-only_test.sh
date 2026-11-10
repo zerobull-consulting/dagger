@@ -80,6 +80,69 @@ check "fails: a renamed manifest" fails "$(pr renamed "$first; git mv $m cmd/cac
 verdict "$(pr msg "echo y >other.txt")"
 check "fails with an annotation naming the file" grep -q "::error file=$m::" "$tmp/out"
 
+# fetch-head (zerobull-consulting/dagger#165, lead 1): a fork PR's head is on
+# no branch of this repository, only under refs/pull/<N>/head. "up" is the
+# base repository; each case clones it fresh, as actions/checkout does.
+up="$tmp/up.git"
+git init -q --bare -b main "$up"
+git -C "$repo" push -q "$up" main
+pushpr() { # <name> <ref>: a commit off base, pushed only to <ref>; prints it
+	git -C "$repo" checkout -q -B "$1" "$base"
+	echo "$1" >"$repo/fork.txt"
+	git -C "$repo" add fork.txt && git -C "$repo" commit -q -m "$1"
+	git -C "$repo" push -q "$up" "HEAD:$2"
+	git -C "$repo" rev-parse HEAD
+}
+fresh() { rm -rf "$tmp/co" && git clone -q "file://$up" "$tmp/co"; }
+fetchhead() { (cd "$tmp/co" && FETCH_REMOTE=origin "$script" fetch-head "$@") >"$tmp/out" 2>&1; }
+at_head() { test "$(git -C "$tmp/co" rev-parse HEAD)" = "$1"; }
+
+fork="$(pushpr fork refs/pull/7/head)"
+fresh
+check "fetch-head: control: a fork's head isn't reachable from a plain clone" not git -C "$tmp/co" checkout -q --detach "$fork"
+fresh
+check "fetch-head: checks out a head that is only under refs/pull/<N>/head" fetchhead 7 "$fork"
+check "fetch-head: and HEAD is that commit" at_head "$fork"
+inbranch="$(pushpr inbranch refs/heads/also-a-branch)"
+git -C "$up" update-ref refs/pull/8/head "$inbranch"
+fresh
+check "fetch-head: a head that is on a branch too" fetchhead 8 "$inbranch"
+check "fetch-head: and HEAD is that commit (reachable)" at_head "$inbranch"
+# The PR was pushed again: the ref is a child of the event's head.
+git -C "$repo" checkout -q -B child "$fork"
+echo c >"$repo/child.txt" && git -C "$repo" add child.txt && git -C "$repo" commit -q -m child
+git -C "$repo" push -q "$up" HEAD:refs/pull/7/head
+fresh
+check "fetch-head: the ref moved on, the event's head is its ancestor" fetchhead 7 "$fork"
+check "fetch-head: and HEAD is the event's head, not the ref's" at_head "$fork"
+# The PR was force-pushed: the ref no longer holds the event's head.
+other="$(pushpr other refs/pull/9/head)"
+fresh
+check "fetch-head: fails when the ref doesn't hold the head" not fetchhead 9 "$fork"
+check "fetch-head: and says the PR was pushed again" grep -q "pushed again" "$tmp/out"
+check "fetch-head: fails for a PR with no such ref" not fetchhead 99 "$fork"
+check "fetch-head: fails for a PR number that isn't one" not fetchhead '7;x' "$fork"
+check "fetch-head: fails for a head that isn't a commit id" not fetchhead 7 main
+# The token reaches git through its environment, not its arguments.
+mkdir -p "$tmp/gitbin"
+cat >"$tmp/gitbin/git" <<'G'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_GIT_ARGS"
+[[ "$1" == remote ]] && { echo https://example.invalid/o/r; exit 0; }
+[[ "$1" == fetch ]] && { echo "extra=${GIT_CONFIG_KEY_0}" >>"$FAKE_GIT_ARGS"; exit 1; }
+exec /usr/bin/env -i PATH="$ORIG_PATH" git "$@"
+G
+chmod +x "$tmp/gitbin/git"
+(cd "$tmp/co" && PATH="$tmp/gitbin:$PATH" ORIG_PATH="$PATH" FAKE_GIT_ARGS="$tmp/gitargs" GH_TOKEN=tok-secret "$script" fetch-head 7 "$fork") >"$tmp/out" 2>&1
+check "fetch-head: uses the token through git's environment" grep -q "extra=http.https://example.invalid/.extraheader" "$tmp/gitargs"
+check "fetch-head: never puts the token in git's arguments" not grep -q tok-secret "$tmp/gitargs"
+check "fetch-head: never prints the token" not grep -q tok-secret "$tmp/out"
+
+# The workflow takes the PR's head through fetch-head, not as the checkout's ref.
+wf="$here/../../.github/workflows/remote-cache-auto-merge-add-compatible-engine.yml"
+check "workflow: calls fetch-head with the PR number and head" grep -q 'accept-line-only.sh" fetch-head "\$PR" "\$HEAD_SHA"' "$wf"
+check "workflow: the checkout doesn't take the head as its ref" not grep -qE '^\s+ref: .*head\.sha' "$wf"
+
 # disable-auto-merge, against a fake gh.
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/gh" <<'G'

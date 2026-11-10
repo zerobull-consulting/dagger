@@ -68,6 +68,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Setup Go
         id: setup-go
         uses: actions/setup-go@v6
@@ -131,6 +133,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Setup Go
         id: setup-go
         uses: actions/setup-go@v6
@@ -180,6 +184,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # STOCK_ENGINE and STOCK_ENGINE_TAG, from the manifest's first accept
       # line, a candidate's (workflow_dispatch), or the release matrix's
       # entry (workflow_call), which must be an accept line. See the top of
@@ -288,6 +294,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # STOCK_ENGINE and STOCK_ENGINE_TAG, from the manifest's first accept
       # line, a candidate's (workflow_dispatch), or the release matrix's
       # entry (workflow_call), which must be an accept line. See the top of
