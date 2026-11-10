@@ -43,31 +43,70 @@ const (
 	// otlpFieldCost is a scalar field's or a string's header, and the least a
 	// varint, fixed or group field is charged.
 	otlpFieldCost = 16
-	// otlpMaxDepth bounds how deep the estimate walks nested messages, as
-	// proto.Unmarshal does (protowire's default recursion limit).
-	otlpMaxDepth = 10000
+	// otlpMaxDepth bounds how deep a body may nest messages, the request
+	// being depth 0; a deeper body is refused with 400 before the estimate
+	// walks it or proto.Unmarshal decodes it, since both recurse once per
+	// level. OTLP's own messages nest 8 deep down to an AnyValue (see
+	// TestOTLPFixedNestingDepth), and the e2e checks that real engines'
+	// requests stay well under this (zerobull-consulting/dagger#86).
+	otlpMaxDepth = 64
+	// otlpMaxJSONDepth bounds how deep a JSON body may nest objects and
+	// arrays. A message in a repeated field takes an array and an object, so
+	// it is twice otlpMaxDepth.
+	otlpMaxJSONDepth = 2 * otlpMaxDepth
+	// otlpDecodeStack is the stack the decode takes at the deepest body the
+	// limits allow, reserved from the budget with the message: the walk and
+	// proto.Unmarshal each recurse once per level (measured at 64 levels: the
+	// walk needs 16 to 32 KiB, Unmarshal 32 to 64 KiB, as goroutine stacks
+	// grow by doubling, in zerobull-consulting/dagger#86).
+	otlpDecodeStack = 64 << 10
+	// otlpJSONDecodeStack is the same for a JSON body, which protojson decodes
+	// over up to otlpMaxJSONDepth objects and arrays: measured at 120 levels,
+	// it needs 64 to 128 KiB.
+	otlpJSONDecodeStack = 128 << 10
 	// otlpJSONObjectCost is what one JSON object is estimated to decode to:
 	// the largest OTLP message (a Span, 280 bytes) and its slice element,
 	// rounded up.
 	otlpJSONObjectCost = 320
 )
 
+// MaxOTLPNesting is otlpMaxDepth: the most levels of messages a protobuf body
+// may nest (a JSON body, objects and arrays twice that), for the e2e to check
+// real engines against.
+const MaxOTLPNesting = otlpMaxDepth
+
 var errOTLPDepth = errors.New("otlp message nested too deep")
+
+// errOTLPEndGroup is an end-group tag that doesn't close the group open.
+var errOTLPEndGroup = errors.New("otlp group closed by a mismatched end-group tag")
 
 // otlpDecodedSize estimates the heap msg takes once decoded from data, as
 // protobuf, or as JSON when asJSON. A protobuf body that isn't a valid
 // encoding is an error, as decoding it would be.
 func otlpDecodedSize(data []byte, msg proto.Message, asJSON bool) (int64, error) {
-	if asJSON {
-		return otlpJSONSize(data), nil
-	}
-	return otlpProtoSize(data, msg.ProtoReflect().Descriptor(), 0)
+	size, _, err := otlpDecodedSizeDepth(data, msg, asJSON)
+	return size, err
 }
 
-func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int64, error) {
+// otlpDecodedSizeDepth is otlpDecodedSize, and also says how deep the body
+// nests messages (0 for a request with none), or -1 for JSON, whose depth is
+// bounded in objects and arrays, not messages, and isn't measured.
+func otlpDecodedSizeDepth(data []byte, msg proto.Message, asJSON bool) (size int64, depth int, err error) {
+	if asJSON {
+		if otlpJSONDepth(data) > otlpMaxJSONDepth {
+			return 0, -1, errOTLPDepth
+		}
+		return otlpJSONSize(data), -1, nil
+	}
+	size, err = otlpProtoSize(data, msg.ProtoReflect().Descriptor(), 0, &depth)
+	return size, depth, err
+}
+
+func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int, deepest *int) (int64, error) {
 	if depth > otlpMaxDepth {
 		return 0, errOTLPDepth
 	}
+	*deepest = max(*deepest, depth)
 	size := otlpMessageCost(md)
 	fields := md.Fields()
 	for len(b) > 0 {
@@ -86,8 +125,15 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 			// know (and any field of the wrong wire type for its number) as raw
 			// bytes. So charge every such field at least its wire size: the
 			// flat cost for the small ones, the size for a group.
-			n = protowire.ConsumeFieldValue(num, typ, b)
-			if n < 0 {
+			if typ == protowire.StartGroupType {
+				// Groups nest, and ConsumeFieldValue recurses into them (to
+				// its own limit, 10,000): walk them here, counting their
+				// levels toward otlpMaxDepth.
+				var err error
+				if n, err = otlpGroupLen(b, num, depth, deepest); err != nil {
+					return 0, err
+				}
+			} else if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
 				return 0, protowire.ParseError(n)
 			}
 			b = b[n:]
@@ -112,7 +158,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 			// message's unknown fields, which append grows.
 			size += otlpUnknownCost(tagLen + int64(n))
 		case fd.Message() != nil:
-			sub, err := otlpProtoSize(v, fd.Message(), depth+1)
+			sub, err := otlpProtoSize(v, fd.Message(), depth+1, deepest)
 			if err != nil {
 				return 0, err
 			}
@@ -127,6 +173,75 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 		}
 	}
 	return size, nil
+}
+
+// otlpGroupLen is the length of the group that starts at the front of b,
+// its end-group tag included: the group num, in a message at depth. It walks
+// the group's nested groups with a stack of at most otlpMaxDepth entries, not
+// by recursion, and refuses one that nests past otlpMaxDepth (each level a
+// message's depth would take).
+func otlpGroupLen(b []byte, num protowire.Number, depth int, deepest *int) (int, error) {
+	open := []protowire.Number{num}
+	off := 0
+	for len(open) > 0 {
+		if depth+len(open) > otlpMaxDepth {
+			return 0, errOTLPDepth
+		}
+		*deepest = max(*deepest, depth+len(open))
+		tag, typ, n := protowire.ConsumeTag(b[off:])
+		if n < 0 {
+			return 0, protowire.ParseError(n)
+		}
+		off += n
+		switch typ {
+		case protowire.StartGroupType:
+			open = append(open, tag)
+		case protowire.EndGroupType:
+			if tag != open[len(open)-1] {
+				return 0, errOTLPEndGroup
+			}
+			open = open[:len(open)-1]
+		default:
+			if n = protowire.ConsumeFieldValue(tag, typ, b[off:]); n < 0 {
+				return 0, protowire.ParseError(n)
+			}
+			off += n
+		}
+	}
+	return off, nil
+}
+
+// otlpJSONDepth is how deep a JSON body nests objects and arrays, counting
+// only the braces and brackets outside strings (a string's quotes end at the
+// first quote not escaped by a backslash). It stops once the depth is past
+// otlpMaxJSONDepth. A body that isn't valid JSON gets whatever depth the scan
+// finds; the decode refuses it.
+func otlpJSONDepth(data []byte) int {
+	depth, deepest := 0, 0
+	inString, escaped := false, false
+	for _, c := range data {
+		switch {
+		case escaped:
+			escaped = false
+		case inString:
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+		case c == '"':
+			inString = true
+		case c == '{' || c == '[':
+			depth++
+			if deepest = max(deepest, depth); deepest > otlpMaxJSONDepth {
+				return deepest
+			}
+		case c == '}' || c == ']':
+			depth = max(depth-1, 0)
+		}
+	}
+	return deepest
 }
 
 // otlpBytesKind says whether a known field is read from a length-delimited

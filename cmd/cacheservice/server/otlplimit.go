@@ -332,6 +332,8 @@ func otlpRefusal(err error) (int, string) {
 	switch {
 	case errors.As(err, &maxBytes), errors.Is(err, errOTLPTooLarge), errors.Is(err, errOTLPDecodesTooLarge):
 		return http.StatusRequestEntityTooLarge, metrics.OTLPRefusedTooLarge
+	case errors.Is(err, errOTLPDepth):
+		return http.StatusBadRequest, metrics.OTLPRefusedTooDeep
 	case errors.Is(err, errOTLPHeadersTooLarge):
 		return http.StatusRequestHeaderFieldsTooLarge, metrics.OTLPRefusedTooLarge
 	case errors.Is(err, errOTLPBusy):

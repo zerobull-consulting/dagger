@@ -1619,6 +1619,41 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     never fit in the budget is refused with **413** before it is decoded
     (`TestOTLPAmplifiedBodyRefused`).
 
+- **Nesting is bounded.** A body that nests deeper than the service decodes
+  is refused with **400**, counted as `too_deep`, before it is decoded
+  (`TestOTLPDeeplyNestedBodyRefused`, `TestOTLPNestedGroupsRefused`,
+  `TestOTLPDeeplyNestedJSONBodyRefused`,
+  [zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86)).
+  The estimate and `proto.Unmarshal` each recurse once per level, and the
+  stack that takes was not in the decode budget. The limit was 10,000 levels,
+  which a body of 40 KB reached, and the walk and the decode took a few MiB of
+  stack (scratch measurements: the goroutine's stack grew to 2 to 4 MiB for
+  the walk, and 4 to 8 MiB for the decode).
+  - **Protobuf: 64 levels** (`otlpMaxDepth`, the request being level 0),
+    counting nested groups, which the walk follows itself, without recursion,
+    since `protowire.ConsumeFieldValue` would walk them uncounted
+    (`TestOTLPNestedGroupsRefused`: 9,000 nested groups, 36 KB, were taken).
+    OTLP's own messages nest 8 levels down to the first `AnyValue`
+    (`TestOTLPFixedNestingDepth`), and an `AnyValue` nested through arrays adds
+    2 levels each, so 64 leaves 28 arrays below the deepest attribute. A body
+    at 64 levels is taken (`TestOTLPBodyAtMaxDepthTaken`).
+  - **JSON: 128 objects and arrays deep** (`otlpMaxJSONDepth`, twice the
+    other, since a message in a repeated field takes an array and an object),
+    counted outside strings (`TestOTLPJSONBracesInStringsNotCounted`).
+  - **The stack is reserved** before the body is walked (a request whose
+    stack doesn't fit is answered 503 without being walked,
+    `TestOTLPDecodeStackReservedBeforeWalk`), and apart from the 16 KiB each
+    request reserves: 64 KiB for a protobuf body (`otlpDecodeStack`) and
+    128 KiB for JSON (`otlpJSONDecodeStack`). At the limits, the goroutine's
+    stack grew to 16 to 32 KiB for the walk and 32 to 64 KiB for the decode of
+    a protobuf body, and 64 to 128 KiB for the decode of a JSON one (a stack
+    grows by doubling, so these are ranges). These are scratch measurements,
+    not a test.
+  - The e2e's `otlp-sizes` scenario logs how deep the real engines' requests
+    nest (`nestingDepth` in the `otlp request accepted` record) and fails if
+    the deepest is over half of 64 (`server.MaxOTLPNesting`), or if any
+    request taken was JSON, whose depth is not measured (`-1`).
+
   Since the decoded message counts too, the route limits are not the only
   bound on a body: one that decodes to more than the budget can hold is
   refused whatever its size. The e2e's requests estimated at up to 5.6 times
@@ -3021,7 +3056,7 @@ paths record into them through their metadata store. All are prefixed
 | `flush_duration_seconds` | | Time of each flush |
 | `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
-| `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full) or `timeout` (408). Nothing of them is recorded |
+| `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full), `timeout` (408) or `too_deep` (400, nested past the limit). Nothing of them is recorded |
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).

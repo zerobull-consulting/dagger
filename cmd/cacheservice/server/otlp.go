@@ -209,10 +209,22 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	if err != nil {
 		return refuse(err)
 	}
+	// The walk and the decode recurse once per level of the body, on the
+	// stack: reserve it before the walk, so a body nested to the limit holds
+	// its stack in the budget while it is estimated as well as while it is
+	// decoded.
+	stack := int64(otlpDecodeStack)
+	if isJSON(r) {
+		stack = otlpJSONDecodeStack
+	}
+	if !lim.budget.reserve(stack) {
+		return refuse(errOTLPBusy)
+	}
+	held += stack
 	// The message decoded from the body can take far more than the body
 	// (otlpDecodedSize): it is estimated, and reserved, before it is
 	// decoded. One that could never fit in the budget is too large.
-	estimate, err := otlpDecodedSize(data, msg, isJSON(r))
+	estimate, nesting, err := otlpDecodedSizeDepth(data, msg, isJSON(r))
 	if err != nil {
 		return refuse(err)
 	}
@@ -233,7 +245,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "messageBytes", estimate, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
+		"decodedBytes", len(data), "messageBytes", estimate, "nestingDepth", nesting, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 
