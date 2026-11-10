@@ -376,16 +376,19 @@ func TestWriterRefusesPrefixWithUpload(t *testing.T) {
 	}
 }
 
-// denyGets answers GETs of some keys with an error other than not found, as
-// a key allowed only its own prefix gets 403 above it.
-type denyGets struct {
+// failGets answers GETs of some keys with an error, as a key allowed only
+// its own prefix gets metastore.ErrDenied above it, or as a store that
+// fails. gets counts every GET, failed ones included.
+type failGets struct {
 	*counting
-	deny map[string]bool
+	fail map[string]error
+	gets int
 }
 
-func (d *denyGets) Get(ctx context.Context, key string) ([]byte, string, error) {
-	if d.deny[key] {
-		return nil, "", errors.New("AccessDenied")
+func (d *failGets) Get(ctx context.Context, key string) ([]byte, string, error) {
+	d.gets++
+	if err, ok := d.fail[key]; ok {
+		return nil, "", fmt.Errorf("get %s: %w", key, err)
 	}
 	return d.counting.Get(ctx, key)
 }
@@ -393,9 +396,9 @@ func (d *denyGets) Get(ctx context.Context, key string) ([]byte, string, error) 
 // A prefix inside one that holds a marker belongs to the service there:
 // both kinds of instance refuse it, naming the ancestor, and write nothing.
 // So does one under a marker at the bucket's top. A marker of any content
-// counts. An ancestor whose marker can't be read is skipped: the check is
-// best effort, and a nested claim costs no data, only the ancestor's GC,
-// which stops on it.
+// counts. An ancestor whose marker the key may not read (403) is skipped:
+// a nested claim costs no data, only the ancestor's GC, which stops on it.
+// Any other error reading it refuses (TestAncestorUnreadRefused).
 func TestNestedPrefixRefused(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct{ marker, prefix, ancestor string }{
@@ -417,10 +420,10 @@ func TestNestedPrefixRefused(t *testing.T) {
 			}
 		}
 	}
-	// An ancestor's marker the key can't read: skipped.
-	st := &denyGets{counting: newCounting(), deny: map[string]bool{"cacheservice.json": true}}
+	// An ancestor's marker the key may not read: skipped.
+	st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": metastore.ErrDenied}}
 	if state, _, err := Check(ctx, st, "cache", true, now); err != nil || state != Claimed {
-		t.Fatalf("an unreadable ancestor: %v, %v; want claimed", state, err)
+		t.Fatalf("an ancestor the key may not read: %v, %v; want claimed", state, err)
 	}
 	// A sibling's marker isn't an ancestor's.
 	st2 := newCounting()
@@ -458,4 +461,97 @@ func (c *claimBeforeUploads) ListUploadKeys(ctx context.Context, prefix string, 
 		c.AddUpload("p/ns/default/blobs/sha256/" + strings.Repeat("0", 64))
 	}
 	return c.counting.ListUploadKeys(ctx, prefix, max)
+}
+
+// An ancestor's marker that can't be read for an error other than not found
+// or access denied (a 5xx, a timeout, a dropped connection) refuses the
+// prefix, for both kinds of instance: the check can't tell whether a
+// service owns the ancestor. The error names the ancestor's key and wraps
+// the store's, and nothing is written. Ancestors after it aren't read: the
+// marker's own GET, then one per ancestor up to the one that failed, from
+// the bucket's top down.
+func TestAncestorUnreadRefused(t *testing.T) {
+	ctx := context.Background()
+	for name, cause := range map[string]error{
+		"5xx":        errors.New("InternalError: status 500"),
+		"503":        errors.New("SlowDown: status 503"),
+		"timeout":    context.DeadlineExceeded,
+		"connection": errors.New("connection reset by peer"),
+	} {
+		for _, tc := range []struct {
+			prefix, fail string
+			gets         int
+		}{
+			{"cache/team", "cacheservice.json", 2},
+			{"cache/team", "cache/cacheservice.json", 3},
+		} {
+			for _, writer := range []bool{true, false} {
+				st := &failGets{counting: newCounting(), fail: map[string]error{tc.fail: cause}}
+				_, _, err := Check(ctx, st, tc.prefix, writer, now)
+				var unread *ErrAncestorUnread
+				if !errors.As(err, &unread) || unread.Key != tc.fail || !errors.Is(err, cause) {
+					t.Fatalf("%s at %s, writer %v: %v; want ErrAncestorUnread of %s wrapping %v", name, tc.fail, writer, err, tc.fail, cause)
+				}
+				if !strings.Contains(err.Error(), tc.fail) || !strings.Contains(err.Error(), "cache/team/") {
+					t.Fatalf("%s: the error doesn't name the ancestor's key and the prefix: %v", name, err)
+				}
+				if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 || c["list"] != 1 || st.gets != tc.gets {
+					t.Fatalf("%s at %s, writer %v: %d GETs, want %d; requests %v", name, tc.fail, writer, st.gets, tc.gets, c)
+				}
+			}
+		}
+	}
+	// A missing marker at one ancestor and a denied one at another: both
+	// skipped.
+	st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": metastore.ErrDenied}}
+	if state, _, err := Check(ctx, st, "cache/team", true, now); err != nil || state != Claimed {
+		t.Fatalf("denied then not found: %v, %v; want claimed", state, err)
+	}
+}
+
+// A check whose context has ended while it reads an ancestor's marker
+// returns the context's error, not ErrAncestorUnread: the caller stopped
+// it (an interrupt, a deadline of its own), not the store. So does one
+// whose GET answered not found or denied as the context ended: a stopped
+// check always stops. Nothing is written, and no later ancestor is read.
+func TestAncestorCheckCancelled(t *testing.T) {
+	for name, answer := range map[string]error{
+		"the context's error": nil,
+		"not found":           metastore.ErrNotFound,
+		"denied":              metastore.ErrDenied,
+	} {
+		for _, writer := range []bool{true, false} {
+			ctx, cancel := context.WithCancel(context.Background())
+			st := &cancelAtGet{failGets: &failGets{counting: newCounting()}, key: "cacheservice.json", cancel: cancel, answer: answer}
+			_, _, err := Check(ctx, st, "cache/team", writer, now)
+			var unread *ErrAncestorUnread
+			if !errors.Is(err, context.Canceled) || errors.As(err, &unread) || !strings.Contains(err.Error(), "cacheservice.json") {
+				t.Fatalf("%s, writer %v: %v; want context.Canceled, naming the key, and no ErrAncestorUnread", name, writer, err)
+			}
+			if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 || st.gets != 1 {
+				t.Fatalf("%s, writer %v: requests %v, %d later GETs", name, writer, c, st.gets)
+			}
+		}
+	}
+}
+
+// cancelAtGet cancels the caller's context during the GET of key, which
+// then answers answer, or, when it is nil, the context's error, as the
+// SDK's does.
+type cancelAtGet struct {
+	*failGets
+	key    string
+	cancel context.CancelFunc
+	answer error
+}
+
+func (c *cancelAtGet) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if key == c.key {
+		c.cancel()
+		if c.answer != nil {
+			return nil, "", fmt.Errorf("get %s: %w", key, c.answer)
+		}
+		return nil, "", fmt.Errorf("get %s: %w", key, ctx.Err())
+	}
+	return c.failGets.Get(ctx, key)
 }

@@ -279,12 +279,32 @@ func (e *ErrNestedPrefix) Error() string {
 		"Set a CACHESERVICE_S3_PREFIX outside it (see the README, \"Bucket ownership\")", e.Prefix, anc, layout.MarkerKey(e.Ancestor))
 }
 
+// ErrAncestorUnread is an ancestor prefix's marker position that the
+// nested-prefix check couldn't read, for an error other than not found or
+// access denied: a 5xx, a timeout, a dropped connection. The check can't
+// tell whether a service owns the ancestor, so it refuses.
+type ErrAncestorUnread struct {
+	Prefix, Key string
+	Err         error
+}
+
+func (e *ErrAncestorUnread) Error() string {
+	return fmt.Sprintf("can't read %s, an ancestor's ownership marker position, to check that prefix %s/ isn't inside another service's: %v. "+
+		"Try again once the store answers (see the README, \"Bucket ownership\")", e.Key, e.Prefix, e.Err)
+}
+
+func (e *ErrAncestorUnread) Unwrap() error { return e.Err }
+
 // checkAncestors refuses a prefix whose ancestors hold a marker, of any
 // content: one GET per ancestor, made only when the prefix has none of its
-// own. It is best effort: an ancestor whose marker can't be read (a key
-// allowed only its own prefix gets 403 there) is skipped, since a nested
-// claim costs no data, only the ancestor's GC, which then stops on this
-// prefix's keys.
+// own. An ancestor whose marker is not found (metastore.ErrNotFound), or
+// that the key may not read (metastore.ErrDenied: a key allowed only its
+// own prefix gets 403 there), is skipped, since a nested claim costs no
+// data, only the ancestor's GC, which then stops on this prefix's keys. Any
+// other error (a 5xx, a timeout) refuses, with ErrAncestorUnread: the store
+// didn't say, so the check doesn't guess. The store's client retries; this
+// adds no retries of its own. When ctx has ended (the caller cancelled, or
+// its deadline passed), the error is ctx's, not the store's.
 func checkAncestors(ctx context.Context, st Store, prefix string) error {
 	p := strings.Trim(prefix, "/")
 	if p == "" {
@@ -293,9 +313,18 @@ func checkAncestors(ctx context.Context, st Store, prefix string) error {
 	segs := strings.Split(p, "/")
 	for i := range segs {
 		anc := strings.Join(segs[:i], "/")
-		_, _, err := st.Get(ctx, layout.MarkerKey(anc))
-		if err == nil {
+		key := layout.MarkerKey(anc)
+		_, _, err := st.Get(ctx, key)
+		switch {
+		case err == nil:
 			return &ErrNestedPrefix{Prefix: p, Ancestor: anc}
+		case ctx.Err() != nil:
+			// Whatever the store answered, a check its caller stopped stops.
+			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
+		case errors.Is(err, metastore.ErrNotFound), errors.Is(err, metastore.ErrDenied):
+			continue
+		default:
+			return &ErrAncestorUnread{Prefix: p, Key: key, Err: err}
 		}
 	}
 	return nil

@@ -286,10 +286,31 @@ checks the prefix:
   instance: with no marker of its own, an instance also reads the marker
   position of each ancestor prefix (`cache/` for `cache/team`, and the
   bucket's top), and refuses if any holds one, of any content: that
-  service owns everything under it (`TestNestedPrefixRefused`). Best
-  effort: an ancestor the key can't read (403, for a key allowed only its
-  own prefix) is skipped. A nested claim it misses costs no data, only the
-  ancestor's GC, which stops on the nested prefix's keys.
+  service owns everything under it (`TestNestedPrefixRefused`). What it
+  does on each answer for an ancestor's marker:
+  - **found** (of any content): refused, naming the ancestor.
+  - **not found** (404): skipped; that ancestor holds no store.
+  - **access denied** (403, for a key allowed only its own prefix):
+    skipped. A nested claim it misses costs no data, only the ancestor's
+    GC, which stops on the nested prefix's keys.
+  - **any other answer or error** (a 5xx, a 401, a store-specific code, a
+    timeout error, a dropped connection): refused, after the S3 client's
+    own retries, with `can't read <key>, an ancestor's ownership marker
+    position, to check that prefix <prefix>/ isn't inside another
+    service's: <the store's error>`. The check doesn't guess, and adds no
+    retries of its own: start again once the store answers
+    (`TestAncestorUnreadRefused`, `TestStartupAncestorMarkerErrors`,
+    `TestClaimAncestorMarkerErrors`).
+
+  Only those two answers are skipped, so a key allowed only its own prefix
+  must be denied the ancestors' markers with a 403. A key that a store
+  refuses with a 401, or with a code of its own, can't start or claim
+  there. Any 403
+  counts as denied, whatever its code: a marker that exists but that a
+  store answers with a 403 of another code (`InvalidObjectState`, say) is
+  skipped too (`TestClaimAncestorInvalidObjectStateSkippedKnownGap`). An
+  interrupt, or the caller's own deadline, ending the check while it reads
+  an ancestor's marker stops it with that error, not this refusal.
 - **An upload in progress counts too.** An object listing doesn't show
   multipart uploads, so a writer about to claim an empty prefix also lists
   them, and refuses one with any, after reading the marker once more, since a
@@ -589,7 +610,9 @@ shell, in this order:
    its multipart uploads, and `s3:GetObject` and `s3:PutObject` on the marker
    (`<prefix>/cacheservice.json`); on a fresh bucket, that is the admin key.
    `s3:GetObject` on each ancestor prefix's marker is optional (see the keys
-   table): without it, the nested-prefix check skips that ancestor.
+   table): on a 403, the nested-prefix check skips that ancestor. Any other
+   error reading it (a 5xx, a timeout error) refuses the claim; run `claim`
+   again.
 2. `lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>` (on
    MinIO, with `-abort-rule=false`).
 3. `lifecycle check -tokens-file tokens`: exit 0.
@@ -2609,7 +2632,7 @@ Keep three credentials, each with only what it needs
 | --- | --- | --- |
 | **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
 | **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
-| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs none of the lifecycle permissions, only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor), so the Read/Write/Delete key can claim a prefix, and so can an admin key that also has these (on Spaces, a full-access key does). |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs none of the lifecycle permissions, only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor on its 403; any other error reading it refuses), so the Read/Write/Delete key can claim a prefix, and so can an admin key that also has these (on Spaces, a full-access key does). |
 
 The admin key is the most powerful: a lifecycle rule can expire anything in
 the bucket. Use it for `lifecycle apply`, and for `plan` and `check` where the writer's
