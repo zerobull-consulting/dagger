@@ -79,6 +79,13 @@
 # the CLI's variables in GITHUB_ENV, and writes the step's outputs.
 set -euo pipefail
 
+# GNU timeout puts itself and its command in a process group of their own,
+# out of reach of start/run's kill of the script's group at its bound, and of
+# the cancel signals it passes on (zerobull-consulting/dagger#209).
+# --foreground keeps them in the script's group. It also stops timeout from
+# timing out its command's own children, and the docker CLI starts none.
+timeout() { command timeout --foreground "$@"; }
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die() {

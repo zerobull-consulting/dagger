@@ -61,15 +61,21 @@ function stopTimeoutMs(file) {
   return stopSeconds(file) * 1000 + stopSlackMs;
 }
 
-// Signals the shim passes on to the script: a cancelled job's.
-const forwarded = ['SIGINT', 'SIGTERM'];
+// Signals the shim passes on to the script: a cancelled job's, and a hangup.
+const forwarded = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+// setTimeout's limit: a longer delay fires at once. About 24.8 days, so no
+// bound here gets near it short of an absurd drain-timeout.
+const maxTimerMs = 2 ** 31 - 1;
 
 // Runs the script in a process group of its own (detached), so the bound can
 // kill all it spawned (docker, timeout, a pull), not only bash
 // (zerobull-consulting/dagger#209). Being in its own group, the script no
-// longer gets a signal sent to the shim's group, so the shim passes SIGINT
-// and SIGTERM on to it, and the bound still holds after one. Resolves to the
-// script's exit code, or 1 when it didn't finish or a signal ended it.
+// longer gets a signal sent to the shim's group, so the shim passes SIGINT,
+// SIGTERM and SIGHUP on to it, and the bound still holds after one. Once bash
+// exits, whatever it left in the group (a background job of a start that
+// failed) is killed too. sidecar.sh keeps its `timeout` calls in the group
+// (--foreground). Resolves to the script's exit code, or 1 when it didn't
+// finish or a signal ended it.
 function run(command, env, timeoutMs) {
   const script = scriptOf(env);
   return new Promise((resolve) => {
@@ -78,19 +84,18 @@ function run(command, env, timeoutMs) {
       try {
         process.kill(-child.pid, signal);
       } catch (_) {
-        // The group is gone already.
+        // The group is gone already, or never was (the spawn failed).
       }
     };
-    const onSignal = (signal) => killGroup(signal);
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       killGroup('SIGKILL');
-    }, timeoutMs);
-    for (const s of forwarded) process.on(s, onSignal);
+    }, Math.min(timeoutMs, maxTimerMs));
+    for (const s of forwarded) process.on(s, killGroup);
     const done = (code) => {
       clearTimeout(timer);
-      for (const s of forwarded) process.removeListener(s, onSignal);
+      for (const s of forwarded) process.removeListener(s, killGroup);
       resolve(code);
     };
     child.on('error', (e) => {
@@ -98,6 +103,7 @@ function run(command, env, timeoutMs) {
       done(1);
     });
     child.on('exit', (code) => {
+      killGroup('SIGKILL');
       if (timedOut) {
         console.log(`::error::remote-cache-sidecar: ${command} did not finish: killed after its bound of ${timeoutMs}ms`);
         return done(1);

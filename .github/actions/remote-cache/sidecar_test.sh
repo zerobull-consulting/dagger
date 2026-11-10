@@ -42,6 +42,12 @@ check "an image starting with '-' is refused" not valid_image "--privileged"
 check "a docker call in a wait is bounded by what is left of it" [ "$(step_bound $((SECONDS + 3)))" -le 3 ]
 check "... at most 10s" [ "$(step_bound $((SECONDS + 600)))" = 10 ]
 check "... and at least 1s, past its end" [ "$(step_bound $((SECONDS - 5)))" = 1 ]
+# zerobull-consulting/dagger#209: a bounded docker call stays in the script's
+# process group, which start/run kills at its bound (GNU timeout alone moves
+# to a group of its own).
+pgid_of() { ps -o pgid= -p "$1" | tr -d ' '; }
+check "a timeout call stays in the script's process group" \
+	[ "$(timeout 5 sh -c 'ps -o pgid= -p $$' | tr -d ' ')" = "$(pgid_of $$)" ]
 check "10m is 600s" [ "$(duration_seconds 10m)" = 600 ]
 check "1h30m is 5400s" [ "$(duration_seconds 1h30m)" = 5400 ]
 check "1.5h is refused" not duration_seconds 1.5h

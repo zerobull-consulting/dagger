@@ -8,6 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const shim = path.join(__dirname, 'index.js');
+const realSidecar = path.join(__dirname, '..', '..', 'sidecar.sh');
 
 // A fake sidecar.sh: logs each command; start writes the state file (stop in
 // 14s at most), stop removes it, as the real one does; FAKE_START_EXIT is
@@ -135,7 +136,20 @@ test('a run past its bound leaves nothing it spawned running', async (t) => {
   const pids = path.join(dir, 'pids');
   fs.writeFileSync(
     env.SIDECAR_SCRIPT,
-    '#!/usr/bin/env bash\nsleep 300 &\necho $! >>"$PIDS"\nbash -c \'sleep 300 & echo $! >>"$PIDS"; wait\' &\necho $! >>"$PIDS"\nwait\n',
+    [
+      '#!/usr/bin/env bash',
+      // The real script's functions, its timeout among them (it runs nothing
+      // when sourced): its docker calls are `timeout N docker ...`.
+      'source "$REAL_SIDECAR"',
+      'set +e',
+      'sleep 300 &',
+      'echo $! >>"$PIDS"',
+      'timeout 600 sh -c \'echo $$ >>"$PIDS"; exec sleep 300\' &',
+      'bash -c \'sleep 300 & echo $! >>"$PIDS"; wait\' &',
+      'echo $! >>"$PIDS"',
+      'wait',
+      '',
+    ].join('\n'),
     { mode: 0o755 },
   );
   const read = () => (fs.existsSync(pids) ? fs.readFileSync(pids, 'utf8').trim().split('\n').filter(Boolean).map(Number) : []);
@@ -149,37 +163,66 @@ test('a run past its bound leaves nothing it spawned running', async (t) => {
     }
   });
   const started = Date.now();
-  const code = await require(shim).run('stop', { ...env, PIDS: pids }, 1500);
+  const code = await require(shim).run('stop', { ...env, PIDS: pids, REAL_SIDECAR: realSidecar }, 1500);
+  spawned = read();
   assert.strictEqual(code, 1);
   assert.ok(Date.now() - started < 10000, 'the run was not cut off at its bound');
-  spawned = read();
-  assert.strictEqual(spawned.length, 3, `the script did not get to spawn everything: ${spawned}`);
+  assert.strictEqual(spawned.length, 4, `the script did not get to spawn everything: ${spawned}`);
   await waitFor(() => spawned.every(dead), 3000);
   for (const pid of spawned) assert.ok(dead(pid), `${pid} the script spawned is still running (${procState(pid)})`);
 });
 
 // The script is in a process group of its own, so a cancel's signal to the
 // shim reaches it only because the shim passes it on.
-test('a SIGTERM to the shim reaches the script, and the step fails', async (t) => {
+for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]]) {
+  const name = signal.slice(3);
+  test(`a ${signal} to the shim reaches the script, and the step fails`, async (t) => {
+    const { dir, env } = setup(t);
+    const ready = path.join(dir, 'ready');
+    const got = path.join(dir, 'got');
+    fs.writeFileSync(
+      env.SIDECAR_SCRIPT,
+      `#!/usr/bin/env bash\ntrap 'echo ${name} >"$GOT"; exit ${code}' ${name}\ntouch "$READY"\nfor i in $(seq 300); do sleep 0.1; done\n`,
+      { mode: 0o755 },
+    );
+    const child = spawn('node', [shim], { env: { ...env, READY: ready, GOT: got }, stdio: 'ignore' });
+    const exited = new Promise((r) => child.on('exit', (c, s) => r({ code: c, signal: s })));
+    t.after(() => child.kill('SIGKILL'));
+    assert.ok(await waitFor(() => fs.existsSync(ready), 10000), 'the script never started');
+    child.kill(signal);
+    const result = await Promise.race([exited, new Promise((r) => setTimeout(() => r('timeout'), 10000))]);
+    assert.notStrictEqual(result, 'timeout', `the shim did not exit after ${signal}`);
+    assert.ok(fs.existsSync(got), `the script never got the ${signal}`);
+    assert.strictEqual(fs.readFileSync(got, 'utf8').trim(), name);
+    // The shim outlives the signal to report the script's own exit, which fails the step.
+    assert.deepStrictEqual(result, { code, signal: null });
+  });
+}
+
+// A script that exits with a background job still running (a start that
+// failed during its pulls) leaves nothing behind either.
+test('a run that ends before its bound leaves nothing it spawned running', async (t) => {
   const { dir, env } = setup(t);
-  const ready = path.join(dir, 'ready');
-  const got = path.join(dir, 'got');
-  fs.writeFileSync(
-    env.SIDECAR_SCRIPT,
-    '#!/usr/bin/env bash\ntrap \'echo TERM >"$GOT"; exit 143\' TERM\ntouch "$READY"\nfor i in $(seq 300); do sleep 0.1; done\n',
-    { mode: 0o755 },
-  );
-  const child = spawn('node', [shim], { env: { ...env, READY: ready, GOT: got }, stdio: 'ignore' });
-  const exited = new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
-  t.after(() => child.kill('SIGKILL'));
-  assert.ok(await waitFor(() => fs.existsSync(ready), 10000), 'the script never started');
-  child.kill('SIGTERM');
-  const result = await Promise.race([exited, new Promise((r) => setTimeout(() => r('timeout'), 10000))]);
-  assert.notStrictEqual(result, 'timeout', 'the shim did not exit after SIGTERM');
-  assert.ok(fs.existsSync(got), 'the script never got the SIGTERM');
-  assert.strictEqual(fs.readFileSync(got, 'utf8').trim(), 'TERM');
-  // The shim outlives the signal to report the script's own exit: 143 fails the step.
-  assert.deepStrictEqual(result, { code: 143, signal: null });
+  const pids = path.join(dir, 'pids');
+  fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\nsleep 300 &\necho $! >"$PIDS"\nexit 3\n', { mode: 0o755 });
+  let pid = 0;
+  t.after(() => {
+    try {
+      if (pid) process.kill(pid, 'SIGKILL');
+    } catch (_) {}
+  });
+  const code = await require(shim).run('stop', { ...env, PIDS: pids }, 10000);
+  pid = Number(fs.readFileSync(pids, 'utf8'));
+  assert.strictEqual(code, 3);
+  assert.ok(await waitFor(() => dead(pid), 3000), `${pid} the script spawned is still running (${procState(pid)})`);
+});
+
+// setTimeout fires at once on a delay over 2^31-1 ms; spawnSync's timeout
+// didn't. A stop_seconds that large (a drain-timeout of 600h) still runs.
+test('a bound longer than a timer can hold does not cut the run off at once', async (t) => {
+  const { env } = setup(t);
+  fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\nsleep 0.3\nexit 0\n', { mode: 0o755 });
+  assert.strictEqual(await require(shim).run('stop', env, 2160025 * 1000), 0);
 });
 
 // A start that never had a script to run leaves the post step nothing to stop.
