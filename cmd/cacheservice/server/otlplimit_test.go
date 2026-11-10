@@ -16,6 +16,7 @@ import (
 	"net/http/httptrace"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +33,9 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
@@ -2027,42 +2030,164 @@ func TestOTLPWrongWireTypeChargedAsUnknown(t *testing.T) {
 	}
 }
 
-// Known gap: a repeated string or bytes field takes the packed-scalar branch,
-// so an element is charged its length times 16, and an empty one nothing,
-// though it decodes to a 16-byte string header in a growing slice.
-// EntityRef.id_keys (Resource.entity_refs, field 3) is the only such field in
-// OTLP's messages (zerobull-consulting/dagger#217 tracks the fix). A separate
-// run of 1,000,000 empty elements for zerobull-consulting/dagger#204, not
-// what this test builds (it uses n = 100000): 2,000,012 bytes on the wire,
-// estimated at 462 bytes, allocated 88 MB in total and retained 15.8 MB.
-func TestOTLPEmptyRepeatedStringsKnownGap(t *testing.T) {
-	const n = 100000
-	var ent []byte
-	for range n {
-		ent = protowire.AppendTag(ent, 3, protowire.BytesType) // id_keys
-		ent = protowire.AppendBytes(ent, nil)
-	}
-	wrap := func(num protowire.Number, b []byte) []byte {
-		return protowire.AppendBytes(protowire.AppendTag(nil, num, protowire.BytesType), b)
-	}
+// Each element of a repeated string or bytes field decodes to a 16-byte
+// string header appended to the field's slice, and its bytes copied, so it is
+// charged its length and otlpStringElemCost (four headers: append holds up
+// to 3.12 per element, at 33 elements), though it takes 2 bytes on the wire
+// when empty. EntityRef.id_keys (Resource.entity_refs, field 3) is the
+// only such field in OTLP's messages. Before zerobull-consulting/dagger#217
+// they took the packed-scalar branch, and an empty one was charged nothing: a
+// run of 1,000,000 empty elements, 2,000,012 bytes on the wire, was estimated
+// at 462 bytes, and allocated 88 MB in total, retaining 15.8 MB.
+// otlpHeldKeys keeps what TestOTLPEmptyRepeatedStringsCoverDecodePeak appends.
+var otlpHeldKeys []string
+
+func TestOTLPEmptyRepeatedStringsCoverDecodePeak(t *testing.T) {
+	headerSize := int64(unsafe.Sizeof(""))
+	// body is a request whose one EntityRef has these id_keys:
 	// ExportTraceServiceRequest.resource_spans (1) > ResourceSpans.resource
 	// (1) > Resource.entity_refs (3) > EntityRef.id_keys (3).
-	body := wrap(1, wrap(1, wrap(3, ent)))
-	m := &coltracepb.ExportTraceServiceRequest{}
-	if err := proto.Unmarshal(body, m); err != nil {
-		t.Fatal(err)
+	body := func(keys []string) []byte {
+		var ent []byte
+		for _, k := range keys {
+			ent = protowire.AppendTag(ent, 3, protowire.BytesType)
+			ent = protowire.AppendString(ent, k)
+		}
+		wrap := func(num protowire.Number, b []byte) []byte {
+			return protowire.AppendBytes(protowire.AppendTag(nil, num, protowire.BytesType), b)
+		}
+		return wrap(1, wrap(1, wrap(3, ent)))
 	}
-	keys := m.ResourceSpans[0].Resource.EntityRefs[0].IdKeys
-	if len(keys) != n {
-		t.Fatalf("%d id_keys decoded", len(keys))
+	// held is what the decode holds at its peak for the keys: the largest
+	// old and new array of headers append holds at once, and the strings'
+	// bytes. It also says the final capacity, to check it against the
+	// decoder's.
+	held := func(keys []string) (peak int64, final int) {
+		var s []string
+		var data int64
+		for _, k := range keys {
+			before := cap(s)
+			s = append(s, k)
+			if cap(s) != before {
+				peak = max(peak, int64(before+cap(s))*headerSize)
+			}
+			data += int64(len(k))
+		}
+		// Kept, so s escapes to the heap as the decoder's slice does: one
+		// that doesn't can start in a buffer on the stack.
+		otlpHeldKeys = s
+		return peak + data, cap(s)
 	}
-	held := int64(len(keys)) * int64(unsafe.Sizeof(""))
-	est, err := otlpDecodedSize(body, &coltracepb.ExportTraceServiceRequest{}, false)
+	check := func(t *testing.T, keys []string) {
+		t.Helper()
+		b := body(keys)
+		m := &coltracepb.ExportTraceServiceRequest{}
+		if err := proto.Unmarshal(b, m); err != nil {
+			t.Fatal(err)
+		}
+		got := m.ResourceSpans[0].Resource.EntityRefs[0].IdKeys
+		p, finalCap := held(keys)
+		if len(got) != len(keys) || cap(got) != finalCap {
+			t.Fatalf("decoded %d id_keys in %d, appending %d gives %d", len(got), cap(got), len(keys), finalCap)
+		}
+		est, err := otlpDecodedSize(b, &coltracepb.ExportTraceServiceRequest{}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Only the id_keys: the messages around them are charged on their own.
+		base, err := otlpDecodedSize(body(nil), &coltracepb.ExportTraceServiceRequest{}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if est-base < p {
+			t.Fatalf("%d id_keys: charged %d, under the %d bytes the decode holds at its peak", len(keys), est-base, p)
+		}
+	}
+	// The peak depends on where the count ends relative to append's growth
+	// steps, so sweep it past where append stops doubling (256 elements).
+	var keys []string
+	for n := 1; n <= 1000; n++ {
+		keys = append(keys, "")
+		check(t, keys)
+	}
+	for _, c := range []struct {
+		name string
+		n    int
+		key  string
+	}{
+		{"100000 empty", 100000, ""},
+		{"100000 of 1 byte", 100000, "k"},
+		{"10000 of 100 bytes", 10000, strings.Repeat("k", 100)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			keys := make([]string, c.n)
+			for i := range keys {
+				keys[i] = c.key
+			}
+			check(t, keys)
+		})
+	}
+
+	// And the heap the decoded message keeps, measured, is under the
+	// estimate.
+	keys = make([]string, 100000)
+	b := body(keys)
+	est, err := otlpDecodedSize(b, &coltracepb.ExportTraceServiceRequest{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if est >= held {
-		t.Fatalf("the estimate %d now covers the %d bytes of string headers: the gap is closed, "+
-			"so replace this test with one that checks it", est, held)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	m := &coltracepb.ExportTraceServiceRequest{}
+	if err := proto.Unmarshal(b, m); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if kept := int64(after.HeapAlloc) - int64(before.HeapAlloc); kept > est {
+		t.Fatalf("the decoded message keeps %d bytes, over the %d estimated", kept, est)
+	}
+	runtime.KeepAlive(m)
+}
+
+// No OTLP message has a repeated bytes field, but the estimate charges one
+// the same way, at its 24-byte slice header: an empty element is charged
+// otlpBytesElemCost, here in a message built for the test.
+func TestOTLPEmptyRepeatedBytesChargedPerElement(t *testing.T) {
+	fd, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("otlp_repeated_bytes_test.proto"),
+		Package: proto.String("otlptest"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Keys"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name:   proto.String("keys"),
+				Number: proto.Int32(1),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum(),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := fd.Messages().Get(0)
+	const n = 1000
+	var body []byte
+	for range n {
+		body = protowire.AppendBytes(protowire.AppendTag(body, 1, protowire.BytesType), nil)
+	}
+	var depth int
+	empty, err := otlpProtoSize(nil, md, 0, &depth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := otlpProtoSize(body, md, 0, &depth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if per := (got - empty) / n; per < 4*int64(unsafe.Sizeof([]byte(nil))) {
+		t.Fatalf("an empty bytes element is charged %d", per)
 	}
 }
