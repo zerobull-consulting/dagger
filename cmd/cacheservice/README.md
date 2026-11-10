@@ -392,6 +392,11 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   repeating exactly the bucket and the prefix (without surrounding slashes).
   A missing or wrong one exits 2 before any request. So does an empty
   `CACHESERVICE_S3_PREFIX`: wiping a whole bucket isn't supported.
+- **Before deleting anything,** a wipe lists the prefix's objects and
+  uploads, read-only, as a dry run does: a listing the key isn't allowed
+  refuses it then, not halfway through (`TestUploadListingRefusedBeforeDelete`),
+  and it prints the same warning about nested stores
+  (`TestWipeWarnsNestedMarkers`).
 - **The order:** the ownership marker first, so a wipe cut off halfway leaves
   keys without a marker, which every instance refuses
   (`TestInterruptedWipeLeavesRefusedPrefix`,
@@ -412,8 +417,18 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
 - **Exit codes:** 0 a dry run reported, or the prefix is empty after the
   wipe; 1 an error, a refusal, or a key or upload that failed (up to 20 are
   listed); 2 usage or confirmation; 3 every request succeeded but the prefix isn't empty
-  after the wipe (a writer is running). `-timeout` (default 30m) bounds the
-  run, and each request is bounded to 30s.
+  after the wipe (a writer is running). `-timeout` (default 30m, room for
+  about one to two million keys) bounds the run, and each request is bounded
+  to 30s.
+- **Versioned buckets:** noncurrent versions aren't deleted (a delete
+  without a version ID only adds a delete marker); not run on a versioned
+  bucket.
+- **Keys XML can't carry** (a control character such as U+0001, which MinIO
+  stores): the listings ask for URL-encoded keys, so a dry run names them,
+  but MinIO answers a `DeleteObjects` of such a key without an error and
+  keeps it, so the wipe leaves it and exits 3. A single `DeleteObject`
+  request for the key removes it (seen with the Go SDK on MinIO;
+  `TestMinIOControlCharKeyNotDeletedKnownGap`).
 
 **Later: import from one prefix, export to another.** Images are pinned by
 SHA, so an old image can still read the old prefix: run an engine with a

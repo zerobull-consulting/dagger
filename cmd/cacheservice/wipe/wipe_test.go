@@ -45,6 +45,11 @@ type fakeStore struct {
 	exactKey bool
 	// listErr, when set, fails the listing of objects after startAfter.
 	listErr func(startAfter string) error
+	// uploadsErr, when set, fails every listing of uploads.
+	uploadsErr error
+	// extraUpload, when set, is an upload every listing of uploads
+	// returns, whatever the prefix: a store that ignores it.
+	extraUpload *Upload
 }
 
 func (f *fakeStore) UploadsByExactKey() bool { return f.exactKey }
@@ -109,6 +114,9 @@ func (f *fakeStore) ListUploads(_ context.Context, prefix, keyMarker, idMarker s
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "uploads "+prefix)
+	if f.uploadsErr != nil {
+		return nil, "", "", f.uploadsErr
+	}
 	n := f.pageSize
 	if n == 0 {
 		n = PageSize
@@ -124,6 +132,9 @@ func (f *fakeStore) ListUploads(_ context.Context, prefix, keyMarker, idMarker s
 		if match && u.Key+"\x00"+u.ID > keyMarker+"\x00"+idMarker {
 			out = append(out, u)
 		}
+	}
+	if f.extraUpload != nil {
+		out = append([]Upload{*f.extraUpload}, out...)
 	}
 	if len(out) > n {
 		last := out[n-1]
@@ -610,7 +621,7 @@ func TestFailuresExit1(t *testing.T) {
 	if code != ExitError {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
-	for _, s := range []string{`FAILED "cache/ns/main/index.json"`, `FAILED "upload:cache/ns/main/staging/a"`, "deleted 25 objects, 2500 bytes; aborted 1 incomplete multipart uploads; 2 failed", "the prefix isn't empty"} {
+	for _, s := range []string{`FAILED "cache/ns/main/index.json"`, `FAILED "upload:cache/ns/main/staging/a": upload ID "2": 500`, "deleted 25 objects, 2500 bytes; aborted 1 incomplete multipart uploads; 2 failed", "the prefix isn't empty"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("output lacks %q:\n%s", s, out)
 		}
@@ -787,7 +798,9 @@ func TestFailuresPrintedOnEarlyExit(t *testing.T) {
 	seed(f, 1)
 	f.deleteFailures = map[string]bool{"cache/ns/main/blobs/sha256/01": true}
 	f.listErr = func(startAfter string) error {
-		if startAfter != "" {
+		// Once deleting has started (the pre-listing is done), with f.mu
+		// held by List.
+		if startAfter != "" && len(f.deleted) > 0 {
 			return errors.New("connection reset")
 		}
 		return nil
@@ -869,5 +882,51 @@ func TestUploadsByExactKeyRootUpload(t *testing.T) {
 		if strings.HasPrefix(u, "cache/") {
 			t.Fatalf("left %v", f.uploadKeys())
 		}
+	}
+}
+
+// A real wipe names the stores nested in the prefix before it deletes
+// anything.
+func TestWipeWarnsNestedMarkers(t *testing.T) {
+	f := newFake()
+	seed(f, 2)
+	f.put("cache/team/cacheservice.json", 1)
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	w, d := strings.Index(out, "WARNING: 1 ownership markers under the prefix"), strings.Index(out, "deleted the ownership marker")
+	if code != ExitOK || w < 0 || d < w || !strings.Contains(out, `  "cache/team/cacheservice.json"`) {
+		t.Fatalf("exit %d, warning at %d, first delete at %d\n%s", code, w, d, out)
+	}
+}
+
+// Uploads it can't list refuse the wipe before anything is deleted, not
+// after the objects are gone.
+func TestUploadListingRefusedBeforeDelete(t *testing.T) {
+	f := newFake()
+	seed(f, 2)
+	f.uploadsErr = errors.New("AccessDenied: ListBucketMultipartUploads")
+	keys := f.keys()
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	if code != ExitError || !strings.Contains(out, "nothing deleted") || !slices.Equal(f.keys(), keys) {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "delete ") || strings.HasPrefix(c, "abort ") {
+			t.Fatalf("made %s", c)
+		}
+	}
+}
+
+// An upload outside the prefix that a store lists anyway is left out:
+// never aborted, never counted, and the wipe completes.
+func TestUploadOutsidePrefixFiltered(t *testing.T) {
+	f := newFake()
+	seed(f, 1)
+	f.extraUpload = &Upload{Key: "cache2/staging/b", ID: "3"}
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	if code != ExitOK || !strings.Contains(out, "aborted 2 incomplete multipart uploads") || slices.Contains(f.aborted, "cache2/staging/b") {
+		t.Fatalf("exit %d, aborted %v\n%s", code, f.aborted, out)
+	}
+	if _, out := run(t, f, Options{Prefix: "cache", DryRun: true}); !strings.Contains(out, "incomplete multipart uploads: 0") {
+		t.Fatalf("dry run:\n%s", out)
 	}
 }

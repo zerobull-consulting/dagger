@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,7 +54,8 @@ const (
 )
 
 // DefaultTimeout bounds a whole run. A wipe lists and deletes 1,000 keys a
-// request pair, so this is room for a few million keys.
+// request pair, one pair at a time, so this is room for about one to two
+// million keys; a larger prefix takes another run, or a longer -timeout.
 const DefaultTimeout = 30 * time.Minute
 
 // MaxPages bounds each listing loop: PageSize keys or uploads a page, so
@@ -223,6 +225,18 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		return ExitOK
 	}
 
+	// Before anything is deleted: list it all, read-only. A listing the key
+	// isn't allowed (the bucket's uploads, on some stores) refuses now, not
+	// halfway through; and the stores nested in the prefix are named.
+	pre, err := survey(ctx, st, root)
+	if err != nil {
+		return fail(ExitError, "can't list the prefix: %v; nothing deleted", err)
+	}
+	if pre.Nested > 0 {
+		fmt.Fprintf(out, "WARNING: %d ownership markers under the prefix, of stores nested in it, which this wipe deletes too:\n", pre.Nested)
+		printKeys(out, pre.NestedKeys, pre.Nested)
+	}
+
 	var (
 		deleted, aborted int
 		bytes            int64
@@ -286,7 +300,7 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 				if ctx.Err() != nil {
 					return context.Cause(ctx)
 				}
-				failures.add(Failure{Key: "upload:" + u.Key, Reason: err.Error()})
+				failures.add(Failure{Key: "upload:" + u.Key, Reason: "upload ID " + strconv.Quote(u.ID) + ": " + err.Error()})
 				continue
 			}
 			aborted++
@@ -332,37 +346,29 @@ func (l *failureLog) add(fs ...Failure) {
 }
 
 // checkAncestors refuses a prefix inside another store's: an ancestor
-// prefix (the bucket's top included) holding an ownership marker, of any
-// content, owns everything under it, so this wipe would delete part of
-// that store. As ownership's own check: an ancestor's marker not found, or
-// that the key may not read (metastore.ErrDenied), is skipped; any other
-// error refuses, since the store didn't say.
+// prefix (the bucket's top included) holding an ownership marker owns
+// everything under it, so this wipe would delete part of that store. It is
+// the service's own check (ownership.CheckAncestors), with what to do
+// instead of this wipe.
 func checkAncestors(ctx context.Context, st Store, prefix string) error {
-	p := strings.Trim(prefix, "/")
-	segs := strings.Split(p, "/")
-	for i := range segs {
-		anc := strings.Join(segs[:i], "/")
-		key := layout.MarkerKey(anc)
-		_, err := st.Get(ctx, key)
-		switch {
-		case err == nil:
-			where, instead := "the bucket's top", "empty the bucket in the provider's console" // an empty prefix isn't supported
-			if anc != "" {
-				where = "prefix " + anc + "/"
-				instead = "wipe " + where + " itself"
-			}
-			return fmt.Errorf("prefix %s/ is inside %s, which holds an ownership marker (%s): wiping it would delete part of that store. "+
-				"Set %s outside it, or %s", p, where, key, blobstore.EnvPrefix, instead)
-		case ctx.Err() != nil:
-			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
-		case errors.Is(err, metastore.ErrNotFound), errors.Is(err, metastore.ErrDenied):
-			continue
-		default:
-			return fmt.Errorf("can't read %s, an ancestor's ownership marker position, to check that prefix %s/ isn't inside another store: %v. "+
-				"Try again once the store answers", key, p, err)
+	err := ownership.CheckAncestors(ctx, storeGetter{st}, prefix)
+	var nested *ownership.ErrNestedPrefix
+	if errors.As(err, &nested) {
+		instead := "empty the bucket in the provider's console" // an empty prefix isn't supported
+		if nested.Ancestor != "" {
+			instead = "wipe prefix " + nested.Ancestor + "/ itself"
 		}
+		return fmt.Errorf("%w; wiping it would delete part of that store, so instead, %s", err, instead)
 	}
-	return nil
+	return err
+}
+
+// storeGetter is st as ownership reads it.
+type storeGetter struct{ st Store }
+
+func (g storeGetter) Get(ctx context.Context, key string) ([]byte, string, error) {
+	b, err := g.st.Get(ctx, key)
+	return b, "", err
 }
 
 // markerState is what the report says of the prefix's marker.
@@ -486,8 +492,8 @@ func walkUploads(ctx context.Context, st Store, root string, fn func([]Upload) e
 
 // walkUploadListing pages through the uploads the store lists for prefix
 // ("": the bucket's), at most MaxPages, and calls fn with those under root,
-// leaving out those at exactly root with skipRoot. A listing by root's
-// prefix that returns any other is refused. It returns how many it passed
+// leaving out those at exactly root with skipRoot. Any other upload the
+// store lists is left out, and never aborted. It returns how many it passed
 // to fn strictly below root, and at exactly root.
 func walkUploadListing(ctx context.Context, st Store, prefix, root string, skipRoot bool, fn func([]Upload) error) (below, atRoot int, err error) {
 	keyMarker, idMarker := "", ""
@@ -496,13 +502,7 @@ func walkUploadListing(ctx context.Context, st Store, prefix, root string, skipR
 		if err != nil {
 			return below, atRoot, err
 		}
-		if prefix != "" {
-			if err := under(root, upKeys(ups)); err != nil {
-				return below, atRoot, err
-			}
-		} else {
-			ups = slices.DeleteFunc(ups, func(u Upload) bool { return !strings.HasPrefix(u.Key, root) })
-		}
+		ups = slices.DeleteFunc(ups, func(u Upload) bool { return !strings.HasPrefix(u.Key, root) })
 		if skipRoot {
 			ups = slices.DeleteFunc(ups, func(u Upload) bool { return u.Key == root })
 		}

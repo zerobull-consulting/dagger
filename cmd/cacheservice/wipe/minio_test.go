@@ -347,3 +347,51 @@ func TestMinIORefusesUploadAtRoot(t *testing.T) {
 		t.Fatalf("an upload at %s: %v (code %q), want XMinioInvalidObjectName", k, err, code)
 	}
 }
+
+// Keys that URL encoding must round-trip (a space, +, %, & and <>): the
+// listing asks for EncodingType=url and decodes them, so the dry run names
+// them as they are, and the wipe deletes them.
+func TestMinIOAwkwardKeys(t *testing.T) {
+	e := newMinIOEnv(t)
+	for _, k := range []string{"cache/ns/x/a b+c%25&<>", "cache/ns/x/%2F"} {
+		e.put(k, 1)
+	}
+	e.put("cache2/ns/x/a b", 1)
+	code, out := e.main()
+	if code != ExitOK || !strings.Contains(out, "objects: 2, 2 bytes") || !strings.Contains(out, `/cache/ns/x/a b+c%25&<>"`) || !strings.Contains(out, `/cache/ns/x/%2F"`) {
+		t.Fatalf("dry run: exit %d\n%s", code, out)
+	}
+	if code, out := e.main("-dry-run=false", "-confirm="+e.cfg.Bucket+"/"+e.target); code != ExitOK || !strings.Contains(out, "deleted 2 objects") {
+		t.Fatalf("wipe: exit %d\n%s", code, out)
+	}
+	if k, _ := e.listing(); !slices.Equal(k, []string{e.cfg.Prefix + "/cache2/ns/x/a b"}) {
+		t.Fatalf("left %q", k)
+	}
+}
+
+// Known gap: a key holding a character XML can't carry, such as U+0001,
+// which MinIO stores. Listing it works (EncodingType=url; without it the
+// page fails to parse, seen on the dev MinIO), so a dry run names it. But
+// MinIO answers DeleteObjects for it with no error and keeps it (seen), so
+// a wipe leaves it, and exits 3. A single DeleteObject does remove it
+// (seen), which is what this test's cleanup uses.
+func TestMinIOControlCharKeyNotDeletedKnownGap(t *testing.T) {
+	e := newMinIOEnv(t)
+	key := e.cfg.Prefix + "/cache/ns/x/\x01"
+	// Before the scope's own cleanup, which lists without URL encoding.
+	t.Cleanup(func() {
+		if _, err := e.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: &e.cfg.Bucket, Key: &key}); err != nil {
+			t.Errorf("cleaning up %q: %v", key, err)
+		}
+	})
+	e.put("cache/ns/x/\x01", 1)
+	e.put("cache/ns/x/ok", 1)
+	code, out := e.main()
+	if code != ExitOK || !strings.Contains(out, "objects: 2, 2 bytes") || !strings.Contains(out, `/cache/ns/x/\x01"`) {
+		t.Fatalf("dry run: exit %d\n%s", code, out)
+	}
+	code, out = e.main("-dry-run=false", "-confirm="+e.cfg.Bucket+"/"+e.target)
+	if code != ExitNotEmpty || !strings.Contains(out, "objects: 1, 1 bytes") || !strings.Contains(out, `/cache/ns/x/\x01"`) {
+		t.Fatalf("wipe: exit %d, want %d (the gap: DeleteObjects keeps the key)\n%s", code, ExitNotEmpty, out)
+	}
+}

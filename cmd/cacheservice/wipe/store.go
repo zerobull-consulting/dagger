@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -94,7 +95,9 @@ var _ Store = (*S3Store)(nil)
 func (s *S3Store) List(ctx context.Context, prefix, startAfter string) ([]Object, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
-	in := &s3.ListObjectsV2Input{Bucket: &s.Bucket, Prefix: aws.String(prefix), MaxKeys: aws.Int32(PageSize)}
+	// URL-encoded keys: a key holding a character XML can't carry (such as
+	// U+0001, which MinIO stores) otherwise fails the whole page's parse.
+	in := &s3.ListObjectsV2Input{Bucket: &s.Bucket, Prefix: aws.String(prefix), MaxKeys: aws.Int32(PageSize), EncodingType: types.EncodingTypeUrl}
 	if startAfter != "" {
 		in.StartAfter = aws.String(startAfter)
 	}
@@ -104,7 +107,11 @@ func (s *S3Store) List(ctx context.Context, prefix, startAfter string) ([]Object
 	}
 	objs := make([]Object, 0, len(out.Contents))
 	for _, o := range out.Contents {
-		objs = append(objs, Object{Key: aws.ToString(o.Key), Size: aws.ToInt64(o.Size)})
+		k, err := decodeKey(aws.ToString(o.Key))
+		if err != nil {
+			return nil, false, fmt.Errorf("list %s: %w", prefix, err)
+		}
+		objs = append(objs, Object{Key: k, Size: aws.ToInt64(o.Size)})
 	}
 	return objs, aws.ToBool(out.IsTruncated), nil
 }
@@ -112,7 +119,7 @@ func (s *S3Store) List(ctx context.Context, prefix, startAfter string) ([]Object
 func (s *S3Store) ListUploads(ctx context.Context, prefix, keyMarker, idMarker string) ([]Upload, string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
-	in := &s3.ListMultipartUploadsInput{Bucket: &s.Bucket, MaxUploads: aws.Int32(PageSize)}
+	in := &s3.ListMultipartUploadsInput{Bucket: &s.Bucket, MaxUploads: aws.Int32(PageSize), EncodingType: types.EncodingTypeUrl}
 	if prefix != "" {
 		in.Prefix = aws.String(prefix)
 	}
@@ -129,12 +136,20 @@ func (s *S3Store) ListUploads(ctx context.Context, prefix, keyMarker, idMarker s
 	}
 	ups := make([]Upload, 0, len(out.Uploads))
 	for _, u := range out.Uploads {
-		ups = append(ups, Upload{Key: aws.ToString(u.Key), ID: aws.ToString(u.UploadId)})
+		k, err := decodeKey(aws.ToString(u.Key))
+		if err != nil {
+			return nil, "", "", fmt.Errorf("list uploads under %s: %w", prefix, err)
+		}
+		ups = append(ups, Upload{Key: k, ID: aws.ToString(u.UploadId)})
 	}
 	if !aws.ToBool(out.IsTruncated) {
 		return ups, "", "", nil
 	}
-	return ups, aws.ToString(out.NextKeyMarker), aws.ToString(out.NextUploadIdMarker), nil
+	nextKey, err := decodeKey(aws.ToString(out.NextKeyMarker))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("list uploads under %s: %w", prefix, err)
+	}
+	return ups, nextKey, aws.ToString(out.NextUploadIdMarker), nil
 }
 
 func (s *S3Store) Get(ctx context.Context, key string) ([]byte, error) {
@@ -194,4 +209,13 @@ func (s *S3Store) Abort(ctx context.Context, u Upload) error {
 		return fmt.Errorf("abort upload of %s: %w", u.Key, err)
 	}
 	return nil
+}
+
+// decodeKey is a key of a listing asked for with EncodingType url.
+func decodeKey(k string) (string, error) {
+	d, err := url.QueryUnescape(k)
+	if err != nil {
+		return "", fmt.Errorf("the store listed a key it didn't URL-encode, %q: %w", k, err)
+	}
+	return d, nil
 }
