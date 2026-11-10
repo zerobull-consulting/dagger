@@ -108,12 +108,9 @@ func (s *Service) removeFlushRun(r *flushRun) {
 }
 
 // flushStored counts roots stored by an export of a namespace's cache, for
-// each flush of it under way. It runs before the tracker hears of the
+// each flush of it under way (see exportStored). It runs before the tracker hears of the
 // export, so a flush that then sees nothing in flight has counted it.
 func (s *Service) flushStored(ns *namespace, cacheID string, roots int) {
-	if roots == 0 {
-		return
-	}
 	s.flushes.mu.Lock()
 	defer s.flushes.mu.Unlock()
 	for r := range s.flushes.runs {

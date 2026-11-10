@@ -242,17 +242,27 @@ func (s *Service) wakeIfEngineConnected(ns *namespace, b exporter.Batch) {
 	ns.tracker.WakeEngineWait(b.CacheID, eng.Generation(), s.export.now())
 }
 
+// exportStored counts the roots an export of a namespace's cache stored,
+// for the drain's report while draining and for each flush of the cache
+// under way. It is the one place exports report what they stored to both.
+func (s *Service) exportStored(ns *namespace, cacheID string, roots int) {
+	if roots == 0 {
+		return
+	}
+	if s.draining.Load() {
+		s.drainStored(ns, cacheID, roots)
+	}
+	s.flushStored(ns, cacheID, roots)
+}
+
 // exportBatch exports b on eng, records its result in the tracker, and
 // measures it.
 func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.Batch) (exporter.Result, error) {
 	start := time.Now()
 	res, err := eng.ns.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
-	// Counted before the tracker hears of it: once it does, the drain may
-	// see nothing in flight and end its report.
-	if len(res.Stored) > 0 && s.draining.Load() {
-		s.drainStored(eng.ns, eng.CacheID(), len(res.Stored))
-	}
-	s.flushStored(eng.ns, eng.CacheID(), len(res.Stored))
+	// Counted before the tracker hears of it: once it does, a drain or a
+	// flush may see nothing in flight and end its report.
+	s.exportStored(eng.ns, eng.CacheID(), len(res.Stored))
 	outcome := s.recordExport(ctx, eng, b, res, err)
 	if s.testHookExportRecorded != nil {
 		s.testHookExportRecorded()
