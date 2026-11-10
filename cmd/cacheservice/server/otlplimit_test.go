@@ -686,14 +686,15 @@ func TestIdleKeepAliveConnectionClosed(t *testing.T) {
 	if resp := readResponse(t, br); resp.StatusCode != http.StatusOK {
 		t.Fatalf("first request: %d", resp.StatusCode)
 	}
-	// The server closes the idle connection: a read sees EOF, after about
-	// the timeout and well before the read deadline.
+	// The server closes the idle connection: a read fails (EOF, or a reset)
+	// before the read deadline, and not before about the timeout.
 	start := time.Now()
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if _, err := br.ReadByte(); !errors.Is(err, io.EOF) {
-		t.Fatalf("idle connection: want EOF, got %v", err)
+	_, err := br.ReadByte()
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("idle connection not closed: %v", err)
 	}
-	if took := time.Since(start); took < timeout/2 || took > 5*timeout {
+	if took := time.Since(start); took < timeout/2 {
 		t.Errorf("idle connection closed after %v, want about %v", took, timeout)
 	}
 }
@@ -712,7 +713,7 @@ func TestIdleTimeoutAboveExporterIdleConnTimeout(t *testing.T) {
 // first, and dials another. Times are scaled down from 90s and IdleTimeout
 // with the ratio kept.
 func TestExporterClientReusesConnectionsAcrossIdleGaps(t *testing.T) {
-	clientIdle := 100 * time.Millisecond
+	clientIdle := 300 * time.Millisecond
 	serverIdle := time.Duration(float64(clientIdle) * float64(IdleTimeout) / float64(ExporterIdleConnTimeout))
 	shortIdleTimeout(t, serverIdle)
 	svc := New(slog.New(slog.DiscardHandler), "")

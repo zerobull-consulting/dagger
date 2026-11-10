@@ -63,8 +63,8 @@ const (
 	// ExporterIdleConnTimeout is how long the engine's Cloud exporters
 	// (engine/telemetry cloudExportTransport, IdleConnTimeout) keep an idle
 	// connection before closing it. The engine is not imported here, so the
-	// value is copied; it was measured by running that transport against a
-	// test server, which saw it close an idle connection after 90.08s.
+	// value is copied, and nothing keeps the two in sync; the README has the
+	// measurement.
 	ExporterIdleConnTimeout = 90 * time.Second
 
 	// IdleTimeout bounds a keep-alive connection between requests on every
@@ -114,10 +114,11 @@ const (
 var idleTimeout = IdleTimeout
 
 // NewHTTPServer is an http.Server for one of the service's handlers, with the
-// limits every listener sets: ReadHeaderTimeout, IdleTimeout and MaxHeaderBytes, and no
-// ReadTimeout or WriteTimeout, which would cut off the engine WebSocket. The
-// OTLP routes bound their bodies themselves (OTLPReadTimeout), and count
-// their headers in the decode budget (otlpHeaderReserve).
+// limits every listener sets: ReadHeaderTimeout, IdleTimeout and
+// MaxHeaderBytes, and no ReadTimeout or WriteTimeout, which would cut off the
+// engine WebSocket. The OTLP routes bound their bodies themselves
+// (OTLPReadTimeout), and count their headers in the decode budget
+// (otlpHeaderReserve).
 func NewHTTPServer(addr string, h http.Handler) *http.Server {
 	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout, IdleTimeout: idleTimeout, MaxHeaderBytes: MaxHeaderBytes}
 }
