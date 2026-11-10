@@ -511,34 +511,46 @@ func TestAncestorUnreadRefused(t *testing.T) {
 
 // A check whose context has ended while it reads an ancestor's marker
 // returns the context's error, not ErrAncestorUnread: the caller stopped
-// it (an interrupt, a deadline of its own), not the store. Nothing is
-// written.
+// it (an interrupt, a deadline of its own), not the store. So does one
+// whose GET answered not found or denied as the context ended: a stopped
+// check always stops. Nothing is written, and no later ancestor is read.
 func TestAncestorCheckCancelled(t *testing.T) {
-	for _, writer := range []bool{true, false} {
-		ctx, cancel := context.WithCancel(context.Background())
-		st := &cancelAtGet{failGets: &failGets{counting: newCounting()}, key: "cacheservice.json", cancel: cancel}
-		_, _, err := Check(ctx, st, "cache/team", writer, now)
-		var unread *ErrAncestorUnread
-		if !errors.Is(err, context.Canceled) || errors.As(err, &unread) || !strings.Contains(err.Error(), "cacheservice.json") {
-			t.Fatalf("writer %v: %v; want context.Canceled, naming the key, and no ErrAncestorUnread", writer, err)
-		}
-		if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 {
-			t.Fatalf("writer %v: requests %v", writer, c)
+	for name, answer := range map[string]error{
+		"the context's error": nil,
+		"not found":           metastore.ErrNotFound,
+		"denied":              metastore.ErrDenied,
+	} {
+		for _, writer := range []bool{true, false} {
+			ctx, cancel := context.WithCancel(context.Background())
+			st := &cancelAtGet{failGets: &failGets{counting: newCounting()}, key: "cacheservice.json", cancel: cancel, answer: answer}
+			_, _, err := Check(ctx, st, "cache/team", writer, now)
+			var unread *ErrAncestorUnread
+			if !errors.Is(err, context.Canceled) || errors.As(err, &unread) || !strings.Contains(err.Error(), "cacheservice.json") {
+				t.Fatalf("%s, writer %v: %v; want context.Canceled, naming the key, and no ErrAncestorUnread", name, writer, err)
+			}
+			if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 || st.gets != 1 {
+				t.Fatalf("%s, writer %v: requests %v, %d later GETs", name, writer, c, st.gets)
+			}
 		}
 	}
 }
 
 // cancelAtGet cancels the caller's context during the GET of key, which
-// then fails with the context's error, as the SDK's does.
+// then answers answer, or, when it is nil, the context's error, as the
+// SDK's does.
 type cancelAtGet struct {
 	*failGets
 	key    string
 	cancel context.CancelFunc
+	answer error
 }
 
 func (c *cancelAtGet) Get(ctx context.Context, key string) ([]byte, string, error) {
 	if key == c.key {
 		c.cancel()
+		if c.answer != nil {
+			return nil, "", fmt.Errorf("get %s: %w", key, c.answer)
+		}
 		return nil, "", fmt.Errorf("get %s: %w", key, ctx.Err())
 	}
 	return c.failGets.Get(ctx, key)

@@ -303,8 +303,9 @@ checks the prefix:
     `TestClaimAncestorMarkerErrors`).
 
   Only those two answers are skipped, so a key allowed only its own prefix
-  must be denied the ancestors' markers with a 403: one a store answers
-  with a 401 or a code of its own can't start or claim there. Any 403
+  must be denied the ancestors' markers with a 403. A key that a store
+  refuses with a 401, or with a code of its own, can't start or claim
+  there. Any 403
   counts as denied, whatever its code: a marker that exists but that a
   store answers with a 403 of another code (`InvalidObjectState`, say) is
   skipped too (`TestClaimAncestorInvalidObjectStateSkippedKnownGap`). An

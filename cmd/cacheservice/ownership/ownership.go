@@ -318,10 +318,11 @@ func checkAncestors(ctx context.Context, st Store, prefix string) error {
 		switch {
 		case err == nil:
 			return &ErrNestedPrefix{Prefix: p, Ancestor: anc}
+		case ctx.Err() != nil:
+			// Whatever the store answered, a check its caller stopped stops.
+			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
 		case errors.Is(err, metastore.ErrNotFound), errors.Is(err, metastore.ErrDenied):
 			continue
-		case ctx.Err() != nil:
-			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
 		default:
 			return &ErrAncestorUnread{Prefix: p, Key: key, Err: err}
 		}
