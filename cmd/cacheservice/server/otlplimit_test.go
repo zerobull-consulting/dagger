@@ -472,17 +472,19 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // exporters retry, records nothing, and is taken once the budget frees.
 // Requests well within it are never refused, however many: only bytes count.
 //
-// Sizes: the budget is 216 KiB, and every request reserves 16 KiB for
+// Sizes: the budget is 232 KiB, and every request reserves 16 KiB for
 // itself, and a few hundred bytes more for its headers (otlpHeaderReserve),
 // and 64 KiB for the stack of its decode with its message.
 // The held request holds 48 KiB (itself, and a 32 KiB buffer for the
-// 20 KiB it sent), and needs about 211 KiB to complete (a 64 KiB buffer, its
+// 20 KiB it sent), and needs about 227 KiB to complete (a 64 KiB buffer, its
 // message and the stack). A 40 KiB body needs 112 KiB as its buffer grows to
-// 64 KiB, and 186 KiB with its message and stack: it fits alone, not beside
-// the held 48 KiB.
+// 64 KiB, and about 194 KiB with its message and stack: it fits alone, not
+// beside the held 48 KiB. (The budget was 152 KiB plus the stack until
+// zerobull-consulting/dagger#232: the padding strings in these bodies are
+// charged a quarter more now.)
 func TestOTLPDecodeBudget(t *testing.T) {
 	cases := otlpCases()
-	svc, rec, srv := limitedService(t, 152<<10+otlpDecodeStack)
+	svc, rec, srv := limitedService(t, 168<<10+otlpDecodeStack)
 	// A request that holds half the budget while its body arrives: 20 KiB
 	// sent, into a buffer of 32 KiB reserved.
 	big := sized(t, cases[2].build, false, testOTLPLimit)
@@ -2365,32 +2367,82 @@ func TestOTLPEmptyRepeatedBytesCoverAppendPeak(t *testing.T) {
 	}
 }
 
-// Known gap: a singular string or bytes field is charged its length and a
-// header, not what the allocator rounds its copy up to: a 32,769-byte
-// AnyValue.string_value takes 40,960 bytes, a quarter more than charged.
-// zerobull-consulting/dagger#217 charges a repeated field's elements for
-// size classes, not a singular field's.
-func TestOTLPSingularStringSizeClassKnownGap(t *testing.T) {
-	const n = 32769
-	body := protowire.AppendString(protowire.AppendTag(nil, 1, protowire.BytesType), strings.Repeat("k", n))
-	m := &commonpb.AnyValue{}
-	if err := proto.Unmarshal(body, m); err != nil {
-		t.Fatal(err)
-	}
-	if len(m.GetStringValue()) != n {
-		t.Fatal("no string_value decoded")
-	}
-	est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+// A singular string or bytes field is charged what the allocator rounds its
+// copy up to (a quarter more past 32 KiB, up to 16 bytes below) and a header:
+// a 32,769-byte AnyValue.string_value takes 40,960 bytes
+// (zerobull-consulting/dagger#232).
+func TestOTLPSingularStringCoversSizeClass(t *testing.T) {
 	empty, err := otlpDecodedSize(nil, &commonpb.AnyValue{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if charged, copied := est-empty, otlpCopySize(n); charged >= copied {
-		t.Fatalf("the field is charged %d, covering the %d bytes its copy takes: the gap is closed, "+
-			"so replace this test with one that checks it", charged, copied)
+	// Lengths just over size-class boundaries, below 32 KiB and past it.
+	for _, n := range []int{1, 17, 33, 129, 1025, 4097, 8193, 32769, 32768 + 8192 + 1, 65537, 100000} {
+		body := protowire.AppendString(protowire.AppendTag(nil, 1, protowire.BytesType), strings.Repeat("k", n))
+		m := &commonpb.AnyValue{}
+		if err := proto.Unmarshal(body, m); err != nil {
+			t.Fatal(err)
+		}
+		if len(m.GetStringValue()) != n {
+			t.Fatalf("%d: no string_value decoded", n)
+		}
+		est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		charged, copied := est-empty, otlpCopySize(n)
+		if charged < copied {
+			t.Fatalf("a %d-byte string_value is charged %d, under the %d its copy takes", n, charged, copied)
+		}
+		// And not far over: the copy, half again, and two headers of slack
+		// (a one-byte string takes no heap of its own).
+		if limit := copied + copied/2 + 2*otlpFieldCost; charged > limit {
+			t.Fatalf("a %d-byte string_value is charged %d, over %d for the %d its copy takes", n, charged, limit, copied)
+		}
+	}
+	// A bytes field, and an ID (bytes) in a span, are charged the same way.
+	span := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), bytes.Repeat([]byte{1}, 32769))
+	spanEst, err := otlpDecodedSize(span, &tracepb.Span{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spanEmpty, err := otlpDecodedSize(nil, &tracepb.Span{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := spanEst-spanEmpty, otlpCopySize(32769); got < want || got > want+want/2+2*otlpFieldCost {
+		t.Fatalf("a 32,769-byte trace_id is charged %d, for the %d its copy takes", got, want)
+	}
+	// An empty string is charged its header only.
+	one := protowire.AppendString(protowire.AppendTag(nil, 1, protowire.BytesType), "")
+	est, err := otlpDecodedSize(one, &commonpb.AnyValue{}, false)
+	if err != nil || est-empty != otlpFieldCost {
+		t.Fatalf("an empty string_value is charged %d, %v", est-empty, err)
+	}
+}
+
+// Known gap: the JSON estimate charges a string its bytes in the body, not
+// what the allocator rounds its copy up to, so a 32,769-byte stringValue, whose
+// copy takes 40,960 bytes, is charged under that, its object included. The
+// protobuf walk charges singular strings for size classes
+// (zerobull-consulting/dagger#232); the JSON estimate doesn't.
+func TestOTLPJSONSingularStringSizeClassKnownGap(t *testing.T) {
+	const n = 32769
+	body := []byte(`{"stringValue":"` + strings.Repeat("k", n) + `"}`)
+	m := &commonpb.AnyValue{}
+	if err := protojson.Unmarshal(body, m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.GetStringValue()) != n {
+		t.Fatal("no stringValue decoded")
+	}
+	est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied := otlpCopySize(n); est >= copied {
+		t.Fatalf("the estimate %d now covers the %d bytes the string's copy takes: the gap is closed, "+
+			"so replace this test with one that checks it", est, copied)
 	}
 }
 
