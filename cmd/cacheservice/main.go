@@ -123,6 +123,11 @@
 // `cacheservice wipe` is another: it empties the prefix, of any layout, a dry
 // run unless given -dry-run=false and -confirm=<bucket>/<prefix> (package
 // wipe; README.md, "Changing layouts").
+//
+// `cacheservice gc` is a third: it runs one garbage collection over every
+// namespace and exits, a dry run unless given -confirm=<bucket>/<prefix> and
+// explicit limits; the job that collects a bucket whose writers run with
+// -gc-mode=batch (package gccmd; README.md, "The gc command").
 package main
 
 import (
@@ -143,6 +148,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/compat"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
+	"github.com/dagger/dagger/cmd/cacheservice/gccmd"
 	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 	"github.com/dagger/dagger/cmd/cacheservice/wipe"
@@ -151,10 +157,13 @@ import (
 // subcommands are the one-shot commands of the binary, by name: each reads
 // the CACHESERVICE_S3_* settings as the service does, and returns its exit
 // code. Each reports by default, needs -confirm=<bucket>/<prefix> to change
-// anything, and exits 2 on a mismatch.
+// anything (gc: collect), and exits 2 on a mismatch.
 var subcommands = map[string]func(ctx context.Context, args []string) int{
 	"lifecycle": func(ctx context.Context, args []string) int {
 		return lifecycle.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
+	},
+	"gc": func(ctx context.Context, args []string) int {
+		return gccmd.Main(ctx, args, os.Stdout, os.Stderr, gccmd.OpenS3)
 	},
 	"wipe": func(ctx context.Context, args []string) int {
 		return wipe.Main(ctx, args, os.Stdout, os.Stderr, wipe.OpenS3)
@@ -187,15 +196,8 @@ func main() {
 		debugToken    string
 		tlsCert       string
 		tlsKey        string
-		nsFile        string
-		maxAge        string
-		maxBytes      string
 		gcInterval    time.Duration
 		gcModeFlag    string
-		gcDryRun      bool
-		gcGrace       time.Duration
-		gcStagingAge  time.Duration
-		gcMaxDeletes  int
 		drainTimeout  time.Duration
 		drainLinger   time.Duration
 		allowVersions bool
@@ -217,18 +219,13 @@ func main() {
 	flag.BoolVar(&exports, "export", true, "export engines' entries to the bucket, and run garbage collection (needs "+blobstore.EnvBucket+"); false: read-only, it only imports, and never writes to or deletes from the bucket, so it runs with a read-only key; can't be combined with -import=false, and needs "+blobstore.EnvBucket)
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
-	flag.StringVar(&nsFile, "namespaces-file", "", "file of per-namespace limits, one '<namespace> max-age=<duration> max-bytes=<size>' per line, '*' for the defaults; SIGHUP reloads it (empty: -max-age and -max-bytes for every namespace)")
-	flag.StringVar(&maxAge, "max-age", "0", "default max age of a namespace's roots, from when an export last recorded them, such as 720h (0: no limit)")
-	flag.StringVar(&maxBytes, "max-bytes", "0", "default max size of what a namespace keeps, such as 500GiB (0: no limit)")
+	// The limit and collector flags are the ones `cacheservice gc` takes too.
+	gcFlags := gc.RegisterFlags(flag.CommandLine, true)
 	flag.StringVar(&gcModeFlag, "gc-mode", string(server.GCModeService), gcModeUsage+" (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25%, with -gc-mode=service (the default; 0 and negative values are refused, and so is any explicit value with batch or off)")
-	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
-	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
-	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
 	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once, with no drain and no linger); -drain-linger and a shutdown of at most 5s follow, so the process manager's stop timeout must be longer than this plus -drain-linger plus 5s")
 	flag.DurationVar(&drainLinger, "drain-linger", DefaultDrainLinger, "after the drain, at most how long to keep answering the engines' OTLP requests, storing nothing, so that each engine connected when the drain started whose events come here can deliver its engine.stop when it is stopped next; it ends once they all did, or at a second signal (0: stop right after the drain)")
 	flag.BoolVar(&allowVersions, "allow-engine-version-mismatch", false, "DEVELOPMENT ONLY: welcome engines whose version isn't on an accept line of the service's manifest (cmd/cacheservice/compat/engines.txt), logging each; by default they are refused before the welcome (close status 4002)")
-	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -310,16 +307,16 @@ func main() {
 		logger.Error("scope", "error", err)
 		os.Exit(2)
 	}
-	defaults, err := parseLimits(maxAge, maxBytes)
+	defaults, err := gcFlags.Limits()
 	if err != nil {
 		logger.Error("limits", "error", err)
 		os.Exit(2)
 	}
-	if err := svc.UseLimits(nsFile, defaults); err != nil {
+	if err := svc.UseLimits(gcFlags.NamespacesFile, defaults); err != nil {
 		logger.Error("namespaces file", "error", err)
 		os.Exit(1)
 	}
-	if tokensFile != "" || nsFile != "" || debugToken != "" {
+	if tokensFile != "" || gcFlags.NamespacesFile != "" || debugToken != "" {
 		// SIGHUP reloads the files; one that doesn't parse leaves what it
 		// set as it was.
 		hup := make(chan os.Signal, 1)
@@ -329,7 +326,7 @@ func main() {
 				if tokensFile != "" {
 					_ = svc.ReloadTokens()
 				}
-				if nsFile != "" {
+				if gcFlags.NamespacesFile != "" {
 					_ = svc.ReloadLimits()
 				}
 				if debugToken != "" {
@@ -374,15 +371,7 @@ func main() {
 			// is off whatever -gc-mode says (an explicit service or batch
 			// was refused above), and it takes no GC options.
 			if exports {
-				gcCfg := &server.GCConfig{
-					Mode: gcMode,
-					Collector: gc.Config{
-						DryRun:     gcDryRun,
-						Grace:      gcGrace,
-						StagingAge: gcStagingAge,
-						MaxDeletes: gcMaxDeletes,
-					},
-				}
+				gcCfg := &server.GCConfig{Mode: gcMode, Collector: gcFlags.Collector()}
 				if gcMode == server.GCModeService {
 					gcCfg.Interval = gcInterval
 				}
@@ -821,17 +810,4 @@ func onOff(on bool) string {
 		return "on"
 	}
 	return "off"
-}
-
-// parseLimits reads -max-age and -max-bytes.
-func parseLimits(maxAge, maxBytes string) (gc.Limits, error) {
-	age, err := gc.ParseAge(maxAge)
-	if err != nil {
-		return gc.Limits{}, fmt.Errorf("-max-age: %w", err)
-	}
-	size, err := gc.ParseSize(maxBytes)
-	if err != nil {
-		return gc.Limits{}, fmt.Errorf("-max-bytes: %w", err)
-	}
-	return gc.Limits{MaxAge: age, MaxBytes: size}, nil
 }
