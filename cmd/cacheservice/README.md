@@ -1565,12 +1565,14 @@ The OTLP receivers bound what a request can make the service read and hold
 item 1). Before, each body was read whole, and gunzipped whole with
 `Content-Encoding: gzip`, so a gzip bomb of a few kilobytes could run the
 service out of memory, with no token in unauthenticated mode. With tokens,
-the token is checked first, and a request without a known one is refused
-with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
-net/http then reads up to 256 KiB more of the body after the handler, and
-discards it, to reuse the connection; the read timeout, set before the token
-is checked, bounds how long that takes, so a client can't hold the connection
-by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
+the token is checked before any of the body is read, once the request and its
+headers are reserved from the budget (below), and a request without a known
+one is refused with 401 (`TestOTLPUnauthenticatedBodyNotRead`). net/http then
+reads up to 256 KiB more of the body after the handler, and discards it, to
+reuse the connection; the 401 cuts the connection's read deadline to 1s
+(`otlpRefusalDrain`), so a client can't hold the connection, or the headers
+net/http holds with it, by trickling or stalling the body after a 401
+(`TestOTLPRefusedTokenSlowBodyCutOff`).
 
 | Route | Limit, as received and decoded | Largest request in six e2e runs | Margin |
 | --- | --- | --- | --- |
@@ -1619,7 +1621,17 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     not until the 30s read timeout: net/http holds the request, headers
     included, while it drains, and 200 refused requests with 40 KiB headers
     and stalled bodies held 12.7 MB for the whole timeout, with nothing
-    reserved (`TestOTLPRefusedStalledBodyConnectionClosed`);
+    reserved (`TestOTLPRefusedStalledBodyConnectionClosed`). The request and
+    its headers are reserved before the token is checked, so a request with
+    a missing or unknown token holds them in the budget too while its handler
+    runs, and is answered 431 or 503 as above, before the check, when they
+    don't fit; it gives them back on the 401, and its drain is cut to 1s
+    like any refusal's. 200 such requests with 24 KiB headers and a stalled
+    body held 9.6 MB of heap for the whole 30s, with nothing reserved; now
+    0.3 MB is left 3s after they are sent
+    ([zerobull-consulting/dagger#219](https://github.com/zerobull-consulting/dagger/issues/219),
+    `TestOTLPRefusedTokenHeadersInBudget`, `TestOTLPFullBudgetRefusedBeforeToken`,
+    `TestOTLPHeaderReserveCapBeforeToken`);
   - a gzipped body's **decompressor**, 64 KiB, before it is built
     (`TestOTLPGzipDecompressorReserved`);
   - the body's **buffer**, doubling from 512 bytes up to the limit as the
@@ -1820,14 +1832,6 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   [Metrics](#metrics)), to check the limits against real traffic.
 
 **Known gaps**, each pinned by a test:
-
-- A request refused for its token (401) before the budget is reserved holds
-  nothing in it, though net/http holds its headers (up to about 68 KiB) while
-  it reads and discards the body, up to the read timeout. 200 such requests
-  with 60 KiB headers and a stalled body grew the heap by 18 MB. It is the
-  same for the 16 KiB each request is reserved for, which a refused one isn't
-  ([zerobull-consulting/dagger#219](https://github.com/zerobull-consulting/dagger/issues/219),
-  `TestOTLPRefusedTokenHeadersNotInBudgetKnownGap`).
 
 - Walking a deeply nested body (OTLP values nest) takes stack the budget
   doesn't count; its structs are counted
