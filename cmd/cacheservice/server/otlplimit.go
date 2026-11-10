@@ -61,8 +61,9 @@ const (
 	ReadHeaderTimeout = 10 * time.Second
 
 	// MaxHeaderBytes bounds a request's line and headers on every listener
-	// (NewHTTPServer); net/http answers a larger one 431 before any handler
-	// runs. Real callers send well under 2 KiB: the engine's OTLP requests
+	// (NewHTTPServer); over HTTP/1 net/http answers a larger one 431 before
+	// any handler runs, and over HTTP/2 it advertises the limit to clients
+	// (the README, "OTLP limits", says what was run). Real callers send well under 2 KiB: the engine's OTLP requests
 	// 0.4 to 1.8 KiB (a Basic token, or a 1.5 KiB bearer token), its
 	// WebSocket upgrade 0.4 KiB. This is over 30 times that, and 1/16 of
 	// net/http's default (1 MiB); net/http allows 4 KiB more than this for its

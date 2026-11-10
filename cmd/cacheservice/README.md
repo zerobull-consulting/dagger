@@ -1574,7 +1574,7 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     the request (`otlpHeaderReserve`): the bytes of every key and value, 112
     per key and 32 per value (measured against the heap of parsed requests:
     `TestOTLPHeaderReserveCoversParsedHeaders`), the host, and the request URI
-    twice. Real engines' come to about 1.5 to 3.2 KiB (see **Headers are
+    twice. Real engines' requests come to about 1.5 to 3.2 KiB (see **Headers are
     bounded**, below), small beside the 16 KiB; but a client sending 48 KiB
     of headers and then stalling its body holds that much of the budget, not
     16 KiB
@@ -1622,9 +1622,17 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   engine and OTLP listener, the debug listener and the metrics listener)
   sets `MaxHeaderBytes` to 64 KiB (`server.MaxHeaderBytes`), where net/http's
   default is 1 MiB. net/http allows 4 KiB more than that for its read buffer,
-  so a request line and headers of up to about 68 KiB are read; a larger one
-  is answered **431** before any handler runs, so it reserves nothing and
-  records nothing (`TestOTLPRequestOverHeaderLimit`). Before
+  so a request line and headers of up to about 68 KiB are read; over
+  HTTP/1 a larger one is answered **431** before any handler runs, so it
+  reserves nothing and records nothing (`TestOTLPRequestOverHeaderLimit`).
+  Over HTTP/2 (`-tls-cert`) the server advertises the limit
+  (`SETTINGS_MAX_HEADER_LIST_SIZE`), and a client that honors it, as Go's does,
+  refuses to send a larger header list ("request header list larger than
+  peer's advertised limit"); a client that doesn't was not tried. Trailers
+  are bounded by net/http too, to a few KiB: a chunked request whose trailer
+  is 1 KiB is taken, one of 4 KiB or more is answered **400** and records
+  nothing (`TestOTLPRequestOverTrailerLimit`), inside the 16 KiB each request
+  reserves. Before
   ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85)),
   up to 1 MiB of headers per request was held outside the budget, so about
   8,000 requests stalled after their headers held about 8 GB it didn't count.

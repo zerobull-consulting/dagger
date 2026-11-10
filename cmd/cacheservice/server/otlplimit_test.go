@@ -1128,6 +1128,46 @@ func TestOTLPRequestOverHeaderLimit(t *testing.T) {
 	}
 }
 
+// net/http bounds a request's trailers to a few KiB, so they hold nothing the
+// per-request reserve doesn't cover: a chunked request whose trailer is 1 KiB
+// is taken, and one of 8 KiB is answered 400 and records nothing.
+func TestOTLPRequestOverTrailerLimit(t *testing.T) {
+	svc, rec, _ := limitedService(t, 4*testOTLPLimit)
+	addr := headerServer(t, svc)
+	body := encodeOTLP(t, otlpCases()[2].build(""), false)
+	post := func(trailer int) int {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-protobuf\r\nTransfer-Encoding: chunked\r\nTrailer: X-T\r\nConnection: close\r\n\r\n%x\r\n%s\r\n0\r\nX-T: %s\r\n\r\n",
+			len(body), body, strings.Repeat("a", trailer))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if status := post(1 << 10); status != http.StatusOK {
+		t.Fatalf("a 1 KiB trailer: %d", status)
+	}
+	if n := len(rec.find("otlp metrics")); n != 1 {
+		t.Fatalf("%d metric requests recorded", n)
+	}
+	if status := post(8 << 10); status != http.StatusBadRequest {
+		t.Fatalf("an 8 KiB trailer: %d", status)
+	}
+	if n := len(rec.find("otlp metrics")); n != 1 {
+		t.Fatalf("%d metric requests recorded after the refusal", n)
+	}
+	if used := svc.otlp.budget.inUse(); used != 0 {
+		t.Fatalf("%d bytes still reserved", used)
+	}
+}
+
 // Known gap, zerobull-consulting/dagger#219: a request refused for its token (401) before decodeOTLP has
 // reserved nothing, not even its headers, though net/http holds them while it
 // reads and discards the body, up to the read timeout. Measured: 200 such
