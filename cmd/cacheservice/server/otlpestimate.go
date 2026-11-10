@@ -20,11 +20,12 @@ import (
 // pointer, so a body of them decodes to about 70 times its size. The
 // estimate errs high: each message at its Go struct's size plus an eighth
 // (allocation size classes), each element of a repeated field 16 bytes more
-// (its pointer, and the slice's growth), each singular string or bytes field its
-// length and a quarter (size classes) plus a header, each element of a repeated string or bytes field its
-// length and a quarter (size classes) plus four of its headers (its header
-// in the slice, and the slice's growth), and each known varint or fixed field its wire size, tag
-// included, or the header if that is more. A field the message doesn't
+// (its pointer, and the slice's growth), each singular string or bytes field
+// its length and a quarter (size classes: otlpAllocSize) plus a header, each
+// element of a repeated string or bytes field its length and a quarter plus
+// four of its headers (its header in the slice, and the slice's growth), and
+// each known varint or fixed field its wire size, tag included, or the header
+// if that is more. A field the message doesn't
 // know (a group, a bytes field, like any field of the wrong wire type for
 // its number) is kept by proto.Unmarshal as raw bytes, appended to one slice
 // per message, so it is charged otlpUnknownGrowth times its wire size (or
@@ -191,12 +192,10 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int, deepe
 			size += int64(len(v)) * otlpListElemCost
 		default:
 			// A singular string or bytes field (a trace or span ID is one),
-			// copied. The allocator rounds its copy up to a size class, so
-			// charge otlpAllocSize of it, and a header on top (the real one
-			// is in the message's struct, so this is slack for the few bytes
-			// a quarter misses at small sizes: 17 bytes take 24, not 21). An
-			// empty one is charged the header only, as otlpAllocSize(0) is 0
-			// (zerobull-consulting/dagger#232).
+			// copied: charged for its size class (otlpAllocSize), and a header
+			// on top, which is slack at small sizes, where a quarter is less
+			// than the class (17 bytes take 24, not 21). An empty one is
+			// charged the header only (zerobull-consulting/dagger#232).
 			size += otlpAllocSize(int64(len(v))) + otlpFieldCost
 		}
 	}

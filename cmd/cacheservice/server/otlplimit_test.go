@@ -2390,8 +2390,14 @@ func TestOTLPSingularStringCoversSizeClass(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if charged, copied := est-empty, otlpCopySize(n); charged < copied {
+		charged, copied := est-empty, otlpCopySize(n)
+		if charged < copied {
 			t.Fatalf("a %d-byte string_value is charged %d, under the %d its copy takes", n, charged, copied)
+		}
+		// And not far over: the copy, half again, and two headers of slack
+		// (a one-byte string takes no heap of its own).
+		if limit := copied + copied/2 + 2*otlpFieldCost; charged > limit {
+			t.Fatalf("a %d-byte string_value is charged %d, over %d for the %d its copy takes", n, charged, limit, copied)
 		}
 	}
 	// A bytes field, and an ID (bytes) in a span, are charged the same way.
@@ -2404,14 +2410,39 @@ func TestOTLPSingularStringCoversSizeClass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := spanEst-spanEmpty, otlpCopySize(32769); got < want {
-		t.Fatalf("a 32,769-byte trace_id is charged %d, under the %d its copy takes", got, want)
+	if got, want := spanEst-spanEmpty, otlpCopySize(32769); got < want || got > want+want/2+2*otlpFieldCost {
+		t.Fatalf("a 32,769-byte trace_id is charged %d, for the %d its copy takes", got, want)
 	}
 	// An empty string is charged its header only.
 	one := protowire.AppendString(protowire.AppendTag(nil, 1, protowire.BytesType), "")
 	est, err := otlpDecodedSize(one, &commonpb.AnyValue{}, false)
 	if err != nil || est-empty != otlpFieldCost {
 		t.Fatalf("an empty string_value is charged %d, %v", est-empty, err)
+	}
+}
+
+// Known gap: the JSON estimate charges a string its bytes in the body, not
+// what the allocator rounds its copy up to, so a 32,769-byte stringValue, whose
+// copy takes 40,960 bytes, is charged under that, its object included. The
+// protobuf walk charges singular strings for size classes
+// (zerobull-consulting/dagger#232); the JSON estimate doesn't.
+func TestOTLPJSONSingularStringSizeClassKnownGap(t *testing.T) {
+	const n = 32769
+	body := []byte(`{"stringValue":"` + strings.Repeat("k", n) + `"}`)
+	m := &commonpb.AnyValue{}
+	if err := protojson.Unmarshal(body, m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.GetStringValue()) != n {
+		t.Fatal("no stringValue decoded")
+	}
+	est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied := otlpCopySize(n); est >= copied {
+		t.Fatalf("the estimate %d now covers the %d bytes the string's copy takes: the gap is closed, "+
+			"so replace this test with one that checks it", est, copied)
 	}
 }
 

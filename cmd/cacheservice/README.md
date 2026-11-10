@@ -1773,10 +1773,13 @@ net/http holds with it, by trickling or stalling the body after a 401
     allocator's size classes, and 16 bytes, so a 32,769-byte one, whose copy
     takes 40,960, is charged 40,977 (`TestOTLPSingularStringCoversSizeClass`,
     [zerobull-consulting/dagger#232](https://github.com/zerobull-consulting/dagger/issues/232));
-    an empty one is charged the 16 bytes. One gap is left: the fix for repeated
-    strings covers protobuf only, as a JSON body is charged 16 bytes for each
-    comma, so an empty element, `"",`, is charged 19 bytes, under what append
-    holds for it (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
+    an empty one is charged the 16 bytes. That is the protobuf estimate. Two
+    gaps are left in the JSON one, which charges a string its bytes in the
+    body, not its size class, so a 32,769-byte `stringValue` is charged under
+    the 40,960 its copy takes (`TestOTLPJSONSingularStringSizeClassKnownGap`),
+    and charges 16 bytes for each comma, so an empty element of a repeated
+    string, `"",`, is charged 19 bytes, under what append holds for it
+    (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded
