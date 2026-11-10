@@ -834,30 +834,47 @@ func TestDrainPathsStoppedDoesNotWaitForExplicit(t *testing.T) {
 }
 
 // A drain that begins once the paths stopped has nothing to export, and
-// says the service is stopping. It reports from its own ctx: deadline once
-// that expired, canceled once it was canceled, complete only while it runs.
+// says the service is stopping. It reports what is left, and is complete
+// when nothing is, whatever its ctx says, as the flush is. With roots left,
+// it was cut short: deadline once its ctx expired, canceled otherwise.
 // (zerobull-consulting/dagger#74, point 2.)
 func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
+	live := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), time.Minute)
+	}
+	expired := func() (context.Context, context.CancelFunc) {
+		return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	}
+	canceled := func() (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx, cancel
+	}
 	for _, tc := range []struct {
 		name string
+		left bool
 		ctx  func() (context.Context, context.CancelFunc)
 		want string
 	}{
-		{"live", func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), time.Minute)
-		}, metrics.DrainComplete},
-		{"deadline passed", func() (context.Context, context.CancelFunc) {
-			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-		}, metrics.DrainDeadline},
-		{"canceled", func() (context.Context, context.CancelFunc) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			return ctx, cancel
-		}, metrics.DrainCanceled},
+		{"nothing left, live", false, live, metrics.DrainComplete},
+		{"nothing left, deadline passed", false, expired, metrics.DrainComplete},
+		{"nothing left, canceled", false, canceled, metrics.DrainComplete},
+		{"roots left, live", true, live, metrics.DrainCanceled},
+		{"roots left, deadline passed", true, expired, metrics.DrainDeadline},
+		{"roots left, canceled", true, canceled, metrics.DrainCanceled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, rec := newDrainHarness(t, nil)
-			h.cancel()
+			if tc.left {
+				// A session that hasn't ended: its roots wait to settle.
+				h.build()
+				h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+				waitUntil(t, 5*time.Second, "the roots to be tracked", func() bool {
+					return len(h.svc.drainLeft(time.Now(), time.Time{})) == 1
+				})
+			}
+			// The stop began: the paths end, the engine stays connected.
+			h.cancelPaths()
 			ctx, cancel := tc.ctx()
 			defer cancel()
 			start := time.Now()
@@ -865,14 +882,23 @@ func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
 			if took := time.Since(start); took > time.Second {
 				t.Fatalf("the drain took %s", took)
 			}
-			if rep.Outcome != tc.want || rep.LeftRoots() != 0 || rep.Explicit != 0 {
+			if rep.Outcome != tc.want || rep.Explicit != 0 {
 				t.Fatalf("report %+v, want outcome %q", rep, tc.want)
+			}
+			if tc.left != (len(rep.Left) == 1) {
+				t.Fatalf("report left %+v", rep.Left)
+			}
+			if tc.left && (rep.Left[0].CacheID != h.cache.ID || !rep.Left[0].Connected || rep.LeftRoots() != 2) {
+				t.Fatalf("report left %+v, %d roots", rep.Left, rep.LeftRoots())
 			}
 			if len(rec.find("drain: nothing to export (the service is stopping)")) != 1 {
 				t.Fatal("the drain didn't log that the service is stopping")
 			}
 			if len(rec.find("drain: nothing to export (the export path is off)")) != 0 {
 				t.Fatal("the drain logged that the export path is off")
+			}
+			if n := len(rec.find("drain: left unexported")); tc.left != (n == 1) {
+				t.Fatalf("logged %d left unexported", n)
 			}
 		})
 	}

@@ -152,6 +152,12 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 // that follows (CloseEngines, the end of the export path's context and
 // Wait), and publishes nothing.
 //
+// A drain that begins once the export path's context ended (the stop
+// began) exports nothing. It logs that the service is stopping, and
+// reports what is left. It is complete when nothing is left that it could
+// export and no explicit request runs, and canceled, or deadline once
+// ctx's deadline passed, otherwise.
+//
 // Call it once, before CloseEngines and Wait. A second call returns a
 // canceled report at once, and doesn't end the first: only the first call's
 // ctx cancels a drain, which then reports canceled, or deadline once ctx's
@@ -209,19 +215,25 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		if n := s.explicitRunning(); n > 0 {
 			s.logger.Info("drain: waiting for explicit requests", "running", n, "deadline", deadline)
 		}
-		return s.endDrain(start, s.waitExplicit(ctx, context.Background(), deadline, explicitEnded), nil)
+		return s.endDrain(start, s.waitExplicit(ctx, deadline, explicitEnded), nil)
 	}
 	if p.ctx.Err() != nil {
 		// The paths stopped before the drain began: the service is
-		// stopping, and an explicit request still running is cut off with
-		// them (canceled). With none, the drain's own ctx says whether it
-		// was cut short: canceled or deadline, complete only while it runs.
+		// stopping, and nothing can be exported. As in the flush below, the
+		// drain is complete when nothing is left that it could have
+		// exported and no explicit request runs, whatever ctx says. Else it
+		// was cut short: deadline once ctx's deadline passed, canceled
+		// otherwise. An explicit request still running isn't waited for:
+		// it runs on its own request's context, until it ends or the stop
+		// cuts it off (CloseEngines).
 		s.logger.Info("drain: nothing to export (the service is stopping)")
-		outcome := s.waitExplicit(ctx, p.ctx, deadline, explicitEnded)
-		if o, ok := drainEnded(ctx, context.Background(), time.Now(), deadline); ok && outcome == metrics.DrainComplete {
-			outcome = o
+		now := p.now()
+		left := s.drainLeft(now, deadline)
+		outcome := metrics.DrainComplete
+		if drainBusy(left) || s.explicitRunning() > 0 {
+			outcome, _ = drainEnded(ctx, p.ctx, now, deadline)
 		}
-		return s.endDrain(start, outcome, nil)
+		return s.endDrain(start, outcome, left)
 	}
 	// Namespaces created from now on drain from their first span
 	// (trackSpans).
@@ -291,10 +303,10 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 }
 
 // waitExplicit waits for the explicit exports and imports admitted before
-// the drain, until ctx or paths (the export path's context) ends, or
-// deadline passes, and returns the drain's outcome. It is the drain's wait
-// when the export path is off, and so has nothing else to wait for.
-func (s *Service) waitExplicit(ctx, paths context.Context, deadline time.Time, ended <-chan struct{}) string {
+// the drain, until ctx ends or deadline passes, and returns the drain's
+// outcome. It is the drain's wait when the export path is off, and so has
+// nothing else to wait for.
+func (s *Service) waitExplicit(ctx context.Context, deadline time.Time, ended <-chan struct{}) string {
 	var timeout <-chan time.Time
 	if !deadline.IsZero() {
 		t := time.NewTimer(time.Until(deadline))
@@ -302,13 +314,12 @@ func (s *Service) waitExplicit(ctx, paths context.Context, deadline time.Time, e
 		timeout = t.C
 	}
 	for s.explicitRunning() > 0 {
-		if outcome, ok := drainEnded(ctx, paths, time.Now(), deadline); ok {
+		if outcome, ok := drainEnded(ctx, context.Background(), time.Now(), deadline); ok {
 			return outcome
 		}
 		select {
 		case <-ended:
 		case <-ctx.Done():
-		case <-paths.Done():
 		case <-timeout:
 			timeout = nil
 		}
