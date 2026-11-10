@@ -50,7 +50,11 @@ type otlpSizes struct {
 // routeSizes are a route's requests taken: how many, and the largest as
 // received, decoded, as the decoded message's estimated heap, and how many
 // levels of messages the deepest nests.
-type routeSizes struct{ n, received, decoded, message, headers, depth int64 }
+type routeSizes struct {
+	n, received, decoded, message, headers, depth int64
+	// json is whether any request taken was JSON, whose depth isn't measured.
+	json bool
+}
 
 // otlpSizesOf reads the OTLP records of the logs.
 func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
@@ -78,6 +82,9 @@ func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
 			sz.decoded = max(sz.decoded, decoded)
 			sz.message = max(sz.message, message)
 			sz.headers = max(sz.headers, headers)
+			if depth < 0 {
+				sz.json = true
+			}
 			sz.depth = max(sz.depth, depth)
 			out.budgetPeak = max(out.budgetPeak, peak)
 		}
@@ -123,6 +130,9 @@ func (s *state) otlpSizes(t *testing.T) {
 		// A body nested past MaxOTLPNesting is refused before it is decoded
 		// (zerobull-consulting/dagger#86). OTLP's own messages nest 8 deep to
 		// an AnyValue, so this is a margin of 2, not otlpMargin.
+		// A JSON request's depth is not measured (-1): real engines send
+		// protobuf, so one in JSON is a change to look at, not to pass.
+		Check(t, !sz.json, "%s: every request taken was protobuf, so its nesting was measured", route.name)
 		t.Logf("%s: deepest request nests %d levels of messages; limit %d", route.name, sz.depth, server.MaxOTLPNesting)
 		Check(t, sz.depth*otlpDepthMargin <= server.MaxOTLPNesting,
 			"%s: deepest request nests %d levels; MaxOTLPNesting %d", route.name, sz.depth, server.MaxOTLPNesting)

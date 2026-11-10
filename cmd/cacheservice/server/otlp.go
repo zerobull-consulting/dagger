@@ -216,13 +216,18 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	if err != nil {
 		return refuse(err)
 	}
+	// The decode also takes stack, for as many levels as the body nests.
+	reserve := estimate + otlpDecodeStack
+	if isJSON(r) {
+		reserve = estimate + otlpJSONDecodeStack
+	}
 	switch {
-	case estimate+held > lim.budget.size:
+	case reserve+held > lim.budget.size:
 		return refuse(errOTLPDecodesTooLarge)
-	case !lim.budget.reserve(estimate):
+	case !lim.budget.reserve(reserve):
 		return refuse(errOTLPBusy)
 	}
-	held += estimate
+	held += reserve
 	if isJSON(r) {
 		err = protojson.Unmarshal(data, msg)
 	} else {

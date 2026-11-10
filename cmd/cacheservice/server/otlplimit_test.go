@@ -217,7 +217,7 @@ func TestOTLPBodyAtAndOverLimit(t *testing.T) {
 		for _, asJSON := range []bool{false, true} {
 			for _, gz := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s,json=%t,gzip=%t", c.route, asJSON, gz), func(t *testing.T) {
-					svc, rec, srv := limitedService(t, 4*testOTLPLimit)
+					svc, rec, srv := limitedService(t, 4*testOTLPLimit+otlpJSONDecodeStack)
 					at := sized(t, c.build, asJSON, testOTLPLimit)
 					over := sized(t, c.build, asJSON, testOTLPLimit+1)
 					if gz {
@@ -469,15 +469,17 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // exporters retry, records nothing, and is taken once the budget frees.
 // Requests well within it are never refused, however many: only bytes count.
 //
-// Sizes: the budget is 152 KiB, and every request reserves 16 KiB for
-// itself, and a few hundred bytes more for its headers (otlpHeaderReserve).
+// Sizes: the budget is 216 KiB, and every request reserves 16 KiB for
+// itself, and a few hundred bytes more for its headers (otlpHeaderReserve),
+// and 64 KiB for the stack of its decode with its message.
 // The held request holds 48 KiB (itself, and a 32 KiB buffer for the
-// 20 KiB it sent), and needs about 147 KiB to complete (a 64 KiB buffer and
-// its message). A 40 KiB body needs 112 KiB as its buffer grows to 64 KiB,
-// and 122 KiB with its message: it fits alone, not beside the held 48 KiB.
+// 20 KiB it sent), and needs about 211 KiB to complete (a 64 KiB buffer, its
+// message and the stack). A 40 KiB body needs 112 KiB as its buffer grows to
+// 64 KiB, and 186 KiB with its message and stack: it fits alone, not beside
+// the held 48 KiB.
 func TestOTLPDecodeBudget(t *testing.T) {
 	cases := otlpCases()
-	svc, rec, srv := limitedService(t, 152<<10)
+	svc, rec, srv := limitedService(t, 152<<10+otlpDecodeStack)
 	// A request that holds half the budget while its body arrives: 20 KiB
 	// sent, into a buffer of 32 KiB reserved.
 	big := sized(t, cases[2].build, false, testOTLPLimit)
@@ -527,7 +529,7 @@ func TestOTLPDecodeBudget(t *testing.T) {
 func TestOTLPSlowBodyCutOff(t *testing.T) {
 	rec := &logRecorder{}
 	svc := New(slog.New(rec), "")
-	setOTLPLimits(svc, testOTLPLimit, 152<<10)
+	setOTLPLimits(svc, testOTLPLimit, 152<<10+otlpDecodeStack)
 	const timeout = 200 * time.Millisecond
 	svc.otlp.readTimeout = timeout
 	srv := httptest.NewUnstartedServer(nil)
@@ -874,6 +876,8 @@ func TestOTLPGzipDecompressorReserved(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable || built != 0 {
 		t.Fatalf("gzipped past the budget: %d, %d decompressors built", resp.StatusCode, built)
 	}
+	// A plain request still fits beside the decode's stack.
+	setOTLPLimits(svc, testOTLPLimit, otlpGzipReserve/2+otlpDecodeStack)
 	if resp := postBody(t, srv.URL+c.path, encodeOTLP(t, c.build(""), false), false, false, ""); resp.StatusCode != http.StatusOK {
 		t.Fatalf("plain: %d", resp.StatusCode)
 	}
@@ -1367,8 +1371,8 @@ func TestOTLPRefusedTokenHeadersNotInBudgetKnownGap(t *testing.T) {
 // nestedMetricsRequest is a metrics request whose resource has one attribute
 // holding an AnyValue nested arrays levels deep, each in an ArrayValue, or
 // in a KeyValueList's KeyValue when kvlist. The deepest message is at depth
-// 4 + 2*arrays (3*arrays with kvlist): ResourceMetrics 1, Resource 2, KeyValue
-// 3, AnyValue 4.
+// 4 + 2*arrays (4 + 3*arrays with kvlist): ResourceMetrics 1, Resource 2,
+// KeyValue 3, AnyValue 4.
 func nestedMetricsRequest(arrays int, kvlist bool) *colmetricspb.ExportMetricsServiceRequest {
 	v := &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "leaf"}}
 	for range arrays {
@@ -1399,7 +1403,7 @@ func TestOTLPDeeplyNestedBodyRefused(t *testing.T) {
 		{"arrays, 2,000 deep", 2000, false},
 		{"arrays, 5,000 deep, the depth this test used to take", 5000, false},
 		{"arrays, 6,000 deep", 6000, false},
-		{"kvlists, one level past the limit", otlpMaxDepth/3 + 1, true},
+		{"kvlists, one level past the limit", (otlpMaxDepth-4)/3 + 1, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			req := nestedMetricsRequest(c.arrays, c.kvlist)
@@ -1410,9 +1414,15 @@ func TestOTLPDeeplyNestedBodyRefused(t *testing.T) {
 			if _, err := otlpDecodedSize(body, req, false); !errors.Is(err, errOTLPDepth) {
 				t.Fatalf("estimate: %v, want errOTLPDepth", err)
 			}
-			_, rec, srv := limitedService(t, 4<<20)
+			svc, rec, srv := limitedService(t, 4<<20)
 			if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("a body nested %d arrays deep: %d, want 400", c.arrays, resp.StatusCode)
+			}
+			if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedTooDeep); got != 1 {
+				t.Fatalf("too_deep %v, want 1", got)
+			}
+			if used := svc.otlp.budget.inUse(); used != 0 {
+				t.Fatalf("%d bytes still reserved", used)
 			}
 			if n := len(rec.find("otlp metrics")); n != 0 {
 				t.Fatalf("%d metric requests recorded", n)
@@ -1493,25 +1503,129 @@ func TestOTLPFixedNestingDepth(t *testing.T) {
 	}
 }
 
-// Known gap, zerobull-consulting/dagger#86: otlpMaxDepth bounds protobuf
-// bodies only. A JSON body is not walked (otlpJSONSize counts braces), so
-// protojson.Unmarshal recurses over it, to its own limit, with nothing
-// refused. Real engines send protobuf. Run: a JSON AnyValue 2,000 arrays deep
-// (4,000 messages, 56 KB) is taken. When JSON is bounded too, this test
-// changes with it.
-func TestOTLPDeeplyNestedJSONBodyTakenKnownGap(t *testing.T) {
-	const arrays = 2000
+// nestedJSONMetrics is a JSON metrics body whose resource has one attribute
+// holding an AnyValue nested arrays levels deep, each in an ArrayValue: 3
+// objects and arrays a level.
+func nestedJSONMetrics(arrays int) []byte {
 	v := `{"stringValue":"x"}`
 	for range arrays {
 		v = `{"arrayValue":{"values":[` + v + `]}}`
 	}
-	body := []byte(`{"resourceMetrics":[{"resource":{"attributes":[{"key":"k","value":` + v + `}]}}]}`)
-	if len(body) > testOTLPLimit {
-		t.Fatalf("a body of %d bytes", len(body))
+	return []byte(`{"resourceMetrics":[{"resource":{"attributes":[{"key":"k","value":` + v + `}]}}]}`)
+}
+
+// A JSON body is bounded too (zerobull-consulting/dagger#86): protojson
+// recurses once per object and array, so one nested past otlpMaxJSONDepth is
+// refused with 400 before it is decoded, and one at the limit is taken. The
+// body's fixed levels are the request, resourceMetrics, its element,
+// resource, attributes, its element and value: 7 before the AnyValue.
+func TestOTLPDeeplyNestedJSONBodyRefused(t *testing.T) {
+	// Each array adds 3 (the AnyValue, arrayValue and values), and the leaf
+	// stringValue object 1 more.
+	atLimit := (otlpMaxJSONDepth - 8) / 3
+	if d := otlpJSONDepth(nestedJSONMetrics(atLimit)); d > otlpMaxJSONDepth || d < otlpMaxJSONDepth-2 {
+		t.Fatalf("%d arrays nest %d deep, want %d or just short", atLimit, d, otlpMaxJSONDepth)
 	}
-	_, _, srv := limitedService(t, 64<<20)
-	if resp := postBody(t, srv.URL+"/v1/metrics", body, true, false, ""); resp.StatusCode != http.StatusOK {
-		t.Fatalf("a JSON body nested %d arrays deep: %d; JSON depth is bounded now: update the known gap", arrays, resp.StatusCode)
+	for _, c := range []struct {
+		name   string
+		arrays int
+		want   int
+	}{
+		{"at the limit", atLimit, http.StatusOK},
+		{"one array past the limit", atLimit + 1, http.StatusBadRequest},
+		{"2,000 deep", 2000, http.StatusBadRequest},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			body := nestedJSONMetrics(c.arrays)
+			if len(body) > testOTLPLimit {
+				t.Fatalf("a body of %d bytes", len(body))
+			}
+			svc, rec, srv := limitedService(t, 64<<20)
+			if resp := postBody(t, srv.URL+"/v1/metrics", body, true, false, ""); resp.StatusCode != c.want {
+				t.Fatalf("%d arrays deep: %d, want %d", c.arrays, resp.StatusCode, c.want)
+			}
+			wantRecorded, wantRefused := 1, 0.0
+			if c.want != http.StatusOK {
+				wantRecorded, wantRefused = 0, 1
+			}
+			if n := len(rec.find("otlp metrics")); n != wantRecorded {
+				t.Fatalf("%d metric requests recorded", n)
+			}
+			if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedTooDeep); got != wantRefused {
+				t.Fatalf("too_deep %v, want %v", got, wantRefused)
+			}
+		})
+	}
+}
+
+// Braces, brackets and quotes inside a JSON string are not nesting: a string
+// of 10,000 of them, escapes and escaped quotes included, is taken.
+func TestOTLPJSONBracesInStringsNotCounted(t *testing.T) {
+	for _, content := range []string{
+		strings.Repeat("{", 10000),
+		strings.Repeat("[", 10000),
+		strings.Repeat(`\"{[`, 2500),
+		strings.Repeat(`\\`, 2500) + strings.Repeat("{", 2500),
+	} {
+		body := []byte(`{"resourceMetrics":[{"resource":{"attributes":[{"key":"k","value":{"stringValue":"` + content + `"}}]}}]}`)
+		if d := otlpJSONDepth(body); d > 8 {
+			t.Fatalf("%.20q... counts %d deep", content, d)
+		}
+		_, rec, srv := limitedService(t, 64<<20)
+		if resp := postBody(t, srv.URL+"/v1/metrics", body, true, false, ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("%.20q...: %d", content, resp.StatusCode)
+		}
+		if n := len(rec.find("otlp metrics")); n != 1 {
+			t.Fatalf("%d metric requests recorded", n)
+		}
+	}
+}
+
+// Groups nest too, and protowire.ConsumeFieldValue would walk them to its
+// own limit (10,000) uncounted: an unknown start-group nested past
+// otlpMaxDepth is refused like nested messages are
+// (zerobull-consulting/dagger#86).
+func TestOTLPNestedGroupsRefused(t *testing.T) {
+	groups := func(n int) []byte {
+		var b []byte
+		for range n {
+			b = protowire.AppendTag(b, 100, protowire.StartGroupType)
+		}
+		for range n {
+			b = protowire.AppendTag(b, 100, protowire.EndGroupType)
+		}
+		return b
+	}
+	for _, c := range []struct {
+		name   string
+		groups int
+		want   int
+	}{
+		{"at the limit", otlpMaxDepth, http.StatusOK},
+		{"one past the limit", otlpMaxDepth + 1, http.StatusBadRequest},
+		{"9,000 deep", 9000, http.StatusBadRequest},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			body := groups(c.groups)
+			svc, _, srv := limitedService(t, 4<<20)
+			if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != c.want {
+				t.Fatalf("%d groups deep (%d bytes): %d, want %d", c.groups, len(body), resp.StatusCode, c.want)
+			}
+			if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedTooDeep); (got == 1) != (c.want == http.StatusBadRequest) {
+				t.Fatalf("too_deep %v", got)
+			}
+		})
+	}
+	// A group nested inside a message counts from that message's depth.
+	inner := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), groups(otlpMaxDepth))
+	req := &colmetricspb.ExportMetricsServiceRequest{}
+	if _, _, err := otlpDecodedSizeDepth(inner, req, false); !errors.Is(err, errOTLPDepth) {
+		t.Fatalf("groups at the limit inside a ResourceMetrics: %v, want errOTLPDepth", err)
+	}
+	// A mismatched end-group is malformed, not deep.
+	bad := append(protowire.AppendTag(nil, 100, protowire.StartGroupType), protowire.AppendTag(nil, 101, protowire.EndGroupType)...)
+	if _, _, err := otlpDecodedSizeDepth(bad, req, false); err == nil || errors.Is(err, errOTLPDepth) {
+		t.Fatalf("mismatched end-group: %v", err)
 	}
 }
 

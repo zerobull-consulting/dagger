@@ -950,6 +950,9 @@ const (
 	// OTLPRefusedTimeout is a body not received within the read timeout
 	// (408).
 	OTLPRefusedTimeout = "timeout"
+	// OTLPRefusedTooDeep is a body that nests messages (or, for JSON,
+	// objects and arrays) deeper than the service decodes (400).
+	OTLPRefusedTooDeep = "too_deep"
 )
 
 // OTLPRefused records an OTLP request refused on route, one of the

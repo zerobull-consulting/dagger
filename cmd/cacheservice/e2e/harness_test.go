@@ -225,15 +225,16 @@ func TestOTLPSizesOf(t *testing.T) {
 	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 100, "decodedBytes", 300, "messageBytes", 900, "headerBytes", 700, "nestingDepth", 8, "budgetPeak", 300)
 	logger.Debug("otlp request accepted", "route", "traces", "receivedBytes", 50, "decodedBytes", 50, "messageBytes", 100, "headerBytes", 800, "nestingDepth", 12, "budgetPeak", 900)
 	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "nestingDepth", 6, "budgetPeak", 7)
-	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", "x", "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "budgetPeak", 7)
-	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "budgetPeak", 7)
-	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "budgetPeak", 7, "headerBytes", 5)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", "x", "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "nestingDepth", 6, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "nestingDepth", 6, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "budgetPeak", 7, "headerBytes", 5, "nestingDepth", 6)
 	logger.Debug("otlp request accepted", "route", "logs", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "budgetPeak", 7)
+	logger.Debug("otlp request accepted", "route", "metrics", "receivedBytes", 7, "decodedBytes", 7, "messageBytes", 70, "headerBytes", 5, "nestingDepth", -1, "budgetPeak", 7)
 	logger.Warn("otlp request refused", "route", "traces", "reason", "too_large")
 	logger.Warn("undecodable otlp request", "path", "/v1/logs")
 	sizes := otlpSizesOf(rec)
 	tr, lg := sizes.largest["traces"], sizes.largest["logs"]
-	if tr == nil || tr.n != 2 || tr.received != 100 || tr.decoded != 300 || tr.message != 900 || tr.headers != 800 || lg == nil || lg.n != 1 || tr.depth != 12 || lg.depth != 6 || sizes.budgetPeak != 900 {
+	if tr == nil || tr.n != 2 || tr.received != 100 || tr.decoded != 300 || tr.message != 900 || tr.headers != 800 || lg == nil || lg.n != 1 || tr.depth != 12 || lg.depth != 6 || sizes.largest["metrics"] == nil || !sizes.largest["metrics"].json || tr.json || sizes.budgetPeak != 900 {
 		t.Fatalf("sizes %+v %+v, peak %d", tr, lg, sizes.budgetPeak)
 	}
 	if len(sizes.refused) != 2 || len(sizes.malformed) != 4 {
