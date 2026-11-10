@@ -56,6 +56,11 @@ type drainState struct {
 	// explicitEnded wakes a drain when an explicit request ends. New makes
 	// it.
 	explicitEnded chan struct{}
+	// explicitWG counts the explicit requests too, for the stop's Wait
+	// (zerobull-consulting/dagger#202). explicitClosed is set, under mu,
+	// once Wait began: none is admitted after it, so no Add races Wait.
+	explicitWG     workGroup
+	explicitClosed bool
 }
 
 // DrainLeft is what a drain left unexported of one engine cache.
@@ -367,30 +372,50 @@ func (s *Service) waitExplicit(ctx context.Context, deadline time.Time, ended <-
 }
 
 // admitExplicit admits an explicit export or import (Service.Export,
-// Service.Import), unless the service drains: ErrDraining. A drain that
-// starts once it was admitted waits for it, until the drain's deadline. The
-// caller calls done when it ends.
-func (s *Service) admitExplicit() (done func(), err error) {
+// Service.Import), unless the service drains (ErrDraining) or its stop
+// began (ErrStopping): stop, the path's context, ended, or Wait began. A
+// drain that starts once it was admitted waits for it, until the drain's
+// deadline, and so does Wait. The caller runs it on run, which ends with
+// ctx or stop, and calls done when it ends.
+func (s *Service) admitExplicit(ctx, stop context.Context) (run context.Context, done func(), err error) {
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
 	// Under drain.mu, which Drain sets draining under.
 	if s.draining.Load() {
-		return nil, ErrDraining
+		return nil, nil, ErrDraining
+	}
+	if s.drain.explicitClosed || stop.Err() != nil {
+		return nil, nil, ErrStopping
 	}
 	s.drain.explicit++
+	s.drain.explicitWG.Add()
 	ended := s.drain.explicitEnded
+	run, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(stop, cancel)
 	var once sync.Once
-	return func() {
+	return run, func() {
 		once.Do(func() {
+			stopCancel()
+			cancel()
 			s.drain.mu.Lock()
 			s.drain.explicit--
 			s.drain.mu.Unlock()
+			s.drain.explicitWG.Done()
 			select {
 			case ended <- struct{}{}:
 			default:
 			}
 		})
 	}, nil
+}
+
+// waitExplicitHooks waits for the explicit exports and imports, after the
+// contexts that run them have ended, and admits none after.
+func (s *Service) waitExplicitHooks() {
+	s.drain.mu.Lock()
+	s.drain.explicitClosed = true
+	s.drain.mu.Unlock()
+	s.drain.explicitWG.Wait()
 }
 
 // explicitRunning is how many explicit exports and imports run.

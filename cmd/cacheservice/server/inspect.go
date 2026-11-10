@@ -109,8 +109,10 @@ func (s *Service) Export(ctx context.Context, conn uint64, req exporter.Request)
 		return exporter.Result{}, s.exportOff()
 	}
 	// New work: the drain runs what is pending itself. One admitted before
-	// the drain started is waited for (zerobull-consulting/dagger#72).
-	done, err := s.admitExplicit()
+	// the drain started is waited for (zerobull-consulting/dagger#72). The
+	// stop cancels it with the export path, and Wait waits for it
+	// (zerobull-consulting/dagger#202).
+	ctx, done, err := s.admitExplicit(ctx, p.ctx)
 	if err != nil {
 		return exporter.Result{}, err
 	}
@@ -173,8 +175,11 @@ func (s *Service) Import(ctx context.Context, conn uint64) (importer.Result, err
 		return importer.Result{}, ErrImportOff
 	}
 	// A drain that starts once it was admitted waits for it
-	// (zerobull-consulting/dagger#72).
-	done, err := s.admitExplicit()
+	// (zerobull-consulting/dagger#72). The stop cancels it, and Wait waits
+	// for it (zerobull-consulting/dagger#202): it runs on the context the
+	// import path was enabled with, which the stop ends, not on the sync
+	// loops' own, which the drain ends.
+	ctx, done, err := s.admitExplicit(ctx, s.imports.svcCtx)
 	if err != nil {
 		return importer.Result{}, err
 	}

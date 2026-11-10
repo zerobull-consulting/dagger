@@ -251,9 +251,12 @@ func (s *Service) checkOwnership(ctx context.Context, st storeSet, writer bool, 
 }
 
 // Wait waits for the exports in flight, those a drain started included, the
-// import sync loops and GC, runs asked for (CollectGarbage) included, after
-// the context that runs them has ended.
+// explicit exports and imports (Service.Export, Service.Import), the import
+// sync loops and GC, runs asked for (CollectGarbage) included, after the
+// context that runs them has ended. No explicit request is admitted once it
+// began (ErrStopping).
 func (s *Service) Wait() {
+	s.waitExplicitHooks()
 	s.waitExports()
 	s.waitImports()
 	s.waitGC()
@@ -305,6 +308,9 @@ type Running struct {
 	Imports int
 	// GC are the GC runs, asked for or scheduled, and its schedule.
 	GC int
+	// Explicit are the explicit exports and imports (Service.Export,
+	// Service.Import).
+	Explicit int
 	// Engines are the engine connections still welcomed. Wait doesn't
 	// wait for them: CloseEngines closes them.
 	Engines int
@@ -315,6 +321,9 @@ type Running struct {
 // LogAttrs returns the counts of r as key-value pairs for slog.
 func (r Running) LogAttrs() []any {
 	attrs := []any{"exports", r.Exports, "imports", r.Imports, "gc", r.GC, "engines", r.Engines}
+	if r.Explicit > 0 {
+		attrs = append(attrs, "explicit", r.Explicit)
+	}
 	if r.Held > 0 {
 		attrs = append(attrs, "held", r.Held)
 	}
@@ -333,6 +342,7 @@ func (s *Service) Running() Running {
 	if p := s.gc; p != nil {
 		r.GC = p.wg.Running()
 	}
+	r.Explicit = s.drain.explicitWG.Running()
 	r.Held = s.testHeld.Running()
 	s.mu.Lock()
 	r.Engines = len(s.conns)

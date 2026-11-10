@@ -27,6 +27,9 @@ type importPath struct {
 	// the service starts draining.
 	ctx  context.Context
 	stop context.CancelFunc
+	// svcCtx is the context EnableImport was given: the stop ends it, the
+	// drain doesn't. The explicit imports run on it (Service.Import).
+	svcCtx context.Context
 
 	mu       sync.Mutex
 	triggers map[*engineConn]chan struct{}
@@ -81,8 +84,9 @@ func (s *Service) EnableImport(ctx context.Context, cfg ImportConfig) error {
 	if err := s.setDefaultNamespace(cfg.Importer.Scope); err != nil {
 		return err
 	}
+	svcCtx := ctx
 	ctx, stop := context.WithCancel(ctx)
-	s.imports = &importPath{cfg: cfg.Importer, poll: cfg.Poll, ctx: ctx, stop: stop, triggers: map[*engineConn]chan struct{}{}}
+	s.imports = &importPath{cfg: cfg.Importer, poll: cfg.Poll, ctx: ctx, stop: stop, svcCtx: svcCtx, triggers: map[*engineConn]chan struct{}{}}
 	return nil
 }
 

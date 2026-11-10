@@ -3043,8 +3043,14 @@ cache's export slot runs once it has it. While the drain waits, `GET
 draining are counted in the report's `stored`. One still running when the
 drain ends (at its deadline, or canceled) is counted in the report's
 `explicit`, logged as `explicitLeft`, and runs on until it ends or the stop
-that follows cuts it off (an export cut off publishes nothing); what it
-stores after the drain ended isn't in the report. Pinned by
+that follows cancels it (an export cut off publishes nothing); what it
+stores after the drain ended isn't in the report. The stop cancels the
+hooks with the service's paths, before it waits for the HTTP servers, and
+waits for them to end with the rest of the service's work; one asked for
+once the stop began answers 503
+(`TestStopCancelsAndWaitsForExplicitHooks`,
+`TestShutdownCancelsExplicitExport`,
+[#202](https://github.com/zerobull-consulting/dagger/issues/202)). Pinned by
 `TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
 `TestDrainRunsExplicitExportWaitingForSlot`, the
 `TestDrainEndsAtDeadlineWith…` tests and
