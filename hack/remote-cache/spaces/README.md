@@ -48,7 +48,7 @@ export DIGITALOCEAN_TOKEN=... GITHUB_TOKEN=... TF_WORKSPACE=dagger
 `up` is `terraform init` and `apply`, and safe to run again: Terraform changes
 only what differs. It needs:
 
-- `terraform` 1.5 or later (or `TF=tofu`);
+- `terraform` 1.7 or later (or `TF=tofu`);
 - one DigitalOcean API token, with read and write scopes, as `do_token`:
   `DIGITALOCEAN_TOKEN` or `TF_VAR_do_token` in the environment, or in a
   `terraform.tfvars` here (git-ignored, loaded by Terraform itself);
