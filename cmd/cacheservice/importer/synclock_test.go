@@ -235,19 +235,25 @@ func TestKnownGapSyncAfterForgetOverlapsRunningSync(t *testing.T) {
 	within(t, first, "held sync")
 }
 
-// flipCtx reports no error on its first Err call and context.Canceled from
-// then on, with a Done that never fires: the context ends between lockSync's
-// first check and the select, where the select can't see it.
+// flipCtx reports no error until its Done is first asked for, and
+// context.Canceled from then on, with a Done that never fires: the context
+// ends between lockSync's first check and the select, where the select can't
+// see it. Extra Err calls before the select don't change that.
 type flipCtx struct {
 	context.Context
-	calls atomic.Int32
+	flipped atomic.Bool
+}
+
+func (c *flipCtx) Done() <-chan struct{} {
+	c.flipped.Store(true)
+	return nil
 }
 
 func (c *flipCtx) Err() error {
-	if c.calls.Add(1) == 1 {
-		return nil
+	if c.flipped.Load() {
+		return context.Canceled
 	}
-	return context.Canceled
+	return nil
 }
 
 // A context that ends while the lock is taken, with the slot free, gets its

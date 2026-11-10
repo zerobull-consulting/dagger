@@ -199,6 +199,7 @@ func TestImportSyncCanceledDoesNotWaitForSyncLock(t *testing.T) {
 	}
 	select {
 	case err := <-done:
+		drained = true
 		t.Fatalf("the held import returned early: %v", err)
 	default:
 	}
