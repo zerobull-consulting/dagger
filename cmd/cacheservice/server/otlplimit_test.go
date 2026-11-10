@@ -1558,6 +1558,34 @@ func TestOTLPDeeplyNestedJSONBodyRefused(t *testing.T) {
 	}
 }
 
+// The stack the walk and the decode take is reserved before the walk: a body
+// nested past the limit, when the budget can't hold the stack, is answered
+// 503 busy without being walked (it would be 400 too_deep if it were).
+func TestOTLPDecodeStackReservedBeforeWalk(t *testing.T) {
+	req := nestedMetricsRequest(otlpMaxDepth, false)
+	body := encodeOTLP(t, req, false)
+	if _, err := otlpDecodedSize(body, req, false); !errors.Is(err, errOTLPDepth) {
+		t.Fatalf("the body isn't too deep: %v", err)
+	}
+	// The request, its headers and the body's buffer fit; the stack doesn't.
+	svc, rec, srv := limitedService(t, otlpRequestReserve+16<<10)
+	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("stack past the budget: %d, want 503", resp.StatusCode)
+	}
+	if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedBusy); got != 1 {
+		t.Fatalf("busy %v", got)
+	}
+	if got := refusedCount(t, svc, metrics.OTLPRouteMetrics, metrics.OTLPRefusedTooDeep); got != 0 {
+		t.Fatalf("too_deep %v: the body was walked", got)
+	}
+	if n := len(rec.find("otlp metrics")); n != 0 {
+		t.Fatalf("%d metric requests recorded", n)
+	}
+	if used := svc.otlp.budget.inUse(); used != 0 {
+		t.Fatalf("%d bytes still reserved", used)
+	}
+}
+
 // Braces, brackets and quotes inside a JSON string are not nesting: a string
 // of 10,000 of them, escapes and escaped quotes included, is taken.
 func TestOTLPJSONBracesInStringsNotCounted(t *testing.T) {
@@ -1710,8 +1738,9 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 	// Reading a body of about 32 KiB holds otlpRequestReserve plus a 32 KiB
 	// and a 64 KiB buffer at its peak (114,688 bytes), then the 64 KiB buffer
 	// (81,920); the group's estimate is its 32,776 bytes plus the request's
-	// struct, so 114,700 admits the read and the flat charge (82,008 held) but
-	// not the size charge (about 114,784).
+	// struct, so 114,700 plus the decode's stack (otlpDecodeStack, reserved with
+	// it) admits the read and the flat charge (82,008 held) but not the size
+	// charge (about 114,784).
 	// A 413 here comes from the estimate: the body is far under the route's
 	// limit, and a read the budget can't hold is a 503.
 	body := unknownGroup
@@ -1726,7 +1755,7 @@ func TestOTLPUnknownGroupChargedItsSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, srv := limitedService(t, 114700+otlpHeaderReserve(parsed))
+	_, _, srv := limitedService(t, 114700+otlpDecodeStack+otlpHeaderReserve(parsed))
 	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)

@@ -1640,8 +1640,10 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   - **JSON: 128 objects and arrays deep** (`otlpMaxJSONDepth`, twice the
     other, since a message in a repeated field takes an array and an object),
     counted outside strings (`TestOTLPJSONBracesInStringsNotCounted`).
-  - **The stack is reserved** with the decoded message, not with the 16 KiB
-    each request reserves: 64 KiB for a protobuf body (`otlpDecodeStack`) and
+  - **The stack is reserved** before the body is walked (a request whose
+    stack doesn't fit is answered 503 without being walked,
+    `TestOTLPDecodeStackReservedBeforeWalk`), and apart from the 16 KiB each
+    request reserves: 64 KiB for a protobuf body (`otlpDecodeStack`) and
     128 KiB for JSON (`otlpJSONDecodeStack`). At the limits, the goroutine's
     stack grew to 16 to 32 KiB for the walk and 32 to 64 KiB for the decode of
     a protobuf body, and 64 to 128 KiB for the decode of a JSON one (a stack

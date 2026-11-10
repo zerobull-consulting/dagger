@@ -209,6 +209,18 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	if err != nil {
 		return refuse(err)
 	}
+	// The walk and the decode recurse once per level of the body, on the
+	// stack: reserve it before the walk, so a body nested to the limit holds
+	// its stack in the budget while it is estimated as well as while it is
+	// decoded.
+	stack := int64(otlpDecodeStack)
+	if isJSON(r) {
+		stack = otlpJSONDecodeStack
+	}
+	if !lim.budget.reserve(stack) {
+		return refuse(errOTLPBusy)
+	}
+	held += stack
 	// The message decoded from the body can take far more than the body
 	// (otlpDecodedSize): it is estimated, and reserved, before it is
 	// decoded. One that could never fit in the budget is too large.
@@ -216,18 +228,13 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	if err != nil {
 		return refuse(err)
 	}
-	// The decode also takes stack, for as many levels as the body nests.
-	reserve := estimate + otlpDecodeStack
-	if isJSON(r) {
-		reserve = estimate + otlpJSONDecodeStack
-	}
 	switch {
-	case reserve+held > lim.budget.size:
+	case estimate+held > lim.budget.size:
 		return refuse(errOTLPDecodesTooLarge)
-	case !lim.budget.reserve(reserve):
+	case !lim.budget.reserve(estimate):
 		return refuse(errOTLPBusy)
 	}
-	held += reserve
+	held += estimate
 	if isJSON(r) {
 		err = protojson.Unmarshal(data, msg)
 	} else {
