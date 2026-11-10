@@ -478,14 +478,36 @@ func TestTrackerConnectedWakesEngineWait(t *testing.T) {
 			t.Fatalf("a hello made a backed-off root due: %v", got)
 		}
 	})
-	t.Run("in flight", func(t *testing.T) {
+	t.Run("interrupted export", func(t *testing.T) {
+		tr, b := setup()
+		tr.Interrupted(b, Result{}, t0, wait)
+		if got := roots(tr.Due(now)); len(got) != 0 {
+			t.Fatalf("due before the hello: %v", got)
+		}
+		tr.Connected("c", 2, now)
+		if got := roots(tr.Due(now)); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("an interrupted root not due at the hello: %v", got)
+		}
+	})
+	t.Run("claimed entry", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		tr.Due(wait) // claims it
+		tr.Connected("c", 2, wait.Add(time.Second))
+		if got := tr.Entries("c")[0].RetryAt; got != "" {
+			t.Fatalf("a hello gave a claimed entry a retry time: %s", got)
+		}
+	})
+	t.Run("stale wait", func(t *testing.T) {
+		// The entry waited until `wait`, was claimed, failed, and its
+		// backoff ends at the same instant: still a backoff.
 		tr, b := setup()
 		tr.Requeue(b, wait)
 		b2 := tr.Due(wait)
-		tr.Connected("c", 2, wait.Add(time.Second))
-		tr.Done(b2[0], Result{Stored: []uint64{1}}, wait.Add(time.Second))
-		if got := roots(tr.Due(wait.Add(time.Minute))); len(got) != 0 {
-			t.Fatalf("stored root due again: %v", got)
+		tr.Done(b2[0], Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, wait.Add(-time.Second))
+		tr.Connected("c", 2, wait.Add(-500*time.Millisecond))
+		if got := roots(tr.Due(wait.Add(-500 * time.Millisecond))); len(got) != 0 {
+			t.Fatalf("a hello cut a backoff short: %v", got)
 		}
 	})
 }

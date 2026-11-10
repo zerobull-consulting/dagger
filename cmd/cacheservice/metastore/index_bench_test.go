@@ -24,7 +24,7 @@ func seedIndex(b *testing.B, s *Store, scope string, n int) int {
 			Bundle:  fmt.Sprintf("%064x", i/50),
 			Ordinal: dagql.TransferOrdinal(i%50 + 1),
 			Source:  Source{CacheID: "cache-a", Generation: 5, Number: num},
-			Deps:    []uint64{num/2 + 1, num/3 + 1},
+			Deps:    benchDeps(num),
 			Parts:   []string{`{"part":"fs"}`},
 		}
 		idx.Roots[num] = Root{RecordedAtUnix: 1}
@@ -45,9 +45,19 @@ func seedIndex(b *testing.B, s *Store, scope string, n int) int {
 	return len(body)
 }
 
+// benchDeps returns an entry's dependencies: numbers below its own.
+func benchDeps(num uint64) []uint64 {
+	if num <= 1 {
+		return nil
+	}
+	return []uint64{num / 2, num/3 + 1}[:1+min(1, int(num/3))]
+}
+
 // BenchmarkCheckGenerationRead measures what the exporter's early stale check
 // (exporter.checkGeneration) costs on each export try: reading and decoding
-// the scope's index, then Index.CheckGeneration. Run by hand:
+// the scope's index, then Index.CheckGeneration of a 20-value bundle from
+// an older generation than the index's, so its loop over the values runs.
+// Run by hand:
 //
 //	go test ./cmd/cacheservice/metastore -run '^$' -bench CheckGenerationRead -benchtime 20x
 //
@@ -80,6 +90,12 @@ func BenchmarkCheckGenerationRead(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
+			// The index is left in the bucket otherwise.
+			b.Cleanup(func() {
+				if key, err := s.IndexKey("scope"); err == nil {
+					_ = s.Objects().Delete(context.Background(), key)
+				}
+			})
 			return s
 		}
 	}
@@ -89,13 +105,20 @@ func BenchmarkCheckGenerationRead(b *testing.B) {
 				s := mk(b)
 				size := seedIndex(b, s, "scope", n)
 				ctx := context.Background()
+				bundle := &dagql.ValueBundle{Version: BundleVersion, Roots: []dagql.TransferredRoot{{Ordinal: 20}}}
+				for i := 1; i <= 20; i++ {
+					bundle.Values = append(bundle.Values, dagql.TransferredValue{
+						Ordinal:      dagql.TransferOrdinal(i),
+						SenderNumber: uint64(i * n / 20),
+					})
+				}
 				b.ResetTimer()
 				for range b.N {
 					idx, err := s.Index(ctx, "scope")
 					if err != nil {
 						b.Fatal(err)
 					}
-					if err := idx.CheckGeneration(&dagql.ValueBundle{}, "cache-a", 5); err != nil {
+					if err := idx.CheckGeneration(bundle, "cache-a", 4); err != nil {
 						b.Fatal(err)
 					}
 				}

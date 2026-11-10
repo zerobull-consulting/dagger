@@ -228,7 +228,7 @@ func TestOlderGenerationConnectingLaterDoesNotTakeExports(t *testing.T) {
 // the hello arrives, the batch is exported at once, not at the end of its
 // wait (zerobull-consulting/dagger#132).
 func TestNewerGenerationBatchExportsAtHello(t *testing.T) {
-	const wait = 4 * time.Second
+	const wait = 10 * time.Second
 	blobs, meta := newMemStores(t)
 	h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = wait })
 	restarted := fakeengine.New("cache-a", 5)
@@ -251,9 +251,11 @@ func TestNewerGenerationBatchExportsAtHello(t *testing.T) {
 	start := time.Now()
 	h.connectEngine(restarted)
 	waitFor(t, "the export from the newer generation", func() bool { return restarted.Exports() > 0 })
-	if d := time.Since(start); d > wait/2 {
+	// Without the wake the export comes at the end of the wait; the bound
+	// is half of it, far above what a loaded runner needs.
+	d := time.Since(start)
+	t.Logf("exported %s after the hello (NoEngineWait %s)", d, wait)
+	if d > wait/2 {
 		t.Fatalf("exported %s after the hello, want at once (the wait is %s)", d, wait)
-	} else {
-		t.Logf("exported %s after the hello (NoEngineWait %s)", d, wait)
 	}
 }

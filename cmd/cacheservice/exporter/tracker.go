@@ -165,12 +165,12 @@ type trackedEntry struct {
 	// retryAt is when a busy or failed root is due again; zero when it
 	// isn't waiting.
 	retryAt time.Time
-	// engineWaitAt is the retryAt a Requeue set, while retryAt is still it:
-	// the entry waits for its generation's engine to connect, not for a
-	// backoff. Connected makes such an entry due.
+	// engineWaitAt is set while the entry waits for its cache's engine to
+	// connect (Requeue, Interrupted), not for a backoff: Connected makes it
+	// due. Every other write of retryAt clears it.
 	engineWaitAt time.Time
 	busy         int
-	failures int
+	failures     int
 	// failedValue is the value failures counts for.
 	failedValue *exportedValue
 	// inFlight is set while a batch holds the entry.
@@ -601,8 +601,8 @@ func (t *Tracker) Started(cacheID string, generation uint64, wipedCache string) 
 // cache's stale-generation refusals, which are exported again (see cache),
 // even when no span or event of that generation reaches this service, as
 // when it goes to another replica. An entry waiting for an engine of that
-// generation to connect (see Requeue) is due at now: not at the end of its
-// wait. A backoff after a failed or busy export is left to run.
+// generation to connect (see Requeue, Interrupted) is due at now: not at the
+// end of its wait. A backoff after a failed or busy export is left to run.
 func (t *Tracker) Connected(cacheID string, generation uint64, now time.Time) {
 	if cacheID == "" {
 		return
@@ -612,12 +612,13 @@ func (t *Tracker) Connected(cacheID string, generation uint64, now time.Time) {
 	c := t.cache(cacheID, generation)
 	if c == nil {
 		// An older generation than the tracker's: the engine entries
-		// wait for is not this one.
+		// wait for is not this one. Past this check the hello is at the
+		// tracker's generation or newer, so the connection can serve them.
 		return
 	}
 	woke := false
 	for _, e := range c.entries {
-		if !e.inFlight && !e.engineWaitAt.IsZero() && e.retryAt.Equal(e.engineWaitAt) && e.retryAt.After(now) {
+		if !e.engineWaitAt.IsZero() && e.retryAt.After(now) {
 			e.retryAt, e.engineWaitAt = now, time.Time{}
 			woke = true
 		}
@@ -754,7 +755,7 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 			if !t.wantedLocked(c, n, e, now) {
 				// No longer worth exporting, as once stored, pruned or
 				// expired: stop waiting, so the entry can be forgotten.
-				e.retryAt, e.recheck, e.accel, e.dirtySince = time.Time{}, false, false, time.Time{}
+				e.retryAt, e.engineWaitAt, e.recheck, e.accel, e.dirtySince = time.Time{}, time.Time{}, false, false, time.Time{}
 				// An entry the engine no longer keeps (not retained,
 				// pruned or expired) is forgotten once its spans have
 				// stopped coming. A stored one is kept, so its stored
@@ -848,7 +849,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 			if !e.inFlight {
 				// No longer worth a retry, as once pruned or expired: stop
 				// waiting, so the entry can be forgotten.
-				e.retryAt = time.Time{}
+				e.retryAt, e.engineWaitAt = time.Time{}, time.Time{}
 			}
 			continue
 		}
@@ -870,7 +871,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 // now, so it is no longer dirty. A change from now on makes it dirty again.
 func (t *Tracker) claimLocked(e *trackedEntry) {
 	e.inFlight = true
-	e.retryAt, e.recheck = time.Time{}, false
+	e.retryAt, e.engineWaitAt, e.recheck = time.Time{}, time.Time{}, false
 	e.dirtySince, e.accel, e.busyAt = time.Time{}, false, time.Time{}
 }
 
@@ -1013,7 +1014,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 	}
 	for _, s := range res.Busy {
 		if e := entry(s.Number); e != nil {
-			e.retryAt = now.Add(t.backoff(e.busy))
+			e.retryAt, e.engineWaitAt = now.Add(t.backoff(e.busy)), time.Time{}
 			e.busy++
 			e.busyAt = now
 		}
@@ -1030,7 +1031,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		}
 		e.failures++
 		if e.failures < t.cfg.MaxFailures {
-			e.retryAt = now.Add(t.backoff(e.failures - 1))
+			e.retryAt, e.engineWaitAt = now.Add(t.backoff(e.failures-1)), time.Time{}
 		}
 	}
 	for _, f := range res.Failed {
@@ -1041,7 +1042,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		if !settled[n] {
 			if !interruptedRetry.IsZero() {
 				if e := c.entries[n]; e != nil {
-					e.retryAt = interruptedRetry
+					e.retryAt, e.engineWaitAt = interruptedRetry, interruptedRetry
 				}
 			} else {
 				failed(n)
@@ -1060,7 +1061,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		// change, as when a stale refusal was dropped, is due now.
 		if t.wantedLocked(c, n, e, now) {
 			if e.retryAt.IsZero() && e.dirtySince.IsZero() {
-				e.retryAt = now
+				e.retryAt, e.engineWaitAt = now, time.Time{}
 			}
 			t.scheduleLocked(c, n, e, now)
 		}
@@ -1212,7 +1213,7 @@ func (t *Tracker) StartDrain(now time.Time) {
 	for _, c := range t.caches {
 		for _, e := range c.entries {
 			if !e.inFlight && e.retryAt.After(now) {
-				e.retryAt = now
+				e.retryAt, e.engineWaitAt = now, time.Time{}
 			}
 		}
 	}
@@ -1314,7 +1315,7 @@ func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
 	if c := t.caches[cacheID]; c != nil {
 		for _, e := range c.entries {
 			if !e.inFlight && e.retryAt.After(now) {
-				e.retryAt = now
+				e.retryAt, e.engineWaitAt = now, time.Time{}
 			}
 		}
 	}
