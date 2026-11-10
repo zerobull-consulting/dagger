@@ -183,6 +183,9 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	// the handler ran), so they are reserved with the request, before any
 	// of the body is read.
 	headers := otlpHeaderReserve(r)
+	if headers > MaxOTLPHeaderReserve {
+		return refuse(errOTLPHeadersTooLarge)
+	}
 	if !lim.budget.reserve(otlpRequestReserve + headers) {
 		return refuse(errOTLPBusy)
 	}

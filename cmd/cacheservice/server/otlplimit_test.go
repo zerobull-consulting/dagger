@@ -468,7 +468,8 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // Requests well within it are never refused, however many: only bytes count.
 //
 // Sizes: the budget is 152 KiB, and every request reserves 16 KiB for
-// itself. The held request holds 48 KiB (itself, and a 32 KiB buffer for the
+// itself, and a few hundred bytes more for its headers (otlpHeaderReserve).
+// The held request holds 48 KiB (itself, and a 32 KiB buffer for the
 // 20 KiB it sent), and needs about 147 KiB to complete (a 64 KiB buffer and
 // its message). A 40 KiB body needs 112 KiB as its buffer grows to 64 KiB,
 // and 122 KiB with its message: it fits alone, not beside the held 48 KiB.
@@ -1013,7 +1014,7 @@ func headerServer(t *testing.T, svc *Service) string {
 }
 
 // A request's headers are in the decode budget (zerobull-consulting/dagger#85):
-// one with 48 KiB of headers that stalls its body holds them in the budget,
+// one with 24 KiB of headers that stalls its body holds them in the budget,
 // beside otlpRequestReserve and its first buffer, until it ends. Without the
 // charge it held only otlpRequestReserve plus the buffer.
 func TestOTLPRequestHeadersInBudget(t *testing.T) {
@@ -1023,7 +1024,7 @@ func TestOTLPRequestHeadersInBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	pad := strings.Repeat("a", 48<<10)
+	pad := strings.Repeat("a", 24<<10)
 	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nX-Pad: %s\r\nContent-Type: application/x-protobuf\r\nContent-Length: 1000\r\n\r\n\x0a", pad)
 	floor := int64(otlpRequestReserve+otlpMinBuffer) + int64(len(pad))
 	waitUntil(t, 5*time.Second, "the stalled request's headers to be reserved", func() bool { return svc.otlp.budget.inUse() >= floor })
@@ -1063,19 +1064,26 @@ func TestOTLPHeaderReserve(t *testing.T) {
 func TestOTLPHeaderReserveCoversParsedHeaders(t *testing.T) {
 	for _, c := range []struct {
 		name string
+		// head is what precedes the generated lines in the header block.
+		head string
 		line func(i int) string
+		// tail ends the last line.
+		tail string
 		heap int64
 	}{
-		{"distinct keys", func(i int) string { return fmt.Sprintf("%x:b\r\n", i) }, 967022},
-		{"one key repeated", func(int) string { return "a:b\r\n" }, 277624},
+		{"distinct keys", "", func(i int) string { return fmt.Sprintf("%x:b\r\n", i) }, "", 967022},
+		{"one key repeated", "", func(int) string { return "a:b\r\n" }, "", 277624},
+		// net/http moves the names of a Trailer header out of r.Header
+		// into r.Trailer (14,783 names, 1,508,797 bytes).
+		{"trailer names", "Transfer-Encoding: chunked\r\nTrailer: ", func(i int) string { return fmt.Sprintf("%x,", i) }, "zz\r\n", 1508797},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var b strings.Builder
-			b.WriteString("POST /v1/traces HTTP/1.1\r\nHost: t\r\n")
+			b.WriteString("POST /v1/traces HTTP/1.1\r\nHost: t\r\n" + c.head)
 			for i := 0; b.Len() < MaxHeaderBytes+4<<10-20; i++ {
 				b.WriteString(c.line(i))
 			}
-			b.WriteString("\r\n")
+			b.WriteString(c.tail + "\r\n")
 			r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(b.String())))
 			if err != nil {
 				t.Fatal(err)
@@ -1085,6 +1093,61 @@ func TestOTLPHeaderReserveCoversParsedHeaders(t *testing.T) {
 				t.Fatalf("reserve %d for headers that held %d", got, c.heap)
 			}
 		})
+	}
+}
+
+// A request whose headers would reserve more than MaxOTLPHeaderReserve is
+// answered 431 before it reserves anything or its body is read, whatever
+// shape they take: one long header, thousands of short ones, or a long list of
+// trailer names. One within it is taken. The refusal is counted as too_large.
+func TestOTLPHeaderReserveCap(t *testing.T) {
+	svc, rec, _ := limitedService(t, 4*testOTLPLimit)
+	addr := headerServer(t, svc)
+	body := encodeOTLP(t, otlpCases()[2].build(""), false)
+	post := func(head, lines string) int {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-protobuf\r\nContent-Length: %d\r\nConnection: close\r\n%s%s\r\n%s", len(body), head, lines, body)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	many := func(n int) string {
+		var b strings.Builder
+		for i := range n {
+			fmt.Fprintf(&b, "h%x:b\r\n", i)
+		}
+		return b.String()
+	}
+	if status := post("", many(100)+"X-Pad: "+strings.Repeat("a", 12<<10)+"\r\n"); status != http.StatusOK {
+		t.Fatalf("headers within the cap: %d", status)
+	}
+	if n := len(rec.find("otlp metrics")); n != 1 {
+		t.Fatalf("%d metric requests recorded", n)
+	}
+	for _, c := range []struct{ name, lines string }{
+		{"one long header", "X-Pad: " + strings.Repeat("a", 40<<10) + "\r\n"},
+		{"many short headers", many(3000)},
+	} {
+		if status := post("", c.lines); status != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("%s: %d", c.name, status)
+		}
+	}
+	if got := refusedCount(t, svc, "metrics", metrics.OTLPRefusedTooLarge); got != 2 {
+		t.Fatalf("too_large refusals: %v", got)
+	}
+	if n := len(rec.find("otlp metrics")); n != 1 {
+		t.Fatalf("%d metric requests recorded after the refusals", n)
+	}
+	if used := svc.otlp.budget.inUse(); used != 0 {
+		t.Fatalf("%d bytes still reserved", used)
 	}
 }
 
@@ -1110,8 +1173,8 @@ func TestOTLPRequestOverHeaderLimit(t *testing.T) {
 		resp.Body.Close()
 		return resp
 	}
-	if resp := post(MaxHeaderBytes - 1<<10); resp.StatusCode != http.StatusOK {
-		t.Fatalf("headers just under the limit: %d", resp.StatusCode)
+	if resp := post(24 << 10); resp.StatusCode != http.StatusOK {
+		t.Fatalf("headers within the limits: %d", resp.StatusCode)
 	}
 	if n := len(rec.find("otlp metrics")); n != 1 {
 		t.Fatalf("%d metric requests recorded", n)
@@ -1130,7 +1193,9 @@ func TestOTLPRequestOverHeaderLimit(t *testing.T) {
 
 // net/http bounds a request's trailers to a few KiB, so they hold nothing the
 // per-request reserve doesn't cover: a chunked request whose trailer is 1 KiB
-// is taken, and one of 8 KiB is answered 400 and records nothing.
+// is taken, so is one of 4,056 bytes, and one of 4 KiB (net/http's read
+// buffer, as measured with Go 1.26.6; a Go upgrade that moves it turns this
+// red, and the README's claim with it) is answered 400 and records nothing.
 func TestOTLPRequestOverTrailerLimit(t *testing.T) {
 	svc, rec, _ := limitedService(t, 4*testOTLPLimit)
 	addr := headerServer(t, svc)
@@ -1151,16 +1216,18 @@ func TestOTLPRequestOverTrailerLimit(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode
 	}
-	if status := post(1 << 10); status != http.StatusOK {
-		t.Fatalf("a 1 KiB trailer: %d", status)
+	for i, n := range []int{1 << 10, 4056} {
+		if status := post(n); status != http.StatusOK {
+			t.Fatalf("a trailer of %d bytes: %d", n, status)
+		}
+		if got := len(rec.find("otlp metrics")); got != i+1 {
+			t.Fatalf("%d metric requests recorded", got)
+		}
 	}
-	if n := len(rec.find("otlp metrics")); n != 1 {
-		t.Fatalf("%d metric requests recorded", n)
+	if status := post(4 << 10); status != http.StatusBadRequest {
+		t.Fatalf("a 4 KiB trailer: %d", status)
 	}
-	if status := post(8 << 10); status != http.StatusBadRequest {
-		t.Fatalf("an 8 KiB trailer: %d", status)
-	}
-	if n := len(rec.find("otlp metrics")); n != 1 {
+	if n := len(rec.find("otlp metrics")); n != 2 {
 		t.Fatalf("%d metric requests recorded after the refusal", n)
 	}
 	if used := svc.otlp.budget.inUse(); used != 0 {

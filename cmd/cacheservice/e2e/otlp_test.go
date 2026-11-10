@@ -107,11 +107,11 @@ func (s *state) otlpSizes(t *testing.T) {
 		Check(t, largest*otlpMargin <= route.limit,
 			"%s: %d requests, largest %d bytes received, %d decoded; limit %d (%.0fx the largest)",
 			route.name, sz.n, sz.received, sz.decoded, route.limit, float64(route.limit)/float64(max(largest, 1)))
-		// The headers' reserve (otlpHeaderReserve) is an estimate of their
-		// parsed size, a little over their bytes, against the limit on
-		// their bytes: the margin covers the difference.
-		Check(t, sz.headers*otlpMargin <= server.MaxHeaderBytes,
-			"%s: largest request headers reserved at %d bytes; MaxHeaderBytes %d", route.name, sz.headers, int64(server.MaxHeaderBytes))
+		// The headers' reserve (otlpHeaderReserve) is what the service
+		// refuses over MaxOTLPHeaderReserve. It is never less than their
+		// wire bytes, so the margin bounds those against MaxHeaderBytes too.
+		Check(t, sz.headers*otlpMargin <= server.MaxOTLPHeaderReserve,
+			"%s: largest request headers reserved at %d bytes; MaxOTLPHeaderReserve %d", route.name, sz.headers, int64(server.MaxOTLPHeaderReserve))
 		Check(t, sz.message*otlpMargin <= server.OTLPDecodeBudget,
 			"%s: largest decoded message estimated at %d bytes; budget %d", route.name, sz.message, int64(server.OTLPDecodeBudget))
 	}
