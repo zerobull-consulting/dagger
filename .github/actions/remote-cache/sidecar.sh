@@ -67,6 +67,10 @@
 #                           welcome nor a refusal logged, after which the
 #                           service is taken for one from before the welcome
 #                           line, with a warning (default: 10)
+#   SIDECAR_FIRST_SYNC_TIMEOUT
+#                           seconds to wait after the welcome for the
+#                           service's first import sync, after which the
+#                           start goes on with a warning (default: 30)
 #   SIDECAR_ENGINE_CA_FILE  local use only: a CA bundle to mount as the
 #                           engine's, for a host behind a TLS-intercepting
 #                           proxy. The actions never set it.
@@ -404,6 +408,7 @@ start() {
 	local drain="${SIDECAR_DRAIN_TIMEOUT:-10m}"
 	local debug_port="${SIDECAR_DEBUG_PORT:-}"
 	local wait="${SIDECAR_START_TIMEOUT:-120}" grace="${SIDECAR_WELCOME_GRACE:-10}"
+	local sync_wait="${SIDECAR_FIRST_SYNC_TIMEOUT:-30}"
 	local version service_image engine_image service_floating
 
 	case "$role" in
@@ -421,6 +426,7 @@ start() {
 		die "debug-port '$debug_port' isn't a port number"
 	[[ "$wait" =~ ^[0-9]{1,4}$ ]] || die "SIDECAR_START_TIMEOUT '$wait' isn't a number of seconds"
 	[[ "$grace" =~ ^[0-9]{1,4}$ ]] || die "SIDECAR_WELCOME_GRACE '$grace' isn't a number of seconds"
+	[[ "$sync_wait" =~ ^[0-9]{1,4}$ ]] || die "SIDECAR_FIRST_SYNC_TIMEOUT '$sync_wait' isn't a number of seconds"
 	valid_prefix "${CACHESERVICE_S3_PREFIX:-}" ||
 		die "s3-prefix '${CACHESERVICE_S3_PREFIX:-}' isn't valid: segments of letters, digits, '.', '_' or '-', separated by '/', none '.' or '..', at most 256 characters"
 	case "${CACHESERVICE_S3_PATH_STYLE:-}" in
@@ -642,6 +648,40 @@ start() {
 		die "the engine didn't connect to the service within ${wait}s"
 	fi
 	[[ "$welcomed" == true ]] && echo "remote-cache-sidecar: the service welcomed the engine (${version:-$engine_image})"
+
+	# Then the first import sync: the service merges what is stored as the
+	# engine connects, and a build that starts before that is done can miss
+	# what it hasn't merged yet (zerobull-consulting/dagger#103). The service
+	# logs its LogImportFirstSync line once, even when it merged nothing
+	# (TestSidecarWaitsForTheseLines). A service image from before that line
+	# never logs it: the wait is bounded, and the start goes on with a
+	# warning. One from before the welcome line predates it too, and isn't
+	# waited for.
+	if [[ "$welcomed" == true ]]; then
+		local synced="" sync_deadline=$((SECONDS + sync_wait))
+		while :; do
+			# exited, not ! running: a docker inspect that fails or doesn't
+			# answer says nothing, and is bounded by what is left of the wait
+			# (zerobull-consulting/dagger#125).
+			exited "$service" "$(step_bound "$sync_deadline")" && { show_log "$engine" 100; show_log "$service" 200; die "the service exited before its first import sync"; }
+			exited "$engine" "$(step_bound "$sync_deadline")" && { show_log "$engine" 200; show_log "$service" 100; die "the engine exited before the service's first import sync"; }
+			log="$(timeout "$(step_bound "$sync_deadline")" docker logs --since "$since" "$service" 2>&1 || true)"
+			synced="$(grep -m1 'msg="import sync: first done"' <<<"$log" || true)"
+			[[ -n "$synced" ]] && break
+			((SECONDS < sync_deadline)) || break
+			sleep 1
+		done
+		if [[ -z "$synced" ]]; then
+			local why="a service image from before that line never logs it: use the version input's service image, or a newer one"
+			[[ "$service_floating" == true ]] &&
+				why="either the version's service image is a release from before that line, which never logs it, or its first sync is slow: see the service's log"
+			warn "the service ($service_image) logged no first import sync within ${sync_wait}s of the welcome: going on, and a build that starts now can miss entries not merged yet (zerobull-consulting/dagger#103); $why"
+		elif [[ "$synced" == *" error=true"* || ! "$synced" =~ \ failed=0( |$) ]]; then
+			warn "the service's first import sync failed, in whole or in part, so builds may miss the remote cache until a later sync: $(redact <<<"$synced" | sed -E 's/^time=[^ ]* //'); see the service's log"
+		else
+			echo "remote-cache-sidecar: the first import sync is done: it merged $(sed -nE 's/.* merged=([0-9]+).*/\1/p' <<<"$synced") stored bundle(s)"
+		fi
+	fi
 
 	# The CLI the job installed (its version checked against the engine's
 	# above), or, in a local run, the engine image's own, which matches.

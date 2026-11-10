@@ -1309,7 +1309,16 @@ bundles, with presigned GETs of its own namespace's blobs.
 **When.** Each welcomed connection gets a sync loop. It syncs on `hello`,
 again whenever another engine's export is stored, and every `-import-poll`
 (30s), which picks up bundles stored by other service replicas. `POST
-/debug/engines/{conn}/import` syncs now.
+/debug/engines/{conn}/import` syncs now. The loop's first sync is logged
+once, when it ends, even when it merged nothing: `msg="import sync: first
+done" merged=N failed=N`, with `error=true` when it failed (the failure has
+its own `import sync failed` warning). `GET /debug/engines` says the same in
+each engine's `firstSyncDone`. A sync cut short by the connection's end
+isn't the first done, and neither is any sync of a connection revoked
+before its first sync ran: a revoked connection syncs nothing, so it never
+logs the line, and the engine's next connection has its own. Later syncs are logged as `import sync` only when they
+merged or failed something
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 
 **One sync.**
 
@@ -3445,6 +3454,11 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   `msg="engine refused: its version is not accepted"`, the service and the
   engine disagree: the engine would build without the cache. `msg="engine
   connected"` comes before either, and says nothing about the version.
+- Then the first import sync: the service logs `msg="import sync: first
+  done"` once it has merged what is stored, even when that was nothing.
+  The action's start waits for it, for up to 30s, so the first build
+  doesn't race the merge
+  ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 
 Then the CLI, which must be the engine's version (the engine is pinned by
 digest, the CLI only by its release tag; the action installs it with
@@ -3550,10 +3564,14 @@ is refused), and a read-only key (see
 the prefix. A job that forgets `-export=false` with that key fails at
 startup, exit 1, rather than running as a writer. Its drain has nothing to
 flush, so the stop is quick. The service merges what is stored as the
-engine connects, within a second or two; there's no signal for when that
-first merge is done, so a build that starts at once can miss what it hasn't
-merged yet
+engine connects, within a second or two, and logs `msg="import sync: first
+done" merged=N` once that first sync ends, even when it merged nothing (see
+[Import path](#import-path)). The action's start waits for that line, in
+both roles, so a build that starts right after it doesn't miss what the
+service hadn't merged yet
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
+The wait is bounded at 30s: a service image from before the line never logs
+it, and the start goes on after that with a warning.
 
 - **DigitalOcean Spaces' `Read` key** was run against the service on
   2026-11-07, after this walk-through (which had no Spaces key); CI's Spaces

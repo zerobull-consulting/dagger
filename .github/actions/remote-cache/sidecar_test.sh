@@ -247,6 +247,15 @@ in_order() {
 	done
 }
 took_hello_at_most() { [[ "$(cat "$tmp/hello.took")" -le "$1" ]]; }
+took_hello_at_least() { [[ "$(cat "$tmp/hello.took")" -ge "$1" ]]; }
+# in_file_order <file> <first> <second>: the first line matching first
+# comes before the first matching second.
+in_file_order() {
+	local a b
+	a="$(grep -nF -m1 -- "$2" "$1" | cut -d: -f1)"
+	b="$(grep -nF -m1 -- "$3" "$1" | cut -d: -f1)"
+	[[ -n "$a" && -n "$b" && "$a" -lt "$b" ]]
+}
 cleaned_up() { called "rm -f t-engine" && called "volume rm -f t-engine-state" && called "network rm t-net" && [[ ! -e "$tmp/sc/t/state" ]]; }
 took_at_most() { [[ "$(cat "$tmp/stop.took")" -le "$1" ]]; }
 
@@ -473,10 +482,17 @@ check "a service that exits while the engine starts fails the start with both lo
 
 # --- start waits for the welcome, and fails on a refusal (#146) ---
 # A docker on which the start runs to the end. Once the engine has started,
-# the service's log says, per FAKE_HELLO: welcome, it welcomed the engine;
-# refused, it refused its version; silent, it connected and said no more;
-# none, nothing. Every docker run is recorded in $FAKE_DIR/runs, and docker
-# cp writes a fake CLI.
+# the service's log says, per FAKE_HELLO: welcome, it welcomed the engine
+# and its first import sync is done; refused, it refused its version;
+# silent, it connected and said no more; none, nothing. With welcome,
+# FAKE_SYNC says how the first sync shows (zerobull-consulting/dagger#103):
+# done (the default), at once; late, 3s after the engine started; failed,
+# done with an error; partial, done with a bundle that failed to merge and
+# no error; never, it isn't logged (an image from before the line). With
+# FAKE_ENGINE_DIES, the engine is running at its first inspect only; with
+# FAKE_INSPECT_FAILS, every inspect of it after the first fails. Every
+# docker run is recorded in $FAKE_DIR/runs, and docker cp
+# writes a fake CLI.
 mkdir -p "$tmp/okbin"
 cat >"$tmp/okbin/docker" <<'EOF2'
 #!/usr/bin/env bash
@@ -491,7 +507,16 @@ case "$1 $2" in
 	exit 0
 	;;
 "port "*) echo 10.9.0.1:30000 ;;
-"inspect -f") echo true ;;
+"inspect -f")
+	if [[ -n "${FAKE_ENGINE_DIES:-}" && "$4" == *-engine && -f "$FAKE_DIR/engine.inspected" ]]; then
+		echo false
+	elif [[ -n "${FAKE_INSPECT_FAILS:-}" && "$4" == *-engine && -f "$FAKE_DIR/engine.inspected" ]]; then
+		exit 1
+	else
+		[[ "$4" == *-engine && -f "$FAKE_DIR/engine.started" ]] && : >"$FAKE_DIR/engine.inspected"
+		echo true
+	fi
+	;;
 "logs --tail") echo "LOG OF $4" ;;
 "logs "*)
 	echo 'time=x level=INFO msg=listening addr=:8090'
@@ -500,6 +525,15 @@ case "$1 $2" in
 	welcome)
 		echo 'time=x level=INFO msg="engine connected" conn=1'
 		echo 'time=x level=INFO msg="engine welcomed" conn=1 engineVersion=v1.0.0-beta.25 versionAccepted=true'
+		case "${FAKE_SYNC:-done}" in
+		done) echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=2 failed=0' ;;
+		late)
+			(($(date +%s) - $(stat -c %Y "$FAKE_DIR/engine.started") >= 3)) &&
+				echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=0 failed=0'
+			;;
+		failed) echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=0 failed=0 error=true' ;;
+		partial) echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=1 failed=1' ;;
+		esac
 		;;
 	refused)
 		echo 'time=x level=INFO msg="engine connected" conn=1'
@@ -558,6 +592,47 @@ check "... with a warning that says why" grep -q "warning: the service (s) logge
 check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
 check "... but not before the grace: a refusal comes first" not hello_start refused SIDECAR_WELCOME_GRACE=0
 check "... and a grace longer than the start's timeout still fails at the timeout" not hello_start silent SIDECAR_WELCOME_GRACE=60
+
+# --- start waits for the first import sync (#103) ---
+check "a welcomed engine: the start waits for the first import sync" hello_start welcome
+check "... and says what it merged" grep -q "the first import sync is done: it merged 2 stored bundle(s)" "$tmp/hello.out"
+check "... before it is ready" in_file_order "$tmp/hello.out" "the first import sync is done" "remote-cache-sidecar: ready"
+check "... without a warning" not grep -q "warning:" "$tmp/hello.out"
+check "a first sync that comes late: the start waits for it" hello_start welcome FAKE_SYNC=late
+check "... and is ready only after it" took_hello_at_least 3
+check "... says so" grep -q "the first import sync is done: it merged 0 stored bundle(s)" "$tmp/hello.out"
+check "... without a warning" not grep -q "warning:" "$tmp/hello.out"
+check "a first sync never logged: the start goes on after its bound" hello_start welcome FAKE_SYNC=never SIDECAR_FIRST_SYNC_TIMEOUT=2
+check "... with a warning that says why" grep -q "warning: the service (s) logged no first import sync within 2s of the welcome" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "... after the bound, not at once" took_hello_at_least 2
+check "... and not much later: a timeout, not a retry" took_hello_at_most 6
+check "... telling a given image to use the version's" grep -q "never logs it: use the version input's service image" "$tmp/hello.out"
+check "the version's own service image is waited for the same" hello_start welcome FAKE_SYNC=never SIDECAR_FIRST_SYNC_TIMEOUT=2 SIDECAR_SERVICE_IMAGE=
+check "... with the warning" grep -q "logged no first import sync within 2s of the welcome" "$tmp/hello.out"
+check "... which doesn't tell it to use the image it runs" not grep -q "use the version input's service image" "$tmp/hello.out"
+check "... but says why it may be" grep -q "the version's service image is a release from before that line" "$tmp/hello.out"
+check "a first sync that failed: the start goes on, with a warning" hello_start welcome FAKE_SYNC=failed
+check "... that shows the line" grep -q 'warning: the service.s first import sync failed, .*msg="import sync: first done" conn=1 .*error=true' "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "a first sync with a bundle that failed to merge, and no error: a warning too" hello_start welcome FAKE_SYNC=partial
+check "... that shows the line" grep -q 'warning: the service.s first import sync failed, in whole or in part, .*merged=1 failed=1' "$tmp/hello.out"
+check "... not a plain success" not grep -q "the first import sync is done" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "an engine that exits after the welcome fails the start" not hello_start welcome FAKE_SYNC=never FAKE_ENGINE_DIES=1 SIDECAR_FIRST_SYNC_TIMEOUT=30
+check "... at once, not at the first sync's bound" took_hello_at_most 6
+check "... says so" grep -q "the engine exited before the service's first import sync" "$tmp/hello.out"
+check "... with the engine's log" grep -q "LOG OF remote-cache-engine" "$tmp/hello.out"
+check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "a docker inspect that fails during the first-sync wait isn't an exit (zerobull-consulting/dagger#125)" hello_start welcome FAKE_INSPECT_FAILS=1
+check "... the start waits for the sync" grep -q "the first import sync is done: it merged 2 stored bundle(s)" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+# An image from before the welcome line predates the first sync's line.
+check "an image from before the welcome line: no first-sync wait" hello_start silent SIDECAR_WELCOME_GRACE=1 SIDECAR_FIRST_SYNC_TIMEOUT=30
+check "... nor its warning" not grep -q "first import sync" "$tmp/hello.out"
+check "... ready well before the sync's bound" took_hello_at_most 6
+check "a first-sync bound that isn't a number is refused" not hello_start welcome SIDECAR_FIRST_SYNC_TIMEOUT=30s
+check "... says so" grep -q "SIDECAR_FIRST_SYNC_TIMEOUT '30s' isn't a number of seconds" "$tmp/hello.out"
 check "an engine that never connects: the start fails" not hello_start none
 check "... says so" grep -q "the engine didn't connect to the service within 5s" "$tmp/hello.out"
 

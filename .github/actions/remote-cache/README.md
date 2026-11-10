@@ -104,6 +104,19 @@ neither line 10s after the engine connected, the start goes on with a
 warning that it can't tell whether the engine was refused (a refusal comes
 within milliseconds of the connection, so one is still caught).
 
+**Then the start waits for the first import sync.** The service merges
+what is stored as the engine connects, and logs `import sync: first done`
+once that first sync ends, even when it merged nothing; a build that started
+before it could miss entries not merged yet
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
+The start waits for that line, in both roles, for up to 30s
+(`SIDECAR_FIRST_SYNC_TIMEOUT` overrides it for a local run of `sidecar.sh`),
+and then goes on with a warning: a `service-image` from before the line
+never logs it.
+A first sync that failed is a warning too, not a failure: the job's builds
+run without what it didn't merge, as they would against a bucket the
+service can't read. An image from before the welcome line isn't waited for.
+
 **Overrides:**
 
 - `service-image` replaces the service image, such as one built in the job
@@ -313,9 +326,7 @@ pin the images to the action's commit, as above.
 | any | Still running past the stop's bound, `drain-timeout` plus 25s: the stop stopped it. | fails |
 | any | The service had exited before the stop. | fails |
 
-Known gaps of the action: a read-only start doesn't wait for the service's first merge
-([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)),
-and the leads in
+Known gaps of the action: the leads in
 [zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
 
 The stop's step summary has the exit code, and its log the drain's and the

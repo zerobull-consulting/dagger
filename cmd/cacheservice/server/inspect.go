@@ -61,6 +61,7 @@ func (s *Service) Engines() []EngineInfo {
 			EngineVersion:   c.hello.EngineVersion,
 			VersionAccepted: c.versionAccepted,
 			EngineName:      c.hello.EngineName,
+			FirstSyncDone:   c.firstSyncDone.Load(),
 		})
 	}
 	s.mu.Unlock()

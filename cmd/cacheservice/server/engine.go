@@ -210,6 +210,9 @@ type engineConn struct {
 	// versionAccepted is set when the hello's version is on an accept line;
 	// it is unset for an engine welcomed by -allow-engine-version-mismatch.
 	versionAccepted bool
+	// firstSyncDone is set once the sync loop's first import sync ended
+	// (LogImportFirstSync).
+	firstSyncDone atomic.Bool
 
 	mu sync.Mutex
 	// stopImports ends the import sync loop; set once it starts.
@@ -742,6 +745,10 @@ type EngineInfo struct {
 	// welcomed by -allow-engine-version-mismatch.
 	VersionAccepted bool   `json:"versionAccepted"`
 	EngineName      string `json:"engineName"`
+	// FirstSyncDone is set once the connection's first import sync ended,
+	// even when it merged nothing (LogImportFirstSync); it stays unset
+	// with the import path off.
+	FirstSyncDone bool `json:"firstSyncDone"`
 }
 
 // serveIdentity answers with the service's identity: its base release (or
