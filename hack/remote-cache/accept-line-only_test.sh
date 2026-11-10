@@ -50,22 +50,39 @@ pr() {
 }
 line="accept v1.0.0-beta.26 $d2 verified: $run2"
 first="sed -i 's|^accept v1.0.0-beta.25|$line\naccept v1.0.0-beta.25|' $m"
-# A fake gh: the cited run (FAKE_RUN, a JSON file; FAKE_RUN_FAIL=1: the read
-# fails), and the PR's auto-merge for disable-auto-merge.
+# A fake gh: the cited run (FAKE_RUN, a JSON file; FAKE_RUN_FAIL=1: every
+# read fails; FAKE_RUN_FLAKY=<n>: the first n reads fail), its jobs
+# (FAKE_JOBS; FAKE_JOBS_FAIL, FAKE_JOBS_FLAKY the same; FAKE_RUN_CUT,
+# FAKE_JOBS_CUT=<n>: the first n replies succeed, cut short), and the PR's
+# auto-merge for disable-auto-merge.
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/gh" <<'G'
 #!/usr/bin/env bash
 echo "$*" >>"${FAKE_CALLS:-/dev/null}"
 case "$2" in
+repos/*/actions/runs/*/jobs\?*)
+	[[ -z "${FAKE_JOBS_FAIL:-}" ]] || { echo "HTTP 403" >&2; exit 1; }
+	t=$(($(cat "$FAKE_TRIES.jobs" 2>/dev/null || echo 0) + 1)); echo "$t" >"$FAKE_TRIES.jobs"
+	((t > ${FAKE_JOBS_FLAKY:-0})) || { echo "HTTP 502" >&2; exit 1; }
+	# FAKE_JOBS_CUT=<n>: the first n replies succeed, cut short.
+	((t > ${FAKE_JOBS_CUT:-0})) || { head -c 20 "$FAKE_JOBS"; exit 0; }
+	# FAKE_JOBS_NOLIST=<n>: the first n replies are JSON without a jobs list.
+	((t > ${FAKE_JOBS_NOLIST:-0})) || { echo '{"message": "x"}'; exit 0; }
+	cat "$FAKE_JOBS" ;;
 repos/*/actions/runs/*)
 	[[ -z "${FAKE_RUN_FAIL:-}" ]] || { echo "HTTP 404" >&2; exit 1; }
+	t=$(($(cat "$FAKE_TRIES.run" 2>/dev/null || echo 0) + 1)); echo "$t" >"$FAKE_TRIES.run"
+	((t > ${FAKE_RUN_FLAKY:-0})) || { echo "HTTP 502" >&2; exit 1; }
+	((t > ${FAKE_RUN_CUT:-0})) || { head -c 20 "$FAKE_RUN"; exit 0; }
+	# FAKE_RUN_NOOBJ=<n>: the first n replies are JSON but not an object.
+	((t > ${FAKE_RUN_NOOBJ:-0})) || { echo '[]'; exit 0; }
 	cat "$FAKE_RUN" ;;
 repos/*/pulls/*) echo "{\"node_id\": \"PR_1\", \"auto_merge\": $FAKE_AUTO_MERGE}" ;;
 graphql) echo '{}' ;;
 esac
 G
 chmod +x "$tmp/bin/gh"
-export PATH="$tmp/bin:$PATH" GITHUB_REPOSITORY=o/r FAKE_CALLS="$tmp/calls"
+export PATH="$tmp/bin:$PATH" GITHUB_REPOSITORY=o/r FAKE_CALLS="$tmp/calls" FAKE_TRIES="$tmp/tries" ACCEPT_LINE_RETRY_SECONDS=0
 
 # run <jq edit>: the cited run for run2/beta.26/d2, in the shape of a real
 # one (beta.24's verifying run, 42336689501, was a successful workflow_dispatch
@@ -74,11 +91,25 @@ run() {
 	jq -n --arg t "Remote cache tests: candidate v1.0.0-beta.26 $d2" '{
 		repository: {full_name: "o/r"}, head_repository: {full_name: "o/r"},
 		path: ".github/workflows/remote-cache-tests.yml", event: "workflow_dispatch",
-		status: "completed", conclusion: "success", head_branch: "remote-cache/release-check",
+		status: "completed", conclusion: "success", head_branch: "remote-cache/release-check", run_attempt: 1,
 		display_title: $t}' | jq "${1:-.}" >"$tmp/run.json"
 	export FAKE_RUN="$tmp/run.json"
 }
 run
+
+# fake_jobs <jq edit>: the cited run's jobs, in the shape of a real listing (a
+# remote-cache-tests.yml candidate run has these four), all green, edited.
+fake_jobs() {
+	jq -n '{total_count: 4, jobs: [
+		{name: "unit tests", status: "completed", conclusion: "success"},
+		{name: "S3 tests against MinIO", status: "completed", conclusion: "success"},
+		{name: "real engines (e2e)", status: "completed", conclusion: "success"},
+		{name: "sidecar demo", status: "completed", conclusion: "success"}]}' | jq "${1:-.}" >"$tmp/jobs.json"
+	export FAKE_JOBS="$tmp/jobs.json"
+}
+fake_jobs
+# engine <name> <jq edit of that job>: fake_jobs, with one job edited.
+engine() { fake_jobs "(.jobs[] | select(.name == \"$1\")) |= ($2)"; }
 
 # verdict <head> [<ref>]: runs the check; status in $status.
 verdict() {
@@ -121,8 +152,10 @@ check "run: a real run's shape passes (head_branch remote-cache/release-check)" 
 run '.head_branch = "feature/remote-cache"'
 check "run: any head_branch passes (the release check dispatches on several)" passes "$okhead"
 run
+run '.run_attempt = 2'
 check "run: an /attempts/N URL reads that attempt" passes "$(withrun $run2/attempts/2)"
 check "run: ... through the attempts endpoint" grep -q "repos/o/r/actions/runs/2/attempts/2" "$tmp/calls"
+run
 check "run: a run of another repository fails" fails "$(withrun https://github.com/x/y/actions/runs/2)"
 check "run: ... and says so" grep -q "of x/y, not of o/r" "$tmp/out"
 : >"$tmp/calls"
@@ -164,6 +197,108 @@ echo 'not json' >"$tmp/run.json"
 check "run: a reply that isn't JSON fails" fails "$okhead"
 run
 check "run: and a good run passes again" passes "$okhead"
+# The cited run's engine jobs (zerobull-consulting/dagger#223): a run whose
+# engine jobs were skipped still ends green.
+run
+fake_jobs
+: >"$tmp/calls"
+check "jobs: both engine jobs succeeded passes" passes "$okhead"
+check "jobs: ... read from the run's own attempt (its run_attempt), one page of 100" grep -q "^api repos/o/r/actions/runs/2/attempts/1/jobs?per_page=100$" "$tmp/calls"
+run '.run_attempt = 3'
+: >"$tmp/calls"
+check "jobs: a later attempt, read as latest, has that attempt's jobs read" passes "$okhead"
+check "jobs: ... through its attempts endpoint" grep -q "^api repos/o/r/actions/runs/2/attempts/3/jobs?per_page=100$" "$tmp/calls"
+run '.run_attempt = 2'
+check "jobs: an /attempts/N URL reads that attempt's jobs" passes "$(withrun $run2/attempts/2)"
+check "jobs: ... through the attempts endpoint" grep -q "^api repos/o/r/actions/runs/2/attempts/2/jobs?per_page=100$" "$tmp/calls"
+check "jobs: an /attempts/N URL the run read disagrees with fails" fails "$(withrun $run2/attempts/4)"
+check "jobs: ... and says so" grep -q "attempt reads as 2, not the URL's 4" "$tmp/out"
+check "jobs: an /attempts/N URL past the bound (six digits) fails" fails "$(withrun $run2/attempts/100000)"
+check "jobs: ... as a URL that isn't one, before any read" grep -q "is not a GitHub Actions run URL" "$tmp/out"
+check "jobs: an /attempts/0 URL fails" fails "$(withrun $run2/attempts/0)"
+run '.run_attempt = 100000'
+check "jobs: a run_attempt past the bound (six digits) fails" fails "$okhead"
+run '.run_attempt = 2'
+for a in 'del(.run_attempt)' '.run_attempt = null' '.run_attempt = "1; x"' '.run_attempt = 0' '.run_attempt = 1.5'; do
+	run "$a"
+	check "jobs: a run whose run_attempt is bad ($a) fails" fails "$okhead"
+done
+check "jobs: ... and says so" grep -q "attempt is '1.5', not a number" "$tmp/out"
+run
+for j in "real engines (e2e)" "sidecar demo"; do
+	engine "$j" '.conclusion = "skipped"'
+	check "jobs: '$j' skipped fails" fails "$okhead"
+	check "jobs: ... and says so" grep -q "$j: completed/skipped" "$tmp/out"
+	engine "$j" '.conclusion = "failure"'
+	check "jobs: '$j' failed fails" fails "$okhead"
+	engine "$j" '.conclusion = "cancelled"'
+	check "jobs: '$j' cancelled fails" fails "$okhead"
+	engine "$j" '.status = "in_progress" | .conclusion = null'
+	check "jobs: '$j' still going fails" fails "$okhead"
+	engine "$j" '.status = "in_progress"'
+	check "jobs: '$j' not completed fails, whatever its conclusion reads" fails "$okhead"
+	fake_jobs "del(.jobs[] | select(.name == \"$j\")) | .total_count = 3"
+	check "jobs: '$j' missing fails" fails "$okhead"
+	check "jobs: ... and says so" grep -q "no single '$j' job" "$tmp/out"
+	fake_jobs ".jobs += [.jobs[] | select(.name == \"$j\")] | .total_count = 5"
+	check "jobs: '$j' listed twice fails" fails "$okhead"
+done
+fake_jobs '(.jobs[] | select(.name == "unit tests")).conclusion = "failure"'
+check "jobs: another job failing doesn't decide (the run's own conclusion does)" passes "$okhead"
+fake_jobs '.total_count = 101'
+check "jobs: more jobs than one page listed fails" fails "$okhead"
+check "jobs: ... and says so" grep -q "more jobs than were listed" "$tmp/out"
+fake_jobs '.jobs = {}'
+check "jobs: a listing that isn't a list fails" fails "$okhead"
+echo 'not json' >"$tmp/jobs.json"
+check "jobs: a reply that isn't JSON fails" fails "$okhead"
+fake_jobs
+export FAKE_JOBS_FAIL=1
+check "jobs: a jobs read that fails fails" fails "$okhead"
+check "jobs: ... and says so" grep -q "couldn't read the cited run .*'s jobs" "$tmp/out"
+unset FAKE_JOBS_FAIL
+fake_jobs
+check "jobs: and good jobs pass again" passes "$okhead"
+# Reads are tried three times (a transient error would turn auto-merge off).
+rm -f "$tmp/tries".*
+export FAKE_RUN_FLAKY=2 FAKE_JOBS_FLAKY=2
+check "retry: a run read and a jobs read that each fail twice pass" passes "$okhead"
+rm -f "$tmp/tries".*
+export FAKE_RUN_FLAKY=3 FAKE_JOBS_FLAKY=0
+check "retry: a run read that fails three times fails" fails "$okhead"
+check "retry: ... and says so" grep -q "couldn't read the cited run" "$tmp/out"
+rm -f "$tmp/tries".*
+export FAKE_RUN_FLAKY=0 FAKE_JOBS_FLAKY=3
+check "retry: a jobs read that fails three times fails" fails "$okhead"
+check "retry: ... and says so" grep -q "couldn't read the cited run .*'s jobs" "$tmp/out"
+rm -f "$tmp/tries".*
+unset FAKE_RUN_FLAKY FAKE_JOBS_FLAKY
+# A reply that succeeds but is cut short is tried again too.
+export FAKE_RUN_CUT=2 FAKE_JOBS_CUT=2
+check "retry: a run reply and a jobs reply each cut short twice pass" passes "$okhead"
+rm -f "$tmp/tries".*
+export FAKE_RUN_CUT=0 FAKE_JOBS_CUT=3
+check "retry: a jobs reply cut short three times fails" fails "$okhead"
+check "retry: ... as a jobs read that failed" grep -q "couldn't read the cited run .*'s jobs" "$tmp/out"
+rm -f "$tmp/tries".*
+export FAKE_RUN_CUT=3 FAKE_JOBS_CUT=0
+check "retry: a run reply cut short three times fails" fails "$okhead"
+rm -f "$tmp/tries".*
+export FAKE_RUN_CUT=0 FAKE_JOBS_NOLIST=2
+check "retry: a jobs reply that is JSON but no jobs list, twice, passes" passes "$okhead"
+rm -f "$tmp/tries".*
+unset FAKE_JOBS_NOLIST
+export FAKE_RUN_NOOBJ=2
+check "retry: a run reply that is JSON but no object, twice, passes" passes "$okhead"
+rm -f "$tmp/tries".*
+unset FAKE_RUN_NOOBJ
+unset FAKE_RUN_CUT FAKE_JOBS_CUT
+# Text the cited run's jobs control can't start a workflow command either.
+engine "sidecar demo" '.conclusion = "x\n::stop-commands::tok"'
+verdict "$okhead"
+check "jobs: a conclusion with a newline still fails" test "$status" -ne 0
+check "jobs: ... and starts no command" not grep -q '^::stop' "$tmp/out"
+fake_jobs
 # remote-cache-tests.yml titles a candidate's run the way verify_run reads it:
 # take the format string from the workflow, fill it in, and cite that title.
 fmt="$(sed -n "s/^run-name: .*format('\([^']*\)', inputs.candidate-version, inputs.candidate-digest).*/\1/p" "$here/../../.github/workflows/remote-cache-tests.yml")"
@@ -173,6 +308,16 @@ check "run-name: the workflow's format string was found" test -n "$fmt"
 run ".display_title = \"$title\""
 check "run-name: a run titled by the workflow's own run-name passes" passes "$okhead"
 run
+# The workflow runs copies of the default branch's scripts, so every file
+# accept-line-only.sh sources must be in its copy list.
+wf="$here/../../.github/workflows/remote-cache-auto-merge-add-compatible-engine.yml"
+copies="$(sed -n 's/^ *for f in \(.*\); do$/\1/p' "$wf")"
+check "workflow: its copy list was found" test -n "$copies"
+sourced="$(sed -n 's|^[[:space:]]*source "\$here/\([^"]*\)"$|\1|p' "$script")"
+check "workflow: accept-line-only.sh sources a file" test -n "$sourced"
+for f in $sourced accept-line-only.sh engines.sh; do
+	check "workflow: copies $f" grep -qxF -- "$f" <<<"$(tr ' ' '\n' <<<"$copies")"
+done
 # Text the cited run controls can't start a workflow command of its own.
 run '.display_title = "x\n::stop-commands::tok\n100%"'
 verdict "$okhead"
@@ -254,7 +399,6 @@ check "fetch-head: never puts the token in git's arguments" not grep -q tok-secr
 check "fetch-head: never prints the token" not grep -q tok-secret "$tmp/out"
 
 # The workflow takes the PR's head through fetch-head, not as the checkout's ref.
-wf="$here/../../.github/workflows/remote-cache-auto-merge-add-compatible-engine.yml"
 check "workflow: calls fetch-head with the PR number and head" grep -q 'accept-line-only.sh" fetch-head "\$PR" "\$HEAD_SHA" "\$HEAD_REF"' "$wf"
 check "workflow: the checkout doesn't take the head as its ref" not grep -qE '^\s+ref: .*head\.sha' "$wf"
 
@@ -264,6 +408,14 @@ check "disable: turns auto-merge off when it's on" grep -q disablePullRequestAut
 : >"$tmp/calls"
 PATH="$tmp/bin:$PATH" FAKE_CALLS="$tmp/calls" FAKE_AUTO_MERGE=null "$script" disable-auto-merge 7 >"$tmp/out" 2>&1
 check "disable: does nothing when it's off" not grep -q graphql "$tmp/calls"
+# Only check sources engine-jobs.sh: the failure path (disable-auto-merge)
+# and fetch-head run without it.
+mkdir -p "$tmp/solo"
+cp "$script" "$tmp/solo/accept-line-only.sh"
+: >"$tmp/calls"
+PATH="$tmp/bin:$PATH" FAKE_CALLS="$tmp/calls" FAKE_AUTO_MERGE='{"merge_method": "squash"}' "$tmp/solo/accept-line-only.sh" disable-auto-merge 7 >"$tmp/out" 2>&1
+check "disable: works without engine-jobs.sh beside it" grep -q disablePullRequestAutoMerge "$tmp/calls"
+check "fetch-head: works without engine-jobs.sh beside it" "$tmp/solo/accept-line-only.sh" fetch-head 7 "$(printf '0%.0s' {1..40})" feature/x
 
 echo
 if ((failures > 0)); then

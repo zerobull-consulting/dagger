@@ -13,7 +13,7 @@ name: Remote cache auto-merge add compatible engine
 # parses its manifest. It requests no environment (only schedule and
 # workflow_dispatch jobs may: hack/remote-cache/README.md, "Automation
 # tokens"), and its token (actions: read, pull-requests: write) is used by
-# the scripts only to read the run an accept line cites and to turn
+# the scripts only to read the run an accept line cites (and its jobs) and to turn
 # auto-merge off. It has no
 # pull_request trigger, so no skipped job of the same name ever reports (a
 # skipped required check counts as passed). The release check's own tests
@@ -39,7 +39,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      # Reads the run an accept line cites (accept-line-only.sh, verify_run).
+      # Reads the run an accept line cites, and its jobs
+      # (accept-line-only.sh, verify_run).
       actions: read
       pull-requests: write
     steps:
@@ -52,7 +53,8 @@ jobs:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
-      # The default branch's copy of the check and of engines.sh, as this
+      # The default branch's copy of the check (with the engine-jobs.sh it
+      # sources) and of engines.sh, as this
       # workflow is (GITHUB_SHA, on pull_request_target), so a PR can't
       # weaken the check it's measured by. Never the PR's. The PR's head
       # is fetched, not checked out: the check reads commits only. It comes
@@ -61,7 +63,11 @@ jobs:
       # (zerobull-consulting/dagger#165).
       - name: Check the PR adds only one accept line
         id: check
-        timeout-minutes: 5
+        # fetch-head is bounded at 300s, and the check's two reads of the
+        # cited run (the run, its jobs) at 70s each (three 20s tries, 5s
+        # apart): 440s in all, within 8 minutes, so the check's own
+        # annotation says why it failed rather than the step timing out.
+        timeout-minutes: 8
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -71,7 +77,7 @@ jobs:
         run: |
           dir="$RUNNER_TEMP/base"
           mkdir -p "$dir"
-          for f in accept-line-only.sh engines.sh; do
+          for f in accept-line-only.sh engine-jobs.sh engines.sh; do
             git show "$GITHUB_SHA:hack/remote-cache/$f" >"$dir/$f"
             chmod +x "$dir/$f"
           done

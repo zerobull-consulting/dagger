@@ -388,14 +388,11 @@ wait_run() {
 	done
 }
 
-# The jobs of remote-cache-tests.yml whose result is the engine's: the
-# verdict is theirs alone (zerobull-consulting/dagger#166). Any other job
-# (unit tests, the MinIO tests) doesn't depend on the engine.
-engine_jobs=("real engines (e2e)" "sidecar demo")
-
-engine_json="$(printf '%s\n' "${engine_jobs[@]}" | jq -R . | jq -s -c .)"
-# is_engine: jq's filter for "this job is an engine job", $e being the list.
-is_engine='(.name as $n | $e | index($n)) != null'
+# The jobs of remote-cache-tests.yml whose result is the engine's
+# (engine_jobs, engine_json, is_engine, engine_jobs_unlisted), shared with
+# accept-line-only.sh.
+# shellcheck source=engine-jobs.sh
+source "$here/engine-jobs.sh"
 
 # failing_jobs: an engine job's failures (a run's jobs JSON on stdin), as a
 # Markdown list.
@@ -419,7 +416,7 @@ start_tests() {
 	echo "$id"
 }
 finish_tests() {
-	local id="$1" p="$2" url conclusion jobs names early other n
+	local id="$1" p="$2" url conclusion jobs names early other why
 	url="$server/$repo/actions/runs/$id"
 	conclusion="$(wait_run "$id")"
 	note "${p}_run" "$url"
@@ -440,18 +437,14 @@ finish_tests() {
 	done
 	[[ -n "$jobs" ]] ||
 		die "couldn't read the verifying run $url's jobs: not deciding on it"
-	jq -e '(.total_count // (.jobs | length)) <= (.jobs | length)' <<<"$jobs" >/dev/null ||
-		die "the verifying run $url has more jobs than were listed: not deciding on it"
+	# All of them listed, and each engine job there, once.
+	why="$(engine_jobs_unlisted "$jobs")"
+	[[ -z "$why" ]] || die "the verifying run $url: $why: not deciding on it"
 	# A job that isn't the engine's and didn't pass says nothing about the
 	# engine: an error, and the next hour verifies the release again.
 	other="$(jq -r --argjson e "$engine_json" \
 		'[.jobs[] | select('"$is_engine"' | not) | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name): \(.conclusion)"] | join(", ")' <<<"$jobs")"
 	[[ -z "$other" ]] || die "the verifying run $url had jobs fail that don't test the engine ($other): not deciding on it"
-	# Each engine job must be there, once.
-	for n in "${engine_jobs[@]}"; do
-		[[ "$(jq -r --arg n "$n" '[.jobs[] | select(.name == $n)] | length' <<<"$jobs")" == 1 ]] ||
-			die "the verifying run $url has no single '$n' job: not deciding on it"
-	done
 	names="$(jq -r --argjson e "$engine_json" \
 		'[.jobs[] | select('"$is_engine"') | .conclusion] | join(" ")' <<<"$jobs")"
 	# Every engine job has to have run to a green or red end first: one

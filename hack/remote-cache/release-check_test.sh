@@ -130,7 +130,8 @@ case "$method $path" in
 	# FAKE_JOBS: the jobs array as it is; otherwise the four jobs of a
 	# candidate run, all green in a green run and with the e2e red in a red
 	# one (at FAKE_FAILED_STEP).
-	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{\"jobs\": $FAKE_JOBS}"; exit 0; fi
+	# FAKE_JOBS_TOTAL: the listing's total_count (none by default).
+	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{${FAKE_JOBS_TOTAL:+\"total_count\": $FAKE_JOBS_TOTAL, }\"jobs\": $FAKE_JOBS}"; exit 0; fi
 	failed_step="${FAKE_FAILED_STEP:-Real engines}"
 	rid="${path#repos/o/r/actions/runs/}"; rid="${rid%%/*}"
 	e2e=success; [[ "$(cat "$FAKE/run-$rid")" == failure ]] && e2e=failure
@@ -372,6 +373,15 @@ setup
 echo failure >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
 check "verify: a red run whose every job is green is an error" test "$status" -ne 0
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_TOTAL=101 FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: a run with more jobs than were listed is an error" test "$status" -ne 0
+check "verify: ... and says so" has "$tmp/out" "more jobs than were listed"
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_TOTAL=3 FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: ... while one whose jobs were all listed passes" has "$tmp/out" "result=pass"
 
 echo "--- the bundle test"
 setup
