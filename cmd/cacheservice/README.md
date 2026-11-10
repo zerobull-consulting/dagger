@@ -24,7 +24,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache, with each entry's `dirty` and `dueAt` |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
-| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) or with `-gc-mode=off`; the answer says the `mode` |
 | `-debug-listen` | `GET /debug/identity` | The service's identity: its base release (or `dev`), the engine versions it accepts and its revision (see [Engine versions](#engine-versions)) |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, without credentials, for a scraper that shouldn't reach the debug API |
