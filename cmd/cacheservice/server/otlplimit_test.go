@@ -710,9 +710,10 @@ func TestIdleTimeoutAboveExporterIdleConnTimeout(t *testing.T) {
 // A client with the exporters' transport settings (IdleConnTimeout below the
 // server's IdleTimeout, as in the engine) keeps POSTing across gaps longer
 // than its idle timeout without a transport error: it closes the connection
-// first, and dials another. Times are scaled down from 90s and IdleTimeout
+// first, and dials another. Over plain HTTP, so HTTP/1.1; the HTTP/2 path
+// (-tls-cert) is in the README, "Idle connections are closed". Times are scaled down from 90s and IdleTimeout
 // with the ratio kept.
-func TestExporterClientReusesConnectionsAcrossIdleGaps(t *testing.T) {
+func TestExporterClientPostsAcrossIdleGaps(t *testing.T) {
 	clientIdle := 300 * time.Millisecond
 	serverIdle := time.Duration(float64(clientIdle) * float64(IdleTimeout) / float64(ExporterIdleConnTimeout))
 	shortIdleTimeout(t, serverIdle)
@@ -721,7 +722,7 @@ func TestExporterClientReusesConnectionsAcrossIdleGaps(t *testing.T) {
 	srv.Config = NewHTTPServer("", svc.Handler())
 	srv.Start()
 	t.Cleanup(srv.Close)
-	tr := &http.Transport{ForceAttemptHTTP2: true, MaxIdleConns: 100, IdleConnTimeout: clientIdle}
+	tr := &http.Transport{MaxIdleConns: 100, IdleConnTimeout: clientIdle}
 	t.Cleanup(tr.CloseIdleConnections)
 	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	body := encodeOTLP(t, otlpCases()[2].build(""), false)

@@ -1644,7 +1644,13 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   a connection as the server closed it would get a transport error that Go
   doesn't retry for a POST: in a test with the server's at half the client's,
   5 of 5 runs failed with `EOF` or `connection reset by peer`
-  (`TestExporterClientReusesConnectionsAcrossIdleGaps`). The engine WebSocket
+  (`TestExporterClientPostsAcrossIdleGaps`, over HTTP/1.1). Over HTTP/2
+  (`-tls-cert`) the race did not occur in a run: a client with
+  `ForceAttemptHTTP2` and an idle timeout of 300ms made 24 POSTs with the
+  server's idle timeout at the real ratio above it, and 24 with it at half the
+  client's, and none failed (the server ends an idle HTTP/2 connection with a
+  GOAWAY, and the client dials another). That run is not a test, as it passes
+  in both orders. The engine WebSocket
   is unaffected, as a hijacked connection is out of the server's hands. There
   is no cap on the number of connections: a client can still hold many open
   while it is sending, and what bounds that is left to the network.
