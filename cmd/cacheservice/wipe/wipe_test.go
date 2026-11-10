@@ -402,6 +402,9 @@ func TestUsageRefusedBeforeAnyRequest(t *testing.T) {
 			if code := Main(context.Background(), tc.args, &out, &out, open); code != ExitUsage {
 				t.Fatalf("exit %d, want %d\n%s", code, ExitUsage, out.String())
 			}
+			if strings.Trim(tc.prefix, "/") == "" && !strings.Contains(out.String(), "wiping a whole bucket isn't supported") {
+				t.Errorf("an empty prefix's refusal doesn't say why:\n%s", out.String())
+			}
 			if opened || len(f.calls) > 0 || !slices.Equal(f.keys(), keys) {
 				t.Fatalf("opened %v, requests %v", opened, f.calls)
 			}
