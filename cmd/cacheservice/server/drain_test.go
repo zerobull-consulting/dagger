@@ -384,8 +384,8 @@ func TestDrainRetriesRootOnBackoff(t *testing.T) {
 // KNOWN GAP: an engine that goes away mid-drain can't reconnect to the
 // draining service, which refuses every new connection: its export is
 // interrupted, as on any disconnect, and isn't tried again. The drain doesn't
-// wait for it: it logs the roots as left unexported, and returns. Tracked in
-// https://github.com/zerobull-consulting/dagger/issues/70.
+// wait for it: it logs the roots as left unexported, and returns. Accepted
+// for now, in https://github.com/zerobull-consulting/dagger/issues/70.
 func TestDrainEngineDisconnectDoesNotHang(t *testing.T) {
 	h, rec := newDrainHarness(t, nil)
 	h.build()

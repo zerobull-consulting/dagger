@@ -1362,9 +1362,11 @@ clients send no spans to the service are invisible (see
 is in memory, so after a service restart entries are learned again from new
 spans; what is in S3 is not lost, and a re-export uploads nothing already
 stored. An export pending or in flight when the service stops is lost until a
-later session names its entries
+later session names its entries. That is accepted, not planned to change
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45), pinned by
-`TestKnownGapServiceRestartForgetsPendingExport`).
+`TestServiceRestartForgetsPendingExport`): exports stream as entries settle,
+so little is pending at any time, and a flush before a planned stop stores
+the rest.
 
 ## Import path
 
@@ -2002,9 +2004,9 @@ them in constant time, and logs only a short fingerprint (the hash's first 4
 bytes).
 
 An engine sends its token as the HTTP Basic username, from
-`DAGGER_CLOUD_TOKEN`
-([#13](https://github.com/zerobull-consulting/dagger/issues/13) will let its
-config set it). On the WebSocket, an unknown or missing token is refused with
+`DAGGER_CLOUD_TOKEN`. The engine's config can't set it: that would be a
+change to the engine, which this fork doesn't carry
+([#13](https://github.com/zerobull-consulting/dagger/issues/13)). On the WebSocket, an unknown or missing token is refused with
 401 before the upgrade, so it never gets a protocol message. A token is
 checked again when its connection says `hello`, against the tokens of that
 moment.
@@ -3107,9 +3109,10 @@ to reorder them.
 
 **An engine that goes away mid-drain.** Its exports are interrupted, as on
 any disconnect, and it can't reconnect to a draining service: the drain
-doesn't wait for it, and logs its roots as left (`connected=false`). Known
-gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
-([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
+doesn't wait for it, and logs its roots as left (`connected=false`). This
+is accepted for now, and pinned by `TestDrainEngineDisconnectDoesNotHang`
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)): it is to be
+looked at again when a shared service is deployed.
 
 **An explicit export or import admitted just before the drain.** The hooks
 are admitted under the drain's lock, so each one is either admitted before
@@ -4010,7 +4013,7 @@ timeouts, a restart with state to compare) or would cost minutes.
 | --- | --- | --- | --- |
 | Connection lost mid-upload | both | e2e `disconnect`; `TestConnectionLostMidUpload`, `TestExportHookInterruptedNotFailed`, engine's `TestExportReleasedWhenTheConnectionDrops` | The real engine shows the release and the reconnect; the fake one checks the chains are released before the retry. |
 | Engine restart, new generation | real engines (export side) | e2e `engine-restart`; import side: `TestSyncStaleGeneration`, `TestOfferPendingStaleGeneration`, `TestTrackerGenerationFence`, `TestRecordFencesOlderGenerations` | Whether entry numbers survive a restart is the engine's: only a real one shows the cut export runs again under the same numbers. |
-| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestKnownGapServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap of a stop without a drain exactly. |
+| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap of a stop without a drain exactly. |
 | Clean stop (drain) | both, and the binary | e2e `drain`; `TestDrain*`, `TestDrainedRestartStoresPendingExport`, `TestMinIODrain`, `TestMinIOBinaryDrainsOnSIGTERM`, `TestMinIOBinarySecondSIGTERMStopsAtOnce` | The real engine shows it stays connected and finishes its upload while the service drains; the fake engine controls the timing (quiet sessions, late spans, deadlines, disconnects); only the built command shows the signal wiring. |
 | S3 throttling, 5xx, outage | real engines | e2e `s3-faults`; `TestExportRetriesFailedUploads`, `TestExportGivesUpOnFailingUploads`, `TestExportBlobStoreFailureReleases`, `TestUpdateIndexRetriesOnAFreshIndex` | Who retries what is split between the engine's PUTs and the service's AWS SDK client, which only the real pair shows. |
 | Oversized messages | fake engine, and MinIO | `TestImportBundleNearMergeLimit` (and `TestMinIO…`), `TestExportSplitsBundleTooLargeToImport`, `TestExportOneRootBundleTooLargeToImport`, `TestMergeSizeBoundsBuildMerge`; splitting: `TestExportSplitsTooLarge`, `TestSyncTooLarge`, `TestSyncSplitsLargeOffers` | A real bundle near 64 MiB would take minutes to build and move; the limit is a setting, lowered in tests. |
@@ -4029,7 +4032,7 @@ live bundle again, once, pruned entries included: see
 [Import path](#import-path). The real run measured it: 8 bundles, 61 values,
 merged into B within 187ms of its `hello`.
 
-**Known gaps.** An export pending or in flight when the service stops
+**Accepted limits.** An export pending or in flight when the service stops
 without a drain (a crash, SIGKILL, or `-drain-timeout 0`) is lost until a
 later session names its entries
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45)). A clean

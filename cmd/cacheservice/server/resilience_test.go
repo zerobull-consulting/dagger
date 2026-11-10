@@ -385,16 +385,16 @@ func TestServiceRestartMergesPrunedEntriesAgainOnce(t *testing.T) {
 	}
 }
 
-// KNOWN GAP (#12, case 3): the export path learns entries only from session
+// Accepted, not planned to change (#45; #12, case 3): the export path learns entries only from session
 // spans, and keeps them in memory. An export pending or in flight when the
 // service stops without a drain (a crash, SIGKILL, or -drain-timeout 0) is
 // lost: the restarted service doesn't know the entries, and exports them
 // only once a later session's spans name them again. What was stored is not
 // lost, and the restarted service resumes exporting new sessions at once. A
 // clean stop drains first, and stores it
-// (TestDrainedRestartStoresPendingExport). Tracked in
+// (TestDrainedRestartStoresPendingExport). Decided in
 // https://github.com/zerobull-consulting/dagger/issues/45.
-func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
+func TestServiceRestartForgetsPendingExport(t *testing.T) {
 	blobs, meta := newMemStores(t)
 	r := newRestartable(t, blobs, meta)
 	svc := r.start()
@@ -431,7 +431,7 @@ func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
 // A clean stop (SIGTERM) drains: the export in flight, and a session in its
 // quiet period, are stored before the service goes away, so the restarted
 // service has them without a later session naming them again. This is what
-// TestKnownGapServiceRestartForgetsPendingExport loses without the drain.
+// TestServiceRestartForgetsPendingExport loses without the drain.
 func TestDrainedRestartStoresPendingExport(t *testing.T) {
 	blobs, meta := newMemStores(t)
 	r := newRestartable(t, blobs, meta)
