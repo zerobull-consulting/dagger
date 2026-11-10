@@ -711,6 +711,9 @@ start() {
 	cat >"$bin/dagger" <<EOF
 #!/usr/bin/env bash
 # Written by the remote cache sidecar (.github/actions/remote-cache).
+# Its timeout keeps to the caller's process group, as the sidecar's does: the
+# start runs this script under start/run (zerobull-consulting/dagger#209).
+$(declare -f timeout)
 if [[ "\$(timeout 30 docker inspect -f '{{.State.Running}}' $q_service 2>/dev/null)" != true ]]; then
 	echo "remote-cache-sidecar: the cache service $q_service isn't running" >&2
 	timeout 30 docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2

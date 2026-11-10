@@ -706,6 +706,9 @@ check "... without copying the CLI out of the engine" [ ! -e "$tmp/okbin.fake/cp
 check "... and says which CLI it uses" grep -q "using the CLI $fake_cli ($first_version)" "$tmp/hello.out"
 sidecar_wrapper="$tmp/okbin.sc/remote-cache/bin/dagger"
 check "... the wrapper runs that CLI" grep -qF "$fake_cli" "$sidecar_wrapper"
+# zerobull-consulting/dagger#209: the start runs the wrapper under start/run,
+# so its timeout calls stay in the script's process group too.
+check "... and its timeout calls keep to the caller's process group" grep -qF 'command timeout --foreground "$@"' "$sidecar_wrapper"
 # The guards survive: a job with a trace and settings of its own.
 wrapped() { TRACEPARENT=00-aa-bb-00 DAGGER_ENGINE=other OTEL_X=1 PATH="$tmp/okbin:$PATH" "$sidecar_wrapper" call; }
 check "... which drops an inherited TRACEPARENT, DAGGER_* and OTEL_*" grep -q "^TRACEPARENT=unset DAGGER_ENGINE=unset OTEL_X=unset" <<<"$(wrapped)"
