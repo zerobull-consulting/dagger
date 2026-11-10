@@ -52,9 +52,9 @@ jobs:
           persist-credentials: false
       # The default branch's copy of the check and of engines.sh, as this
       # workflow is (GITHUB_SHA, on pull_request_target), so a PR can't
-      # weaken the check it's measured by. Never the PR's. They are copied
-      # out before the PR's head, data only, replaces the working tree. The
-      # head comes from refs/pull/<N>/head, fetched explicitly, so it works
+      # weaken the check it's measured by. Never the PR's. The PR's head
+      # is fetched, not checked out: the check reads commits only. It comes
+      # from refs/pull/<N>/head, fetched explicitly, so it works
       # for a fork's PR too, whose commit is on no branch of this repository
       # (zerobull-consulting/dagger#165).
       - name: Check the PR adds only one accept line
@@ -75,7 +75,7 @@ jobs:
           done
           echo "Running the default branch's check ($(git rev-parse --short "$GITHUB_SHA"))."
           echo "CHECK_DIR=$dir" >>"$GITHUB_ENV"
-          "$dir/accept-line-only.sh" fetch-head "$PR" "$HEAD_SHA"
+          "$dir/accept-line-only.sh" fetch-head "$PR" "$HEAD_SHA" "$HEAD_REF"
           "$dir/accept-line-only.sh" check "$BASE_SHA" "$HEAD_SHA" "$HEAD_REF"
       - name: Turn auto-merge off
         if: failure() && steps.check.outcome == 'failure'

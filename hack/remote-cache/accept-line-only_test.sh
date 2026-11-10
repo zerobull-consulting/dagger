@@ -164,9 +164,24 @@ echo 'not json' >"$tmp/run.json"
 check "run: a reply that isn't JSON fails" fails "$okhead"
 run
 check "run: and a good run passes again" passes "$okhead"
-# remote-cache-tests.yml titles a candidate's run the way verify_run reads it.
-check "run-name: remote-cache-tests.yml titles a candidate's run with its version and digest" grep -qF "format('Remote cache tests: candidate {0} {1}', inputs.candidate-version, inputs.candidate-digest)" "$here/../../.github/workflows/remote-cache-tests.yml"
-check "run-name: ... and verify_run wants that title" grep -qF 'want="Remote cache tests: candidate $v $d"' "$script"
+# remote-cache-tests.yml titles a candidate's run the way verify_run reads it:
+# take the format string from the workflow, fill it in, and cite that title.
+fmt="$(sed -n "s/^run-name: .*format('\([^']*\)', inputs.candidate-version, inputs.candidate-digest).*/\1/p" "$here/../../.github/workflows/remote-cache-tests.yml")"
+title="${fmt//\{0\}/v1.0.0-beta.26}"
+title="${title//\{1\}/$d2}"
+check "run-name: the workflow's format string was found" test -n "$fmt"
+run ".display_title = \"$title\""
+check "run-name: a run titled by the workflow's own run-name passes" passes "$okhead"
+run
+# Text the cited run controls can't start a workflow command of its own.
+run '.display_title = "x\n::stop-commands::tok\n100%"'
+verdict "$okhead"
+check "annotation: a title with newlines still fails" test "$status" -ne 0
+check "annotation: no output line is a command of the title's" not grep -q '^::stop' "$tmp/out"
+check "annotation: and the newlines and % are escaped" grep -q 'x%0A::stop-commands::tok%0A100%25' "$tmp/out"
+run
+# GitHub's names don't care about case.
+check "run: a URL differing from the repository in case passes" passes "$(withrun https://github.com/O/R/actions/runs/2)"
 # Other PRs never read a run.
 : >"$tmp/calls"
 verdict "$(pr other2 "echo z >other.txt")" feature/x
@@ -186,33 +201,41 @@ pushpr() { # <name> <ref>: a commit off base, pushed only to <ref>; prints it
 	git -C "$repo" rev-parse HEAD
 }
 fresh() { rm -rf "$tmp/co" && git clone -q "file://$up" "$tmp/co"; }
-fetchhead() { (cd "$tmp/co" && FETCH_REMOTE=origin "$script" fetch-head "$@") >"$tmp/out" 2>&1; }
-at_head() { test "$(git -C "$tmp/co" rev-parse HEAD)" = "$1"; }
+fetchhead() { # <PR> <sha> [<ref>]
+	(cd "$tmp/co" && FETCH_REMOTE=origin "$script" fetch-head "$1" "$2" "${3:-release-check/accept/v1.0.0-beta.26}") >"$tmp/out" 2>&1
+}
+have() { git -C "$tmp/co" cat-file -e "$1^{commit}"; }
 
 fork="$(pushpr fork refs/pull/7/head)"
 fresh
 check "fetch-head: control: a fork's head isn't reachable from a plain clone" not git -C "$tmp/co" checkout -q --detach "$fork"
 fresh
 check "fetch-head: checks out a head that is only under refs/pull/<N>/head" fetchhead 7 "$fork"
-check "fetch-head: and HEAD is that commit" at_head "$fork"
+check "fetch-head: and the commit is here" have "$fork"
+check "fetch-head: and nothing was checked out" test "$(git -C "$tmp/co" rev-parse HEAD)" != "$fork"
 inbranch="$(pushpr inbranch refs/heads/also-a-branch)"
 git -C "$up" update-ref refs/pull/8/head "$inbranch"
 fresh
 check "fetch-head: a head that is on a branch too" fetchhead 8 "$inbranch"
-check "fetch-head: and HEAD is that commit (reachable)" at_head "$inbranch"
+check "fetch-head: and the commit is here (reachable)" have "$inbranch"
 # The PR was pushed again: the ref is a child of the event's head.
 git -C "$repo" checkout -q -B child "$fork"
 echo c >"$repo/child.txt" && git -C "$repo" add child.txt && git -C "$repo" commit -q -m child
 git -C "$repo" push -q "$up" HEAD:refs/pull/7/head
 fresh
 check "fetch-head: the ref moved on, the event's head is its ancestor" fetchhead 7 "$fork"
-check "fetch-head: and HEAD is the event's head, not the ref's" at_head "$fork"
+check "fetch-head: and the event's head is here" have "$fork"
 # The PR was force-pushed: the ref no longer holds the event's head.
 other="$(pushpr other refs/pull/9/head)"
 fresh
 check "fetch-head: fails when the ref doesn't hold the head" not fetchhead 9 "$fork"
 check "fetch-head: and says the PR was pushed again" grep -q "pushed again" "$tmp/out"
+# A head some branch holds is still refused when the PR's ref no longer does.
+git -C "$up" update-ref refs/pull/10/head "$other"
+fresh
+check "fetch-head: fails for a head reachable from a branch, not from the ref" not fetchhead 10 "$inbranch"
 check "fetch-head: fails for a PR with no such ref" not fetchhead 99 "$fork"
+check "fetch-head: any other PR passes untouched, with no fetch" fetchhead 99 "$fork" feature/x
 check "fetch-head: fails for a PR number that isn't one" not fetchhead '7;x' "$fork"
 check "fetch-head: fails for a head that isn't a commit id" not fetchhead 7 main
 # The token reaches git through its environment, not its arguments.
@@ -225,14 +248,14 @@ echo "$*" >>"$FAKE_GIT_ARGS"
 exec /usr/bin/env -i PATH="$ORIG_PATH" git "$@"
 G
 chmod +x "$tmp/gitbin/git"
-(cd "$tmp/co" && PATH="$tmp/gitbin:$PATH" ORIG_PATH="$PATH" FAKE_GIT_ARGS="$tmp/gitargs" GH_TOKEN=tok-secret "$script" fetch-head 7 "$fork") >"$tmp/out" 2>&1
+(cd "$tmp/co" && PATH="$tmp/gitbin:$PATH" ORIG_PATH="$PATH" FAKE_GIT_ARGS="$tmp/gitargs" GH_TOKEN=tok-secret "$script" fetch-head 7 "$fork" release-check/accept/v1.0.0-beta.26) >"$tmp/out" 2>&1
 check "fetch-head: uses the token through git's environment" grep -q "extra=http.https://example.invalid/.extraheader" "$tmp/gitargs"
 check "fetch-head: never puts the token in git's arguments" not grep -q tok-secret "$tmp/gitargs"
 check "fetch-head: never prints the token" not grep -q tok-secret "$tmp/out"
 
 # The workflow takes the PR's head through fetch-head, not as the checkout's ref.
 wf="$here/../../.github/workflows/remote-cache-auto-merge-add-compatible-engine.yml"
-check "workflow: calls fetch-head with the PR number and head" grep -q 'accept-line-only.sh" fetch-head "\$PR" "\$HEAD_SHA"' "$wf"
+check "workflow: calls fetch-head with the PR number and head" grep -q 'accept-line-only.sh" fetch-head "\$PR" "\$HEAD_SHA" "\$HEAD_REF"' "$wf"
 check "workflow: the checkout doesn't take the head as its ref" not grep -qE '^\s+ref: .*head\.sha' "$wf"
 
 # disable-auto-merge, against the fake gh.

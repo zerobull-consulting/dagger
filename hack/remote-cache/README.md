@@ -1021,9 +1021,13 @@ accept branch anyway, [zerobull-consulting/dagger#152](https://github.com/zerobu
 and the run's branch isn't checked, since the release check dispatches on
 `RELEASE_CHECK_BRANCH`, on `RELEASE_CHECK_TEST_REF` in a dry run, and on
 `release-check/rebuild/<version>` for B, and a hand-added line may cite any.
-The check gets the PR's head from `refs/pull/<N>/head`, fetched explicitly,
-so a fork PR's commit, which is on no branch of this repository, is found
-the same way (a real fork PR hasn't been tried
+The run must come from a ref whose `remote-cache-tests.yml` has that
+`run-name`, or its title is GitHub's default and the check fails (closed,
+with the title it saw in the message). The forgery above needs write access.
+For an accept PR the check fetches `refs/pull/<N>/head` explicitly (it
+checks nothing out; it only reads commits) and requires the PR's head to be
+that ref's tip or in its history, so a fork PR's commit, which is on no
+branch of this repository, is found the same way (a real fork PR hasn't been tried
 ([zerobull-consulting/dagger#165](https://github.com/zerobull-consulting/dagger/issues/165))).
 On failure it turns the PR's auto-merge off. The release check's
 `auto-merge` job checks only the PR's files before enabling it, and only on

@@ -18,11 +18,13 @@
 #       verify_run; GH_TOKEN, GITHUB_TOKEN, actions: read).
 #       Every other PR passes: it isn't auto-merged.
 #
-#   accept-line-only.sh fetch-head <PR number> <head sha>
-#       Checks out the PR's head, from refs/pull/<PR>/head of the base
-#       repository (where GitHub keeps every PR's head, a fork's too),
-#       fetched explicitly: the commit needn't be reachable from any branch
-#       the checkout fetched. Fails if that ref no longer holds the commit.
+#   accept-line-only.sh fetch-head <PR number> <head sha> <head ref>
+#       For a release-check/accept/* PR, fetches refs/pull/<PR>/head of the
+#       base repository (where GitHub keeps every PR's head, a fork's too)
+#       explicitly, so the head commit's objects are here whether or not any
+#       branch holds it, and fails unless the head is that ref's tip or in its
+#       history. Every other PR passes untouched. It checks nothing out: check
+#       only reads commits (git diff, git show).
 #       (zerobull-consulting/dagger#165)
 #
 #   accept-line-only.sh disable-auto-merge <PR number>
@@ -45,8 +47,15 @@ run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+
 
 tests_wf=.github/workflows/remote-cache-tests.yml
 
+# fail <message>: an annotation. The message can hold text the PR or the
+# cited run controls, so %, CR and LF are escaped as workflow commands need,
+# or a line of it could be a command of its own.
 fail() {
-	echo "::error file=$manifest::auto-merge: adds compatible engine only: $*"
+	local msg="$*"
+	msg="${msg//'%'/%25}"
+	msg="${msg//$'\r'/%0D}"
+	msg="${msg//$'\n'/%0A}"
+	echo "::error file=$manifest::auto-merge: adds compatible engine only: $msg"
 	exit 1
 }
 
@@ -60,10 +69,11 @@ fail() {
 # cite a run from any branch. A writer who edits the run-name on a branch
 # can still make a run look like this (zerobull-consulting/dagger#165).
 verify_run() {
-	local v="$1" d="$2" url="$3" path id attempt run api_path got want
+	local v="$1" d="$2" url="$3" path urlrepo id attempt run api_path got want
 	path="${url#https://github.com/}"
-	[[ "${path%%/actions/*}" == "$repo" ]] ||
-		fail "the cited run is of ${path%%/actions/*}, not of $repo"
+	# GitHub's names are case-insensitive.
+	urlrepo="${path%%/actions/*}"
+	[[ "${urlrepo,,}" == "${repo,,}" ]] || fail "the cited run is of $urlrepo, not of $repo"
 	path="${path#*/actions/runs/}"
 	id="${path%%/*}"
 	attempt=""
@@ -123,10 +133,12 @@ check() {
 	echo "the PR adds only '$added': passes"
 }
 
-# fetch_head <PR> <head sha>: see the header. GH_TOKEN, if set, reaches git
-# through its environment, never its arguments (the checkout persists none).
+# fetch_head <PR> <head sha> <head ref>: see the header. GH_TOKEN, if set,
+# reaches git through its environment, never its arguments (the checkout
+# persists none).
 fetch_head() {
-	local pr="$1" head="$2" remote="${FETCH_REMOTE:-origin}" url auth
+	local pr="$1" head="$2" ref="$3" remote="${FETCH_REMOTE:-origin}" url auth
+	[[ "$ref" == release-check/accept/* ]] || { echo "not a release-check accept PR ($ref): nothing to fetch"; return; }
 	[[ "$pr" =~ ^[0-9]{1,9}$ ]] || fail "'$pr' is not a PR number"
 	[[ "$head" =~ ^[0-9a-f]{40}$ ]] || fail "the head must be a commit id"
 	url="$(git remote get-url "$remote")"
@@ -136,13 +148,12 @@ fetch_head() {
 	fi
 	timeout 300 git fetch -q --no-tags "$remote" "+refs/pull/$pr/head:refs/remotes/pull/$pr" ||
 		fail "fetching refs/pull/$pr/head failed"
-	# The ref has moved on if the PR got a newer push; its history still
-	# holds this head unless the push rewrote it, and then a newer run
+	# The ref has moved on if the PR got a newer push, and its history still
+	# holds this head; a push that rewrote it doesn't, and then a newer run
 	# measures the newer head.
-	git cat-file -e "$head^{commit}" 2>/dev/null ||
+	git merge-base --is-ancestor "$head" "refs/remotes/pull/$pr" 2>/dev/null ||
 		fail "refs/pull/$pr/head is $(git rev-parse --short "refs/remotes/pull/$pr") and doesn't hold $head: the PR was pushed again"
-	git checkout -q --detach "$head"
-	echo "checked out $head from refs/pull/$pr/head"
+	echo "fetched $head from refs/pull/$pr/head"
 }
 
 disable() {
@@ -162,7 +173,7 @@ disable() {
 
 case "${1:-}" in
 check) [[ $# -eq 4 ]] || fail "usage: accept-line-only.sh check <base sha> <head sha> <head ref>"; check "$2" "$3" "$4" ;;
-fetch-head) [[ $# -eq 3 ]] || fail "usage: accept-line-only.sh fetch-head <PR> <head sha>"; fetch_head "$2" "$3" ;;
+fetch-head) [[ $# -eq 4 ]] || fail "usage: accept-line-only.sh fetch-head <PR> <head sha> <head ref>"; fetch_head "$2" "$3" "$4" ;;
 disable-auto-merge) [[ $# -eq 2 ]] || exit 2; disable "$2" ;;
-*) echo "usage: accept-line-only.sh check <base> <head> <ref> | fetch-head <PR> <head> | disable-auto-merge <PR>" >&2; exit 2 ;;
+*) echo "usage: accept-line-only.sh check <base> <head> <ref> | fetch-head <PR> <head> <ref> | disable-auto-merge <PR>" >&2; exit 2 ;;
 esac
