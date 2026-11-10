@@ -119,7 +119,7 @@ function saveState(env, key, value) {
   fs.appendFileSync(env.GITHUB_STATE, `${key}=${value}\n`);
 }
 
-function main(env) {
+async function main(env) {
   const name = env.SIDECAR_NAME || 'remote-cache';
   // Saved first: the post step must stop what a start that failed halfway
   // left.
@@ -129,7 +129,7 @@ function main(env) {
   return run('start', env, startMs);
 }
 
-function post(env) {
+async function post(env) {
   const name = env.STATE_name || env.SIDECAR_NAME || 'remote-cache';
   const dir = env.STATE_dir || sidecarDir(env);
   // Always `sidecar.sh stop`, which knows where its state is and says

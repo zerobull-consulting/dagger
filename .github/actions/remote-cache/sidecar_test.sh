@@ -45,9 +45,33 @@ check "... and at least 1s, past its end" [ "$(step_bound $((SECONDS - 5)))" = 1
 # zerobull-consulting/dagger#209: a bounded docker call stays in the script's
 # process group, which start/run kills at its bound (GNU timeout alone moves
 # to a group of its own).
-pgid_of() { ps -o pgid= -p "$1" | tr -d ' '; }
-check "a timeout call stays in the script's process group" \
-	[ "$(timeout 5 sh -c 'ps -o pgid= -p $$' | tr -d ' ')" = "$(pgid_of $$)" ]
+# The process group of a /proc/<pid>/stat line on stdin: the 3rd field after
+# the command's name, which is in parentheses.
+stat_pgid() {
+	local s
+	s="$(cat)"
+	s="${s##*) }"
+	read -r _ _ pgid _ <<<"$s"
+	echo "${pgid:-}"
+}
+timeout_keeps_group() {
+	local inner outer
+	inner="$(timeout 5 sh -c 'cat /proc/$$/stat' | stat_pgid)"
+	outer="$(stat_pgid </proc/$$/stat)"
+	[[ -n "$inner" && "$inner" == "$outer" ]]
+}
+check "a timeout call stays in the script's process group" timeout_keeps_group
+# A timeout with no --foreground (BusyBox's) is used as it is, not wrapped.
+mkdir -p "$tmp/bbtimeout"
+cat >"$tmp/bbtimeout/timeout" <<'FAKE'
+#!/bin/sh
+case "$1" in -*) echo "timeout: unrecognized option '$1'" >&2; exit 125 ;; esac
+shift
+exec "$@"
+FAKE
+chmod +x "$tmp/bbtimeout/timeout"
+check "... and a timeout with no --foreground still runs the command" \
+	[ "$(PATH="$tmp/bbtimeout:$PATH" bash -c "source '$here/sidecar.sh'; timeout 5 echo ran" 2>&1)" = ran ]
 check "10m is 600s" [ "$(duration_seconds 10m)" = 600 ]
 check "1h30m is 5400s" [ "$(duration_seconds 1h30m)" = 5400 ]
 check "1.5h is refused" not duration_seconds 1.5h
