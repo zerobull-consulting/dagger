@@ -52,7 +52,8 @@ line="accept v1.0.0-beta.26 $d2 verified: $run2"
 first="sed -i 's|^accept v1.0.0-beta.25|$line\naccept v1.0.0-beta.25|' $m"
 # A fake gh: the cited run (FAKE_RUN, a JSON file; FAKE_RUN_FAIL=1: every
 # read fails; FAKE_RUN_FLAKY=<n>: the first n reads fail), its jobs
-# (FAKE_JOBS; FAKE_JOBS_FAIL, FAKE_JOBS_FLAKY the same), and the PR's
+# (FAKE_JOBS; FAKE_JOBS_FAIL, FAKE_JOBS_FLAKY the same; FAKE_RUN_CUT,
+# FAKE_JOBS_CUT=<n>: the first n replies succeed, cut short), and the PR's
 # auto-merge for disable-auto-merge.
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/gh" <<'G'
@@ -63,11 +64,18 @@ repos/*/actions/runs/*/jobs\?*)
 	[[ -z "${FAKE_JOBS_FAIL:-}" ]] || { echo "HTTP 403" >&2; exit 1; }
 	t=$(($(cat "$FAKE_TRIES.jobs" 2>/dev/null || echo 0) + 1)); echo "$t" >"$FAKE_TRIES.jobs"
 	((t > ${FAKE_JOBS_FLAKY:-0})) || { echo "HTTP 502" >&2; exit 1; }
+	# FAKE_JOBS_CUT=<n>: the first n replies succeed, cut short.
+	((t > ${FAKE_JOBS_CUT:-0})) || { head -c 20 "$FAKE_JOBS"; exit 0; }
+	# FAKE_JOBS_NOLIST=<n>: the first n replies are JSON without a jobs list.
+	((t > ${FAKE_JOBS_NOLIST:-0})) || { echo '{"message": "x"}'; exit 0; }
 	cat "$FAKE_JOBS" ;;
 repos/*/actions/runs/*)
 	[[ -z "${FAKE_RUN_FAIL:-}" ]] || { echo "HTTP 404" >&2; exit 1; }
 	t=$(($(cat "$FAKE_TRIES.run" 2>/dev/null || echo 0) + 1)); echo "$t" >"$FAKE_TRIES.run"
 	((t > ${FAKE_RUN_FLAKY:-0})) || { echo "HTTP 502" >&2; exit 1; }
+	((t > ${FAKE_RUN_CUT:-0})) || { head -c 20 "$FAKE_RUN"; exit 0; }
+	# FAKE_RUN_NOOBJ=<n>: the first n replies are JSON but not an object.
+	((t > ${FAKE_RUN_NOOBJ:-0})) || { echo '[]'; exit 0; }
 	cat "$FAKE_RUN" ;;
 repos/*/pulls/*) echo "{\"node_id\": \"PR_1\", \"auto_merge\": $FAKE_AUTO_MERGE}" ;;
 graphql) echo '{}' ;;
@@ -265,6 +273,26 @@ check "retry: a jobs read that fails three times fails" fails "$okhead"
 check "retry: ... and says so" grep -q "couldn't read the cited run .*'s jobs" "$tmp/out"
 rm -f "$tmp/tries".*
 unset FAKE_RUN_FLAKY FAKE_JOBS_FLAKY
+# A reply that succeeds but is cut short is tried again too.
+export FAKE_RUN_CUT=2 FAKE_JOBS_CUT=2
+check "retry: a run reply and a jobs reply each cut short twice pass" passes "$okhead"
+rm -f "$tmp/tries".*
+export FAKE_RUN_CUT=0 FAKE_JOBS_CUT=3
+check "retry: a jobs reply cut short three times fails" fails "$okhead"
+check "retry: ... as a jobs read that failed" grep -q "couldn't read the cited run .*'s jobs" "$tmp/out"
+rm -f "$tmp/tries".*
+export FAKE_RUN_CUT=3 FAKE_JOBS_CUT=0
+check "retry: a run reply cut short three times fails" fails "$okhead"
+rm -f "$tmp/tries".*
+export FAKE_RUN_CUT=0 FAKE_JOBS_NOLIST=2
+check "retry: a jobs reply that is JSON but no jobs list, twice, passes" passes "$okhead"
+rm -f "$tmp/tries".*
+unset FAKE_JOBS_NOLIST
+export FAKE_RUN_NOOBJ=2
+check "retry: a run reply that is JSON but no object, twice, passes" passes "$okhead"
+rm -f "$tmp/tries".*
+unset FAKE_RUN_NOOBJ
+unset FAKE_RUN_CUT FAKE_JOBS_CUT
 # Text the cited run's jobs control can't start a workflow command either.
 engine "sidecar demo" '.conclusion = "x\n::stop-commands::tok"'
 verdict "$okhead"

@@ -66,12 +66,18 @@ fail() {
 	exit 1
 }
 
-# read_api <path>: gh api <path>, tried three times (a transient error
-# shouldn't fail the check, which turns auto-merge off), each bounded.
+# read_api <jq filter> <path>: gh api <path>, tried three times until the
+# reply passes the jq filter (a transient error, or a reply cut short,
+# shouldn't fail the check, which turns auto-merge off). Each try is bounded
+# at 20s, so a read takes at most 3 x 20 + 2 x 5 = 70s, and the check's two
+# reads 140s: with fetch-head's 300s, within the workflow step's 8 minutes.
 read_api() {
 	local try out
 	for try in 1 2 3; do
-		out="$(timeout 60 gh api "$1")" && { printf '%s\n' "$out"; return 0; }
+		out="$(timeout 20 gh api "$2")" && jq -e "$1" >/dev/null 2>&1 <<<"$out" && {
+			printf '%s\n' "$out"
+			return 0
+		}
 		((try == 3)) || sleep "$retry_seconds"
 	done
 	return 1
@@ -97,8 +103,7 @@ verify_run() {
 	attempt=""
 	[[ "$path" == */attempts/* ]] && attempt="${path##*/}"
 	api_path="repos/$repo/actions/runs/$id${attempt:+/attempts/$attempt}"
-	run="$(read_api "$api_path")" || fail "couldn't read the cited run $url"
-	jq -e . >/dev/null 2>&1 <<<"$run" || fail "the cited run $url didn't read as JSON"
+	run="$(read_api 'type == "object"' "$api_path")" || fail "couldn't read the cited run $url as JSON"
 	# One jq per field, so a field the API leaves out reads as empty.
 	field() { jq -r "$1 // \"\"" <<<"$run"; }
 	got="$(field .repository.full_name)"
@@ -124,7 +129,8 @@ verify_run() {
 	n="$(field .run_attempt)"
 	[[ "$n" =~ ^[1-9][0-9]{0,4}$ ]] || fail "the cited run's attempt is '$n', not a number"
 	[[ -z "$attempt" || "$n" == "$attempt" ]] || fail "the cited run's attempt reads as $n, not the URL's $attempt"
-	jobs="$(read_api "repos/$repo/actions/runs/$id/attempts/$n/jobs?per_page=100")" || fail "couldn't read the cited run $url's jobs"
+	jobs="$(read_api '.jobs | type == "array"' "repos/$repo/actions/runs/$id/attempts/$n/jobs?per_page=100")" ||
+		fail "couldn't read the cited run $url's jobs"
 	why="$(engine_jobs_unlisted "$jobs")"
 	[[ -z "$why" ]] || fail "the cited run $url: $why"
 	jq -e --argjson e "$engine_json" '[.jobs[] | select('"$is_engine"')] | all(.status == "completed" and .conclusion == "success")' <<<"$jobs" >/dev/null || {

@@ -1023,7 +1023,9 @@ from the URL's `/attempts/N`), if the run has more jobs than were listed, or
 if either job is missing, listed twice, or anything but `completed`/`success`
 ([zerobull-consulting/dagger#223](https://github.com/zerobull-consulting/dagger/issues/223)).
 The job names, and the checks on the listing, are `engine-jobs.sh`'s, which
-`release-check.sh` shares. The runs API doesn't return a dispatch's inputs, so
+`release-check.sh` shares. A run some of whose jobs were re-run ("Re-run
+failed jobs") hasn't been tried: if its attempt lists only the re-run jobs,
+the check refuses it (an engine job is missing), so it fails closed. The runs API doesn't return a dispatch's inputs, so
 `remote-cache-tests.yml`'s `run-name` puts them in the title. **Known
 limits:** the title is the workflow file's, so a writer who edits `run-name`
 on a branch can make a run look like this (the same writer can push the

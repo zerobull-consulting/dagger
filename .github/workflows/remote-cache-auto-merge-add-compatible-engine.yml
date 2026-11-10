@@ -63,7 +63,11 @@ jobs:
       # (zerobull-consulting/dagger#165).
       - name: Check the PR adds only one accept line
         id: check
-        timeout-minutes: 5
+        # fetch-head is bounded at 300s, and the check's two reads of the
+        # cited run (the run, its jobs) at 70s each (three 20s tries, 5s
+        # apart): 440s in all, within 8 minutes, so the check's own
+        # annotation says why it failed rather than the step timing out.
+        timeout-minutes: 8
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}

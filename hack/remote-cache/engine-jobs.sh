@@ -13,8 +13,10 @@ engine_json="$(printf '%s\n' "${engine_jobs[@]}" | jq -R . | jq -s -c .)"
 # (jq --argjson e "$engine_json").
 is_engine='(.name as $n | $e | index($n)) != null'
 
-# engine_jobs_unlisted <jobs JSON>: why a run's jobs listing (one page of
-# GET .../runs/<id>/jobs?per_page=100) can't be decided on, or nothing. It
+# engine_jobs_unlisted <jobs JSON>: why a jobs listing (one page,
+# per_page=100, of a run's jobs, GET .../runs/<id>/jobs, or of one
+# attempt's, GET .../runs/<id>/attempts/<n>/jobs) can't be decided on, or
+# nothing. It
 # can't when it isn't a jobs list, when the run has more jobs than were
 # listed (one page is all that's read, so the rest are refused, not
 # fetched), or when an engine job isn't there exactly once.
