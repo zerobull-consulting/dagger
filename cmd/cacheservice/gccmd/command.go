@@ -143,6 +143,11 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	if confirm != "" && confirm != want {
 		return fail(ExitUsage, "-confirm=%s doesn't match the bucket and prefix it would collect, %s; nothing read or deleted", confirm, want)
 	}
+	// An empty -confirm that was given (-confirm="$VAR", VAR unset) is not
+	// "no -confirm": a job that means to collect mustn't quietly dry-run.
+	if set["confirm"] && confirm == "" {
+		return fail(ExitUsage, "-confirm was given but is empty; give -confirm=%s to collect, or leave -confirm out for a dry run; nothing read or deleted", want)
+	}
 	confirmed := confirm != ""
 	limitsGiven := fl.NamespacesFile != "" || (set["max-age"] && set["max-bytes"])
 	if confirmed && !limitsGiven {
@@ -162,9 +167,6 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 		return fail(ExitUsage, "%v", err)
 	}
 	c := fl.Collector()
-	if c.Grace < 0 || c.StagingAge < 0 || c.MaxDeletes < 0 {
-		return fail(ExitUsage, "-gc-grace, -gc-staging-age and -gc-max-deletes must not be negative")
-	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 	if !confirmed {
@@ -189,6 +191,8 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	c.Limits = limits.For
 	c.Logger = logger.With("component", "gc")
 	c.DryRun = !confirmed
+	// Settings gc.New refuses (a negative -gc-grace, say) are bad flags: it
+	// makes no request, and nothing has been read.
 	collector, err := gc.New(c)
 	if err != nil {
 		return fail(ExitUsage, "%v", err)

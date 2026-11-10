@@ -2809,7 +2809,12 @@ cacheservice gc -namespaces-file limits -confirm=dagger-cache/cache
   -max-bytes=0` collects with no age or size limit, on purpose. A confirmed
   run without them exits 2 and names the flag it lacks
   (`TestConfirmedRunNeedsExplicitLimits`): a job that deletes shouldn't do so
-  under limits nobody chose.
+  under limits nobody chose. `-namespaces-file` alone satisfies this, but a
+  file with no `*` line leaves every namespace it doesn't list with no limit
+  (`-max-age` and `-max-bytes` are 0 unless given), as in the service
+  (`TestNamespacesFileLimits`): put a `*` line in the file for defaults.
+- **An empty `-confirm=`** (say `-confirm="$VAR"` with `VAR` unset) exits 2:
+  it is not a dry run. Leave `-confirm` out for one.
 - **Flags:** `-confirm`, `-max-age`, `-max-bytes`, `-namespaces-file` (read
   once; there is no SIGHUP), `-gc-grace`, `-gc-staging-age` and
   `-gc-max-deletes`: the service's, with the same defaults. It has no

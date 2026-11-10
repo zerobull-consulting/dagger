@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -55,14 +57,39 @@ func stdoutReports(t *testing.T, stdout string) []gc.Report {
 	return reps
 }
 
+// notFound is an S3 endpoint with nothing in it: every request is a 404
+// NoSuchKey, so a run finds no ownership marker.
+func notFound(t *testing.T) string {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>nothing here</Message></Error>`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// cleanEnv is the process's environment without what could change how the
+// binary reaches S3: AWS_* and CACHESERVICE_S3_*.
+func cleanEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "AWS_") && !strings.HasPrefix(kv, "CACHESERVICE_S3_") {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
 // The built binary dispatches `gc` to the command, with its exit codes and
-// its JSON on stdout. The endpoint here answers nothing, so the run can't
-// read the ownership marker, and refuses (3) with an empty report; a wrong
-// -confirm, no limits with -confirm, and bad flags exit 2 before any request.
+// its JSON on stdout. Against a store with nothing in it, the run finds no
+// ownership marker and refuses (3) with an empty report; a wrong -confirm, an
+// empty one, no limits with -confirm, and bad flags exit 2 before any
+// request.
 func TestBinaryGCExitCodes(t *testing.T) {
 	bin := buildBinary(t)
-	env := append(os.Environ(),
-		blobstore.EnvEndpoint+"=http://127.0.0.1:1",
+	env := append(cleanEnv(),
+		blobstore.EnvEndpoint+"="+notFound(t),
 		blobstore.EnvRegion+"=us-east-1",
 		blobstore.EnvBucket+"=bkt",
 		blobstore.EnvPrefix+"=cache",
@@ -76,12 +103,13 @@ func TestBinaryGCExitCodes(t *testing.T) {
 		wantJSON bool // stdout is the report array; otherwise empty
 	}{
 		{[]string{"-confirm=bkt/other", "-max-age=0", "-max-bytes=0"}, 2, false},
+		{[]string{"-confirm=", "-max-age=0", "-max-bytes=0"}, 2, false},
 		{[]string{"-confirm=bkt/cache"}, 2, false},
 		{[]string{"-confirm=bkt/cache", "-max-age=0"}, 2, false},
 		{[]string{"-bogus"}, 2, false},
 		{[]string{"-gc-mode=batch"}, 2, false},
 		{[]string{"extra"}, 2, false},
-		{[]string{}, 3, true},                                                   // dry run: no marker can be read
+		{[]string{}, 3, true},                                                   // dry run: no marker
 		{[]string{"-confirm=bkt/cache", "-max-age=0", "-max-bytes=0"}, 3, true}, // confirmed: the same
 	} {
 		code, out, errOut := runGC(t, bin, env, tc.args...)
@@ -89,7 +117,12 @@ func TestBinaryGCExitCodes(t *testing.T) {
 			t.Errorf("%q: exit %d, want %d\nstdout: %s\nstderr: %s", tc.args, code, tc.want, out, errOut)
 		}
 		if tc.wantJSON {
-			stdoutReports(t, out)
+			if reps := stdoutReports(t, out); len(reps) != 0 {
+				t.Errorf("%q: reports %+v", tc.args, reps)
+			}
+			if !strings.Contains(errOut, "no ownership marker") {
+				t.Errorf("%q: stderr should say there is no marker:\n%s", tc.args, errOut)
+			}
 		} else if out != "" {
 			t.Errorf("%q: stdout %q, want none", tc.args, out)
 		}

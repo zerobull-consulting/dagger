@@ -208,8 +208,14 @@ func run(t *testing.T, open Opener, args ...string) (int, string, string) {
 // runAsIs is run with the environment the test already set.
 func runAsIs(t *testing.T, open Opener, args ...string) (int, string, string) {
 	t.Helper()
+	return runCtx(t, context.Background(), open, args...)
+}
+
+// runCtx is runAsIs with the context Main runs under.
+func runCtx(t *testing.T, ctx context.Context, open Opener, args ...string) (int, string, string) {
+	t.Helper()
 	var out, errOut bytes.Buffer
-	code := Main(context.Background(), args, &out, &errOut, open)
+	code := Main(ctx, args, &out, &errOut, open)
 	return code, out.String(), errOut.String()
 }
 
@@ -489,12 +495,11 @@ func TestBadFlagsExit2(t *testing.T) {
 		{"-max-age=100ms"},
 		{"-max-age=-1h"},
 		{"-max-bytes=lots"},
-		{"-gc-grace=-1s"},
-		{"-gc-staging-age=-1s"},
-		{"-gc-max-deletes=-1"},
 		{"-gc-grace=notaduration"},
 		{"-namespaces-file=" + missing},
 		{"-confirm"},
+		{"-confirm="},
+		{"-confirm=", "-max-age=0", "-max-bytes=0"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			code, out, errOut := run(t, opened(t), args...)
@@ -729,4 +734,78 @@ func TestSigtermAfterClaimFinishesClaims(t *testing.T) {
 		t.Fatalf("run after the signal: %d %s", code, errOut)
 	}
 	reports(t, out)
+}
+
+// An explicitly empty -confirm is a usage error that says so, not a dry run.
+func TestEmptyConfirmIsNotADryRun(t *testing.T) {
+	code, out, errOut := run(t, opened(t), "-confirm=", "-max-age=0", "-max-bytes=0")
+	if code != ExitUsage || out != "" || !strings.Contains(errOut, "empty") || !strings.Contains(errOut, "-confirm="+bucketName+"/"+prefix) {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
+// Settings the collector refuses exit 2 before the bucket is used: the
+// bucket here panics on any call.
+func TestNegativeSettingsExit2BeforeAnyRequest(t *testing.T) {
+	f := newFixture(t, true)
+	f.seed()
+	before := f.state()
+	untouchable := func(context.Context, blobstore.S3Config) (Stores, error) {
+		return Stores{Bucket: struct{ gc.Bucket }{}, Meta: f.meta}, nil
+	}
+	for _, arg := range []string{"-gc-grace=-1s", "-gc-staging-age=-1s", "-gc-max-deletes=-1"} {
+		t.Run(arg, func(t *testing.T) {
+			for _, confirmed := range []bool{false, true} {
+				args := slices.Clone(limits)
+				if confirmed {
+					args = append(args, confirmArg())
+				}
+				code, out, errOut := run(t, untouchable, append(args, arg)...)
+				if code != ExitUsage || out != "" || !strings.Contains(errOut, "negative") {
+					t.Fatalf("confirmed %v: exit %d, stdout %q, stderr %q", confirmed, code, out, errOut)
+				}
+			}
+		})
+	}
+	same(t, before, f.state())
+}
+
+// cancelOnList cancels the run's context at the first listing inside a
+// namespace: during its collection, after the survey, before the next
+// namespace.
+type cancelOnList struct {
+	*gc.MemBucket
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *cancelOnList) List(ctx context.Context, p string, fn func([]gc.Object) error) error {
+	if strings.Contains(p, "/ns/team-") {
+		b.once.Do(b.cancel)
+	}
+	return b.MemBucket.List(ctx, p, fn)
+}
+
+// A run whose context ends during its first namespace exits 1, whatever the
+// reports say, prints the JSON of what it did, and the namespace it never
+// reached is visible: it has no report, and stderr says the run was
+// interrupted.
+func TestCanceledRunExits1AndSkipIsVisible(t *testing.T) {
+	f := newFixture(t, true)
+	f.seed()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := &cancelOnList{MemBucket: f.bucket, cancel: cancel}
+	setEnv(t)
+	code, out, errOut := runCtx(t, ctx, f.opener(b), slices.Concat([]string{confirmArg()}, limits)...)
+	if code != ExitError {
+		t.Fatalf("exit %d, want 1\nstderr:\n%s", code, errOut)
+	}
+	reps := reports(t, out)
+	if len(reps) >= 2 || report(reps, "team-b").Namespace != "" {
+		t.Fatalf("team-b should have been skipped, with no report: %+v", reps)
+	}
+	if !strings.Contains(errOut, "interrupted") {
+		t.Fatalf("stderr should say the run was interrupted:\n%s", errOut)
+	}
 }
