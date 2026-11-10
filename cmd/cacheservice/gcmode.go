@@ -33,6 +33,9 @@ func resolveGCMode(mode string, interval time.Duration, exports bool, set map[st
 		return "", fmt.Errorf("-gc-interval=%s: negative; want a positive interval (a schedule needs -gc-mode=service, the default)", interval)
 	}
 	if set["gc-interval"] && interval == 0 {
+		if !exports {
+			return "", fmt.Errorf("-gc-interval=0 and -export=false: a zero interval no longer means 'only POST /debug/gc', and a read-only instance never runs garbage collection, which deletes from the bucket; drop -gc-interval (a read-only instance is -gc-mode=%s already)", server.GCModeOff)
+		}
 		return "", fmt.Errorf("-gc-interval=0: no longer means 'only POST /debug/gc'; use -gc-mode=%s to run GC on demand (a job collects), or -gc-mode=%s to collect nothing", server.GCModeBatch, server.GCModeOff)
 	}
 	if !exports {

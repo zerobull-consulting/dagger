@@ -3496,6 +3496,8 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
 
+`-gc-mode` needs an image built after zerobull-consulting/dagger#248; the tag above is older than that.
+
 - **No `-tokens-file`**: the service is unauthenticated, and every engine is
   in the `-scope` namespace. That is fine on a runner's private network, and
   only there: anything that reaches the port can read and add to the

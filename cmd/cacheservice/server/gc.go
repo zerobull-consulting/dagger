@@ -162,7 +162,9 @@ func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 		return fmt.Errorf("gc: unknown mode %q", cfg.Mode)
 	}
 	if cfg.Mode == GCModeOff {
-		s.gc = &gcPath{mode: GCModeOff}
+		// No collector, but a path like the others': the drain calls stop.
+		ctx, stop := context.WithCancel(ctx)
+		s.gc = &gcPath{mode: GCModeOff, ctx: ctx, stop: stop}
 		s.logger.Warn("gc off", "mode", GCModeOff, "reason", "nothing collects this bucket, so it grows without bound; -gc-mode=batch is for a cacheservice gc job, -gc-mode=service for the service's own schedule")
 		return nil
 	}

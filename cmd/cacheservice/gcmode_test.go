@@ -21,6 +21,7 @@ func TestResolveGCMode(t *testing.T) {
 		set      []string
 		want     server.GCMode
 		wantErr  []string
+		wantNot  []string
 	}{
 		{name: "defaults", mode: def, interval: gc.DefaultInterval, want: server.GCModeService},
 		{name: "service, explicit", mode: "service", interval: gc.DefaultInterval, set: []string{"gc-mode"}, want: server.GCModeService},
@@ -29,6 +30,7 @@ func TestResolveGCMode(t *testing.T) {
 		{name: "off", mode: "off", interval: gc.DefaultInterval, set: []string{"gc-mode"}, want: server.GCModeOff},
 
 		{name: "interval 0", mode: def, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=0", "-gc-mode=batch", "-gc-mode=off"}},
+		{name: "read-only, interval 0", mode: def, noExport: true, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=0", "-export=false", "drop -gc-interval", "-gc-mode=off"}, wantNot: []string{"-gc-mode=batch"}},
 		{name: "interval 0 with batch", mode: "batch", set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=0", "-gc-mode"}},
 		{name: "negative interval", mode: def, interval: -time.Second, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=-1s", "negative"}},
 		{name: "interval with batch", mode: "batch", interval: time.Hour, set: []string{"gc-mode", "gc-interval"}, wantErr: []string{"-gc-interval=1h0m0s", "-gc-mode=batch"}},
@@ -61,6 +63,11 @@ func TestResolveGCMode(t *testing.T) {
 			for _, want := range tc.wantErr {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error %q doesn't name %s", err, want)
+				}
+			}
+			for _, not := range tc.wantNot {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("error %q names %s", err, not)
 				}
 			}
 		})

@@ -74,11 +74,12 @@ D4):
 
 So the service can be a newer build than the action's commit. The action
 passes the service only flags every build has kept (`-scope`,
-`-drain-timeout`, `-drain-linger`, `-export`, `-v`,
-`-debug-listen`, `-debug-token-file`), and, with `role: writer`,
-`-gc-mode=batch`, which builds from before zerobull-consulting/dagger#248
-don't know (they exit at startup on an unknown flag); removing or renaming one of them is a breaking change for
-pinned actions. To run one exact build, set
+`-drain-timeout`, `-drain-linger`, `-export`, `-v`, `-debug-listen`,
+`-debug-token-file`); removing or renaming one of them is a breaking change
+for pinned actions. The exception is `role: writer`, which also passes
+`-gc-mode=batch`: it needs a service image built after
+zerobull-consulting/dagger#248, with no backwards compatibility. (The
+action has not been run against an older image.) To run one exact build, set
 `service-image` to `dagger-remote-cache:<commit SHA>`, such as the action's
 own commit.
 

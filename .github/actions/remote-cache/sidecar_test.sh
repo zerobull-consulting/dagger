@@ -855,8 +855,12 @@ check "debug-port: the service gets the file, read-only" grep -qxF -- "$dbg_dir/
 check "debug-port: and -debug-token-file" grep -qxF -- "-debug-token-file" <<<"$dbg_args"
 check "writer: the service gets -gc-mode=batch" grep -qxF -- "-gc-mode=batch" <<<"$dbg_args"
 check "writer: and no -gc-interval" not grep -q -- "-gc-interval" <<<"$dbg_args"
-fake_start dbgbin SIDECAR_NAME=ro SIDECAR_ROLE=read-only >/dev/null
-ro_args="$(cat "$tmp/dbgbin.fake/service.args" 2>/dev/null)"
+# Its own bin directory (a copy of the same fake docker), so it leaves the
+# debug-port start's state alone.
+mkdir -p "$tmp/robin"
+cp "$tmp/dbgbin/docker" "$tmp/robin/docker"
+fake_start robin SIDECAR_ROLE=read-only >/dev/null
+ro_args="$(cat "$tmp/robin.fake/service.args" 2>/dev/null)"
 check "read-only: the service gets -export=false" grep -qxF -- "-export=false" <<<"$ro_args"
 check "read-only: and neither -gc-mode nor -gc-interval" not grep -qE -- "^-gc-(mode|interval)" <<<"$ro_args"
 check "start passes the linger the stop's bounds assume" grep -qx -- "-drain-linger" <<<"$dbg_args"

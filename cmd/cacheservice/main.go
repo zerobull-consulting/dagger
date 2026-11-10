@@ -93,18 +93,18 @@
 //     conditional write check at startup, no GC, and no import records in
 //     the index. It is -gc-mode=off. It refuses -import=false, no
 //     CACHESERVICE_S3_BUCKET, and an explicit -gc-mode=service or batch.
-//     See README.md, "Read-only
-//     instances".
+//     See README.md, "Read-only instances".
 //
-//   - with CACHESERVICE_S3_BUCKET set, garbage collection (-gc-mode=service,
-//     the default: every -gc-interval; batch: only on POST /debug/gc, a
-//     'cacheservice gc' job collects; off: none): per namespace in the bucket, it expires entries past
-//     their expiry, -max-age or -max-bytes (per namespace with
-//     -namespaces-file, which SIGHUP reloads too), and deletes what no live
-//     entry names, and staged and incomplete multipart uploads older than
-//     -gc-staging-age (an export's upload timeout plus an hour). POST
-//     /debug/gc runs it now (?dry-run: report only). See
-//     README.md, "Retention and garbage collection".
+//   - with CACHESERVICE_S3_BUCKET set, garbage collection, by -gc-mode:
+//     service (the default) runs it every -gc-interval, batch only on POST
+//     /debug/gc (a 'cacheservice gc' job collects), off never. Per
+//     namespace in the bucket, it expires entries past their expiry,
+//     -max-age or -max-bytes (per namespace with -namespaces-file, which
+//     SIGHUP reloads too), and deletes what no live entry names, and staged
+//     and incomplete multipart uploads older than -gc-staging-age (an
+//     export's upload timeout plus an hour). POST /debug/gc runs it now
+//     (?dry-run: report only; off answers 409). See README.md, "Retention
+//     and garbage collection".
 //
 // With -tls-cert and -tls-key, the engine address serves HTTPS (wss:// for
 // the WebSocket); otherwise run it behind a TLS-terminating proxy. See

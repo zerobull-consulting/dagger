@@ -782,3 +782,41 @@ func TestDebugGCRequiresToken(t *testing.T) {
 		t.Fatal("the debug token's request ran no collection")
 	}
 }
+
+// A drain, Running and Wait leave no nil in the GC path, in every mode and
+// on a read-only instance (which has no GC path at all): the drain stops the
+// path, and a GC run asked for after it is refused.
+func TestGCModesDrain(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     GCMode
+		interval time.Duration
+		readOnly bool
+		wantErr  error
+	}{
+		{"service", GCModeService, time.Hour, false, ErrDraining},
+		{"batch", GCModeBatch, 0, false, ErrDraining},
+		{"off", GCModeOff, 0, false, ErrGCModeOff},
+		{"read-only", "", 0, true, ErrGCReadOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newGCStores(t, nil)
+			svc := New(slog.New(slog.DiscardHandler), "")
+			if tc.readOnly {
+				if err := svc.SetReadOnly(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := svc.EnableGC(context.Background(), GCConfig{Mode: tc.mode, Interval: tc.interval, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+				t.Fatal(err)
+			}
+			drainFor(svc, 10*time.Second)
+			svc.Wait()
+			if r := svc.Running(); r.GC != 0 {
+				t.Errorf("Running after Wait: %+v", r)
+			}
+			if _, err := svc.CollectGarbage(context.Background(), true); !errors.Is(err, tc.wantErr) {
+				t.Errorf("CollectGarbage after the drain: %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
