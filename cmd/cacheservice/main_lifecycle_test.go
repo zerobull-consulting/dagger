@@ -165,3 +165,53 @@ func TestBinaryLifecycleExitCodes(t *testing.T) {
 		}
 	}
 }
+
+// The built binary dispatches `wipe` to the command, with its exit codes: a
+// wrong or missing -confirm, or an empty prefix, exits 2 before any request
+// (the endpoint here answers nothing), and the secret key is never printed.
+func TestBinaryWipeExitCodes(t *testing.T) {
+	bin := buildBinary(t)
+	env := func(prefix string) []string {
+		return append(os.Environ(),
+			blobstore.EnvEndpoint+"=http://127.0.0.1:1",
+			blobstore.EnvRegion+"=us-east-1",
+			blobstore.EnvBucket+"=bkt",
+			blobstore.EnvPrefix+"="+prefix,
+			blobstore.EnvAccessKeyID+"=id",
+			blobstore.EnvSecretAccessKey+"=a-secret-never-printed",
+		)
+	}
+	for _, tc := range []struct {
+		prefix string
+		args   []string
+		want   int
+	}{
+		{"cache", []string{"wipe", "-dry-run=false"}, 2},
+		{"cache", []string{"wipe", "-dry-run=false", "-confirm=bkt/other"}, 2},
+		{"cache", []string{"wipe", "-dry-run=false", "-confirm=other/cache"}, 2},
+		{"cache", []string{"wipe", "-confirm=bkt/other"}, 2},
+		{"", []string{"wipe"}, 2},
+		{"", []string{"wipe", "-dry-run=false", "-confirm=bkt/"}, 2},
+		{"/", []string{"wipe", "-dry-run=false", "-confirm=bkt/"}, 2},
+		{"cache", []string{"wipe", "extra"}, 2},
+		{"cache", []string{"wipe", "-bogus"}, 2},
+		{"cache", []string{"wipe", "-timeout", "2s"}, 1},                                         // nothing answers
+		{"cache", []string{"wipe", "-dry-run=false", "-confirm=bkt/cache", "-timeout", "2s"}, 1}, // nothing answers
+	} {
+		cmd := exec.Command(bin, tc.args...)
+		cmd.Env = env(tc.prefix)
+		out, err := cmd.CombinedOutput()
+		code := 0
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if code != tc.want {
+			t.Errorf("prefix %q, %q: exit %d, want %d\n%s", tc.prefix, tc.args, code, tc.want, out)
+		}
+		if strings.Contains(string(out), "a-secret-never-printed") {
+			t.Errorf("%q printed the secret key", tc.args)
+		}
+	}
+}

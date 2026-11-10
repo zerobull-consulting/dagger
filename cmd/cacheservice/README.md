@@ -368,9 +368,41 @@ re-run the cache-warming job. The first writer claims the empty prefix, and
 the cache fills again. Pull-request jobs before that run start with nothing
 to import (see [Read-only instances](#read-only-instances)).
 
+**Stop every writer on the prefix first.** The command can't see running
+services: a writer still exporting during the wipe leaves new keys behind,
+and the wipe then exits 3.
+
+`cacheservice wipe` empties the prefix, of any layout (layout 1 included,
+which has no marker). It reads the same `CACHESERVICE_S3_*` settings as the
+service, with a key that can list the prefix and its multipart uploads, and
+delete and abort there (a Read/Write/Delete key):
+
 ```bash
-aws s3 rm --recursive s3://dagger-cache/cache/   # or: mc rm --recursive --force local/dagger-cache/cache/
+cacheservice wipe                                         # dry run: what the prefix holds, and the marker's layout
+cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
 ```
+
+- **A dry run is the default.** It reports the object count, their bytes,
+  the incomplete multipart uploads, up to 20 keys of each, and the ownership
+  marker's layout version, and deletes nothing.
+- **Deleting needs `-dry-run=false` and `-confirm=<bucket>/<prefix>`**,
+  repeating exactly the bucket and the prefix (without surrounding slashes).
+  A missing or wrong one exits 2 before any request. So does an empty
+  `CACHESERVICE_S3_PREFIX`: wiping a whole bucket isn't supported.
+- **The order:** the ownership marker first, so a wipe cut off halfway leaves
+  keys without a marker, which every instance refuses
+  (`TestInterruptedWipeLeavesRefusedPrefix`,
+  `TestMinIOInterruptedWipeRefused`); then the objects, 1,000 per request;
+  then the incomplete multipart uploads; then it lists the prefix again.
+  If the marker can't be read or deleted, nothing else is deleted.
+- **Only under the prefix:** it deletes only keys a listing under
+  `<prefix>/` returned, so `cache2/` and the bucket's top are untouched when
+  wiping `cache` (`TestWipeEmptiesPrefix`, `TestMinIOWipe`).
+- **Exit codes:** 0 a dry run reported, or the prefix is empty after the
+  wipe; 1 an error, or a key or upload that failed (each is listed); 2 usage
+  or confirmation; 3 every request succeeded but the prefix isn't empty
+  after the wipe (a writer is running). `-timeout` (default 30m) bounds the
+  run, and each request is bounded to 30s.
 
 **Later: import from one prefix, export to another.** Images are pinned by
 SHA, so an old image can still read the old prefix: run an engine with a
