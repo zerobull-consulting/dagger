@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -662,19 +663,23 @@ func (h *logRecorder) findRecords(msg string) []slog.Record {
 	return found
 }
 
-// Known gap, zerobull-consulting/dagger#83: a keep-alive connection between
-// requests has no bound. The listeners set no IdleTimeout (nor ReadTimeout,
-// which would cut off the engine WebSocket), so net/http waits for the next
-// request indefinitely; ReadHeaderTimeout starts only once its first bytes
-// arrive. A connection idle well past the header timeout still takes a
-// request. It holds no part of the decode budget, but costs a goroutine and
-// a file descriptor. When #83 adds a bound, this test changes with it.
-func TestIdleKeepAliveConnectionsUnbounded(t *testing.T) {
-	svc := New(slog.New(slog.DiscardHandler), "")
+// shortIdleTimeout makes NewHTTPServer set d as its IdleTimeout for the
+// test.
+func shortIdleTimeout(t *testing.T, d time.Duration) {
+	old := idleTimeout
+	idleTimeout = d
+	t.Cleanup(func() { idleTimeout = old })
+}
+
+// A keep-alive connection between requests is closed after IdleTimeout
+// (zerobull-consulting/dagger#83): without a bound, it stayed open for as long
+// as a client liked, at the cost of a goroutine and a file descriptor.
+func TestIdleKeepAliveConnectionClosed(t *testing.T) {
 	const timeout = 200 * time.Millisecond
+	shortIdleTimeout(t, timeout)
+	svc := New(slog.New(slog.DiscardHandler), "")
 	srv := httptest.NewUnstartedServer(nil)
 	srv.Config = NewHTTPServer("", svc.Handler())
-	srv.Config.ReadHeaderTimeout = timeout
 	srv.Start()
 	t.Cleanup(srv.Close)
 	body := encodeOTLP(t, otlpCases()[2].build(""), false)
@@ -682,17 +687,71 @@ func TestIdleKeepAliveConnectionsUnbounded(t *testing.T) {
 	if resp := readResponse(t, br); resp.StatusCode != http.StatusOK {
 		t.Fatalf("first request: %d", resp.StatusCode)
 	}
-	// Five times the header timeout: a bound on idle connections at or
-	// below it would have closed this one by now. The sleep only shows that
-	// nothing happens.
-	time.Sleep(5 * timeout)
+	// The server closes the idle connection: a read fails (EOF, or a reset)
+	// before the read deadline, and not before about the timeout.
+	start := time.Now()
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	fmt.Fprintf(conn, "POST /v1/metrics HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-protobuf\r\nContent-Length: %d\r\n\r\n", len(body))
-	if _, err := conn.Write(body); err != nil {
-		t.Fatal(err)
+	_, err := br.ReadByte()
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("idle connection not closed: %v", err)
 	}
-	if resp := readResponse(t, br); resp.StatusCode != http.StatusOK {
-		t.Fatalf("after idling: %d", resp.StatusCode)
+	if took := time.Since(start); took < timeout/2 {
+		t.Errorf("idle connection closed after %v, want about %v", took, timeout)
+	}
+}
+
+// IdleTimeout is above the engine Cloud exporters' own idle connection
+// timeout, so their client always closes an idle connection first.
+func TestIdleTimeoutAboveExporterIdleConnTimeout(t *testing.T) {
+	if got := NewHTTPServer("", nil).IdleTimeout; got <= ExporterIdleConnTimeout {
+		t.Fatalf("IdleTimeout %v is not above the exporters' %v", got, ExporterIdleConnTimeout)
+	}
+}
+
+// A client with the exporters' transport settings (IdleConnTimeout below the
+// server's IdleTimeout, as in the engine) keeps POSTing across gaps longer
+// than its idle timeout without a transport error: it closes the connection
+// first, and dials another (each POST after the first is checked to have
+// got a new connection). Over plain HTTP, so HTTP/1.1; the HTTP/2 path
+// (-tls-cert) is in the README, "Idle connections are closed". Times are
+// scaled down from 90s and IdleTimeout, with their ratio kept.
+func TestExporterClientPostsAcrossIdleGaps(t *testing.T) {
+	clientIdle := 300 * time.Millisecond
+	serverIdle := time.Duration(float64(clientIdle) * float64(IdleTimeout) / float64(ExporterIdleConnTimeout))
+	shortIdleTimeout(t, serverIdle)
+	svc := New(slog.New(slog.DiscardHandler), "")
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config = NewHTTPServer("", svc.Handler())
+	srv.Start()
+	t.Cleanup(srv.Close)
+	tr := &http.Transport{MaxIdleConns: 100, IdleConnTimeout: clientIdle}
+	t.Cleanup(tr.CloseIdleConnections)
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	body := encodeOTLP(t, otlpCases()[2].build(""), false)
+	// A gap past the client's idle timeout and short of the server's: the
+	// client has closed the connection, the server hasn't.
+	gap := clientIdle + (serverIdle-clientIdle)/2
+	for i := range 5 {
+		reused := false
+		trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }}
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(t.Context(), trace), http.MethodPost, srv.URL+"/v1/metrics", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST %d: %v", i, err)
+		}
+		if reused {
+			t.Errorf("POST %d reused a connection: the client should have closed it in the gap, so the test isn't about the closing order", i)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST %d: %d", i, resp.StatusCode)
+		}
+		time.Sleep(gap)
 	}
 }
 
