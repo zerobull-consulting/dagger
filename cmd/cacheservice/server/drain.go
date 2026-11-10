@@ -306,7 +306,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 	for _, l := range startLeft {
 		s.logger.Info("drain: started", "namespace", l.Namespace, "cacheID", l.CacheID, "connected", l.Connected,
-			"sessions", l.Sessions, "pending", l.Pending, "inFlight", l.InFlight, "retrying", l.Retrying+l.Later)
+			"sessions", l.Sessions, "pending", l.Pending, "inFlight", l.InFlight, "retrying", l.Retrying+l.Later, "paused", l.Paused)
 	}
 	if deadline.IsZero() {
 		s.logger.Info("drain: no deadline")
@@ -536,7 +536,7 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 	}
 	s.drain.ended = &rep
 	s.drain.mu.Unlock()
-	s.metrics.DrainEnded(outcome, took, rep.LeftRoots())
+	s.metrics.DrainEnded(outcome, took, rep.LeftRoots(), rep.PausedRoots())
 
 	for _, st := range rep.Stored {
 		s.logger.Info("drain: stored", "namespace", st.Namespace, "cacheID", st.CacheID, "roots", st.Roots)

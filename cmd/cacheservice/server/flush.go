@@ -242,8 +242,8 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		now := p.now()
 		st := tracker.FlushStatus(cacheID, now, deadline)
 		switch {
-		case flushEmpty(st):
-			return end(flushDone(st)), nil
+		case flushEmpty(st) && st.Paused == 0:
+			return end(metrics.FlushComplete), nil
 		case p.ctx.Err() != nil, s.closing.Load():
 			// The stop began (the paths' context ended, or CloseEngines
 			// ran, in either order): its engines are closed, which isn't
@@ -251,6 +251,10 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 			return end(metrics.FlushCanceled), nil
 		case !connected():
 			return end(metrics.FlushNotConnected), nil
+		case flushEmpty(st):
+			// Only paused roots left, of an engine still connected: one
+			// that went away takes them with it, and is reported so above.
+			return end(metrics.FlushPaused), nil
 		case st.InFlight == 0 && st.Pending == 0 && st.Retrying == 0 && st.Sessions == 0:
 			// Only retries due after the timeout: not waited for.
 			return end(metrics.FlushTimeout), nil
@@ -298,7 +302,7 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 		Stored:  stored,
 		Left:    left,
 	}
-	s.metrics.FlushEnded(outcome, took, left.Roots())
+	s.metrics.FlushEnded(outcome, took, left.Roots(), left.Paused)
 	level := s.logger.Info
 	if left.Roots() > 0 || outcome == metrics.FlushTimeout || outcome == metrics.FlushCanceled {
 		level = s.logger.Warn
@@ -314,7 +318,7 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 // connections is welcomed: nothing was flushed.
 func (s *Service) notConnectedReport(ns *namespace, start time.Time) FlushReport {
 	took := time.Since(start)
-	s.metrics.FlushEnded(metrics.FlushNotConnected, took, 0)
+	s.metrics.FlushEnded(metrics.FlushNotConnected, took, 0, 0)
 	// The same fields as every flush's (endFlush), with no cache.
 	s.logger.Info("flush: done", "namespace", ns.name, "cacheID", "", "outcome", metrics.FlushNotConnected,
 		"took", took.Round(time.Millisecond), "storedRoots", 0, "leftRoots", 0,

@@ -1166,6 +1166,15 @@ func TestDrainPausedEngine(t *testing.T) {
 			if warned := rec.find("drain: left unexported"); len(warned) != 0 {
 				t.Fatalf("paused roots logged as left unexported: %v", warned)
 			}
+			if tc.before {
+				if started := rec.find("drain: started"); len(started) != 1 || started[0]["paused"] != "1" || started[0]["pending"] != "0" {
+					t.Fatalf("drain start logged %v, want the paused root counted as such", started)
+				}
+			}
+			waitMetric(t, h.svc, "cacheservice_drain_paused_roots_total", nil, 1)
+			if left := metricstest.Read(t, h.svc.registry, "cacheservice_drain_unexported_roots_total", nil); left.Value != 0 {
+				t.Fatalf("%v roots counted left unexported, want the paused root counted apart", left.Value)
+			}
 			// Past the roots' own wait: nothing more is asked of the engine.
 			time.Sleep(600 * time.Millisecond)
 			if asked := metricstest.Read(t, h.svc.registry, "cacheservice_export_roots_total", map[string]string{"result": "paused"}); asked.Value != 1 {

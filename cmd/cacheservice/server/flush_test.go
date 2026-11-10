@@ -830,10 +830,36 @@ func TestFlushPausedEngine(t *testing.T) {
 		t.Fatalf("the paused engine was asked for the root %v times, want once", asked.Value)
 	}
 
+	// Three flushes each left it.
+	waitMetric(t, h.svc, "cacheservice_flush_paused_roots_total", nil, 3)
+	if left := metricstest.Read(t, h.svc.registry, "cacheservice_flush_unexported_roots_total", nil); left.Value != 0 {
+		t.Fatalf("%v roots counted left unexported, want the paused root counted apart", left.Value)
+	}
+
 	paused.Refused = ""
 	h.cache.Add(paused)
 	h.ns().tracker.Opened(h.cache.ID, h.cache.Generation, time.Now())
 	if rep = h.flush("1m"); rep.Outcome != metrics.FlushComplete || rep.Left.Paused != 0 || !indexHas(t, h, 10) {
 		t.Fatalf("after the open: report %+v", rep)
+	}
+}
+
+// An engine that went away takes its paused roots with it: the flush says
+// it isn't connected, not that the roots wait for its next session.
+func TestFlushPausedEngineGone(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	other := fakeengine.New("cache-b", 4)
+	other.Add(fakeengine.Entry{Number: 20, Layers: [][]byte{testLayer("other")}, Refused: exporter.EnginePausedMessage})
+	_, stop := h.connectStoppable(other)
+	h.postSpansOf(other, "session-1", cacheSpan(20))
+	res := postFlush(t, flushURL(h.srv.URL, other.ID, "1m"), "engine-token")
+	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushPaused || res.rep.Left.Paused != 1 {
+		t.Fatalf("connected: %d %+v", res.code, res.rep)
+	}
+	stop()
+	waitUntil(t, 10*time.Second, "the engine to be gone", func() bool { return h.svc.engineFor(h.ns(), other.ID) == nil })
+	res = postFlush(t, flushURL(h.srv.URL, other.ID, "1m"), "engine-token")
+	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushNotConnected || res.rep.Left.Paused != 1 {
+		t.Fatalf("disconnected: %d %+v", res.code, res.rep)
 	}
 }

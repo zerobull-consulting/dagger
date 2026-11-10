@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"os"
+	"regexp"
 	"slices"
 	"testing"
 	"time"
@@ -304,4 +306,54 @@ func TestNewServiceSettleBounds(t *testing.T) {
 	if got := time.Duration(svc.settleRetryWait.Load()); got != DefaultSettleRetryWait {
 		t.Fatalf("retry wait %s, want %s", got, DefaultSettleRetryWait)
 	}
+	if got := time.Duration(svc.settleQuiet.Load()); got != DefaultSettleQuiet || got <= EngineSettleBound {
+		t.Fatalf("quiet %s, want %s, past the engine's bound", got, DefaultSettleQuiet)
+	}
+}
+
+// EngineSettleBound is engine/server's remoteCacheSettleBound, which that
+// package doesn't export: the quiet after a settle has to outlast it.
+func TestEngineSettleBoundMatchesEngine(t *testing.T) {
+	src, err := os.ReadFile("../../../engine/server/engine_status.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`const remoteCacheSettleBound = (\d+) \* time\.Second`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("engine/server/engine_status.go no longer declares remoteCacheSettleBound as a number of seconds: find the engine's bound, and update EngineSettleBound and this test")
+	}
+	if got := string(m[1]) + "s"; got != EngineSettleBound.String() {
+		t.Fatalf("the engine's bound is %s, and EngineSettleBound is %s", got, EngineSettleBound)
+	}
+}
+
+// Once it answered settled, the service starts no export of the cache until
+// the engine's bound has passed: an export in progress at that moment makes
+// even a settled engine give up. An open ends the quiet.
+func TestSettledCacheIsQuietUntilTheEnginesBound(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	h.svc.settleQuiet.Store(int64(time.Second))
+	if err := h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: 0}); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	settled := time.Now()
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
+	waitUntil(t, 10*time.Second, "the late entry to be stored", func() bool { return indexHas(t, h, 10) })
+	if took := time.Since(settled); took < 900*time.Millisecond {
+		t.Fatalf("exported %s after the settle, inside the quiet", took)
+	}
+
+	h.svc.settleQuiet.Store(int64(time.Hour))
+	if err := h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: 0}); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	h.cache.Add(fakeengine.Entry{Number: 12, Layers: [][]byte{testLayer("other")}})
+	h.postSpans("session-2", cacheSpan(12), carrierSpan(1))
+	time.Sleep(300 * time.Millisecond)
+	if indexHas(t, h, 12) {
+		t.Fatal("exported inside an hour's quiet")
+	}
+	h.cache.SetSettleState(remotecache.SettleState{Period: 1, Live: true})
+	waitUntil(t, 10*time.Second, "the entry to be stored after the open", func() bool { return indexHas(t, h, 12) })
 }

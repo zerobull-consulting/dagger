@@ -540,8 +540,18 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// A release that failed made the engine forget nothing: asked
 		// again, it would send the same held rows, try after try.
 		if _, rerr := x.requestUpload(ctx, eng, exported.ExportID, nil); rerr != nil {
-			if ctx.Err() != nil {
+			switch {
+			case ctx.Err() != nil:
 				return res, nil, retryNone, rerr
+			case errors.Is(rerr, errEnginePaused):
+				// The engine gave up its remote-cache work, which released
+				// the bundle: no root's failure.
+				res.Paused = append(res.Paused, survivors...)
+				return res, nil, retryNone, nil
+			case errors.Is(rerr, errEngineCut):
+				// It dropped the export before the release reached it:
+				// asked again, a paused engine refuses the roots.
+				return res, survivors, retryCut, nil
 			}
 			x.log.Warn("export: release of a bundle with held rows failed", "exportID", exported.ExportID, "error", rerr)
 			res.fail(survivors, fmt.Errorf("release of a bundle with held rows: %w", rerr))
@@ -648,7 +658,7 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			paused = true
 			continue
 		}
-		if strings.Contains(f.Message, context.Canceled.Error()) {
+		if canceledMessage(f.Message) {
 			cut = true
 		}
 		x.log.Warn("export: blob upload failed", "digest", f.Digest, "error", f.Message)
@@ -988,6 +998,19 @@ var errEngineCut = errors.New("the engine cut the export off")
 // TestEngineCutMessagesMatchEngine pins it to the engine's source.
 const engineNoExportPrefix = "no export "
 
+// canceledMessage reports whether an engine's error text is of work its
+// context's cancellation cut off: context.Canceled's, or the net package's
+// for a connection it was still making ("operation was canceled"), which a
+// blob's PUT ends with when it is cut before it connected.
+func canceledMessage(message string) bool {
+	return strings.Contains(message, context.Canceled.Error()) || strings.Contains(message, netCanceledMessage)
+}
+
+// netCanceledMessage is the text of the net package's error for a dial its
+// context canceled (its unexported errCanceled);
+// TestEngineCutMessagesMatchEngine pins it to what a canceled dial returns.
+const netCanceledMessage = "operation was canceled"
+
 // replyError is the error of an error reply, nil for any other. An error
 // reply saying the reply was too large is errTooLarge, one that carries
 // EnginePausedMessage is errEnginePaused, and one of a canceled context or
@@ -1006,7 +1029,7 @@ func replyError(env protocol.Envelope) error {
 	if strings.Contains(e.Message, EnginePausedMessage) {
 		return errEnginePaused
 	}
-	if strings.Contains(e.Message, context.Canceled.Error()) || strings.HasPrefix(e.Message, engineNoExportPrefix) {
+	if canceledMessage(e.Message) || strings.HasPrefix(e.Message, engineNoExportPrefix) {
 		return fmt.Errorf("%w: %s", errEngineCut, e.Message)
 	}
 	return errors.New(e.Message)

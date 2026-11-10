@@ -1065,3 +1065,39 @@ func TestKnownGapUnseenSessionsForgetsLongEndedSessions(t *testing.T) {
 		t.Fatalf("after the retention: %d unseen, want 1: the gap is closed, update the README", got)
 	}
 }
+
+// A cache made quiet starts no export until then, unless a flush or a drain
+// asks, or its engine opens a new period first: an engine that settled
+// still gives up if an export is in progress when its bound passes.
+func TestTrackerQuietHoldsExports(t *testing.T) {
+	until := t0.Add(22 * time.Second)
+	newQuiet := func() *Tracker {
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		tr.Quiet("c", until)
+		return tr
+	}
+	tr := newQuiet()
+	if got := roots(tr.Due(until.Add(-time.Second))); len(got) != 0 {
+		t.Fatalf("exported while quiet: %v", got)
+	}
+	if next := tr.NextDue(); !next.Equal(until) {
+		t.Fatalf("next due %s, want the end of the quiet %s", next, until)
+	}
+	if got := roots(tr.Due(until)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due once the quiet passed: %v, want [1]", got)
+	}
+
+	tr = newQuiet()
+	tr.Opened("c", 1, t0.Add(time.Minute/2))
+	if got := roots(tr.Due(until.Add(-time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after an open ended the quiet: %v, want [1]", got)
+	}
+
+	tr = newQuiet()
+	end := tr.StartFlush("c", t0.Add(time.Second))
+	defer end()
+	if got := roots(tr.Due(t0.Add(time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due in a flush, quiet or not: %v, want [1]", got)
+	}
+}

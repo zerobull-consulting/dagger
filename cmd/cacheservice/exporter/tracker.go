@@ -146,6 +146,10 @@ type trackedCache struct {
 	// entries that wait for it (wakeEngineWaitLocked): a batch claimed
 	// before the latest one doesn't make its roots wait for the next.
 	engineWakes uint64
+	// quietUntil, when set, holds the cache's exports back until then
+	// (Quiet): its engine settled, and pauses if an export is in progress
+	// when its bound after its last session passes.
+	quietUntil time.Time
 	// seen are the sessions no longer tracked, with when their tracking
 	// ended: every counted span in, or their spans stopped (UnseenSessions).
 	seen map[string]time.Time
@@ -698,6 +702,22 @@ func (t *Tracker) Opened(cacheID string, generation uint64, now time.Time) {
 	t.WakeEngineWait(cacheID, generation, now)
 }
 
+// Quiet holds the exports of cacheID back until until, unless a flush or a
+// drain makes them urgent, or its engine opens a new idle period or
+// connects again first. A settle that answered settled calls it: the engine
+// gives up its remote-cache work, and cancels its exports, if one is in
+// progress when its bound after its last session passes, settled or not;
+// once that moment has passed with none, it takes exports until its next
+// session. So what comes due meanwhile, as a retry or a late span's entry,
+// waits for it.
+func (t *Tracker) Quiet(cacheID string, until time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c := t.caches[cacheID]; c != nil && until.After(c.quietUntil) {
+		c.quietUntil = until
+	}
+}
+
 // WakeEngineWait makes the entries of a cache that wait for its engine due at
 // now, when an engine of generation, or a newer one than the tracker's, is
 // connected. Unlike Connected it records nothing of the generation: it is for
@@ -713,6 +733,9 @@ func (t *Tracker) WakeEngineWait(cacheID string, generation uint64, now time.Tim
 
 func (t *Tracker) wakeEngineWaitLocked(c *trackedCache, now time.Time) {
 	c.engineWakes++
+	// A session started, or the engine connected anew: its bound after
+	// the last session no longer runs.
+	c.quietUntil = time.Time{}
 	woke := false
 	for _, e := range c.entries {
 		// A paused entry's own wait may have passed with a drain leaving
@@ -898,6 +921,13 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 		}
 		if held {
 			t.waiting += len(due)
+			continue
+		}
+		if !urgent && now.Before(c.quietUntil) {
+			// Quiet: what is due waits for the engine's bound to pass.
+			if len(due) > 0 && (t.next.IsZero() || c.quietUntil.Before(t.next)) {
+				t.next = c.quietUntil
+			}
 			continue
 		}
 		// The longest due first, so that under a backlog of more than a

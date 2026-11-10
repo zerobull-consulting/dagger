@@ -37,14 +37,31 @@ import (
 // It leaves most of the engine's 20s for the exports.
 const DefaultSettleMarkerWait = 5 * time.Second
 
+// EngineSettleBound is how long after its last session ended an engine
+// gives up its remote-cache work, if the service hasn't settled or an
+// export is in progress at that moment: engine/server's
+// remoteCacheSettleBound, which that package doesn't export.
+// TestEngineSettleBoundMatchesEngine pins the two together.
+const EngineSettleBound = 20 * time.Second
+
 // DefaultSettleRetryWait is how far ahead, from its arrival, a settle waits
 // for a root's next try (after a busy answer or a failed export). A root
 // whose try is due later doesn't hold the settle back: an engine that hears
 // no settled gives up, and then refuses that try and every other export
-// until its next session, while one that settled still takes the try when
-// it comes due. Half the engine's 20s, so the tries waited for can still
-// end inside it.
-const DefaultSettleRetryWait = 10 * time.Second
+// until its next session, while one that settled takes the try once its
+// bound has passed (DefaultSettleQuiet). Half the engine's bound, so the
+// tries waited for can still end inside it.
+const DefaultSettleRetryWait = EngineSettleBound / 2
+
+// DefaultSettleQuiet is how long, from a settle's arrival, the service
+// starts no export of a cache it answered settled for, unless a flush or a
+// drain asks, or the engine opens a new period first. The engine's bound
+// runs from its last session's end, just before the settle, whether it
+// settled or not: an export in progress when it passes makes the engine
+// give up, cancel it, and refuse every other until its next session. Past
+// it, a settled engine takes exports again. The margin covers the settle's
+// way here.
+const DefaultSettleQuiet = EngineSettleBound + 2*time.Second
 
 // MaxSettleWait bounds a settle's wait. An engine gives up a settle it sent
 // 20s after its last session ended, without saying so, and cancels the
@@ -181,6 +198,9 @@ func (c *engineConn) serveSettle(ctx context.Context, env protocol.Envelope) {
 //     whose try is due later, or that the engine refused as paused, isn't
 //     waited for (exporter.DrainState.Later, Paused).
 //
+// Once settled, the cache's exports are held back until the engine's bound
+// has passed (DefaultSettleQuiet, exporter.Tracker.Quiet).
+//
 // Unlike a flush, it makes nothing due sooner: the scheduler exports the
 // cache's entries as it would anyway, a session's once its carrier came
 // with every span in, so that a session's entries still go in one export,
@@ -208,6 +228,7 @@ func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle
 		return nil
 	}
 	cacheID := c.hello.CacheID
+	quietUntil := p.now().Add(time.Duration(s.settleQuiet.Load()))
 	var marked []string
 	for _, session := range req.Sessions {
 		if session.Marker && validEngineID(session.ID) {
@@ -237,6 +258,9 @@ func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle
 			unseen = tracker.UnseenSessions(cacheID, marked)
 		}
 		if st.Pending == 0 && st.InFlight == 0 && st.Retrying == 0 && st.Sessions == 0 && unseen == 0 {
+			// What comes due from here on, as the later tries do, waits
+			// for the engine's bound to pass.
+			tracker.Quiet(cacheID, quietUntil)
 			return nil
 		}
 		select {

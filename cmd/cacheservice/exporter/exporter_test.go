@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1147,19 +1148,27 @@ func TestExportCutByPausedEngine(t *testing.T) {
 // The blobs a paused engine was sending fail with their context's error,
 // not the pause's: the export is asked again, and its roots are paused.
 func TestExportUploadCanceledByPausedEngine(t *testing.T) {
-	e := newTestEnv(t, nil)
-	e.addBuild()
-	e.eng.cutUploads = "upload: context canceled"
-	e.eng.pauseAfter = true
-	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-	if got := e.eng.requests[protocol.TypeUpload]; got != 1 {
-		t.Fatalf("%d uploads, want 1: no upload attempt was spent on the cut", got)
+	for _, message := range []string{
+		"upload: context canceled",
+		// A PUT cut before it connected ends with the net package's error.
+		"upload: dial tcp 10.0.0.1:443: operation was canceled",
+	} {
+		t.Run(message, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			e.addBuild()
+			e.eng.cutUploads = message
+			e.eng.pauseAfter = true
+			res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+				t.Fatalf("unexpected result: %+v", res)
+			}
+			if got := e.eng.requests[protocol.TypeUpload]; got != 1 {
+				t.Fatalf("%d uploads, want 1: no upload attempt was spent on the cut", got)
+			}
+		})
 	}
 }
 
@@ -1232,6 +1241,23 @@ func TestEngineCutMessagesMatchEngine(t *testing.T) {
 	if err := replyError(mustError(t, fmt.Sprintf(engineNoExportPrefix+"%q", "x-1"))); !errors.Is(err, errEngineCut) {
 		t.Fatalf("the engine's no-export reply is %v, want errEngineCut", err)
 	}
+	// And the net package's, for a connection a canceled context cut off
+	// while it was being made, as a blob's PUT is: what a dial with a
+	// canceled context returns.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+	if err == nil || !strings.Contains(err.Error(), netCanceledMessage) {
+		t.Fatalf("a dial with a canceled context returns %v, and netCanceledMessage is %q", err, netCanceledMessage)
+	}
+	if !canceledMessage("upload: "+err.Error()) || canceledMessage("upload: 503 Service Unavailable") {
+		t.Fatal("canceledMessage doesn't tell a canceled dial's error from a store's")
+	}
 }
 
 func mustError(t *testing.T, message string) protocol.Envelope {
@@ -1278,6 +1304,41 @@ func TestExportHeldRowsReleaseFails(t *testing.T) {
 	}
 	if got := e.eng.requests[protocol.TypeExport]; got != 1 {
 		t.Fatalf("%d export requests, want 1: the export was asked again after its release failed", got)
+	}
+}
+
+// An engine that gives up its remote-cache work between a bundle with held
+// rows and its release answers the release as it does any upload then: with
+// the pause's error, or with no export of that ID. Neither is a failure of
+// the roots: they are paused.
+func TestExportHeldRowsReleaseCutByPausedEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name, reply string
+		exports     int
+	}{
+		{"the pause's error", "context canceled: " + EnginePausedMessage, 1},
+		{"no export of that ID", engineNoExportPrefix + `"export-1"`, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			e.addBuild()
+			heldFirst(e, func() {
+				e.eng.mu.Lock()
+				e.eng.errOnce = map[protocol.Type]string{protocol.TypeUpload: tc.reply}
+				e.eng.pauseAfter = true
+				e.eng.mu.Unlock()
+			})
+			res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+				t.Fatalf("unexpected result: %+v", res)
+			}
+			if got := e.eng.requests[protocol.TypeExport]; got != tc.exports {
+				t.Fatalf("%d export requests, want %d", got, tc.exports)
+			}
+		})
 	}
 }
 
