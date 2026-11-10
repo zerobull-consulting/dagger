@@ -1,0 +1,210 @@
+name: Remote cache speedup
+# One Dagger pipeline (hack/remote-cache/speedup/run.sh: a build of
+# cmd/cacheservice in a golang container), timed three ways on the commit:
+#
+#   baseline  a fresh engine and no cache: what a PR check costs today
+#   writer    a fresh engine with the writer sidecar (pr-checks-readwrite):
+#             builds, and stores the result in the bucket
+#   reader    a fresh engine with a read-only sidecar (pr-checks-readonly),
+#             after the writer: the build comes from the bucket
+#
+# The report job puts the baseline's and the reader's times side by side in the
+# run's summary. It fails only if the reader's build executed instead of coming
+# from the cache, not on a time: wall times vary from run to run.
+#
+# The key is the commit's files under the pipeline's paths, so a push gets its
+# own entry, and a re-run of the same commit gets the writer's earlier one: the
+# writer then shows a hit too, and the baseline is the number to compare.
+# Same pins and environments as remote-cache-spaces-smoke.yml.
+"on":
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  VERSION: v1.0.0-beta.25
+  # What some runners export: an unsampled trace. The CLI the start sets up
+  # must not continue it (see the sidecar demo job).
+  TRACEPARENT: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00
+jobs:
+  baseline:
+    name: baseline (no cache)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # Only installs the CLI. The pipeline runs in a run: step below, on the
+      # engine the CLI starts on this runner.
+      - name: Install the dagger CLI
+        uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+        with:
+          version: ${{ env.VERSION }}
+      - name: Build, no cache
+        timeout-minutes: 20
+        run: ./hack/remote-cache/speedup/run.sh baseline "$RUNNER_TEMP/speedup"
+      - name: Upload the timing
+        uses: actions/upload-artifact@v6
+        with:
+          name: speedup-baseline
+          path: |
+            ${{ runner.temp }}/speedup/baseline.seconds
+            ${{ runner.temp }}/speedup/baseline.size
+      - name: Upload the log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: speedup-baseline-log
+          path: ${{ runner.temp }}/speedup/baseline.log
+          if-no-files-found: ignore
+
+  writer:
+    name: writer (fills the cache)
+    runs-on: ubuntu-24.04
+    environment: pr-checks-readwrite
+    # The work, the drain (10m) and the stop's 2 minutes.
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Verify the sidecar is stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: speedup-writer
+      - name: Start the writer sidecar
+        id: writer
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: writer
+          name: speedup-writer
+          version: ${{ env.VERSION }}
+          verbose: "true"
+          s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
+          s3-region: ${{ vars.CACHE_S3_REGION }}
+          s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
+          s3-prefix: ${{ vars.CACHE_S3_PREFIX }}
+          s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
+      - name: Build, filling the cache
+        timeout-minutes: 20
+        env:
+          SERVICE: ${{ steps.writer.outputs.service-container }}
+          DAGGER: ${{ steps.writer.outputs.dagger }}
+        run: ./hack/remote-cache/speedup/run.sh writer "$RUNNER_TEMP/speedup" "$SERVICE"
+      # The drain must be done before the reader starts.
+      - name: Stop the writer sidecar
+        id: stop
+        if: always()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: speedup-writer
+      - name: Check the export was stored
+        env:
+          LOGS: ${{ steps.stop.outputs.logs }}
+        run: ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/speedup/stored"
+      - name: Upload the timing
+        uses: actions/upload-artifact@v6
+        with:
+          name: speedup-writer
+          path: |
+            ${{ runner.temp }}/speedup/writer.seconds
+            ${{ runner.temp }}/speedup/writer.spans
+      # The logs name the bucket and the prefix; only on failure.
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: speedup-writer-logs
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/speedup/writer.log
+          if-no-files-found: ignore
+
+  reader:
+    name: reader (from the cache)
+    needs: writer
+    runs-on: ubuntu-24.04
+    environment: pr-checks-readonly
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Verify the sidecar is stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: speedup-reader
+      - name: Start the read-only sidecar
+        id: reader
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: read-only
+          name: speedup-reader
+          version: ${{ env.VERSION }}
+          verbose: "true"
+          s3-endpoint: ${{ vars.CACHE_S3_READ_ENDPOINT }}
+          s3-region: ${{ vars.CACHE_S3_READ_REGION }}
+          s3-bucket: ${{ vars.CACHE_S3_READ_BUCKET }}
+          s3-prefix: ${{ vars.CACHE_S3_READ_PREFIX }}
+          s3-access-key-id: ${{ secrets.CACHE_S3_READ_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.CACHE_S3_READ_SECRET_ACCESS_KEY }}
+      - name: Build, from the cache
+        timeout-minutes: 20
+        env:
+          SERVICE: ${{ steps.reader.outputs.service-container }}
+          DAGGER: ${{ steps.reader.outputs.dagger }}
+        run: ./hack/remote-cache/speedup/run.sh reader "$RUNNER_TEMP/speedup" "$SERVICE"
+      - name: The build came from the cache
+        run: |
+          read -r hit executed <"$RUNNER_TEMP/speedup/reader.spans"
+          if ((hit < 1 || executed > 0)); then
+            echo "::error::the reader's build wasn't a cache hit: $hit hit, $executed executed"
+            exit 1
+          fi
+      - name: Upload the timing
+        uses: actions/upload-artifact@v6
+        with:
+          name: speedup-reader
+          path: |
+            ${{ runner.temp }}/speedup/reader.seconds
+            ${{ runner.temp }}/speedup/reader.size
+            ${{ runner.temp }}/speedup/reader.spans
+      # On failure only: the start's post step stops it otherwise, after the
+      # upload, so its logs would not exist yet.
+      - name: Stop the read-only sidecar, to upload its logs
+        if: failure()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: speedup-reader
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: speedup-reader-logs
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/speedup/reader.log
+          if-no-files-found: ignore
+
+  report:
+    name: report
+    needs: [baseline, writer, reader]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download the timings
+        uses: actions/download-artifact@v7
+        with:
+          pattern: speedup-{baseline,writer,reader}
+          path: ${{ runner.temp }}/timings
+          merge-multiple: true
+      - name: Report
+        run: ./hack/remote-cache/speedup/report.sh "$RUNNER_TEMP/timings" "$VERSION"
