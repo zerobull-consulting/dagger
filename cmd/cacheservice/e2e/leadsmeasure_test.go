@@ -100,15 +100,20 @@ func TestLazyToCallGaps(t *testing.T) {
 		t.Fatalf("gaps %+v; want 3", gaps)
 	}
 	var open, kept *lazyGap
+	risky := 0
 	for i := range gaps {
 		switch {
 		case gaps[i].atRisk():
 			open = &gaps[i]
+			risky++
 		case gaps[i].number == 7:
 			kept = &gaps[i]
 		case gaps[i].number != 9 || gaps[i].gap != 40*time.Second || gaps[i].call.retained:
 			t.Errorf("unexpected gap %+v", gaps[i])
 		}
+	}
+	if risky != 1 {
+		t.Errorf("%d gaps at risk, want 1 (entry 9's call span says it isn't retained)", risky)
 	}
 	if open == nil || open.gap != 12*time.Second || open.number != 7 {
 		t.Errorf("open gap %+v; want entry 7, 12s", open)
