@@ -1768,10 +1768,12 @@ net/http holds with it, by trickling or stalling the body after a 401
     doesn't know, or that arrives with the wrong wire type for its number,
     at three times its wire size and at least 16 bytes, for the slice the
     decoder appends it to (`TestOTLPUnknownFieldsEstimateCoversDecodePeak`,
-    `TestOTLPWrongWireTypeChargedAsUnknown`). Two gaps: a singular string is
-    charged its length and 16 bytes, not its size class, so a 32,769-byte one
-    that takes 40,960 is charged 32,785
-    (`TestOTLPSingularStringSizeClassKnownGap`); and the fix for repeated
+    `TestOTLPWrongWireTypeChargedAsUnknown`). A singular string or bytes field
+    (a trace or span ID is one) is charged its length and a quarter, for the
+    allocator's size classes, and 16 bytes, so a 32,769-byte one, whose copy
+    takes 40,960, is charged 40,977 (`TestOTLPSingularStringCoversSizeClass`,
+    [zerobull-consulting/dagger#232](https://github.com/zerobull-consulting/dagger/issues/232));
+    an empty one is charged the 16 bytes. One gap is left: the fix for repeated
     strings covers protobuf only, as a JSON body is charged 16 bytes for each
     comma, so an empty element, `"",`, is charged 19 bytes, under what append
     holds for it (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its

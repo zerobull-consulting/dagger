@@ -20,8 +20,8 @@ import (
 // pointer, so a body of them decodes to about 70 times its size. The
 // estimate errs high: each message at its Go struct's size plus an eighth
 // (allocation size classes), each element of a repeated field 16 bytes more
-// (its pointer, and the slice's growth), each string or bytes field its
-// length plus a header, each element of a repeated string or bytes field its
+// (its pointer, and the slice's growth), each singular string or bytes field its
+// length and a quarter (size classes) plus a header, each element of a repeated string or bytes field its
 // length and a quarter (size classes) plus four of its headers (its header
 // in the slice, and the slice's growth), and each known varint or fixed field its wire size, tag
 // included, or the header if that is more. A field the message doesn't
@@ -190,8 +190,14 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int, deepe
 			// at most 8 decoded, plus the slice's growth.
 			size += int64(len(v)) * otlpListElemCost
 		default:
-			// A string or bytes field, copied.
-			size += int64(len(v)) + otlpFieldCost
+			// A singular string or bytes field (a trace or span ID is one),
+			// copied. The allocator rounds its copy up to a size class, so
+			// charge otlpAllocSize of it, and a header on top (the real one
+			// is in the message's struct, so this is slack for the few bytes
+			// a quarter misses at small sizes: 17 bytes take 24, not 21). An
+			// empty one is charged the header only, as otlpAllocSize(0) is 0
+			// (zerobull-consulting/dagger#232).
+			size += otlpAllocSize(int64(len(v))) + otlpFieldCost
 		}
 	}
 	return size, nil
@@ -275,8 +281,8 @@ func otlpBytesKind(fd protoreflect.FieldDescriptor) bool {
 // otlpAllocSize is at least what the allocator gives a copy of n bytes,
 // which it rounds up to a size class, or to 8 KiB pages past 32 KiB: by up
 // to a quarter (a 32,769-byte string takes 40,960), and to 16 bytes below
-// that (17 bytes take 24, 33 take 48), which a repeated element's headers
-// cover.
+// that (17 bytes take 24, 33 take 48), which the headers charged with each
+// copy cover.
 func otlpAllocSize(n int64) int64 {
 	return n + n/4
 }
