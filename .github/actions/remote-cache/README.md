@@ -265,7 +265,9 @@ work plus `drain-timeout` (10m) plus 2 minutes: the drain's wait, the
 engine's stop (cut off at 90s), then the cleanup. A job cancelled while the
 sidecar drains gets the runner's cancellation grace (about 5 minutes) for the
 stop, so a long drain can be cut off then; set a shorter `drain-timeout`
-where cancelled jobs matter.
+where cancelled jobs matter. The shim passes a SIGINT, SIGTERM or SIGHUP it
+gets on to the script's whole process group, and `sidecar.sh` traps none, so
+a start or stop that gets one ends at once, its cleanup with it.
 
 ## stop
 
