@@ -60,7 +60,7 @@ func TestShutdownCancelsBeforeWaitingForRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	bucket := &heldBucket{Bucket: &gc.MemBucket{Blobs: blobstore.NewMemStore(""), Objects: objs}, held: make(chan struct{})}
-	if err := svc.EnableGC(ctx, server.GCConfig{Collector: gc.Config{Bucket: bucket, Meta: meta}}); err != nil {
+	if err := svc.EnableGC(ctx, server.GCConfig{Mode: server.GCModeBatch, Collector: gc.Config{Bucket: bucket, Meta: meta}}); err != nil {
 		t.Fatal(err)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

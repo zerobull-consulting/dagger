@@ -213,7 +213,7 @@ func writeDebugError(w http.ResponseWriter, err error) {
 		http.Error(w, "no such engine", http.StatusNotFound)
 	case errors.Is(err, ErrDraining), errors.Is(err, ErrStopping):
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-	case errors.Is(err, ErrExportOff), errors.Is(err, ErrReadOnly), errors.Is(err, ErrImportOff), errors.Is(err, ErrGCReadOnly), errors.As(err, &conflict):
+	case errors.Is(err, ErrExportOff), errors.Is(err, ErrReadOnly), errors.Is(err, ErrImportOff), errors.Is(err, ErrGCReadOnly), errors.Is(err, ErrGCModeOff), errors.As(err, &conflict):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:
 		http.Error(w, err.Error(), http.StatusBadGateway)

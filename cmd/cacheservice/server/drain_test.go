@@ -486,7 +486,7 @@ func TestDrainStopsImportsAndGC(t *testing.T) {
 	st := newGCStores(t, nil)
 	h := newExportHarness(t, st.blobs, st.meta, nil)
 	// Scheduled, though not within the test: the drain must end the loop.
-	if err := h.svc.EnableGC(h.ctx, GCConfig{Interval: time.Hour, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+	if err := h.svc.EnableGC(h.ctx, GCConfig{Mode: GCModeService, Interval: time.Hour, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
 		t.Fatal(err)
 	}
 	conn := h.engine
@@ -686,7 +686,7 @@ func TestDrainCancelsGCRunAskedFor(t *testing.T) {
 	st := newGCStores(t, nil)
 	h := newExportHarness(t, st.blobs, st.meta, nil)
 	bucket := &blockingBucket{Bucket: st.bucket, blocked: make(chan struct{})}
-	if err := h.svc.EnableGC(h.ctx, GCConfig{Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+	if err := h.svc.EnableGC(h.ctx, GCConfig{Mode: GCModeBatch, Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
 		t.Fatal(err)
 	}
 	ran := make(chan error, 1)

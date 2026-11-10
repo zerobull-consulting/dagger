@@ -24,7 +24,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache, with each entry's `dirty` and `dueAt` |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
-| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) or with `-gc-mode=off`; the answer says the `mode` |
 | `-debug-listen` | `GET /debug/identity` | The service's identity: its base release (or `dev`), the engine versions it accepts and its revision (see [Engine versions](#engine-versions)) |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, without credentials, for a scraper that shouldn't reach the debug API |
@@ -1508,8 +1508,8 @@ What it does, and doesn't:
 - **No conditional write check at startup.** It checks the index's
   conditional writes, which only the export path makes, and it writes. The
   service logs that it skipped it, and why.
-- **No GC.** GC deletes, so it is forced off whatever `-gc-interval` says,
-  and `POST /debug/gc` answers 409, `gc is off: the instance is read-only
+- **No GC.** GC deletes, so it is `-gc-mode=off` (an explicit `service` or `batch` is refused at
+  startup), and `POST /debug/gc` answers 409, `gc is off: the instance is read-only
   (-export=false), and never deletes from the bucket`. This goes beyond
   [#65](https://github.com/zerobull-consulting/dagger/issues/65)'s "GC
   unchanged": a read-only key couldn't delete anyway, and a GC that fails
@@ -1537,10 +1537,11 @@ naming both settings, before anything connects to the bucket:
 - `-export=false` without `CACHESERVICE_S3_BUCKET`: a read-only instance
   only imports from the bucket, so it would have nothing to do either, and a
   typo in the variable would otherwise go unnoticed.
-- `-export=false` with an explicit nonzero `-gc-interval` (even `1h`, the
-  default, when it's set on the command line): it asks for GC, which a
-  read-only instance never runs. The default alone is fine; `-gc-interval=0`
-  too.
+- `-export=false` with an explicit `-gc-mode=service` or `-gc-mode=batch`:
+  they ask for GC, which a read-only instance never runs. The default
+  alone is fine, and so is an explicit `-gc-mode=off`, which states what
+  already happens (`POST /debug/gc` keeps the read-only reason). An explicit
+  `-gc-interval` is refused too: it belongs to `-gc-mode=service`.
 
 The startup log has one line of the mode, `msg=mode export=off import=on
 gc=off readOnly=true`, and `cacheservice_export_enabled` is 0, so a
@@ -2269,11 +2270,26 @@ nothing an engine reports (`engine.prune`, an offer's `gone`, a failed
 signals describe one engine's cache, not the stored copy (see
 [#11](https://github.com/zerobull-consulting/dagger/issues/11#issuecomment-6561084554)).
 
-It runs every `-gc-interval` (1h, jittered by ±25%, so replicas spread out;
-0 runs it only on `POST /debug/gc`), with the S3 stores
-(`CACHESERVICE_S3_BUCKET`). It is off on a read-only instance
-(`-export=false`), whatever `-gc-interval` says; an explicit nonzero one is
-refused at startup (see [Read-only instances](#read-only-instances)). Without limits (`-max-age` and `-max-bytes` are 0
+`-gc-mode` says who collects, with the S3 stores
+(`CACHESERVICE_S3_BUCKET`):
+
+| `-gc-mode` | The service's schedule | `POST /debug/gc` | Meant for |
+|---|---|---|---|
+| `service` (default) | every `-gc-interval` (1h, jittered by ±25%, so replicas spread out) | runs | a service with no job beside it |
+| `batch` | none | runs, on demand | a bucket that a `cacheservice gc` job collects |
+| `off` | none | 409, `gc is off: -gc-mode=off, ...` | a bucket nothing collects: it grows without bound, so the startup log warns |
+
+A zero `-gc-interval` is refused at startup (it used to mean "only on `POST
+/debug/gc`", which is `-gc-mode=batch`), and so is a negative interval, an
+explicit `-gc-interval` with `batch` or `off`, and an unknown mode. A
+read-only instance (`-export=false`) is `off`; an explicit `service` or
+`batch` is refused at startup (see [Read-only instances](#read-only-instances)).
+The startup log says the mode (`msg=mode ... gc=service`, and `gc on
+mode=service`, or the warning `gc off`), and so does `POST /debug/gc`'s
+answer (`"mode"`).
+
+`-gc-dry-run`, `-gc-grace`, `-gc-staging-age` and `-gc-max-deletes` apply to
+`service` and `batch`. With `off` they are accepted and unused. Without limits (`-max-age` and `-max-bytes` are 0
 by default, and no namespaces file), it expires only what engines gave an
 expiry, and deletes only what nothing names: bundles and blobs of exports
 that were never recorded or were superseded, and staged uploads. So an
@@ -2707,7 +2723,8 @@ first.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0). GC is off with `-export=false`, which refuses an explicit nonzero value |
+| `-gc-mode` | `service` | Who collects garbage: `service` (the service, every `-gc-interval`, and on `POST /debug/gc`), `batch` (a `cacheservice gc` job collects; no schedule, and `POST /debug/gc` still runs), or `off` (nothing collects, so the bucket grows without bound; `POST /debug/gc` answers 409). `-export=false` is `off`, and refuses an explicit `service` or `batch` |
+| `-gc-interval` | `1h` | Time between runs with `-gc-mode=service`, jittered by ±25%. 0 and negative values are refused at startup, and so is any explicit value with `batch` or `off` |
 | `-gc-dry-run` | false | Log and report what a run would do; change nothing |
 | `-gc-grace` | `2h` | How old an unreferenced bundle, resolution or blob must be to be deleted |
 | `-gc-staging-age` | `2h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |
@@ -3478,9 +3495,11 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
   ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25 \
-  -scope default -drain-timeout 10m -drain-linger 15s -gc-interval=0
+  -scope default -drain-timeout 10m -drain-linger 15s -gc-mode=batch
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
+
+`-gc-mode` needs an image built at or after zerobull-consulting/dagger#248. The tag above is the floating `:<engine version>` tag, which carries it once the publish workflow has moved it to a build with that change; an image pinned to an older commit does not.
 
 - **No `-tokens-file`**: the service is unauthenticated, and every engine is
   in the `-scope` namespace. That is fine on a runner's private network, and
@@ -3488,7 +3507,8 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
   namespace. Its OTLP bodies are bounded either way (see
   [OTLP limits](#otlp-limits)); `cacheservice_otlp_refused_total` should stay
   at 0 for a sidecar's engines.
-- **`-gc-interval=0`** on writers: scheduled GC belongs to a job of its own
+- **`-gc-mode=batch`** on writers: the service has no GC schedule, and
+  `POST /debug/gc` still runs GC; collecting belongs to a job of its own
   ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
 - **`-drain-timeout 10m`**: the stop's chance to store what the job built
   (see step 4); **`-drain-linger 15s`** (its default) lets the engine's stop
@@ -3635,8 +3655,8 @@ ends the linger at once, and the engine's last event goes undelivered.
   session's end.
 
 **Pull-request jobs:** the same, with `-export=false` instead of
-`-gc-interval=0` (GC is off anyway, and an explicit nonzero `-gc-interval`
-is refused), and a read-only key (see
+`-gc-mode=batch` (GC is off anyway, and an explicit `-gc-mode=service` or
+`batch` is refused), and a read-only key (see
 [A read-only key](#a-read-only-key)): `s3:GetObject` and `s3:ListBucket` on
 the prefix. A job that forgets `-export=false` with that key fails at
 startup, exit 1, rather than running as a writer. Its drain has nothing to
