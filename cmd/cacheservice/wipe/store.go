@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -62,6 +63,10 @@ type Store interface {
 	// Delete deletes up to PageSize keys, and returns those the store
 	// reported failing.
 	Delete(ctx context.Context, keys []string) ([]Failure, error)
+	// Versioning is the bucket's versioning status: "" when it was never
+	// enabled, else Enabled or Suspended. metastore.ErrDenied when the key
+	// may not read it.
+	Versioning(ctx context.Context) (string, error)
 	// Abort aborts an upload; one already gone is not an error.
 	Abort(ctx context.Context, u Upload) error
 }
@@ -181,24 +186,84 @@ func (s *S3Store) Delete(ctx context.Context, keys []string) ([]Failure, error) 
 	if len(keys) > PageSize {
 		return nil, fmt.Errorf("delete: %d keys, over %d", len(keys), PageSize)
 	}
+	// A key XML can't carry goes in a request of its own: MinIO answers a
+	// DeleteObjects of one without an error and keeps it, and deletes it
+	// with a DeleteObject (both seen on the dev MinIO).
+	var batch []string
+	var failed []Failure
+	for _, k := range keys {
+		if xmlSafe(k) {
+			batch = append(batch, k)
+			continue
+		}
+		if err := s.deleteOne(ctx, k); err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			failed = append(failed, Failure{Key: k, Reason: err.Error()})
+		}
+	}
+	if len(batch) == 0 {
+		return failed, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
-	ids := make([]types.ObjectIdentifier, len(keys))
-	for i := range keys {
-		ids[i] = types.ObjectIdentifier{Key: aws.String(keys[i])}
+	ids := make([]types.ObjectIdentifier, len(batch))
+	for i := range batch {
+		ids[i] = types.ObjectIdentifier{Key: aws.String(batch[i])}
 	}
 	out, err := s.Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 		Bucket: &s.Bucket,
 		Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("delete %d objects: %w", len(keys), err)
+		return nil, fmt.Errorf("delete %d objects: %w", len(batch), err)
 	}
-	failed := make([]Failure, 0, len(out.Errors))
 	for _, e := range out.Errors {
 		failed = append(failed, Failure{Key: aws.ToString(e.Key), Reason: aws.ToString(e.Code) + ": " + aws.ToString(e.Message)})
 	}
 	return failed, nil
+}
+
+func (s *S3Store) deleteOne(ctx context.Context, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	if _, err := s.Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.Bucket, Key: &key}); err != nil {
+		return fmt.Errorf("delete %q: %w", key, err)
+	}
+	return nil
+}
+
+func (s *S3Store) Versioning(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	out, err := s.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: &s.Bucket})
+	if err != nil {
+		if s3util.Denied(err) {
+			return "", fmt.Errorf("get the bucket's versioning: %w: %w", metastore.ErrDenied, err)
+		}
+		return "", fmt.Errorf("get the bucket's versioning: %w", err)
+	}
+	return string(out.Status), nil
+}
+
+// xmlSafe reports whether XML 1.0 can carry k: valid UTF-8, of the
+// characters XML allows.
+func xmlSafe(k string) bool {
+	if !utf8.ValidString(k) {
+		return false
+	}
+	for _, r := range k {
+		switch {
+		case r == 0x9 || r == 0xA || r == 0xD,
+			r >= 0x20 && r <= 0xD7FF,
+			r >= 0xE000 && r <= 0xFFFD,
+			r >= 0x10000 && r <= 0x10FFFF:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (s *S3Store) Abort(ctx context.Context, u Upload) error {
@@ -206,7 +271,7 @@ func (s *S3Store) Abort(ctx context.Context, u Upload) error {
 	defer cancel()
 	_, err := s.Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &s.Bucket, Key: &u.Key, UploadId: &u.ID})
 	if err != nil && s3util.HTTPStatus(err) != http.StatusNotFound {
-		return fmt.Errorf("abort upload of %s: %w", u.Key, err)
+		return fmt.Errorf("abort upload of %q: %w", u.Key, err)
 	}
 	return nil
 }

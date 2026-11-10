@@ -50,6 +50,16 @@ type fakeStore struct {
 	// extraUpload, when set, is an upload every listing of uploads
 	// returns, whatever the prefix: a store that ignores it.
 	extraUpload *Upload
+	// versioning and versioningErr are what Versioning answers.
+	versioning    string
+	versioningErr error
+}
+
+func (f *fakeStore) Versioning(context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "versioning")
+	return f.versioning, f.versioningErr
 }
 
 func (f *fakeStore) UploadsByExactKey() bool { return f.exactKey }
@@ -928,5 +938,136 @@ func TestUploadOutsidePrefixFiltered(t *testing.T) {
 	}
 	if _, out := run(t, f, Options{Prefix: "cache", DryRun: true}); !strings.Contains(out, "incomplete multipart uploads: 0") {
 		t.Fatalf("dry run:\n%s", out)
+	}
+}
+
+// An ancestor prefix claimed during the wipe stops it before its next
+// delete: that store's keys may be under this prefix (wiping a/ns under a
+// new store at a).
+func TestAncestorClaimedDuringWipeStops(t *testing.T) {
+	f := newFake()
+	f.pageSize = 4
+	for i := range 10 {
+		f.put(fmt.Sprintf("a/ns/k%02d", i), 1)
+	}
+	f.uploads = []Upload{{Key: "a/ns/staging/x", ID: "1"}}
+	once := sync.Once{}
+	f.afterDelete = func(f *fakeStore) {
+		once.Do(func() {
+			f.mu.Lock()
+			f.putMarker("a", 2)
+			f.put("a/ns/main/index.json", 9) // the new store's
+			f.mu.Unlock()
+		})
+	}
+	code, out := run(t, f, Options{Prefix: "a/ns", Confirm: "bkt/a/ns"})
+	if code != ExitError || !strings.Contains(out, "stopped before the next delete") || !strings.Contains(out, "holds an ownership marker (a/cacheservice.json)") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if _, ok := f.objects["a/ns/main/index.json"]; !ok || len(f.aborted) > 0 {
+		t.Fatalf("deleted the new store's key, or aborted %v\n%s", f.aborted, out)
+	}
+	var dels int
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "delete ") {
+			dels++
+		}
+	}
+	if dels != 1 {
+		t.Fatalf("%d deletes, want the first page's only", dels)
+	}
+}
+
+// An ancestor claimed after the last object delete stops the wipe before
+// any upload is aborted.
+func TestAncestorClaimedBeforeAbortsStops(t *testing.T) {
+	f := newFake()
+	f.put("a/ns/k", 1)
+	f.uploads = []Upload{{Key: "a/ns/staging/x", ID: "1"}}
+	f.afterDelete = func(f *fakeStore) {
+		f.mu.Lock()
+		f.putMarker("a", 2)
+		f.mu.Unlock()
+	}
+	code, out := run(t, f, Options{Prefix: "a/ns", Confirm: "bkt/a/ns"})
+	if code != ExitError || len(f.aborted) > 0 || !strings.Contains(out, "stopped before the next delete") {
+		t.Fatalf("exit %d, aborted %v\n%s", code, f.aborted, out)
+	}
+}
+
+// A versioned bucket (Enabled or Suspended) is refused before anything is
+// deleted; a key that may not read the setting gets a warning, and the
+// wipe goes on; any other error refuses.
+func TestVersionedBucket(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+		err    error
+		want   int
+		say    string
+	}{
+		{"enabled", "Enabled", nil, ExitError, "versioning is Enabled"},
+		{"suspended", "Suspended", nil, ExitError, "versioning is Suspended"},
+		{"denied", "", fmt.Errorf("get: %w: 403", metastore.ErrDenied), ExitOK, "WARNING: the key may not read the bucket's versioning"},
+		{"5xx", "", errors.New("get the bucket's versioning: 503"), ExitError, "503; nothing deleted"},
+		{"never enabled", "", nil, ExitOK, "wipe: the prefix is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake()
+			seed(f, 2)
+			f.versioning, f.versioningErr = tc.status, tc.err
+			keys := f.keys()
+			code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+			if code != tc.want || !strings.Contains(out, tc.say) {
+				t.Fatalf("exit %d, want %d, and %q\n%s", code, tc.want, tc.say, out)
+			}
+			if tc.want == ExitError && (!slices.Equal(f.keys(), keys) || !strings.Contains(out, "nothing deleted")) {
+				t.Fatalf("changed the store\n%s", out)
+			}
+			// A dry run reports it, and exits 0.
+			f = newFake()
+			seed(f, 2)
+			f.versioning, f.versioningErr = tc.status, tc.err
+			if code, out := run(t, f, Options{Prefix: "cache", DryRun: true}); code != ExitOK || !strings.Contains(out, "versioning") {
+				t.Fatalf("dry run: exit %d\n%s", code, out)
+			}
+		})
+	}
+}
+
+// What the store answers is printed escaped: a key or an error message
+// holding control characters can't write them to the terminal.
+func TestStoreStringsEscaped(t *testing.T) {
+	f := newFake()
+	f.uploads = []Upload{{Key: "cache/\x1b[2Jx", ID: "\x1b]0;id"}}
+	f.abortErr = func(u Upload) error { return errors.New("500 \x1b[31mred " + u.Key) }
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), Options{Bucket: "bkt", Prefix: "cache", Confirm: "bkt/cache"}, f, &out, &errOut)
+	if code != ExitError || strings.Contains(out.String()+errOut.String(), "\x1b") || !strings.Contains(out.String(), `\x1b[31mred`) {
+		t.Fatalf("exit %d\n%q\n%q", code, out.String(), errOut.String())
+	}
+	f = newFake()
+	seed(f, 2)
+	f.versioningErr = errors.New("503 \x1b[2J")
+	errOut.Reset()
+	if code := Run(context.Background(), Options{Bucket: "bkt", Prefix: "cache", Confirm: "bkt/cache"}, f, &out, &errOut); code != ExitError || strings.Contains(errOut.String(), "\x1b") {
+		t.Fatalf("exit %d\n%q", code, errOut.String())
+	}
+}
+
+func TestXMLSafe(t *testing.T) {
+	for k, want := range map[string]bool{
+		"cache/ns/x":      true,
+		"cache/a b+c%&<>": true,
+		"cache/\t\n\r":    true,
+		"cache/é😀":        true,
+		"cache/\x01":      false,
+		"cache/\x1b":      false,
+		"cache/\uFFFE":    false,
+		"cache/\xff":      false,
+	} {
+		if got := xmlSafe(k); got != want {
+			t.Errorf("xmlSafe(%q) = %v, want %v", k, got, want)
+		}
 	}
 }

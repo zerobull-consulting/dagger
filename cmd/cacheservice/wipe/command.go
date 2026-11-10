@@ -29,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
@@ -113,7 +115,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 		return ExitUsage
 	}
 	fail := func(code int, format string, a ...any) int {
-		fmt.Fprintf(stderr, "cacheservice wipe: "+format+"\n", a...)
+		fmt.Fprintf(stderr, "cacheservice wipe: %s\n", printable(fmt.Sprintf(format, a...)))
 		return code
 	}
 	if fs.NArg() > 0 {
@@ -183,8 +185,10 @@ func (s Summary) Empty() bool { return s.Objects == 0 && s.Uploads == 0 }
 // Run runs a dry run or a wipe of o's prefix against st, printing its
 // report to out and why it failed to errOut.
 func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
+	// What the store answers (errors, keys) is printed escaped: it can't
+	// write control characters to the terminal.
 	fail := func(code int, format string, a ...any) int {
-		fmt.Fprintf(errOut, "cacheservice wipe: "+format+"\n", a...)
+		fmt.Fprintf(errOut, "cacheservice wipe: %s\n", printable(fmt.Sprintf(format, a...)))
 		return code
 	}
 	// Again, for Run's other callers: before anything is read.
@@ -204,7 +208,7 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		// safe: without knowing whether there is one, stop.
 		return fail(ExitError, "can't read the ownership marker %s: %v; nothing deleted", markerKey, err)
 	}
-	fmt.Fprintf(out, "ownership marker: %s\n", marker.desc)
+	fmt.Fprintf(out, "ownership marker: %s\n", printable(marker.desc))
 
 	if o.DryRun {
 		s, err := survey(ctx, st, root)
@@ -215,6 +219,14 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		if s.Nested > 0 {
 			fmt.Fprintf(out, "WARNING: %d ownership markers under the prefix, of stores nested in it, which the wipe deletes too:\n", s.Nested)
 			printKeys(out, s.NestedKeys, s.Nested)
+		}
+		switch v, err := st.Versioning(ctx); {
+		case err != nil:
+			fmt.Fprintf(out, "bucket versioning: can't read it: %s\n", printable(err.Error()))
+		case v != "":
+			fmt.Fprintf(out, "WARNING: the bucket's versioning is %s: a wipe refuses a versioned bucket\n", printable(v))
+		default:
+			fmt.Fprintln(out, "bucket versioning: never enabled")
 		}
 		if s.Empty() {
 			fmt.Fprintln(out, "dry run: the prefix is empty; nothing to wipe")
@@ -236,6 +248,19 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		fmt.Fprintf(out, "WARNING: %d ownership markers under the prefix, of stores nested in it, which this wipe deletes too:\n", pre.Nested)
 		printKeys(out, pre.NestedKeys, pre.Nested)
 	}
+	// A versioned bucket keeps the noncurrent versions of what a delete
+	// without a version ID removes, which the listings don't show: the
+	// wipe would report an empty prefix and leave it all. A key that may
+	// not read the setting gets a warning; any other error refuses, since
+	// the store didn't say.
+	switch v, err := st.Versioning(ctx); {
+	case errors.Is(err, metastore.ErrDenied):
+		fmt.Fprintln(out, "WARNING: the key may not read the bucket's versioning: if the bucket is versioned, this wipe leaves the noncurrent versions of all it deletes")
+	case err != nil:
+		return fail(ExitError, "%v; nothing deleted", err)
+	case v != "":
+		return fail(ExitError, "the bucket's versioning is %s: a wipe deletes only current versions and leaves the noncurrent ones, so it refuses a versioned bucket; nothing deleted", v)
+	}
 
 	var (
 		deleted, aborted int
@@ -247,7 +272,7 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	progress := func() {
 		fmt.Fprintf(out, "deleted %d objects, %d bytes; aborted %d incomplete multipart uploads; %d failed\n", deleted, bytes, aborted, failures.n)
 		for _, f := range failures.first {
-			fmt.Fprintf(out, "  FAILED %q: %s\n", f.Key, f.Reason)
+			fmt.Fprintf(out, "  FAILED %q: %s\n", f.Key, printable(f.Reason))
 		}
 		if failures.n > len(failures.first) {
 			fmt.Fprintf(out, "  ... and %d more failures\n", failures.n-len(failures.first))
@@ -271,7 +296,19 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 
 	// 2. The objects.
+	// recheck stops the wipe if an ancestor prefix was claimed since it
+	// started: that store's keys may be under this prefix (wiping <a>/ns
+	// under a new store at <a>). Before each destructive request.
+	recheck := func() error {
+		if err := checkAncestors(ctx, st, o.Prefix); err != nil {
+			return fmt.Errorf("stopped before the next delete: %w", err)
+		}
+		return nil
+	}
 	err = walkObjects(ctx, st, root, func(objs []Object) error {
+		if err := recheck(); err != nil {
+			return err
+		}
 		keyFailures, err := st.Delete(ctx, objKeys(objs))
 		if err != nil {
 			return err
@@ -294,6 +331,9 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	}
 
 	// 3. The incomplete multipart uploads.
+	if err := recheck(); err != nil {
+		return stop("%v", err)
+	}
 	err = walkUploads(ctx, st, root, func(ups []Upload) error {
 		for _, u := range ups {
 			if err := st.Abort(ctx, u); err != nil {
@@ -558,6 +598,22 @@ func printSummary(out io.Writer, s Summary) {
 	printKeys(out, s.Keys, s.Objects)
 	fmt.Fprintf(out, "incomplete multipart uploads: %d\n", s.Uploads)
 	printKeys(out, s.Upload, s.Uploads)
+}
+
+// printable is s with every character that isn't printable escaped, as %q
+// escapes it: a string from the store can't write control characters to the
+// terminal.
+func printable(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r != utf8.RuneError && unicode.IsPrint(r) {
+			b.WriteRune(r)
+			continue
+		}
+		q := strconv.QuoteRune(r)
+		b.WriteString(q[1 : len(q)-1])
+	}
+	return b.String()
 }
 
 // printKeys prints keys quoted, so that a key can't write control

@@ -368,14 +368,18 @@ re-run the cache-warming job. The first writer claims the empty prefix, and
 the cache fills again. Pull-request jobs before that run start with nothing
 to import (see [Read-only instances](#read-only-instances)).
 
-**Stop every writer on the prefix first.** The command can't see running
-services: a writer still exporting during the wipe leaves new keys behind,
-and the wipe then exits 3.
+**Stop every writer on the prefix, and on its ancestor prefixes, first.**
+The command can't see running services: a writer still exporting during the
+wipe leaves new keys behind, and the wipe then exits 3. A writer that claims
+an ancestor prefix during the wipe stops it before its next delete, with
+exit 1, since that store's keys may be under the prefix
+(`TestAncestorClaimedDuringWipeStops`, `TestAncestorClaimedBeforeAbortsStops`).
 
 `cacheservice wipe` empties the prefix, of any layout (layout 1 included,
 which has no marker). It reads the same `CACHESERVICE_S3_*` settings as the
 service, with a key that can list the prefix and its multipart uploads, and
-delete and abort there (a Read/Write/Delete key):
+delete and abort there (a Read/Write/Delete key), and that should be able to
+read the bucket's versioning setting (see below):
 
 ```bash
 cacheservice wipe                                         # dry run: what the prefix holds, and the marker's layout
@@ -420,15 +424,21 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   after the wipe (a writer is running). `-timeout` (default 30m, room for
   about one to two million keys) bounds the run, and each request is bounded
   to 30s.
-- **Versioned buckets:** noncurrent versions aren't deleted (a delete
-  without a version ID only adds a delete marker); not run on a versioned
-  bucket.
+- **Versioned buckets are refused:** a delete without a version ID leaves
+  the noncurrent versions, which the listings don't show, so before deleting
+  anything a wipe reads the bucket's versioning (`s3:GetBucketVersioning`)
+  and exits 1 if it is Enabled or Suspended. A key that may not read it (403)
+  gets a warning and the wipe goes on; any other error refuses. A dry run
+  reports it (`TestVersionedBucket`). Not run on a versioned bucket.
 - **Keys XML can't carry** (a control character such as U+0001, which MinIO
   stores): the listings ask for URL-encoded keys, so a dry run names them,
-  but MinIO answers a `DeleteObjects` of such a key without an error and
-  keeps it, so the wipe leaves it and exits 3. A single `DeleteObject`
-  request for the key removes it (seen with the Go SDK on MinIO;
-  `TestMinIOControlCharKeyNotDeletedKnownGap`).
+  and the wipe deletes each such key with a `DeleteObject` of its own, since
+  MinIO answers a `DeleteObjects` of one without an error and keeps it
+  (both seen on MinIO; `TestMinIOControlCharKeyDeleted`,
+  `TestMinIODeleteObjectsKeepsControlCharKey`).
+- **What the store answers is printed escaped:** keys are quoted, and errors
+  and failure reasons have their control characters escaped
+  (`TestStoreStringsEscaped`).
 
 **Later: import from one prefix, export to another.** Images are pinned by
 SHA, so an old image can still read the old prefix: run an engine with a

@@ -24,6 +24,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
@@ -97,14 +98,18 @@ func (e *minioEnv) listing() (keys, uploads []string) {
 	e.t.Helper()
 	ctx := context.Background()
 	under := e.cfg.Prefix + "/"
-	pages := s3.NewListObjectsV2Paginator(e.client, &s3.ListObjectsV2Input{Bucket: &e.cfg.Bucket, Prefix: &under})
+	pages := s3.NewListObjectsV2Paginator(e.client, &s3.ListObjectsV2Input{Bucket: &e.cfg.Bucket, Prefix: &under, EncodingType: types.EncodingTypeUrl})
 	for pages.HasMorePages() {
 		page, err := pages.NextPage(ctx)
 		if err != nil {
 			e.t.Fatal(err)
 		}
 		for _, o := range page.Contents {
-			keys = append(keys, aws.ToString(o.Key))
+			k, err := decodeKey(aws.ToString(o.Key))
+			if err != nil {
+				e.t.Fatal(err)
+			}
+			keys = append(keys, k)
 		}
 	}
 	// MinIO lists uploads only by exact key: list the bucket's, and filter.
@@ -369,29 +374,48 @@ func TestMinIOAwkwardKeys(t *testing.T) {
 	}
 }
 
-// Known gap: a key holding a character XML can't carry, such as U+0001,
-// which MinIO stores. Listing it works (EncodingType=url; without it the
-// page fails to parse, seen on the dev MinIO), so a dry run names it. But
-// MinIO answers DeleteObjects for it with no error and keeps it (seen), so
-// a wipe leaves it, and exits 3. A single DeleteObject does remove it
-// (seen), which is what this test's cleanup uses.
-func TestMinIOControlCharKeyNotDeletedKnownGap(t *testing.T) {
+// A key holding a character XML can't carry, such as U+0001, which MinIO
+// stores: listing it works (EncodingType=url; without it the page fails to
+// parse, seen on the dev MinIO), and the wipe deletes it with a DeleteObject
+// of its own, since MinIO answers a DeleteObjects of it with no error and
+// keeps it (seen).
+func TestMinIOControlCharKeyDeleted(t *testing.T) {
 	e := newMinIOEnv(t)
-	key := e.cfg.Prefix + "/cache/ns/x/\x01"
-	// Before the scope's own cleanup, which lists without URL encoding.
-	t.Cleanup(func() {
-		if _, err := e.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: &e.cfg.Bucket, Key: &key}); err != nil {
-			t.Errorf("cleaning up %q: %v", key, err)
-		}
-	})
 	e.put("cache/ns/x/\x01", 1)
 	e.put("cache/ns/x/ok", 1)
+	e.put("cache2/ns/x/\x01", 1)
 	code, out := e.main()
 	if code != ExitOK || !strings.Contains(out, "objects: 2, 2 bytes") || !strings.Contains(out, `/cache/ns/x/\x01"`) {
 		t.Fatalf("dry run: exit %d\n%s", code, out)
 	}
 	code, out = e.main("-dry-run=false", "-confirm="+e.cfg.Bucket+"/"+e.target)
-	if code != ExitNotEmpty || !strings.Contains(out, "objects: 1, 1 bytes") || !strings.Contains(out, `/cache/ns/x/\x01"`) {
-		t.Fatalf("wipe: exit %d, want %d (the gap: DeleteObjects keeps the key)\n%s", code, ExitNotEmpty, out)
+	if code != ExitOK || !strings.Contains(out, "deleted 2 objects, 2 bytes") {
+		t.Fatalf("wipe: exit %d\n%s", code, out)
+	}
+	// The scope's cleanup (s3test.DeletePrefix) lists URL-encoded too, and
+	// removes cache2's.
+	if k, _ := e.listing(); !slices.Equal(k, []string{e.cfg.Prefix + "/cache2/ns/x/\x01"}) {
+		t.Fatalf("left %q", k)
+	}
+}
+
+// MinIO's answer to a DeleteObjects of such a key, pinned: no error, and
+// the key kept. If MinIO changes, the per-key delete may no longer be needed.
+func TestMinIODeleteObjectsKeepsControlCharKey(t *testing.T) {
+	if s := os.Getenv(s3test.EnvStore); s != "" && s != "minio" {
+		t.Skipf("pins MinIO's answer; the store is %s", s)
+	}
+	e := newMinIOEnv(t)
+	e.put("cache/\x01", 1)
+	k := e.cfg.Prefix + "/cache/\x01"
+	out, err := e.client.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+		Bucket: &e.cfg.Bucket,
+		Delete: &types.Delete{Objects: []types.ObjectIdentifier{{Key: &k}}, Quiet: aws.Bool(true)},
+	})
+	if err != nil || len(out.Errors) > 0 {
+		t.Fatalf("DeleteObjects: %v %v", err, out)
+	}
+	if keys, _ := e.listing(); !slices.Equal(keys, []string{k}) {
+		t.Fatalf("after DeleteObjects: %q, want the key kept", keys)
 	}
 }
