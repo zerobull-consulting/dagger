@@ -67,6 +67,10 @@
 #                           welcome nor a refusal logged, after which the
 #                           service is taken for one from before the welcome
 #                           line, with a warning (default: 10)
+#   SIDECAR_FIRST_SYNC_TIMEOUT
+#                           seconds to wait after the welcome for the
+#                           service's first import sync, after which the
+#                           start goes on with a warning (default: 30)
 #   SIDECAR_ENGINE_CA_FILE  local use only: a CA bundle to mount as the
 #                           engine's, for a host behind a TLS-intercepting
 #                           proxy. The actions never set it.

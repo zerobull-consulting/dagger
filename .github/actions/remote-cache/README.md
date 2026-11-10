@@ -109,8 +109,10 @@ what is stored as the engine connects, and logs `import sync: first done`
 once that first sync ends, even when it merged nothing; a build that started
 before it could miss entries not merged yet
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
-The start waits for that line, in both roles, for up to 30s, and then goes
-on with a warning: a `service-image` from before the line never logs it.
+The start waits for that line, in both roles, for up to 30s
+(`SIDECAR_FIRST_SYNC_TIMEOUT` overrides it for a local run of `sidecar.sh`),
+and then goes on with a warning: a `service-image` from before the line
+never logs it.
 A first sync that failed is a warning too, not a failure: the job's builds
 run without what it didn't merge, as they would against a bucket the
 service can't read. An image from before the welcome line isn't waited for.
