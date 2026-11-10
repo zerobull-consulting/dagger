@@ -1364,11 +1364,11 @@ spans; what is in S3 is not lost, and a re-export uploads nothing already
 stored. An export pending or in flight when the service stops is lost until a
 later session names its entries. That is accepted, not planned to change
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45), pinned by
-`TestServiceRestartForgetsPendingExport`). An entry is exported once
-`-export-settle` has passed with no cache span naming it, or at the latest
-`-export-max-delay` after it changed, so what a stop without a drain can lose
-is what changed within those bounds, plus an export in flight or waiting
-out a retry. A clean stop drains first and stores the rest (see
+`TestServiceRestartForgetsPendingExport`). The tracker keeps what it hasn't
+stored only in memory, so a stop without a drain loses every export not yet
+stored. `-export-settle` and `-export-max-delay` bound how long a changed
+entry waits before its export is first tried. A clean stop drains first, and
+stores what the drain finishes (see
 [Stopping and draining](#stopping-and-draining)).
 
 ## Import path
@@ -3150,9 +3150,9 @@ whatever its context says (`TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx`).
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45)): the tracker
-keeps them only in memory. This is accepted, and what it loses is bounded
-(see [Export path](#export-path)). What was stored is never lost, and blobs uploaded
-by an export cut off are named by nothing, and GC deletes them.
+keeps them only in memory. This is accepted (see
+[Export path](#export-path)). What was stored is never lost, and blobs
+uploaded by an export cut off are named by nothing, and GC deletes them.
 
 **A service that doesn't export** (no `CACHESERVICE_S3_BUCKET`) has nothing
 to drain: it refuses new engines, and stops at once
