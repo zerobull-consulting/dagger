@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
@@ -1363,41 +1364,154 @@ func TestOTLPRefusedTokenHeadersNotInBudgetKnownGap(t *testing.T) {
 	}
 }
 
-// Known gap, zerobull-consulting/dagger#86: walking a deeply nested body
-// costs stack the decode budget doesn't count. OTLP's AnyValue nests through
-// ArrayValue a few bytes per level, so a body of a few KB can nest thousands
-// of messages deep; otlpDecodedSize walks it recursively, as
-// proto.Unmarshal does, up to otlpMaxDepth (10,000), and counts each level's
-// structs but not the stack frames the walk takes. Such a body is estimated
-// and taken. When #86 bounds the depth or walks iteratively, this test
-// changes with it.
-func TestOTLPDeeplyNestedBodyTaken(t *testing.T) {
-	// 2,000 AnyValues, each in an ArrayValue: 4,000 nested messages, within
-	// otlpMaxDepth and proto.Unmarshal's own limit.
-	const depth = 2000
+// nestedMetricsRequest is a metrics request whose resource has one attribute
+// holding an AnyValue nested arrays levels deep, each in an ArrayValue, or
+// in a KeyValueList's KeyValue when kvlist. The deepest message is at depth
+// 4 + 2*arrays (3*arrays with kvlist): ResourceMetrics 1, Resource 2, KeyValue
+// 3, AnyValue 4.
+func nestedMetricsRequest(arrays int, kvlist bool) *colmetricspb.ExportMetricsServiceRequest {
 	v := &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "leaf"}}
-	for range depth {
-		v = &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: []*commonpb.AnyValue{v}}}}
+	for range arrays {
+		if kvlist {
+			v = &commonpb.AnyValue{Value: &commonpb.AnyValue_KvlistValue{KvlistValue: &commonpb.KeyValueList{
+				Values: []*commonpb.KeyValue{{Key: "k", Value: v}}}}}
+		} else {
+			v = &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: []*commonpb.AnyValue{v}}}}
+		}
 	}
-	req := &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+	return &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
 		Resource:     &resourcepb.Resource{Attributes: []*commonpb.KeyValue{{Key: "nested", Value: v}}},
 		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{Name: "a"}}}},
 	}}}
-	body := encodeOTLP(t, req, false)
+}
+
+// A body nested past otlpMaxDepth is refused with 400 before it is decoded
+// (zerobull-consulting/dagger#86): walking it, and proto.Unmarshal's decode,
+// recurse once per level, and the stack that takes isn't in the decode
+// budget. 10,000 levels was the limit; a body of 40 KB reached it.
+func TestOTLPDeeplyNestedBodyRefused(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		arrays int
+		kvlist bool
+	}{
+		{"arrays, one past the limit", (otlpMaxDepth-4)/2 + 1, false},
+		{"arrays, 2,000 deep", 2000, false},
+		{"arrays, 5,000 deep, the depth this test used to take", 5000, false},
+		{"arrays, 6,000 deep", 6000, false},
+		{"kvlists, one level past the limit", otlpMaxDepth/3 + 1, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req := nestedMetricsRequest(c.arrays, c.kvlist)
+			body := encodeOTLP(t, req, false)
+			if len(body) > testOTLPLimit {
+				t.Fatalf("a body of %d bytes", len(body))
+			}
+			if _, err := otlpDecodedSize(body, req, false); !errors.Is(err, errOTLPDepth) {
+				t.Fatalf("estimate: %v, want errOTLPDepth", err)
+			}
+			_, rec, srv := limitedService(t, 4<<20)
+			if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("a body nested %d arrays deep: %d, want 400", c.arrays, resp.StatusCode)
+			}
+			if n := len(rec.find("otlp metrics")); n != 0 {
+				t.Fatalf("%d metric requests recorded", n)
+			}
+		})
+	}
+}
+
+// A body nested exactly otlpMaxDepth deep is taken, and its depth is what
+// the estimate reports (and the accepted record logs, for the e2e to check).
+func TestOTLPBodyAtMaxDepthTaken(t *testing.T) {
+	for _, kvlist := range []bool{false, true} {
+		// The deepest AnyValue is at depth 4 + 2 per array, or 4 + 3 per
+		// kvlist level (KeyValueList, KeyValue, AnyValue).
+		step := 2
+		if kvlist {
+			step = 3
+		}
+		req := nestedMetricsRequest((otlpMaxDepth-4)/step, kvlist)
+		body := encodeOTLP(t, req, false)
+		_, depth, err := otlpDecodedSizeDepth(body, req, false)
+		if err != nil {
+			t.Fatalf("kvlist=%t: estimate: %v", kvlist, err)
+		}
+		if depth > otlpMaxDepth || depth < otlpMaxDepth-step+1 {
+			t.Fatalf("kvlist=%t: nests %d deep, want %d or one level short", kvlist, depth, otlpMaxDepth)
+		}
+		_, rec, srv := limitedService(t, 4<<20)
+		if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("kvlist=%t: a body nested %d deep: %d", kvlist, depth, resp.StatusCode)
+		}
+		if n := len(rec.find("otlp metrics")); n != 1 {
+			t.Fatalf("kvlist=%t: %d metric requests recorded", kvlist, n)
+		}
+	}
+	// With arrays the limit is hit exactly.
+	req := nestedMetricsRequest((otlpMaxDepth-4)/2, false)
+	if _, depth, _ := otlpDecodedSizeDepth(encodeOTLP(t, req, false), req, false); depth != otlpMaxDepth {
+		t.Fatalf("nests %d deep, want exactly %d", depth, otlpMaxDepth)
+	}
+}
+
+// OTLP's own messages nest a fixed number of levels before the first
+// AnyValue, whose nesting is the only unbounded part (AnyValue, ArrayValue,
+// KeyValueList). The limit must clear those levels and leave room for real
+// values: this finds the deepest AnyValue the three requests reach by messages
+// alone, and checks the limit is several times that.
+func TestOTLPFixedNestingDepth(t *testing.T) {
+	anyValue := (&commonpb.AnyValue{}).ProtoReflect().Descriptor().FullName()
+	deepest := 0
+	var walk func(md protoreflect.MessageDescriptor, depth int, path map[protoreflect.FullName]bool)
+	walk = func(md protoreflect.MessageDescriptor, depth int, path map[protoreflect.FullName]bool) {
+		if md.FullName() == anyValue {
+			deepest = max(deepest, depth)
+			return
+		}
+		if path[md.FullName()] {
+			return
+		}
+		path[md.FullName()] = true
+		defer delete(path, md.FullName())
+		for i := range md.Fields().Len() {
+			if sub := md.Fields().Get(i).Message(); sub != nil {
+				walk(sub, depth+1, path)
+			}
+		}
+	}
+	for _, c := range otlpCases() {
+		walk(c.build("").ProtoReflect().Descriptor(), 0, map[protoreflect.FullName]bool{})
+	}
+	t.Logf("deepest first AnyValue by OTLP's own messages: depth %d; otlpMaxDepth %d", deepest, otlpMaxDepth)
+	if deepest != 8 {
+		t.Fatalf("the deepest first AnyValue is at depth %d, not 8: update otlpMaxDepth's comment and the README", deepest)
+	}
+	// An AnyValue nested through arrays adds 2 levels each.
+	if arrays := (otlpMaxDepth - deepest) / 2; arrays < 20 {
+		t.Fatalf("otlpMaxDepth %d leaves %d nested arrays below the deepest attribute, want at least 20", otlpMaxDepth, arrays)
+	}
+}
+
+// Known gap, zerobull-consulting/dagger#86: otlpMaxDepth bounds protobuf
+// bodies only. A JSON body is not walked (otlpJSONSize counts braces), so
+// protojson.Unmarshal recurses over it, to its own limit, with nothing
+// refused. Real engines send protobuf. Run: a JSON AnyValue 2,000 arrays deep
+// (4,000 messages, 56 KB) is taken. When JSON is bounded too, this test
+// changes with it.
+func TestOTLPDeeplyNestedJSONBodyTakenKnownGap(t *testing.T) {
+	const arrays = 2000
+	v := `{"stringValue":"x"}`
+	for range arrays {
+		v = `{"arrayValue":{"values":[` + v + `]}}`
+	}
+	body := []byte(`{"resourceMetrics":[{"resource":{"attributes":[{"key":"k","value":` + v + `}]}}]}`)
 	if len(body) > testOTLPLimit {
 		t.Fatalf("a body of %d bytes", len(body))
 	}
-	if _, err := otlpDecodedSize(body, req, false); err != nil {
-		t.Fatalf("estimate: %v", err)
-	}
-	// Each level's structs are counted (about 150 bytes), so the budget is
-	// large enough for them; the stack isn't.
-	_, rec, srv := limitedService(t, 4<<20)
-	if resp := postBody(t, srv.URL+"/v1/metrics", body, false, false, ""); resp.StatusCode != http.StatusOK {
-		t.Fatalf("a body nested %d deep: %d", depth, resp.StatusCode)
-	}
-	if n := len(rec.find("otlp metrics")); n != 1 {
-		t.Fatalf("%d metric requests recorded", n)
+	_, _, srv := limitedService(t, 64<<20)
+	if resp := postBody(t, srv.URL+"/v1/metrics", body, true, false, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("a JSON body nested %d arrays deep: %d; JSON depth is bounded now: update the known gap", arrays, resp.StatusCode)
 	}
 }
 

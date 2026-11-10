@@ -212,7 +212,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	// The message decoded from the body can take far more than the body
 	// (otlpDecodedSize): it is estimated, and reserved, before it is
 	// decoded. One that could never fit in the budget is too large.
-	estimate, err := otlpDecodedSize(data, msg, isJSON(r))
+	estimate, nesting, err := otlpDecodedSizeDepth(data, msg, isJSON(r))
 	if err != nil {
 		return refuse(err)
 	}
@@ -233,7 +233,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "messageBytes", estimate, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
+		"decodedBytes", len(data), "messageBytes", estimate, "nestingDepth", nesting, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 

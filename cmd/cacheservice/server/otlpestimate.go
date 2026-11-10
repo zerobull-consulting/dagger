@@ -43,14 +43,22 @@ const (
 	// otlpFieldCost is a scalar field's or a string's header, and the least a
 	// varint, fixed or group field is charged.
 	otlpFieldCost = 16
-	// otlpMaxDepth bounds how deep the estimate walks nested messages, as
-	// proto.Unmarshal does (protowire's default recursion limit).
-	otlpMaxDepth = 10000
+	// otlpMaxDepth bounds how deep a body may nest messages, the request
+	// being depth 0; a deeper body is refused with 400 before the estimate
+	// walks it or proto.Unmarshal decodes it, since both recurse once per
+	// level. OTLP's own messages nest 8 deep down to an AnyValue (see
+	// TestOTLPFixedNestingDepth), and the e2e checks that real engines'
+	// requests stay well under this (zerobull-consulting/dagger#86).
+	otlpMaxDepth = 64
 	// otlpJSONObjectCost is what one JSON object is estimated to decode to:
 	// the largest OTLP message (a Span, 280 bytes) and its slice element,
 	// rounded up.
 	otlpJSONObjectCost = 320
 )
+
+// MaxOTLPNesting is otlpMaxDepth: the most levels of messages a protobuf body
+// may nest, for the e2e to check real engines against.
+const MaxOTLPNesting = otlpMaxDepth
 
 var errOTLPDepth = errors.New("otlp message nested too deep")
 
@@ -58,16 +66,25 @@ var errOTLPDepth = errors.New("otlp message nested too deep")
 // protobuf, or as JSON when asJSON. A protobuf body that isn't a valid
 // encoding is an error, as decoding it would be.
 func otlpDecodedSize(data []byte, msg proto.Message, asJSON bool) (int64, error) {
-	if asJSON {
-		return otlpJSONSize(data), nil
-	}
-	return otlpProtoSize(data, msg.ProtoReflect().Descriptor(), 0)
+	size, _, err := otlpDecodedSizeDepth(data, msg, asJSON)
+	return size, err
 }
 
-func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int64, error) {
+// otlpDecodedSizeDepth is otlpDecodedSize, and also says how deep the body
+// nests messages (0 for a request with none, and for JSON, which isn't walked).
+func otlpDecodedSizeDepth(data []byte, msg proto.Message, asJSON bool) (size int64, depth int, err error) {
+	if asJSON {
+		return otlpJSONSize(data), 0, nil
+	}
+	size, err = otlpProtoSize(data, msg.ProtoReflect().Descriptor(), 0, &depth)
+	return size, depth, err
+}
+
+func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int, deepest *int) (int64, error) {
 	if depth > otlpMaxDepth {
 		return 0, errOTLPDepth
 	}
+	*deepest = max(*deepest, depth)
 	size := otlpMessageCost(md)
 	fields := md.Fields()
 	for len(b) > 0 {
@@ -112,7 +129,7 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int) (int6
 			// message's unknown fields, which append grows.
 			size += otlpUnknownCost(tagLen + int64(n))
 		case fd.Message() != nil:
-			sub, err := otlpProtoSize(v, fd.Message(), depth+1)
+			sub, err := otlpProtoSize(v, fd.Message(), depth+1, deepest)
 			if err != nil {
 				return 0, err
 			}

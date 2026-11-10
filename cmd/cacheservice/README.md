@@ -1619,6 +1619,25 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     never fit in the budget is refused with **413** before it is decoded
     (`TestOTLPAmplifiedBodyRefused`).
 
+- **Nesting is bounded.** A protobuf body that nests messages more than 64
+  levels deep (`otlpMaxDepth`, the request being level 0) is refused with
+  **400** before it is walked or decoded: the estimate and `proto.Unmarshal`
+  both recurse once per level, and the stack that takes is not in the decode
+  budget. It was 10,000, which a body of 40 KB reached: the walk and the
+  decode took a few MiB of stack (measured: 2 to 4 MiB for the walk, 4 to 8
+  MiB with the decode). OTLP's own messages nest 8 levels down to an
+  `AnyValue`, the first one (`TestOTLPFixedNestingDepth`), and an `AnyValue`
+  nested through arrays adds 2 levels each, so 64 leaves 28 arrays below the
+  deepest attribute. At 64 levels the walk takes 16 to 32 KiB of stack and the
+  decode 32 to 64 KiB (the stack is a power of two, so these are the sizes it
+  grows to), against the 16 KiB each request reserves. The e2e's
+  `otlp-sizes` scenario logs how deep the real engines' requests nest
+  (`nestingDepth` in the `otlp request accepted` record) and fails if the
+  deepest is over half of 64 (`server.MaxOTLPNesting`)
+  ([zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86),
+  `TestOTLPDeeplyNestedBodyRefused`, `TestOTLPBodyAtMaxDepthTaken`). One gap: a JSON body is not
+  walked, so its nesting is not bounded (`TestOTLPDeeplyNestedJSONBodyTakenKnownGap`).
+
   Since the decoded message counts too, the route limits are not the only
   bound on a body: one that decodes to more than the budget can hold is
   refused whatever its size. The e2e's requests estimated at up to 5.6 times
