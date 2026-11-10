@@ -240,9 +240,10 @@ type Result struct {
 	Busy    []protocol.SkippedRoot `json:"busy,omitempty"`
 	Refused []protocol.SkippedRoot `json:"refused,omitempty"`
 	// Paused are the roots the engine refused because it has given up its
-	// remote-cache work until its next session (EnginePausedMessage). They
-	// say nothing of the roots' values: they are exported again once the
-	// engine opens a new idle period, or connects again.
+	// remote-cache work until its next session (EnginePausedMessage), or
+	// whose export or upload it cut off when it did. They say nothing of
+	// the roots' values: they are exported again once the engine opens a
+	// new idle period, or connects again.
 	Paused []uint64 `json:"paused,omitempty"`
 	// Failed roots were exported, but could not be stored: their blobs kept
 	// failing to upload, the store failed, or a root alone was too large
@@ -606,7 +607,15 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	if err != nil {
 		return res, nil, retryUpload, err
 	}
+	// An engine that gives up its remote-cache work during an upload still
+	// answers it: the blobs that arrived done, the others failed with that
+	// error.
+	paused := false
 	for _, f := range uploaded.Failed {
+		if strings.Contains(f.Message, EnginePausedMessage) {
+			paused = true
+			continue
+		}
 		x.log.Warn("export: blob upload failed", "digest", f.Digest, "error", f.Message)
 	}
 	done, err := x.promote(ctx, eng, stage, blobs, urls, uploaded.Done, &res)
@@ -618,6 +627,14 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		if !done[d] {
 			missing++
 		}
+	}
+	if missing > 0 && paused {
+		// No upload's failure: the blobs that arrived are stored, and the
+		// roots wait for the engine, which refuses them until then.
+		x.log.Info("export: the engine gave up its remote-cache work during the upload", "cacheID", eng.CacheID(),
+			"roots", len(survivors), "blobs", len(urls), "missing", missing)
+		res.Paused = append(res.Paused, survivors...)
+		return res, nil, retryUpload, nil
 	}
 	if missing > 0 {
 		return res, survivors, retryUpload, nil

@@ -91,12 +91,20 @@ func (c *engineConn) serveOpen(ctx context.Context, env protocol.Envelope) {
 		_ = c.replyError(ctx, env, err.Error())
 		return
 	}
-	if c.period.open(req.Period) {
-		if p := c.svc.export; p != nil && c.ns.tracker != nil && !c.revoked.Load() {
-			c.ns.tracker.Opened(c.hello.CacheID, c.hello.Generation, p.now())
-		}
-	}
+	c.openPeriod(req.Period)
 	_ = c.reply(ctx, env, protocol.TypeOpened, protocol.Opened{})
+}
+
+// openPeriod records that the engine opened period, and, if it is later
+// than the connection's, makes the roots that wait for the engine due: the
+// engine takes exports again.
+func (c *engineConn) openPeriod(period uint64) {
+	if !c.period.open(period) {
+		return
+	}
+	if p := c.svc.export; p != nil && c.ns.tracker != nil && !c.revoked.Load() {
+		c.ns.tracker.Opened(c.hello.CacheID, c.hello.Generation, p.now())
+	}
 }
 
 // serveClaims answers claims.
@@ -175,8 +183,11 @@ func (c *engineConn) serveSettle(ctx context.Context, env protocol.Envelope) {
 func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle) error {
 	period, _ := c.period.current()
 	if req.Period > period {
-		// The engine opens a period before it settles it; taken as said.
-		c.period.open(req.Period)
+		// The engine opens a period before it settles it. One whose open
+		// didn't come is opened here, as that open would have: the roots
+		// the engine refused while paused would otherwise hold this settle
+		// back past the engine's bound.
+		c.openPeriod(req.Period)
 	} else if req.Period < period {
 		return errStaleSettle
 	}

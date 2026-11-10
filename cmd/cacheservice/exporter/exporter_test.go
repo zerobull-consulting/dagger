@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,6 +52,9 @@ type fakeEngine struct {
 	// onUpload, when set, runs when an upload that asks for blobs arrives,
 	// before the engine answers it.
 	onUpload func()
+	// cutUploads, when set, fails every blob but the first of each upload
+	// with it, unsent, as an upload the engine cut off does.
+	cutUploads string
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -110,7 +114,7 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 			e.inFlight--
 		}
 		e.uploads = append(e.uploads, req.URLs)
-		onUpload := e.onUpload
+		onUpload, cut := e.onUpload, e.cutUploads
 		e.mu.Unlock()
 		if onUpload != nil && len(req.URLs) > 0 {
 			onUpload()
@@ -119,7 +123,12 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 			return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: "no export " + req.ExportID})
 		}
 		reply := protocol.Uploaded{Done: []digest.Digest{}}
-		for d, url := range req.URLs {
+		for i, d := range slices.Sorted(maps.Keys(req.URLs)) {
+			url := req.URLs[d]
+			if cut != "" && i > 0 {
+				reply.Failed = append(reply.Failed, protocol.UploadFailure{Digest: d, Message: cut})
+				continue
+			}
 			e.mu.Lock()
 			skip := e.noPut[d]
 			e.mu.Unlock()
@@ -1011,6 +1020,38 @@ func TestExportPausedRoots(t *testing.T) {
 		t.Fatalf("an export the engine canceled as paused failed: %v", err)
 	}
 	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// An engine that gives up its remote-cache work during an upload answers it,
+// with the blobs it never sent failed by that error: the roots are paused at
+// once, with no further try, and the blob that arrived is stored.
+func TestExportPausedDuringUpload(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.cutUploads = "context canceled: " + EnginePausedMessage
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if len(e.eng.uploads) != 1 || len(e.eng.uploads[0]) < 2 {
+		t.Fatalf("want one upload of several blobs, got %v", e.eng.uploads)
+	}
+	if len(res.Uploaded) != 1 {
+		t.Fatalf("want the blob that arrived stored, got %v", res.Uploaded)
+	}
+
+	// The next export asks only for the blobs still missing.
+	e.eng.cutUploads = ""
+	res, err = e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Present) != 1 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 }

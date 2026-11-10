@@ -241,7 +241,9 @@ good: they are *paused* (`exporter.Result.Paused`), count no failure, and
 are due again when the engine sends `open`, or connects again, or after a
 minute (`exporter.DefaultPausedWait`). **So an export has about 20s after
 the last session's end to finish**; one that takes longer, such as a large
-upload on a slow link, is cut, and goes on in the engine's next session.
+upload on a slow link, is cut, and goes on in the engine's next session:
+its roots are paused too, and the blobs that arrived stay stored, so the
+next export uploads only the rest.
 Sessions that overlap keep the engine from asking to settle at all.
 
 **The engine downloads what it is offered at once.** An offered part's

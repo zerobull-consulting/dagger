@@ -174,6 +174,36 @@ func TestPausedRootsExportedAfterOpen(t *testing.T) {
 	}
 }
 
+// A settle for a period whose open didn't come opens it, as the open would
+// have: the roots the engine refused while paused are due at once, and
+// don't hold the settle back for their wait.
+func TestSettleOpensItsPeriod(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	paused := fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Refused: exporter.EnginePausedMessage}
+	h.cache.Add(paused)
+	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
+	waitUntil(t, 10*time.Second, "the root to wait after the engine refused it as paused", func() bool {
+		entries := h.ns().tracker.Entries(h.cache.ID)
+		return len(entries) == 1 && entries[0].RetryAt != "" && !entries[0].InFlight
+	})
+	paused.Refused = ""
+	h.cache.Add(paused)
+	current, _ := h.engine.period.current()
+	done := make(chan error, 1)
+	go func() { done <- h.svc.settle(t.Context(), h.engine, protocol.Settle{Period: current + 1}) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the settle waited for the paused root's own wait")
+	}
+	if !indexHas(t, h, 10) {
+		t.Fatal("the service settled before the paused root was stored")
+	}
+}
+
 // open, claims and lookup are answered, each with its reply: every miss of
 // a lookup unknown, since the service looks nothing up.
 func TestEngineRequestsAnswered(t *testing.T) {
