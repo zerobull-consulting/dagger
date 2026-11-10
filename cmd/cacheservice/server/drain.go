@@ -454,10 +454,14 @@ func (s *Service) explicitRunning() int {
 // outcome: canceled when ctx was canceled, or the export path stopped;
 // deadline when ctx's deadline passed, or now is past deadline.
 func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bool) {
+	// Read once: a deadline that passes between two reads would be seen
+	// as no deadline by the first and as an end by the second, and taken
+	// for a cancellation.
+	err := ctx.Err()
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
 		return metrics.DrainDeadline, true
-	case ctx.Err() != nil, paths.Err() != nil:
+	case err != nil, paths.Err() != nil:
 		return metrics.DrainCanceled, true
 	case !deadline.IsZero() && !now.Before(deadline):
 		return metrics.DrainDeadline, true
@@ -470,10 +474,12 @@ func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bo
 // canceled, and deadline when now is past deadline. Unlike drainEnded, it
 // doesn't look at the export path.
 func ctxEnded(ctx context.Context, now, deadline time.Time) (string, bool) {
+	// Read once, as in drainEnded.
+	err := ctx.Err()
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
 		return metrics.DrainDeadline, true
-	case ctx.Err() != nil:
+	case err != nil:
 		return metrics.DrainCanceled, true
 	case !deadline.IsZero() && !now.Before(deadline):
 		return metrics.DrainDeadline, true

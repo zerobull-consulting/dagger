@@ -1183,3 +1183,40 @@ func TestDrainPausedEngine(t *testing.T) {
 		})
 	}
 }
+
+// expiringCtx is a context whose deadline passes between two reads of its
+// error: the first read finds none, every later one the deadline's.
+type expiringCtx struct {
+	context.Context
+	reads int
+}
+
+func (c *expiringCtx) Err() error {
+	c.reads++
+	if c.reads == 1 {
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+// A drain's deadline that passes while its end is being decided is still
+// its deadline, not a cancellation: the drain polls every 100ms, so with a
+// timeout of whole tenths of a second a pass begins as the deadline passes
+// (seen as outcome=canceled in TestMinIOBinaryLingerStoresNothing).
+func TestDrainEndReadsItsContextOnce(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background()}, context.Background(), now, later); ok {
+		t.Fatalf("drainEnded: %q for a context that hadn't ended when read", outcome)
+	}
+	if outcome, ok := ctxEnded(&expiringCtx{Context: context.Background()}, now, later); ok {
+		t.Fatalf("ctxEnded: %q for a context that hadn't ended when read", outcome)
+	}
+	// The next pass, or the drain's own clock, then says deadline.
+	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background(), reads: 1}, context.Background(), now, later); !ok || outcome != metrics.DrainDeadline {
+		t.Fatalf("drainEnded: %q, %v after the deadline; want deadline", outcome, ok)
+	}
+	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background()}, context.Background(), later, later); !ok || outcome != metrics.DrainDeadline {
+		t.Fatalf("drainEnded: %q, %v at the deadline on the drain's clock; want deadline", outcome, ok)
+	}
+}
