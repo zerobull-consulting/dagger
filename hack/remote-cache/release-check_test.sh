@@ -801,6 +801,19 @@ run accept v1.0.0-beta.26 "$d2" https://github.com/o/r/actions/runs/5001
 check "no bot token: accept fails" test "$status" -ne 0
 check "no bot token: and says the token is missing" has "$tmp/out" "BOT_TOKEN is not set"
 
+echo "--- remote-cache-tests.yml's checkouts (zerobull-consulting/dagger#165, lead 2)"
+# B's verifying run executes remote-cache-tests.yml as the rebuild branch has
+# it, after upstream's tag was merged in: no checkout there may leave the
+# job's token in .git/config.
+tests_yml="$here/../../.github/workflows/remote-cache-tests.yml"
+checkouts_without_persist_off() {
+	awk '/uses: actions\/checkout@/ { n++; want = 1; next }
+		want && /persist-credentials: false/ { want = 0; ok++ }
+		want && /^      - name:/ { want = 0 }
+		END { if (n == 0 || n != ok) { print n+0 " checkouts, " ok+0 " with persist-credentials: false"; exit 1 } }' "$tests_yml"
+}
+check "every checkout in remote-cache-tests.yml has persist-credentials: false" checkouts_without_persist_off
+
 echo
 if ((failures > 0)); then
 	echo "$failures failed"
