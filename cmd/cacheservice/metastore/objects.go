@@ -46,9 +46,10 @@ var (
 	// ErrNotFound is an object that doesn't exist.
 	ErrNotFound = errors.New("object not found")
 	// ErrDenied is a request the store refused the key: a 403, or an
-	// AccessDenied code (s3util.Denied). The store's own error is kept
-	// alongside it.
-	ErrDenied = errors.New("access denied")
+	// AccessDenied code (s3util.Denied). A 403 isn't always about
+	// permissions, so its text says only that; the store's own error,
+	// kept alongside it, says why.
+	ErrDenied = errors.New("refused (403)")
 	// ErrPreconditionFailed is a conditional write that lost: the object
 	// exists (IfNoneMatch), or has changed (IfMatch).
 	ErrPreconditionFailed = errors.New("precondition failed")

@@ -137,8 +137,9 @@ func TestS3ObjectsErrors(t *testing.T) {
 	f.getErr["failing"] = s3Err{http.StatusBadRequest, "InvalidRequest"}
 	for key, code := range map[string]string{"denied": "AccessDenied", "archived": "InvalidObjectState"} {
 		_, _, err := o.Get(ctx, key)
-		if !errors.Is(err, ErrDenied) || s3util.ErrorCode(err) != code || !strings.Contains(err.Error(), key) {
-			t.Fatalf("403 %s: %v, want ErrDenied wrapping %s", key, err, code)
+		if !errors.Is(err, ErrDenied) || s3util.ErrorCode(err) != code || !strings.HasPrefix(err.Error(), "get "+key+": refused (403): ") ||
+			!strings.Contains(err.Error(), code) || strings.Contains(err.Error(), "access denied") {
+			t.Fatalf("403 %s: %v, want ErrDenied wrapping %s, saying only that the store refused it", key, err, code)
 		}
 	}
 	if _, _, err := o.Get(ctx, "failing"); err == nil || errors.Is(err, ErrDenied) || errors.Is(err, ErrNotFound) || s3util.ErrorCode(err) != "InvalidRequest" {

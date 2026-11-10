@@ -121,14 +121,9 @@ func (t timedObjects) ListUploadKeys(ctx context.Context, prefix string, max int
 	return t.Store.ListUploadKeys(ctx, prefix, max)
 }
 
-// denied reports an error of a key that isn't allowed the request.
-func denied(err error) bool {
-	return s3util.Denied(err)
-}
-
 // explainRead is an error reading the configuration, with what to do.
 func explainRead(err error) error {
-	if denied(err) {
+	if s3util.Denied(err) {
 		return fmt.Errorf("can't read the bucket's lifecycle configuration: the key isn't allowed to (%w). "+
 			"Use a key with s3:GetLifecycleConfiguration; apply needs the admin key, which also reads it", err)
 	}
@@ -138,7 +133,7 @@ func explainRead(err error) error {
 // explainWrite is an error writing the configuration, with what to do.
 func explainWrite(err error, abortRule bool) error {
 	switch {
-	case denied(err):
+	case s3util.Denied(err):
 		return fmt.Errorf("the store refused to set the lifecycle configuration (%w). "+
 			"Setting it takes the admin key (on DigitalOcean Spaces, a full-access key): a Read or Read/Write/Delete key gets 403. "+
 			"Run apply with it, interactively; never put it in the service's or a job's secrets", err)
