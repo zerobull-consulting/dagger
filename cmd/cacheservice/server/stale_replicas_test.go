@@ -275,12 +275,10 @@ func TestEngineWaitWokenByConnectionFoundAfterwards(t *testing.T) {
 	}{
 		{"requeue", func(h *exportHarness, b exporter.Batch) { h.svc.requeueForEngine(h.ns(), b) }},
 		{"interrupted export", func(h *exportHarness, b exporter.Batch) {
-			// The engine's connection dropped mid-export: the context
-			// of the export ended.
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			eng := h.svc.engineFor(h.ns(), "cache-a")
-			if out := h.svc.recordExport(ctx, eng, b, exporter.Result{}, errors.New("cut short")); out != metrics.ExportInterrupted {
+			// The engine's connection dropped mid-export: it is no longer
+			// one of the service's, and the restarted engine is.
+			dropped := &engineConn{id: 1 << 40, ns: h.ns(), logger: h.svc.logger}
+			if out := h.svc.recordExport(context.Background(), dropped, b, exporter.Result{}, errors.New("cut short")); out != metrics.ExportInterrupted {
 				t.Fatalf("outcome %q, want interrupted", out)
 			}
 		}},

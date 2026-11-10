@@ -285,7 +285,12 @@ func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
 		tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
-		s.wakeIfEngineConnected(eng.ns, b)
+		if !s.connected(eng) {
+			// Its connection was lost: another may be there already. An
+			// export cut short with its engine still connected (its
+			// request ended) waits out its time as before.
+			s.wakeIfEngineConnected(eng.ns, b)
+		}
 		return metrics.ExportInterrupted
 	}
 	outcome := metrics.OutcomeOK
