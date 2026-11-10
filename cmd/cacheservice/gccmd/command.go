@@ -167,6 +167,11 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 		return fail(ExitUsage, "%v", err)
 	}
 	c := fl.Collector()
+	// Before the stores are opened: a setting the collector refuses is a bad
+	// flag (2) whatever else fails first. gc.New checks the same rule.
+	if err := c.ValidateSettings(); err != nil {
+		return fail(ExitUsage, "%v: -gc-grace, -gc-staging-age and -gc-max-deletes must not be negative", err)
+	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 	if !confirmed {
@@ -191,8 +196,6 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, open Ope
 	c.Limits = limits.For
 	c.Logger = logger.With("component", "gc")
 	c.DryRun = !confirmed
-	// Settings gc.New refuses (a negative -gc-grace, say) are bad flags: it
-	// makes no request, and nothing has been read.
 	collector, err := gc.New(c)
 	if err != nil {
 		return fail(ExitUsage, "%v", err)

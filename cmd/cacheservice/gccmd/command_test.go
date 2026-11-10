@@ -809,3 +809,25 @@ func TestCanceledRunExits1AndSkipIsVisible(t *testing.T) {
 		t.Fatalf("stderr should say the run was interrupted:\n%s", errOut)
 	}
 }
+
+// A bad setting is a usage error (2) even when opening the stores would fail
+// first (here: no region, and an opener that fails): the check comes before
+// open, and makes no request.
+func TestNegativeSettingExits2WhenOpeningWouldFail(t *testing.T) {
+	setEnv(t)
+	t.Setenv(blobstore.EnvRegion, "")
+	calls := 0
+	failing := func(context.Context, blobstore.S3Config) (Stores, error) {
+		calls++
+		return Stores{}, errors.New("no region")
+	}
+	for _, arg := range []string{"-gc-grace=-1s", "-gc-staging-age=-1s", "-gc-max-deletes=-1"} {
+		code, out, errOut := runAsIs(t, failing, arg)
+		if code != ExitUsage || out != "" || !strings.Contains(errOut, "negative") {
+			t.Errorf("%s: exit %d, stdout %q, stderr %q", arg, code, out, errOut)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("the stores were opened %d times", calls)
+	}
+}
