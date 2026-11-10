@@ -2038,10 +2038,11 @@ A request with another namespace's token, or none, can't change what the
 importer or tracker knows of an engine (`TestForgedTelemetryIgnored`). Within
 a namespace, tokens trust each other further: a connection may say `hello`
 with another engine's cache ID, and then takes over its exports and its
-engine events. That is a known gap
+engine events. That is by design: the namespace is the trust boundary, and a
+cache ID isn't bound to a token within it
 ([#51](https://github.com/zerobull-consulting/dagger/issues/51),
-`TestKnownGapSameNamespaceTokenClaimsCacheID`); give engines you don't trust
-with each other different namespaces.
+`TestSameNamespaceTokenClaimsCacheID`). Give engines you don't trust with
+each other different namespaces.
 
 ### Reloading and revocation
 
