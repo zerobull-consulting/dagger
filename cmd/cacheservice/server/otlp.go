@@ -92,7 +92,8 @@ func (s *Service) otlpRoutes(mux *http.ServeMux) {
 // A request refused before its body is read (401) still has net/http read up
 // to 256 KiB of it after the handler, and discard it, to reuse the
 // connection; otlpAdmit cuts the deadline to otlpRefusalDrain for it, which
-// bounds how long a client can hold the request that way. The server clears the deadline before reading the next request.
+// bounds how long a client can hold the request that way. The server clears
+// the deadline before reading the next request.
 func (s *Service) otlpDeadline(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.otlp.readTimeout)); err != nil {
@@ -104,10 +105,9 @@ func (s *Service) otlpDeadline(h http.HandlerFunc) http.HandlerFunc {
 
 // otlpAdmit reserves what an OTLP request holds before its body is read, the
 // request itself and its parsed headers (otlpRequestReserve and
-// otlpHeaderReserve), and then checks its token (otlpAuth): a request refused
-// for its token holds its headers while the handler runs, and net/http after
-// it while it drains the unread body, so they count against the budget like
-// any other request's (zerobull-consulting/dagger#219). Headers over
+// otlpHeaderReserve), and then checks its token (otlpAuth), so a request
+// refused for its token counts against the budget while its handler runs,
+// like any other request (zerobull-consulting/dagger#219). Headers over
 // MaxOTLPHeaderReserve are answered 431, and a full budget 503, as decodeOTLP
 // answers them, before the token is checked. A request refused for its token
 // gives its reservation back, and its connection's read deadline is cut to
@@ -116,6 +116,10 @@ func (s *Service) otlpDeadline(h http.HandlerFunc) http.HandlerFunc {
 // most that long rather than the read timeout. With ok true, held is what was
 // reserved, which decodeOTLP takes over.
 func (s *Service) otlpAdmit(w http.ResponseWriter, r *http.Request, route otlpRoute) (ns *namespace, key tokenKey, held int64, ok bool) {
+	// No Connection: close on a 401, unlike refuseOTLP: an engine whose
+	// token was removed keeps retrying, and a small body it sent whole is
+	// drained at once, so its connection can be reused. A stalled body is
+	// still cut off at otlpRefusalDrain.
 	refuse := func(err error) (*namespace, tokenKey, int64, bool) {
 		status, reason := otlpRefusal(err)
 		s.refuseOTLP(w, r, route, status, reason, err)
@@ -216,6 +220,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	// release: the request itself (its goroutine and the server's buffers)
 	// and its headers (otlpAdmit, before the token was checked), a gzipped
 	// body's decompressor, the body's buffer, and the decoded message.
+	headers := held - otlpRequestReserve
 	release = func() { lim.budget.release(held) }
 	refuse := func(err error) (func(), bool) {
 		release()
@@ -278,7 +283,7 @@ func (s *Service) decodeOTLP(w http.ResponseWriter, r *http.Request, route otlpR
 	}
 	s.metrics.OTLPAccepted(route.name, received.n, int64(len(data)))
 	s.logger.Debug("otlp request accepted", "route", route.name, "receivedBytes", received.n,
-		"decodedBytes", len(data), "messageBytes", estimate, "nestingDepth", nesting, "headerBytes", otlpHeaderReserve(r), "budgetPeak", lim.budget.peakUse())
+		"decodedBytes", len(data), "messageBytes", estimate, "nestingDepth", nesting, "headerBytes", headers, "budgetPeak", lim.budget.peakUse())
 	return release, true
 }
 

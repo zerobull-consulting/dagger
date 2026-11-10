@@ -1626,7 +1626,9 @@ net/http holds with it, by trickling or stalling the body after a 401
     a missing or unknown token holds them in the budget too while its handler
     runs, and is answered 431 or 503 as above, before the check, when they
     don't fit; it gives them back on the 401, and its drain is cut to 1s
-    like any refusal's. 200 such requests with 24 KiB headers and a stalled
+    like any refusal's. That drain comes after the handler, once the
+    reservation is given back: for up to 1s, a refused request's headers
+    are held outside the budget. 200 such requests with 24 KiB headers and a stalled
     body held 9.6 MB of heap for the whole 30s, with nothing reserved; now
     0.3 MB is left 3s after they are sent
     ([zerobull-consulting/dagger#219](https://github.com/zerobull-consulting/dagger/issues/219),

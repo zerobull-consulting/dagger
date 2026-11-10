@@ -246,8 +246,8 @@ const (
 // r.Header into r.Trailer (68 KB of them took 1.5 MB). A request over
 // MaxHeaderBytes never gets here, but the reserve is not bounded by it: 68 KB
 // of 5-byte headers is 14,000 values, or 9,000 keys, and reserves up to about
-// 1.4 MB, which is also about what they hold. decodeOTLP refuses a request
-// whose reserve is over MaxOTLPHeaderReserve.
+// 1.4 MB, which is also about what they hold. otlpAdmit refuses a request
+// whose reserve is over MaxOTLPHeaderReserve, before its token is checked.
 func otlpHeaderReserve(r *http.Request) int64 {
 	n := int64(len(r.Host) + 2*len(r.RequestURI))
 	for k := range r.Trailer {
