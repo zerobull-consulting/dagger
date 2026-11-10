@@ -929,3 +929,66 @@ func TestTrackerStartDrainOnce(t *testing.T) {
 		t.Fatalf("a second StartDrain cut the retry's backoff short: %v", got)
 	}
 }
+
+// A root its engine refused because it has given up its remote-cache work
+// (Result.Paused) is neither refused for good nor failed: it waits for the
+// engine, and its next open makes it due; without one, PausedWait does.
+func TestTrackerPausedRootsWaitForOpen(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Observe(state(2, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Paused: []uint64{1, 2}}, t0)
+	for _, e := range tr.EntriesAt("c", t0) {
+		if e.Refused != "" || e.Failures != 0 || e.Stored || e.RetryAt == "" {
+			t.Fatalf("a paused root is settled as %+v, want only waiting", e)
+		}
+	}
+	if got := roots(tr.Due(t0.Add(DefaultPausedWait - time.Second))); len(got) != 0 {
+		t.Fatalf("paused roots exported before the engine opened: %v", got)
+	}
+	// An older generation's open isn't the engine they wait for.
+	tr.Opened("c", 0, t0.Add(time.Second))
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("paused roots exported on an older generation's open: %v", got)
+	}
+	tr.Opened("c", 1, t0.Add(2*time.Second))
+	due := tr.Due(t0.Add(2 * time.Second))
+	if got := roots(due); !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("due after the open: %v, want [1 2]", got)
+	}
+	// Refused again, with no open after: due once PausedWait passed.
+	at := t0.Add(2 * time.Second)
+	tr.Done(due[0], Result{Paused: []uint64{1, 2}}, at)
+	if got := roots(tr.Due(at.Add(DefaultPausedWait - time.Second))); len(got) != 0 {
+		t.Fatalf("paused roots exported before PausedWait: %v", got)
+	}
+	if got := roots(tr.Due(at.Add(DefaultPausedWait))); !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("due after PausedWait: %v, want [1 2]", got)
+	}
+}
+
+// UnseenSessions counts the sessions the tracker saw nothing of: not those
+// it tracks, nor those it stopped tracking lately.
+func TestTrackerUnseenSessions(t *testing.T) {
+	tr := newTestTracker()
+	if got := tr.UnseenSessions("c", []string{"s1", "s2"}); got != 2 {
+		t.Fatalf("an unknown cache: %d unseen, want 2", got)
+	}
+	tr.Observe(state(1, 10, fsPart), t0)
+	if got := tr.UnseenSessions("c", []string{"s1", "s2"}); got != 1 {
+		t.Fatalf("with a span of s1: %d unseen, want 1", got)
+	}
+	// s1 ends with its span in, and is no longer tracked; s2 only ever
+	// sends its carrier.
+	tr.SessionEnded("c", 1, "s1", 1, t0)
+	tr.SessionEnded("c", 1, "s2", 0, t0)
+	if got := tr.UnseenSessions("c", []string{"s1", "s2", "s3"}); got != 1 {
+		t.Fatalf("after s1 and s2 ended: %d unseen, want only s3", got)
+	}
+	// Forgotten once seenSessionRetention passed.
+	tr.Due(t0.Add(seenSessionRetention))
+	if got := tr.UnseenSessions("c", []string{"s1", "s2"}); got != 2 {
+		t.Fatalf("after the retention: %d unseen, want 2", got)
+	}
+}

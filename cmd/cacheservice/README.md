@@ -47,6 +47,9 @@ On the engine WebSocket, the service:
 - answers WebSocket pings (the library does this; `-v` logs each one).
 - answers `renew` with fresh presigned GETs when the import path is on and
   every layer is stored, and with `{"unavailable": true}` otherwise.
+- answers `open`, `claims`, `settle` and `lookup`, which engines send since
+  `v1.0.0-beta.26` (see
+  [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)).
 - answers any other request from the engine with an `error` reply.
 - logs every envelope in both directions: direction, type, `id`, `re`, message
   size, body size, and a short summary for the known body types.
@@ -167,6 +170,89 @@ reports `dev`. A build
 stamped as another release than the manifest's `base` refuses to start.
 The revision is the image's `REVISION`, else the build's VCS revision, else
 `dev`.
+
+## Engines from v1.0.0-beta.26
+
+`v1.0.0-beta.26` changed the engine's side of the remote cache, and a
+service built on `v1.0.0-beta.25` stored nothing from such an engine
+([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)).
+This is what the service does about each change. It serves engines of that
+bundle version only: a `v1.0.0-beta.25` engine is no longer accepted.
+
+**Bundles are version 7** (`metastore.BundleVersion`). A version 7 bundle
+can lean on what its recipient holds, or on its own other outputs. A stored
+bundle is merged whole into any engine, so the service stores neither
+(`metastore.ValidateBundle`):
+
+- **Held rows.** Once the service merged a bundle into an engine, the
+  engine sends the rows that merge landed on with no record, as *held
+  rows*, in its later exports over that connection: it expects the service
+  to hold them. Another engine holds no such row, and would refuse the
+  whole merge as stale. So the exporter releases an export with held rows,
+  with an `upload` that doesn't say `merged`, which makes the engine forget
+  that the service holds them, and asks for the same roots again at once:
+  that bundle carries them in full. A held row stands for everything below
+  it in an export that selects no parts, so such an export takes one try
+  per level of merged rows under its roots (at most 256); a try is one
+  round trip and uploads nothing. The rows the engine imported still keep
+  their stored entries' numbers (see [Imported entries](#imported-entries)),
+  so nothing is stored twice. The service never says `merged`: it records a
+  bundle only after its blobs are uploaded.
+- **Chain prefixes.** An output whose layers are the first of another
+  output's chain names that chain instead of listing them. The exporter
+  gives each output its own chain (`dagql.ResolveChainPrefixes`) before it
+  stores the bundle.
+- **Computed layers.** Each layer says whether that export computed its
+  blob or found it, which differs between a layer's first export and every
+  later one. It is cleared before the bundle is stored, like the other
+  fields that would make the same values a different bundle (see
+  [Export path](#export-path)).
+
+A merge lists its chains' layers, and each blob's address, once on the wire
+(`protocol.Merge`'s encoding), so the bound on a merge's size
+(`importer.MergeSize`) starts from that form.
+
+**A store written for earlier engines** keeps its version 3 bundles. They
+aren't merged into a `v1.0.0-beta.26` engine: each fails to build a merge
+(`unsupported bundle version 3`), is logged, and is given up on after
+`MergeAttempts` tries per connection. Their entries stay until they expire
+or pass the namespace's max age, and GC then deletes them as any other; a
+value exported again gets a version 7 record. To drop them at once, empty
+the prefix (`cacheservice wipe`) or use a new one.
+
+**The engine's own requests.** Besides `renew`, the engine now sends:
+
+| Engine sends | Service answers | What the service does |
+| --- | --- | --- |
+| `open` | `opened` | A session started on an engine with none live, which begins a new idle period. The roots the engine refused while it had given up (below) are due at once. |
+| `claims` | `claimed` | Nothing: the Dagger Cloud claim of each session, which this service has no use for. |
+| `settle` | `settled`, or the error `stale settle` | No session is live, and the engine asks the service to finish what it wants of it. The service answers once it has nothing left to export for the engine's cache: no root dirty, in flight or waiting for another try, and no session whose spans may still come. A listed session whose engine sent its completion marker, and of which no span reached the service yet, is waited for up to 5s (`DefaultSettleMarkerWait`): spans reach the service through the session's client, so the settle can come first. A settle for a period that is no longer the connection's is stale, and one not settled within 2m (`MaxSettleWait`, far past the engine's own 20s) gets an error. With the export path off, it answers at once. |
+| `lookup` | `lookedUp`, every miss `unknown` | Nothing: the calls the engine's cache missed. This service keeps no index of its values by call, and merges every stored root into every engine anyway (see [Import path](#import-path)), so it looks nothing up and sends no merge for a lookup. |
+
+**An engine that isn't answered gives up.** 20s after its last session
+ended, an engine whose `settle` got no `settled`, or that still has an
+export in progress, gives up its remote-cache work: it cancels its exports
+in progress and refuses every root of a new one, until a session starts
+again. That is why an unanswered `settle` stored nothing. The service
+doesn't settle such roots as refused, which would end their exports for
+good: they are *paused* (`exporter.Result.Paused`), count no failure, and
+are due again when the engine sends `open`, or connects again, or after a
+minute (`exporter.DefaultPausedWait`). **So an export has about 20s after
+the last session's end to finish**; one that takes longer, such as a large
+upload on a slow link, is cut, and goes on in the engine's next session.
+Sessions that overlap keep the engine from asking to settle at all.
+
+**The engine downloads what it is offered at once.** An offered part's
+blobs are fetched when the merge offers it, ahead of any read, so the blob
+GETs follow each merge within milliseconds, and `renew` is rare: it takes a
+download that failed, and a read after the GET expired.
+
+**A stopping engine waits for its exports.** On SIGTERM the engine lets
+its exports in progress finish, for up to its stop budget (5m by default)
+less 30s, before it closes its connection. Give its container a stop
+timeout that covers that: an engine killed while it waits (docker's default
+is 10s) comes back with a new, empty cache, and the export is lost with
+the old one.
 
 ## Code layout
 
@@ -898,7 +984,10 @@ records into it. Each scope (a team, a tenant) has:
   is written once (`If-None-Match: *`) and never changes. Storing it again
   writes nothing. Reading it checks its content against the ID. Only bundles
   of the version the engine imports are stored: the service's own
-  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture writes.
+  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture
+  writes, and only bundles that stand on their own, with no held row and a
+  chain for every output (see
+  [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)).
 - **resolutions**, at `<prefix>/ns/<scope>/resolutions/<id>.json`: one per
   export, the service number each of the bundle's values resolved to when
   the export was recorded, which merges of that bundle send (see
@@ -4119,7 +4208,10 @@ This section comes from reading `engine/remotecache`, `cmd/engine` and
   should never show one.
 
 The engine sends nothing else on its own initiative. It does not announce new
-cache entries over the WebSocket.
+cache entries over the WebSocket. Since `v1.0.0-beta.26` it also sends
+`open`, `claims`, `settle` and `lookup` (see
+[Engines from v1.0.0-beta.26](#engines-from-v100-beta26)); this section and
+the live run below are of `v1.0.0-beta.23`.
 
 ### On the WebSocket, what the engine sends only when asked
 

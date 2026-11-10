@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -479,11 +481,11 @@ func (e *testEnv) mergeSize(t *testing.T, roots ...uint64) int {
 		t.Fatal(err)
 	}
 	stripVolatile(capt.Bundle)
-	data, err := json.Marshal(capt.Bundle)
+	size, err := importer.MergeSize(capt.Bundle, e.x.addressSize(context.Background()), "team")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return importer.MergeSize(capt.Bundle, len(data), e.x.addressSize(context.Background()), "team")
+	return size
 }
 
 // manyLayers is a chain of n distinct layers, as a deep image has: its
@@ -907,5 +909,126 @@ func TestExportStaleGenerationAfterEarlyCheck(t *testing.T) {
 	}
 	if after := e.indexBytes(t); !bytes.Equal(after, before) {
 		t.Fatal("index changed by the refused export")
+	}
+}
+
+// Since v1.0.0-beta.26 an engine sends an output whose layers are the first
+// of another output's chain as a prefix of that chain. The stored bundle
+// gives each output its own chain: it is merged whole into other engines,
+// and the blobs it names are read from its chains.
+func TestExportStoresPrefixedOutputsWithTheirChains(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.cache.ChainPrefixes = true
+	e.addBuild()
+	prefixes := 0
+	e.eng.mangle = func(capt *fakeengine.Capture) {
+		for _, o := range capt.Bundle.Outputs {
+			if o.Prefix != nil && o.Chain == nil {
+				prefixes++
+			}
+		}
+	}
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefixes != 1 {
+		t.Fatalf("the engine sent %d prefixed outputs, want the base's", prefixes)
+	}
+	if !slices.Equal(res.Stored, []uint64{11}) || len(res.Bundles) != 1 || len(res.Uploaded) != 2 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	b, err := e.meta.GetBundle(ctx, "team", res.Bundles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := map[int]int{}
+	for _, o := range b.Outputs {
+		if o.Prefix != nil || o.Chain == nil {
+			t.Fatalf("stored output %d: prefix %v, chain %v", o.Ordinal, o.Prefix, o.Chain)
+		}
+		layers[len(o.Chain.Layers)]++
+	}
+	if len(b.Outputs) != 2 || layers[1] != 1 || layers[2] != 1 {
+		t.Fatalf("stored chains by length: %v, want one of the base's layer and one of both", layers)
+	}
+}
+
+// A layer's first export says the export computed its blob, and every later
+// one doesn't: the same values are the same bundle all the same.
+func TestRepeatedExportComputedLayersSameBundle(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.cache.ComputedLayers = true
+	e.addBuild()
+	ctx := context.Background()
+	req := Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)}
+	computed := 0
+	e.eng.mangle = func(capt *fakeengine.Capture) {
+		for _, o := range capt.Bundle.Outputs {
+			for _, l := range o.Chain.Layers {
+				if l.Computed {
+					computed++
+				}
+			}
+		}
+	}
+	first, err := e.x.Export(ctx, e.eng, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if computed == 0 {
+		t.Fatal("the first export marked no layer computed: the test proves nothing")
+	}
+	second, err := e.x.Export(ctx, e.eng, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Bundles) != 1 || !slices.Equal(first.Bundles, second.Bundles) {
+		t.Fatalf("bundles: %v then %v", first.Bundles, second.Bundles)
+	}
+}
+
+// Roots an engine refuses because it has given up its remote-cache work
+// are paused, not refused: with its skip, and when it cancels an export in
+// progress with that error.
+func TestExportPausedRoots(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.cache.Add(fakeengine.Entry{Number: 20, Refused: EnginePausedMessage})
+	e.cache.Add(fakeengine.Entry{Number: 21, Refused: "no codec"})
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{20, 21}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Paused, []uint64{20}) || len(res.Refused) != 1 || res.Refused[0].Number != 21 || len(res.Failed) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	e.eng.replyErr = "context canceled: " + EnginePausedMessage
+	res, err = e.x.Export(ctx, e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatalf("an export the engine canceled as paused failed: %v", err)
+	}
+	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// EnginePausedMessage is engine/server's errRemoteCacheTimedOut, which that
+// package doesn't export.
+func TestEnginePausedMessageMatchesEngine(t *testing.T) {
+	src, err := os.ReadFile("../../../engine/server/remote_cache.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`errRemoteCacheTimedOut = errors\.New\("([^"]+)"\)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("engine/server/remote_cache.go no longer declares errRemoteCacheTimedOut as errors.New of a literal: " +
+			"find the message of the roots an engine refuses once it has given up its remote-cache work, and update EnginePausedMessage and this test")
+	}
+	if string(m[1]) != EnginePausedMessage {
+		t.Fatalf("the engine refuses roots with %q once it has given up its remote-cache work, and EnginePausedMessage is %q: "+
+			"the service would settle those roots as refused for good", m[1], EnginePausedMessage)
 	}
 }

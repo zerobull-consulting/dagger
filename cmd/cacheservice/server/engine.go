@@ -104,6 +104,12 @@ type Service struct {
 	registry *prometheus.Registry
 	metrics  *metrics.Metrics
 
+	// settleMarkerWait is DefaultSettleMarkerWait, in nanoseconds; tests
+	// change it.
+	settleMarkerWait atomic.Int64
+	// maxSettleWait is MaxSettleWait, in nanoseconds; tests change it.
+	maxSettleWait atomic.Int64
+
 	// otlp bounds the OTLP bodies (otlplimit.go); otlpRefusals rate-limits
 	// the warnings of the requests it refuses, by route and reason.
 	otlp         otlpLimits
@@ -127,7 +133,7 @@ type Service struct {
 func New(logger *slog.Logger, dumpDir string) *Service {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	return &Service{
+	s := &Service{
 		logger:     logger,
 		dumpDir:    dumpDir,
 		conns:      map[uint64]*engineConn{},
@@ -139,6 +145,9 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 		engines:    defaultEnginePolicy(),
 		drain:      drainState{explicitEnded: make(chan struct{}, 1)},
 	}
+	s.settleMarkerWait.Store(int64(DefaultSettleMarkerWait))
+	s.maxSettleWait.Store(int64(MaxSettleWait))
+	return s
 }
 
 // newMetrics are a new service's metrics: its export path is off until
@@ -210,6 +219,9 @@ type engineConn struct {
 	// versionAccepted is set when the hello's version is on an accept line;
 	// it is unset for an engine welcomed by -allow-engine-version-mismatch.
 	versionAccepted bool
+	// period is the engine's idle period: the hello's, then its opens'
+	// (settle.go).
+	period periodState
 	// firstSyncDone is set once the sync loop's first import sync ended
 	// (LogImportFirstSync).
 	firstSyncDone atomic.Bool
@@ -353,6 +365,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// upgrade, before the hello says whether the engine is accepted.
 	c.logger.Info(LogEngineWelcomed, "engineVersion", boundVersion(c.hello.EngineVersion),
 		"versionAccepted", c.versionAccepted)
+	c.period.open(c.hello.Period)
 	// The engine reports in at its generation: a newer one clears the
 	// cache's stale-generation refusals, to be exported from it (#129).
 	if c.ns.tracker != nil {
@@ -424,6 +437,14 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 			}
 			_ = c.reply(ctx, env, protocol.TypeRenewed, c.svc.renew(ctx, c, req))
 		}()
+	case protocol.TypeOpen:
+		go c.serveOpen(ctx, env)
+	case protocol.TypeClaims:
+		go c.serveClaims(ctx, env)
+	case protocol.TypeSettle:
+		go c.serveSettle(ctx, env)
+	case protocol.TypeLookup:
+		go c.serveLookup(ctx, env)
 	default:
 		go func() { _ = c.replyError(ctx, env, fmt.Sprintf("unexpected request %q", env.Type)) }()
 	}
@@ -538,7 +559,28 @@ func summarize(env protocol.Envelope) []any {
 	case protocol.TypeHello:
 		var b protocol.Hello
 		if env.Decode(&b) == nil {
-			return []any{"cacheID", b.CacheID, "generation", b.Generation, "engineVersion", b.EngineVersion, "engineName", b.EngineName}
+			return []any{"cacheID", b.CacheID, "generation", b.Generation, "engineVersion", b.EngineVersion, "engineName", b.EngineName,
+				"period", b.Period, "settled", b.Settled}
+		}
+	case protocol.TypeOpen:
+		var b protocol.Open
+		if env.Decode(&b) == nil {
+			return []any{"period", b.Period}
+		}
+	case protocol.TypeSettle:
+		var b protocol.Settle
+		if env.Decode(&b) == nil {
+			return []any{"period", b.Period, "sessions", len(b.Sessions)}
+		}
+	case protocol.TypeClaims:
+		var b protocol.Claims
+		if env.Decode(&b) == nil {
+			return []any{"sessions", len(b.Sessions)}
+		}
+	case protocol.TypeLookup:
+		var b protocol.Lookup
+		if env.Decode(&b) == nil {
+			return []any{"misses", len(b.Misses)}
 		}
 	case protocol.TypeRenew:
 		var b protocol.Renew
@@ -563,7 +605,7 @@ func summarize(env protocol.Envelope) []any {
 	case protocol.TypeMerged:
 		var b protocol.Merged
 		if env.Decode(&b) == nil {
-			return []any{"generation", b.Generation, "values", len(b.Values), "retained", len(b.Retained), "skipped", len(b.Skipped)}
+			return []any{"generation", b.Generation, "values", len(b.Values), "retained", len(b.Retained), "skipped", len(b.Skipped), "stale", len(b.Stale)}
 		}
 	case protocol.TypeOffered:
 		var b protocol.Offered
