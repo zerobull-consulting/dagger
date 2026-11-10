@@ -201,7 +201,9 @@ key the service writes is in [`layout`](layout/), and the ownership marker
 and its startup check in [`ownership`](ownership/). The one-shot
 `cacheservice lifecycle` subcommand, which sets the bucket's lifecycle rules,
 is [`lifecycle`](lifecycle/) (see
-[The lifecycle command](#the-lifecycle-command)).
+[The lifecycle command](#the-lifecycle-command)), and the one-shot
+`cacheservice gc` subcommand, which runs one garbage collection, is
+[`gccmd`](gccmd/) (see [The gc command](#the-gc-command)).
 
 ## Bucket ownership
 
@@ -2276,7 +2278,7 @@ signals describe one engine's cache, not the stored copy (see
 | `-gc-mode` | The service's schedule | `POST /debug/gc` | Meant for |
 |---|---|---|---|
 | `service` (default) | every `-gc-interval` (1h, jittered by ±25%, so replicas spread out) | runs | a service with no job beside it |
-| `batch` | none | runs, on demand | a bucket that a `cacheservice gc` job collects |
+| `batch` | none | runs, on demand | a bucket that a [`cacheservice gc`](#the-gc-command) job collects |
 | `off` | none | 409, `gc is off: -gc-mode=off, ...` | a bucket nothing collects: it grows without bound, so the startup log warns |
 
 A zero `-gc-interval` is refused at startup (it used to mean "only on `POST
@@ -2733,6 +2735,11 @@ first.
 | `-max-bytes` | 0 | Default max size of what a namespace keeps, such as `500GiB` (0: none) |
 | `-namespaces-file` | none | Per-namespace limits (see [The namespaces file](#the-namespaces-file)) |
 
+`cacheservice gc` takes `-max-age`, `-max-bytes`, `-namespaces-file`,
+`-gc-grace`, `-gc-staging-age` and `-gc-max-deletes` under the same names,
+defaults and rules, from the same code (`gc.RegisterFlags`); see
+[The gc command](#the-gc-command).
+
 The service's credentials also need `s3:ListBucket`,
 `s3:ListBucketMultipartUploads` (without it, GC does nothing:
 `uploads_unlisted`), `s3:DeleteObject` on every key under the prefix, and,
@@ -2767,6 +2774,67 @@ staged uploads itself" on each run, the fallback above, which is safe but
 costs requests; and `lifecycle check` needs the admin key there. A writer
 with such a key also claimed an empty prefix at startup, creating the marker
 with `If-None-Match: *`.
+
+### The gc command
+
+`cacheservice gc` runs one garbage collection over every namespace under the
+prefix, and exits: what collects a bucket whose writers run with
+`-gc-mode=batch`
+([zerobull-consulting/dagger#249](https://github.com/zerobull-consulting/dagger/issues/249)).
+It is a subcommand of the service's binary, so it ships in the image. It
+reads the same `CACHESERVICE_S3_*` settings as the service, with a key that
+can do what GC does (the Read/Write/Delete key, see [The keys](#the-keys)),
+and runs the same collector as `POST /debug/gc`, one pass, with the limits
+and settings its flags give. Scheduling it (a CronJob, a timer, a CI
+schedule) is up to the operator.
+
+```bash
+cacheservice gc                                              # dry run: report only
+cacheservice gc -max-age=720h -max-bytes=500GiB -confirm=dagger-cache/cache   # collect
+cacheservice gc -namespaces-file limits -confirm=dagger-cache/cache
+```
+
+- **A dry run is the default.** Without `-confirm`, it reports what a run
+  would expire and delete, and changes nothing: no object, no index, no
+  upload (`TestDryRunChangesNothing`). Without limits it still runs, and says
+  on stderr that no limits were given, so the report shows only what each
+  entry's own expiry and reachability decide.
+- **A confirmed run collects.** `-confirm=<bucket>/<prefix>` must repeat the
+  bucket and prefix of the settings (the prefix without surrounding slashes);
+  any other value exits 2 before anything is read, so a confirmation for one
+  prefix can't collect another (`TestConfirmMismatchExits2`). It does what
+  `POST /debug/gc` does on the same bucket (`TestConfirmedRunMatchesService`).
+- **A confirmed run needs explicit limits:** `-namespaces-file`, or both
+  `-max-age` and `-max-bytes`. `0` is a limit (none), so `-max-age=0
+  -max-bytes=0` collects with no age or size limit, on purpose. A confirmed
+  run without them exits 2 and names the flag it lacks
+  (`TestConfirmedRunNeedsExplicitLimits`): a job that deletes shouldn't do so
+  under limits nobody chose.
+- **Flags:** `-confirm`, `-max-age`, `-max-bytes`, `-namespaces-file` (read
+  once; there is no SIGHUP), `-gc-grace`, `-gc-staging-age` and
+  `-gc-max-deletes`: the service's, with the same defaults. It has no
+  `-gc-mode` and no `-gc-interval`: `batch` is the service's setting, and a
+  job doesn't look at it. It has no `-gc-dry-run` either: no `-confirm` is its
+  dry run.
+- **Output:** the reports (`[]gc.Report`, the same fields as `POST /debug/gc`'s
+  `reports`) as a JSON array on stdout, and nothing else. Logs and errors go
+  to stderr. A run that did nothing prints `[]`, or the one report that says
+  why. No metrics are served.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | a clean run, or a dry run that ran cleanly |
+  | 1 | a namespace's report has errors, the run failed, the stores couldn't be opened, or a signal ended it; a dry run too |
+  | 2 | bad flags, or a `-confirm` that is wrong or without explicit limits; nothing was read or deleted |
+  | 3 | the run refused to do anything (`gc.ErrNotOwned`): no ownership marker, a marker of another layout, keys of no known shape at the root of the prefix, or the marker or the multipart uploads couldn't be read (so an unreachable store is 3 too). Nothing was changed |
+
+- **SIGTERM or an interrupt** ends the run's context. The collector still
+  finishes the claims it made, within a minute, so none is left in progress
+  for others to wait on until it goes stale
+  (`TestSigtermAfterClaimFinishesClaims`), then the process exits 1 with the
+  report so far. A second signal doesn't end the process or cut the finish
+  off; the process manager's kill is the last resort.
 
 ## Stopping and draining
 
