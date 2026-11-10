@@ -128,6 +128,10 @@
 // namespace and exits, a dry run unless given -confirm=<bucket>/<prefix> and
 // explicit limits; the job that collects a bucket whose writers run with
 // -gc-mode=batch (package gccmd; README.md, "The gc command").
+//
+// `cacheservice provision claim|rules create|read|update|delete` does what
+// lifecycle claim and apply do, as two declarative resources, for
+// Terraform's shell provider (package provision).
 package main
 
 import (
@@ -150,6 +154,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/gccmd"
 	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
+	"github.com/dagger/dagger/cmd/cacheservice/provision"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 	"github.com/dagger/dagger/cmd/cacheservice/wipe"
 )
@@ -167,6 +172,9 @@ var subcommands = map[string]func(ctx context.Context, args []string) int{
 	},
 	"wipe": func(ctx context.Context, args []string) int {
 		return wipe.Main(ctx, args, os.Stdout, os.Stderr, wipe.OpenS3)
+	},
+	"provision": func(ctx context.Context, args []string) int {
+		return provision.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
 	},
 }
 
