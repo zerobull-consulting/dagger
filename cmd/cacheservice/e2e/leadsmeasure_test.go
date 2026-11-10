@@ -1,0 +1,122 @@
+package e2e
+
+import (
+	"testing"
+	"time"
+)
+
+// These test the measurements of the "leads" scenario on records laid out
+// as the service logs them, without Docker.
+
+var leadsT0 = time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+func spanRec(after time.Duration, cache string, n string, call bool, retained bool, repl string, deps string) LogRecord {
+	outcome := ""
+	if call {
+		outcome = "executed"
+	}
+	r := "false"
+	if retained {
+		r = "true"
+	}
+	return LogRecord{Time: leadsT0.Add(after), Msg: "cache span", Attrs: map[string]string{
+		"cache": cache, "result": n, "outcome": outcome, "retained": r, "replacements": repl, "deps": deps,
+	}}
+}
+
+func storedRec(after time.Duration, cacheID, numbers string) LogRecord {
+	return LogRecord{Time: leadsT0.Add(after), Msg: "export stored roots", Attrs: map[string]string{"cacheID": cacheID, "numbers": numbers}}
+}
+
+func TestDepsAfterStoreSeesGrowthAtTheSameCount(t *testing.T) {
+	recs := []LogRecord{
+		spanRec(0, "c1/1", "7", false, false, "1", "1"),
+		spanRec(time.Second, "c1/1", "7", true, true, "1", "2"),
+		storedRec(3*time.Second, "c1", "7,9"),
+		spanRec(5*time.Second, "c1/1", "7", false, true, "1", "3"), // grew after the store
+		spanRec(6*time.Second, "c1/1", "7", false, true, "1", "3"), // not again
+	}
+	stored, growth := depsAfterStore(recs)
+	if stored != 1 || len(growth) != 1 {
+		t.Fatalf("stored %d, growth %+v; want 1 stored value and one growth", stored, growth)
+	}
+	g := growth[0]
+	if g.number != 7 || g.before != 2 || g.after != 3 || g.late != 2*time.Second {
+		t.Errorf("growth %+v; want entry 7, deps 2 -> 3, 2s after the store", g)
+	}
+}
+
+func TestDepsAfterStoreIgnoresWhatIsNotGrowth(t *testing.T) {
+	recs := []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "2", "3"),
+		storedRec(time.Second, "c1", "7"),
+		spanRec(2*time.Second, "c1/1", "7", false, true, "2", "1"), // fewer deps: the tracker keeps the longest
+		spanRec(3*time.Second, "c1/1", "7", false, true, "1", "9"), // an older value
+		spanRec(4*time.Second, "c1/1", "7", false, true, "3", "9"), // a new value, stored for itself
+		spanRec(5*time.Second, "c1/1", "8", false, true, "1", "5"), // never stored
+		spanRec(6*time.Second, "c1/1", "7", false, true, "3", "9"), // the new value's deps, unchanged
+	}
+	stored, growth := depsAfterStore(recs)
+	if stored != 1 {
+		t.Errorf("stored %d values; want 1 (entry 8 was never stored)", stored)
+	}
+	if len(growth) != 0 {
+		t.Errorf("growth %+v; want none", growth)
+	}
+}
+
+func TestDepsAfterStoreMatchesTheCacheID(t *testing.T) {
+	// A store of the same number in another cache says nothing of this one.
+	recs := []LogRecord{
+		spanRec(0, "c1/1", "7", true, true, "1", "1"),
+		storedRec(time.Second, "c2", "7"),
+		spanRec(2*time.Second, "c1/1", "7", false, true, "1", "4"),
+	}
+	if stored, growth := depsAfterStore(recs); stored != 0 || len(growth) != 0 {
+		t.Errorf("stored %d, growth %+v; want neither", stored, growth)
+	}
+}
+
+func TestLazyToCallGaps(t *testing.T) {
+	recs := []LogRecord{
+		// Entry 7: lazy spans, then its call span 12s after the last.
+		spanRec(0, "c1/1", "7", false, false, "1", "0"),
+		spanRec(2*time.Second, "c1/1", "7", false, false, "1", "1"),
+		spanRec(14*time.Second, "c1/1", "7", true, true, "1", "1"),
+		// Later, retained: a lazy span and a call span 30s apart is not a
+		// risk to the entry, and counts as a gap of the entry the engine
+		// already kept.
+		spanRec(20*time.Second, "c1/1", "7", false, true, "1", "1"),
+		spanRec(50*time.Second, "c1/1", "7", true, true, "1", "1"),
+		// Entry 8: a call span with no lazy span before it.
+		spanRec(60*time.Second, "c1/1", "8", true, true, "1", "0"),
+	}
+	gaps := lazyToCall(recs)
+	if len(gaps) != 2 {
+		t.Fatalf("gaps %+v; want 2", gaps)
+	}
+	var open, kept *lazyGap
+	for i := range gaps {
+		if gaps[i].unretained {
+			open = &gaps[i]
+		} else {
+			kept = &gaps[i]
+		}
+	}
+	if open == nil || open.gap != 12*time.Second || open.number != 7 {
+		t.Errorf("open gap %+v; want entry 7, 12s", open)
+	}
+	if kept == nil || kept.gap != 30*time.Second {
+		t.Errorf("kept gap %+v; want 30s", kept)
+	}
+}
+
+func TestFirstStoredKeepsTheFirstTimeAndSkipsJunk(t *testing.T) {
+	at := firstStored([]LogRecord{
+		storedRec(time.Second, "c1", "7,x,,9"),
+		storedRec(2*time.Second, "c1", "7"),
+	})
+	if !at["c1"][7].Equal(leadsT0.Add(time.Second)) || at["c1"][9].IsZero() || len(at["c1"]) != 2 {
+		t.Errorf("firstStored: %v", at)
+	}
+}

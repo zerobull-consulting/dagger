@@ -145,6 +145,7 @@ func (s *Service) logSpans(req *coltracepb.ExportTraceServiceRequest) {
 					"outcome", cutString(stringAttr(span.Attributes, telemetryattrs.CacheOutcomeAttr), 200),
 					"type", cutString(stringAttr(span.Attributes, telemetryattrs.CacheTypeAttr), 200),
 					"retained", cutString(stringAttr(span.Attributes, telemetryattrs.CacheRetainedAttr), 200),
+					"replacements", cutString(stringAttr(span.Attributes, telemetryattrs.CacheReplacementsAttr), 200),
 					"deps", arrayLen(span.Attributes, telemetryattrs.CacheDepsAttr),
 					"parts", arrayLen(span.Attributes, telemetryattrs.CachePartsAttr))
 			}

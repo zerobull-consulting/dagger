@@ -51,6 +51,8 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -549,10 +551,28 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 	}
 	res.Stored = append(res.Stored, survivors...)
 	res.Bundles = append(res.Bundles, rec.BundleID)
+	x.logStoredRoots(eng.CacheID(), survivors)
 	x.log.Info("export stored", "cacheID", eng.CacheID(), "roots", len(survivors),
 		"values", len(exported.Bundle.Values), "bundle", rec.BundleID,
 		"uploaded", len(res.Uploaded), "present", len(res.Present))
 	return res, nil, false, nil
+}
+
+// maxLoggedRoots bounds the root numbers one "export stored roots" record
+// lists (a batch has at most 1,000 roots).
+const maxLoggedRoots = 1000
+
+// logStoredRoots logs which roots an export stored, at debug level: the
+// e2e reads when each value was first stored (zerobull-consulting/dagger#154).
+func (x *Exporter) logStoredRoots(cacheID string, roots []uint64) {
+	if len(roots) > maxLoggedRoots {
+		roots = roots[:maxLoggedRoots]
+	}
+	nums := make([]string, len(roots))
+	for i, n := range roots {
+		nums[i] = strconv.FormatUint(n, 10)
+	}
+	x.log.Debug("export stored roots", "cacheID", cacheID, "numbers", strings.Join(nums, ","))
 }
 
 // checkGeneration returns the index's ErrStaleGeneration refusal of the
