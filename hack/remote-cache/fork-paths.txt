@@ -33,6 +33,7 @@ any       .github/workflows/cacheservice-image.yml       builds and smoke-tests 
 any       .github/workflows/cacheservice-publish.yml     builds the service's release image on pushes to feature/remote-cache, verifies it against every accept line, then publishes it and moves its engine-version tags
 any       .github/workflows/remote-cache-tests.yml       the service's unit (the release check's script tests included), MinIO, e2e and sidecar jobs, and the release matrix's e2e and sidecar runs
 any       .github/workflows/remote-cache-spaces.yml      the service's DigitalOcean Spaces jobs
+any       .github/workflows/remote-cache-spaces-smoke.yml  the sidecar against the PR-checks bucket: a writer and a read-only job, through the pr-checks-* environments
 any       .github/workflows/remote-cache-fork-paths.yml  runs this check
 any       .github/workflows/remote-cache-release-check.yml  the hourly release check: verifies each new upstream release and opens its accept, rebuild or reject PR (zerobull-consulting/dagger#117, D5)
 any       .github/workflows/remote-cache-auto-merge-add-compatible-engine.yml  the "auto-merge: adds compatible engine only" check on the release check's auto-merged PRs

@@ -7,7 +7,11 @@
 #   demo.sh app        run the cache-volume step only (it runs the first
 #                      step's pipeline too, as its base)
 #
-# DAGGER is the CLI to run (default: dagger, from PATH). Run the steps on a
+# DAGGER is the CLI to run (default: dagger, from PATH). DEMO_NONCE, when set,
+# becomes part of the cacheable step's cache key (letters, digits, ., _ and -),
+# so a run against a store that keeps entries between runs doesn't get an earlier
+# run's entry back: the writer executes, a reader given the same nonce gets a hit.
+# Unset, the pipeline is unchanged. Run the steps on a
 # fresh engine after a writer stored them: the first comes back at once,
 # with the writer's stamp, while the second reruns its work.
 set -euo pipefail
@@ -37,6 +41,13 @@ container |
       echo "build $(cat /proc/sys/kernel/random/uuid) $(sha256sum /build.bin | cut -c1-16)" > /stamp &&
       sleep 20'
 EOF
+
+# See DEMO_NONCE above.
+if [[ -n "${DEMO_NONCE:-}" ]]; then
+	[[ "$DEMO_NONCE" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "demo.sh: DEMO_NONCE may have only letters, digits, '.', '_' and '-'" >&2; exit 2; }
+	build="${build/with-mounted-cache/with-env-variable DEMO_NONCE $DEMO_NONCE |
+  with-mounted-cache}"
+fi
 
 # The cache-volume step. It builds on the first step's container, with a
 # change of its own on every run (CHANGE, a random value, like an edited
