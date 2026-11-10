@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/importer"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/telemetryattrs"
 )
@@ -260,30 +262,49 @@ func TestNewerGenerationBatchExportsAtHello(t *testing.T) {
 	}
 }
 
-// A hello that ran Connected before a batch was requeued woke nothing: the
-// requeue then chooses the connection again, and a batch whose engine is there
-// is due at once (zerobull-consulting/dagger#225, the interleaving of runBatch
-// choosing the old connection, the newer engine's hello, and the requeue).
-func TestRequeueForEngineRechecksConnection(t *testing.T) {
-	const wait = time.Hour
-	blobs, meta := newMemStores(t)
-	h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = wait })
-	restarted := fakeengine.New("cache-a", 5)
-	restarted.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
-	h.postSpansOf(restarted, "session-5", cacheSpan(10))
-	// The batch is claimed by hand, as runBatch holds it, at generation 5.
-	now := h.svc.export.now()
-	batches := h.ns().tracker.All("cache-a", now)
-	if len(batches) != 1 || batches[0].Generation() != 5 {
-		t.Fatalf("setup: batches %+v", batches)
-	}
-	// The newer engine says hello, and Connected runs, with nothing waiting.
-	h.connectEngine(restarted)
-	waitEngines(t, h.svc, 2)
-	h.ns().tracker.Connected("cache-a", 5, now)
+// A hello that ran Connected before a batch was put to wait for its engine
+// woke nothing: choosing the connection again after the wait is marked wakes
+// the batch (zerobull-consulting/dagger#225: runBatch choosing the old
+// connection, the newer engine's hello, then the requeue; and the same with an
+// interrupted export). The scheduler exports a woken batch at once, and an hour
+// from then otherwise.
+func TestEngineWaitWokenByConnectionFoundAfterwards(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wait func(h *exportHarness, b exporter.Batch)
+	}{
+		{"requeue", func(h *exportHarness, b exporter.Batch) { h.svc.requeueForEngine(h.ns(), b) }},
+		{"interrupted export", func(h *exportHarness, b exporter.Batch) {
+			// The engine's connection dropped mid-export: the context
+			// of the export ended.
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			eng := h.svc.engineFor(h.ns(), "cache-a")
+			if out := h.svc.recordExport(ctx, eng, b, exporter.Result{}, errors.New("cut short")); out != metrics.ExportInterrupted {
+				t.Fatalf("outcome %q, want interrupted", out)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blobs, meta := newMemStores(t)
+			h := newExportHarness(t, blobs, meta, func(c *ExportConfig) { c.NoEngineWait = time.Hour })
+			restarted := fakeengine.New("cache-a", 5)
+			restarted.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+			h.postSpansOf(restarted, "session-5", cacheSpan(10))
+			// The batch is claimed by hand, as runBatch holds it, at
+			// generation 5.
+			batches := h.ns().tracker.All("cache-a", h.svc.export.now())
+			if len(batches) != 1 || batches[0].Generation() != 5 {
+				t.Fatalf("setup: batches %+v", batches)
+			}
+			// The newer engine says hello, and Connected runs, with
+			// nothing waiting.
+			h.connectEngine(restarted)
+			waitEngines(t, h.svc, 2)
+			h.ns().tracker.Connected("cache-a", 5, h.svc.export.now())
 
-	h.svc.requeueForEngine(h.ns(), batches[0])
-	if got := h.ns().tracker.Due(h.svc.export.now()); len(got) != 1 {
-		t.Fatalf("%d batches due after the requeue, want the one whose engine is connected", len(got))
+			tc.wait(h, batches[0])
+			waitFor(t, "the export from the connected engine", func() bool { return restarted.Exports() > 0 })
+		})
 	}
 }

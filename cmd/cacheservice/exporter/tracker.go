@@ -616,6 +616,23 @@ func (t *Tracker) Connected(cacheID string, generation uint64, now time.Time) {
 		// tracker's generation or newer, so the connection can serve them.
 		return
 	}
+	t.wakeEngineWaitLocked(c, now)
+}
+
+// WakeEngineWait makes the entries of a cache that wait for its engine due at
+// now, when an engine of generation, or a newer one than the tracker's, is
+// connected. Unlike Connected it records nothing of the generation: it is for
+// a connection already welcomed, found after a requeue (see Requeue) that a
+// hello's Connected ran too early to wake.
+func (t *Tracker) WakeEngineWait(cacheID string, generation uint64, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c := t.caches[cacheID]; c != nil && generation >= c.generation {
+		t.wakeEngineWaitLocked(c, now)
+	}
+}
+
+func (t *Tracker) wakeEngineWaitLocked(c *trackedCache, now time.Time) {
 	woke := false
 	for _, e := range c.entries {
 		if !e.engineWaitAt.IsZero() && e.retryAt.After(now) {

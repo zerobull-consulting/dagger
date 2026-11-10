@@ -221,16 +221,25 @@ func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch)
 }
 
 // requeueForEngine puts a batch back to wait for its engine, up to
-// NoEngineWait, which the engine's hello cuts short (Tracker.Connected). A
-// hello that registered after runBatch chose its connection, and ran Connected
-// before the requeue marked the wait, woke nothing: so the connection is chosen
-// again after the requeue, and a suitable one wakes the batch.
+// NoEngineWait, which the engine's hello cuts short (Tracker.Connected).
 func (s *Service) requeueForEngine(ns *namespace, b exporter.Batch) {
-	p := s.export
-	ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
-	if eng := s.engineFor(ns, b.CacheID); eng != nil && eng.Generation() >= b.Generation() {
-		ns.tracker.Connected(b.CacheID, eng.Generation(), p.now())
+	ns.tracker.Requeue(b, s.export.now().Add(s.export.noEngineWait))
+	s.wakeIfEngineConnected(ns, b)
+}
+
+// wakeIfEngineConnected wakes the roots of b, just put to wait for their
+// engine (Requeue, Interrupted), if one that can export them is connected. A
+// hello that registered after the connection was chosen, and ran Connected
+// before the wait was marked, woke nothing, so the connection is chosen again
+// once the wait is marked.
+func (s *Service) wakeIfEngineConnected(ns *namespace, b exporter.Batch) {
+	eng := s.engineFor(ns, b.CacheID)
+	if eng == nil || eng.Generation() < b.Generation() {
+		return
 	}
+	s.logger.Debug("export: engine connected while the batch was put to wait; due now", "namespace", ns.name, "cacheID", b.CacheID,
+		"generation", eng.Generation(), "roots", len(b.Request.Roots))
+	ns.tracker.WakeEngineWait(b.CacheID, eng.Generation(), s.export.now())
 }
 
 // exportBatch exports b on eng, records its result in the tracker, and
@@ -276,6 +285,7 @@ func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
 		tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
+		s.wakeIfEngineConnected(eng.ns, b)
 		return metrics.ExportInterrupted
 	}
 	outcome := metrics.OutcomeOK
