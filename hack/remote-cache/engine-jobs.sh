@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # The engine jobs of remote-cache-tests.yml, shared by release-check.sh and
 # accept-line-only.sh, which source this file (it runs nothing on its own).
 #

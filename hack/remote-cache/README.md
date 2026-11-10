@@ -1015,8 +1015,11 @@ of this repository (its code too, not a fork's), titled
 `Remote cache tests: candidate <version> <digest>` for the line's own version and
 digest, whose `real engines (e2e)` and `sidecar demo` jobs each completed
 successfully: a run whose engine jobs were skipped still ends green, so it
-reads the run's jobs too (one page of 100, from the same attempt as the run),
-and fails if that read fails, if the run has more jobs than were listed, or
+reads the run's jobs too (one page of 100, of the attempt the run read
+reports as its `run_attempt`, so a re-run started between the two reads
+can't swap in another attempt's jobs; each read is tried three times),
+and fails if that read fails, if `run_attempt` isn't a number (or differs
+from the URL's `/attempts/N`), if the run has more jobs than were listed, or
 if either job is missing, listed twice, or anything but `completed`/`success`
 ([zerobull-consulting/dagger#223](https://github.com/zerobull-consulting/dagger/issues/223)).
 The job names, and the checks on the listing, are `engine-jobs.sh`'s, which
