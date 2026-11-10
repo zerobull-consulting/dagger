@@ -12,7 +12,7 @@ name: Remote cache auto-merge add compatible engine
 # replace. It runs none of the PR's code: it only diffs the PR's commits and
 # parses its manifest. It requests no environment (only schedule and
 # workflow_dispatch jobs may: hack/remote-cache/README.md, "Automation
-# tokens"), and its token can only turn auto-merge off. It has no
+# tokens"), and its token can only read runs and turn auto-merge off. It has no
 # pull_request trigger, so no skipped job of the same name ever reports (a
 # skipped required check counts as passed). The release check's own tests
 # run in remote-cache-tests.yml's unit job.
@@ -37,6 +37,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # Reads the run an accept line cites (accept-line-only.sh, verify_run).
+      actions: read
       pull-requests: write
     steps:
       # The default branch (pull_request_target's own checkout), with the

@@ -1008,10 +1008,26 @@ accept PR unless, from
 its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
 one added line (no mode change, no rename), that line is
 `accept <the branch's version> <digest> verified: <run URL>`, it is the
-first accept line, and `engines.sh` takes the result. On failure it turns
-the PR's auto-merge off. The release check's `auto-merge` job checks the
-same before enabling it, and only on PRs from this repository's own
-branches. If the PR's required checks have all passed before the gate is
+first accept line, and `engines.sh` takes the result. It also reads the run
+the line cites (with `GITHUB_TOKEN`, `actions: read`) and requires it to be
+a completed, successful `workflow_dispatch` run of `remote-cache-tests.yml`
+of this repository (its code too, not a fork's), titled
+`Remote cache tests: candidate <version> <digest>` for the line's own version and
+digest. The runs API doesn't return a dispatch's inputs, so
+`remote-cache-tests.yml`'s `run-name` puts them in the title. **Known
+limits:** the title is the workflow file's, so a writer who edits `run-name`
+on a branch can make a run look like this (the same writer can push the
+accept branch anyway, [zerobull-consulting/dagger#152](https://github.com/zerobull-consulting/dagger/issues/152));
+and the run's branch isn't checked, since the release check dispatches on
+`RELEASE_CHECK_BRANCH`, on `RELEASE_CHECK_TEST_REF` in a dry run, and on
+`release-check/rebuild/<version>` for B, and a hand-added line may cite any.
+The check gets the PR's head from `refs/pull/<N>/head`, fetched explicitly,
+so a fork PR's commit, which is on no branch of this repository, is found
+the same way (a real fork PR hasn't been tried
+([zerobull-consulting/dagger#165](https://github.com/zerobull-consulting/dagger/issues/165))).
+On failure it turns the PR's auto-merge off. The release check's
+`auto-merge` job checks only the PR's files before enabling it, and only on
+PRs from this repository's own branches. If the PR's required checks have all passed before the gate is
 on, GitHub refuses to enable auto-merge on it ("clean status"), so the job
 squash-merges it instead, with `GITHUB_TOKEN`, at the head it checked;
 `GITHUB_TOKEN` can't bypass the ruleset, so that merge still needs every

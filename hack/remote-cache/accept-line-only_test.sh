@@ -50,6 +50,36 @@ pr() {
 }
 line="accept v1.0.0-beta.26 $d2 verified: $run2"
 first="sed -i 's|^accept v1.0.0-beta.25|$line\naccept v1.0.0-beta.25|' $m"
+# A fake gh: the cited run (FAKE_RUN, a JSON file; FAKE_RUN_FAIL=1: the read
+# fails), and the PR's auto-merge for disable-auto-merge.
+mkdir -p "$tmp/bin"
+cat >"$tmp/bin/gh" <<'G'
+#!/usr/bin/env bash
+echo "$*" >>"${FAKE_CALLS:-/dev/null}"
+case "$2" in
+repos/*/actions/runs/*)
+	[[ -z "${FAKE_RUN_FAIL:-}" ]] || { echo "HTTP 404" >&2; exit 1; }
+	cat "$FAKE_RUN" ;;
+repos/*/pulls/*) echo "{\"node_id\": \"PR_1\", \"auto_merge\": $FAKE_AUTO_MERGE}" ;;
+graphql) echo '{}' ;;
+esac
+G
+chmod +x "$tmp/bin/gh"
+export PATH="$tmp/bin:$PATH" GITHUB_REPOSITORY=o/r FAKE_CALLS="$tmp/calls"
+
+# run <jq edit>: the cited run for run2/beta.26/d2, in the shape of a real
+# one (beta.24's verifying run, 42336689501, was a successful workflow_dispatch
+# of remote-cache-tests.yml on the branch remote-cache/release-check), edited.
+run() {
+	jq -n --arg t "Remote cache tests: candidate v1.0.0-beta.26 $d2" '{
+		repository: {full_name: "o/r"}, head_repository: {full_name: "o/r"},
+		path: ".github/workflows/remote-cache-tests.yml", event: "workflow_dispatch",
+		status: "completed", conclusion: "success", head_branch: "remote-cache/release-check",
+		display_title: $t}' | jq "${1:-.}" >"$tmp/run.json"
+	export FAKE_RUN="$tmp/run.json"
+}
+run
+
 # verdict <head> [<ref>]: runs the check; status in $status.
 verdict() {
 	(cd "$repo" && "$script" check "$base" "$1" "${2:-release-check/accept/v1.0.0-beta.26}") >"$tmp/out" 2>&1
@@ -79,6 +109,68 @@ check "fails: so engines.sh refuses it" grep -q "engines.sh refuses" "$tmp/out"
 check "fails: a renamed manifest" fails "$(pr renamed "$first; git mv $m cmd/cacheservice/compat/e.txt")"
 verdict "$(pr msg "echo y >other.txt")"
 check "fails with an annotation naming the file" grep -q "::error file=$m::" "$tmp/out"
+
+# The cited run (zerobull-consulting/dagger#165, lead 3). The fake gh serves
+# $FAKE_RUN; the PR is always the good one, unless its line cites another URL.
+okhead="$(pr run-ok "$first")"
+withrun() { # <run URL>: a PR whose line cites it
+	pr "run-$RANDOM" "sed -i 's|^accept v1.0.0-beta.25|accept v1.0.0-beta.26 $d2 verified: $1\naccept v1.0.0-beta.25|' $m"
+}
+run
+check "run: a real run's shape passes (head_branch remote-cache/release-check)" passes "$okhead"
+run '.head_branch = "feature/remote-cache"'
+check "run: any head_branch passes (the release check dispatches on several)" passes "$okhead"
+run
+check "run: an /attempts/N URL reads that attempt" passes "$(withrun $run2/attempts/2)"
+check "run: ... through the attempts endpoint" grep -q "repos/o/r/actions/runs/2/attempts/2" "$tmp/calls"
+check "run: a run of another repository fails" fails "$(withrun https://github.com/x/y/actions/runs/2)"
+check "run: ... and says so" grep -q "of x/y, not of o/r" "$tmp/out"
+: >"$tmp/calls"
+verdict "$(withrun https://github.com/x/y/actions/runs/2)"
+check "run: ... without asking the API about it" not grep -q actions/runs "$tmp/calls"
+run '.repository.full_name = "x/y"'
+check "run: a run the API says belongs to another repository fails" fails "$okhead"
+run '.head_repository.full_name = "x/fork"'
+check "run: a run of a fork's code fails" fails "$okhead"
+run '.conclusion = "failure"'
+check "run: a failed run fails" fails "$okhead"
+check "run: ... and says so" grep -q "completed/failure" "$tmp/out"
+run '.conclusion = "cancelled"'
+check "run: a cancelled run fails" fails "$okhead"
+run '.status = "in_progress" | .conclusion = null'
+check "run: a run still going fails" fails "$okhead"
+run '.path = ".github/workflows/other.yml"'
+check "run: another workflow fails" fails "$okhead"
+run '.event = "push"'
+check "run: a push run fails" fails "$okhead"
+run '.event = "pull_request"'
+check "run: a pull_request run fails" fails "$okhead"
+run ".display_title = \"Remote cache tests: candidate v1.0.0-beta.27 $d2\""
+check "run: a run for another version fails" fails "$okhead"
+check "run: ... and says it didn't verify this version" grep -q "didn't verify this version and digest" "$tmp/out"
+run ".display_title = \"Remote cache tests: candidate v1.0.0-beta.26 $d1\""
+check "run: a run for another digest fails" fails "$okhead"
+run '.display_title = "Remote cache tests"'
+check "run: a run with the default title fails" fails "$okhead"
+run ".display_title = \"Remote cache tests: candidate v1.0.0-beta.26 $d2 \""
+check "run: a title with trailing text fails" fails "$okhead"
+run 'del(.display_title)'
+check "run: a run without a title fails" fails "$okhead"
+run
+export FAKE_RUN_FAIL=1
+check "run: a run that can't be read fails" fails "$okhead"
+unset FAKE_RUN_FAIL
+echo 'not json' >"$tmp/run.json"
+check "run: a reply that isn't JSON fails" fails "$okhead"
+run
+check "run: and a good run passes again" passes "$okhead"
+# remote-cache-tests.yml titles a candidate's run the way verify_run reads it.
+check "run-name: remote-cache-tests.yml titles a candidate's run with its version and digest" grep -qF "format('Remote cache tests: candidate {0} {1}', inputs.candidate-version, inputs.candidate-digest)" "$here/../../.github/workflows/remote-cache-tests.yml"
+check "run-name: ... and verify_run wants that title" grep -qF 'want="Remote cache tests: candidate $v $d"' "$script"
+# Other PRs never read a run.
+: >"$tmp/calls"
+verdict "$(pr other2 "echo z >other.txt")" feature/x
+check "run: a PR that isn't an accept PR reads no run" not grep -q actions/runs "$tmp/calls"
 
 # fetch-head (zerobull-consulting/dagger#165, lead 1): a fork PR's head is on
 # no branch of this repository, only under refs/pull/<N>/head. "up" is the
@@ -143,17 +235,7 @@ wf="$here/../../.github/workflows/remote-cache-auto-merge-add-compatible-engine.
 check "workflow: calls fetch-head with the PR number and head" grep -q 'accept-line-only.sh" fetch-head "\$PR" "\$HEAD_SHA"' "$wf"
 check "workflow: the checkout doesn't take the head as its ref" not grep -qE '^\s+ref: .*head\.sha' "$wf"
 
-# disable-auto-merge, against a fake gh.
-mkdir -p "$tmp/bin"
-cat >"$tmp/bin/gh" <<'G'
-#!/usr/bin/env bash
-echo "$*" >>"$FAKE_CALLS"
-case "$2" in
-repos/*/pulls/*) echo "{\"node_id\": \"PR_1\", \"auto_merge\": $FAKE_AUTO_MERGE}" ;;
-graphql) echo '{}' ;;
-esac
-G
-chmod +x "$tmp/bin/gh"
+# disable-auto-merge, against the fake gh.
 PATH="$tmp/bin:$PATH" FAKE_CALLS="$tmp/calls" FAKE_AUTO_MERGE='{"merge_method": "squash"}' "$script" disable-auto-merge 7 >"$tmp/out" 2>&1
 check "disable: turns auto-merge off when it's on" grep -q disablePullRequestAutoMerge "$tmp/calls"
 : >"$tmp/calls"
