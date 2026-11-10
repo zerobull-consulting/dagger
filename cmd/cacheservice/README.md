@@ -3250,8 +3250,11 @@ for once the stop began answers 503 too
 (`TestStopCancelsAndWaitsForExplicitHooks`,
 `TestShutdownCancelsExplicitExport`,
 [#202](https://github.com/zerobull-consulting/dagger/issues/202)). An
-import sync still waits for the one under way of the same engine cache
-whatever its context says (`TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx`). Pinned by
+import sync waits for the one under way of the same engine cache only as
+long as its context lives: one whose context is done, before it waits or
+while it does, returns the context's error without waiting
+(`TestImportSyncCanceledDoesNotWaitForSyncLock`,
+[#240](https://github.com/zerobull-consulting/dagger/issues/240)). Pinned by
 `TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
 `TestDrainRunsExplicitExportWaitingForSlot`, the
 `TestDrainEndsAtDeadlineWith…` tests and

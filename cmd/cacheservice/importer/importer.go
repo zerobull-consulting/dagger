@@ -175,8 +175,11 @@ func New(cfg Config) (*Importer, error) {
 // cacheState is what the importer knows of one engine cache, at one
 // generation.
 type cacheState struct {
-	// sync serializes syncs of the cache, from any of its connections.
-	sync sync.Mutex
+	// sync serializes syncs of the cache, from any of its connections: a
+	// one-slot semaphore, so a sync waits for it only as long as its context
+	// lives. Made with the state (stateLocked, the only constructor): a nil
+	// channel would block forever.
+	sync chan struct{}
 
 	// The fields below are guarded by Importer.mu.
 	generation uint64
@@ -344,7 +347,7 @@ type FailedBundle struct {
 func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	st := im.caches[cacheID]
 	if st == nil {
-		st = &cacheState{}
+		st = &cacheState{sync: make(chan struct{}, 1)}
 		im.caches[cacheID] = st
 	}
 	if st.merged != nil && st.generation > generation {
@@ -363,6 +366,24 @@ func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	}
 	return st
 }
+
+// lockSync takes the cache's sync lock, waiting for the sync that holds it
+// only while ctx lives. A ctx already done returns its cause without taking
+// the lock, even a free one, so the result doesn't depend on select's choice.
+func (st *cacheState) lockSync(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	select {
+	case st.sync <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+// unlockSync releases the sync lock lockSync took, once.
+func (st *cacheState) unlockSync() { <-st.sync }
 
 // Forget drops what the importer knows of an engine cache, as when its cache
 // was wiped.
@@ -420,8 +441,10 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	if st == nil {
 		return res, errStateReset
 	}
-	st.sync.Lock()
-	defer st.sync.Unlock()
+	if err := st.lockSync(ctx); err != nil {
+		return res, err
+	}
+	defer st.unlockSync()
 	// The state may have moved on while this sync waited for the lock.
 	im.mu.Lock()
 	current := im.currentLocked(eng, st)
