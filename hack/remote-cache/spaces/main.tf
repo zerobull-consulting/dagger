@@ -1,12 +1,12 @@
 # A dedicated Spaces bucket, ready for the remote cache service: the three
 # keys it documents (cmd/cacheservice/README.md, "The keys"), the prefix's
-# ownership marker, and the lifecycle rules `cacheservice lifecycle apply`
-# would set. The GitHub side is github.tf.
+# ownership marker and the bucket's lifecycle rules. The marker and the rules
+# are `cacheservice provision` resources, run through the shell provider, so
+# the service's own code claims the prefix and sets the rules, with its
+# checks (cmd/cacheservice/provision). The GitHub side is github.tf.
 #
 # force_destroy lets `terraform destroy` delete a bucket that still holds
-# cache objects. Don't point this configuration at a bucket you care about:
-# it owns the bucket's whole lifecycle configuration, and writes the marker
-# without the checks `lifecycle claim` makes (see the marker below).
+# cache objects. Don't point this configuration at a bucket you care about.
 
 resource "random_string" "slug" {
   length  = 6
@@ -22,34 +22,6 @@ locals {
   # Name the keys after the workspace (one per repository and environment,
   # see README.md), so the control panel's key list says which is which. Not
   # after the github_* variables: changing those only changes an output.
-  # The service's layout (cmd/cacheservice/layout): its root is the prefix
-  # with one trailing slash, or "" for the whole bucket.
-  root       = trimspace(trim(var.prefix, "/")) == "" ? "" : "${trim(var.prefix, "/")}/"
-  marker_key = "${local.root}cacheservice.json"
-  # layout.Version. terraform_test.go fails when they differ.
-  marker_layout = 2
-
-  # cacheservice lifecycle's rules (lifecycle.Rules): one per namespace,
-  # expiring its staged uploads after a day, and one aborting incomplete
-  # multipart uploads under the prefix after a day. The IDs carry 8 hex
-  # digits of the root's SHA-256, as the command's do, so `lifecycle plan`
-  # and `check` see them as its own. terraform_test.go compares them.
-  rule_tag = substr(sha256(local.root), 0, 8)
-  lifecycle_rules = concat(
-    [for ns in distinct(var.namespaces) : {
-      id              = "cacheservice-${local.rule_tag}-staging-${ns}"
-      prefix          = "${local.root}ns/${ns}/staging/"
-      expiration_days = 1
-      abort_days      = null
-    }],
-    var.abort_rule ? [{
-      id              = "cacheservice-${local.rule_tag}-incomplete-uploads"
-      prefix          = local.root
-      expiration_days = null
-      abort_days      = 1
-    }] : [],
-  )
-
   key_name_prefix = coalesce(
     var.key_name_prefix,
     terraform.workspace == "default" ? "dagger-remote-cache-test" : "dagger-rc-${terraform.workspace}",
@@ -69,46 +41,11 @@ resource "digitalocean_spaces_bucket" "cache" {
     enabled = false
   }
 
-  # The bucket's whole lifecycle configuration: rules set by anything else
-  # are removed on the next apply.
-  dynamic "lifecycle_rule" {
-    for_each = local.lifecycle_rules
-    content {
-      id                                     = lifecycle_rule.value.id
-      prefix                                 = lifecycle_rule.value.prefix
-      enabled                                = true
-      abort_incomplete_multipart_upload_days = lifecycle_rule.value.abort_days
-
-      dynamic "expiration" {
-        for_each = lifecycle_rule.value.expiration_days == null ? [] : [lifecycle_rule.value.expiration_days]
-        content {
-          days = expiration.value
-        }
-      }
-    }
+  # cacheservice provision rules (below) owns this prefix's rules, merged
+  # with any others: don't let the bucket resource remove them.
+  lifecycle {
+    ignore_changes = [lifecycle_rule]
   }
-}
-
-# The prefix's ownership marker (ownership.Marker), which a writer's startup
-# check and `lifecycle apply` require: what `cacheservice lifecycle claim`
-# writes. claim also refuses a prefix that already holds keys, and writes
-# with If-None-Match; Terraform does neither, which is safe only because
-# the bucket above is this state's own and new. Don't import a bucket that
-# is in use.
-resource "time_static" "marker_created" {}
-
-resource "digitalocean_spaces_bucket_object" "marker" {
-  provider     = digitalocean.spaces
-  region       = var.region
-  bucket       = digitalocean_spaces_bucket.cache.name
-  key          = local.marker_key
-  content_type = "application/json"
-  acl          = "private"
-  content = jsonencode({
-    layout         = local.marker_layout
-    created        = time_static.marker_created.rfc3339
-    serviceVersion = "terraform"
-  })
 }
 
 # Admin: lifecycle rules (`cacheservice lifecycle apply`). Spaces gives a
@@ -143,4 +80,69 @@ resource "digitalocean_spaces_key" "read" {
     bucket     = digitalocean_spaces_bucket.cache.name
     permission = "read"
   }
+}
+
+# `cacheservice provision` resources (shell_script: see
+# cmd/cacheservice/provision for the contract). They use the admin key: on
+# Spaces, the only one that can read and write lifecycle rules.
+locals {
+  provision = "${var.cacheservice_command} provision"
+
+  provision_environment = {
+    CACHESERVICE_S3_ENDPOINT = local.endpoint
+    CACHESERVICE_S3_REGION   = var.region
+    CACHESERVICE_S3_BUCKET   = digitalocean_spaces_bucket.cache.name
+    CACHESERVICE_S3_PREFIX   = var.prefix
+  }
+  provision_secrets = {
+    CACHESERVICE_S3_ACCESS_KEY_ID     = digitalocean_spaces_key.admin.access_key
+    CACHESERVICE_S3_SECRET_ACCESS_KEY = digitalocean_spaces_key.admin.secret_key
+  }
+}
+
+# The prefix's ownership marker, which a writer's startup check and the rules
+# require: `lifecycle claim`, which refuses a prefix that already holds keys.
+# Destroying it leaves the marker (the bucket's deletion removes it).
+resource "shell_script" "claim" {
+  lifecycle_commands {
+    create = "${local.provision} claim create"
+    read   = "${local.provision} claim read"
+    delete = "${local.provision} claim delete"
+  }
+  environment           = local.provision_environment
+  sensitive_environment = local.provision_secrets
+  working_directory     = path.module
+
+  # Another bucket or prefix is another claim.
+  triggers = {
+    bucket = digitalocean_spaces_bucket.cache.name
+    prefix = var.prefix
+  }
+}
+
+# One staging rule per namespace and the abort rule: `lifecycle apply
+# -allow-removals`, merged with any other tool's rules. A rule changed or
+# removed by hand shows as an update in the next plan.
+resource "shell_script" "rules" {
+  lifecycle_commands {
+    create = "${local.provision} rules create"
+    read   = "${local.provision} rules read"
+    update = "${local.provision} rules update"
+    delete = "${local.provision} rules delete"
+  }
+  environment = merge(local.provision_environment, {
+    CACHESERVICE_NAMESPACES = join(",", distinct(var.namespaces))
+    CACHESERVICE_ABORT_RULE = tostring(var.abort_rule)
+  })
+  sensitive_environment = local.provision_secrets
+  working_directory     = path.module
+
+  # The rules of another bucket or prefix are other rules: replacing this
+  # resource removes the old prefix's first.
+  triggers = {
+    bucket = digitalocean_spaces_bucket.cache.name
+    prefix = var.prefix
+  }
+
+  depends_on = [shell_script.claim]
 }

@@ -597,6 +597,14 @@ shell, in this order:
 Then start the service with its own key (the Read/Write/Delete one). A prefix
 a writer already started on needs no `claim`; running it anyway is harmless.
 
+**From Terraform,** `cacheservice provision claim|rules create|read|update|delete`
+does `claim` and `apply -allow-removals` as two declarative resources, for the
+shell provider's `shell_script` (package `provision`): the settings come from
+`CACHESERVICE_S3_*`, `CACHESERVICE_NAMESPACES` and `CACHESERVICE_ABORT_RULE`,
+the resource's state goes to stdout as JSON, and a read reports drift. It
+takes no `-confirm`: Terraform's plan is the confirmation.
+[`hack/remote-cache/spaces`](../../hack/remote-cache/spaces/README.md) uses it.
+
 **Run `apply` with the admin key, interactively.** Setting lifecycle rules
 takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
 key), since a rule can expire anything in the bucket. `claim` doesn't need

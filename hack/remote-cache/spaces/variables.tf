@@ -34,11 +34,16 @@ variable "key_name_prefix" {
   default     = null
 }
 
-# The service's prefix, as the bucket's lifecycle rules and ownership marker
-# see it. See main.tf.
+# The marker and the lifecycle rules (main.tf, cacheservice provision).
+
+variable "cacheservice_command" {
+  description = "How to run the cacheservice binary, from this directory: go run builds it from this checkout (cached after the first run), or give a built binary's path."
+  type        = string
+  default     = "go run github.com/dagger/dagger/cmd/cacheservice"
+}
 
 variable "namespaces" {
-  description = "The namespaces the bucket's lifecycle rules cover, one staging rule each (cacheservice lifecycle's rules). The sidecar action's is its namespace input, default."
+  description = "The namespaces the bucket's lifecycle rules cover, one staging rule each. The sidecar action's is its namespace input, default."
   type        = list(string)
   default     = ["default"]
 

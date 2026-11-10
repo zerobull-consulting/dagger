@@ -12,9 +12,10 @@ terraform {
       # github_actions_*_secret's value arrived in 6.13 (plaintext_value is deprecated).
       version = ">= 6.13"
     }
-    time = {
-      source  = "hashicorp/time"
-      version = ">= 0.9"
+    shell = {
+      source = "scottwinkler/shell"
+      # Runs cacheservice provision for the marker and the rules (main.tf).
+      version = ">= 1.7.10"
     }
     random = {
       source  = "hashicorp/random"

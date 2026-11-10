@@ -21,7 +21,7 @@ output "prefix" {
   value = var.prefix
 }
 
-# For `spaces.sh lifecycle check`, which checks the rules main.tf set.
+# For `spaces.sh lifecycle plan|check`.
 output "namespaces" {
   value = distinct(var.namespaces)
 }

@@ -117,6 +117,9 @@
 // `cacheservice lifecycle plan|claim|apply|check` is a one-shot subcommand, not
 // the service: it claims the prefix, sets or checks the bucket's lifecycle
 // rules, with the admin key (package lifecycle; README.md, "The lifecycle command").
+// `cacheservice provision claim|rules create|read|update|delete` does the
+// same as two declarative resources, for Terraform's shell provider
+// (package provision).
 package main
 
 import (
@@ -138,6 +141,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
+	"github.com/dagger/dagger/cmd/cacheservice/provision"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
@@ -149,6 +153,9 @@ import (
 var subcommands = map[string]func(ctx context.Context, args []string) int{
 	"lifecycle": func(ctx context.Context, args []string) int {
 		return lifecycle.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
+	},
+	"provision": func(ctx context.Context, args []string) int {
+		return provision.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
 	},
 }
 
