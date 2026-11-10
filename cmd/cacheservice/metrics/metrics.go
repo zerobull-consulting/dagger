@@ -385,7 +385,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		otlpRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "otlp_refused_total",
-			Help: "OTLP requests refused for their body, by route (traces, logs, metrics) and reason: too_large (413, over the route's limit as received or decoded, or decoding to a message the decode budget could never hold), busy (503, the decode budget full) timeout (408, not received within the read timeout) or too_deep (400, nested past the limit). Nothing of a refused request is recorded.",
+			Help: "OTLP requests refused for their body, by route (traces, logs, metrics) and reason: too_large (413, over the route's limit as received or decoded, or decoding to a message the decode budget could never hold), busy (503, the decode budget full), timeout (408, not received within the read timeout) or too_deep (400, nested past the limit). Nothing of a refused request is recorded.",
 		}, []string{"route", "reason"}),
 		otlpRequestBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "otlp_request_bytes",

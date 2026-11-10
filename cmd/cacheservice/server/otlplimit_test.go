@@ -1652,7 +1652,7 @@ func TestOTLPNestedGroupsRefused(t *testing.T) {
 	}
 	// A mismatched end-group is malformed, not deep.
 	bad := append(protowire.AppendTag(nil, 100, protowire.StartGroupType), protowire.AppendTag(nil, 101, protowire.EndGroupType)...)
-	if _, _, err := otlpDecodedSizeDepth(bad, req, false); err == nil || errors.Is(err, errOTLPDepth) {
+	if _, _, err := otlpDecodedSizeDepth(bad, req, false); !errors.Is(err, errOTLPEndGroup) {
 		t.Fatalf("mismatched end-group: %v", err)
 	}
 }

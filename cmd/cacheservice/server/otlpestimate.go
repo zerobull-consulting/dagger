@@ -77,6 +77,9 @@ const MaxOTLPNesting = otlpMaxDepth
 
 var errOTLPDepth = errors.New("otlp message nested too deep")
 
+// errOTLPEndGroup is an end-group tag that doesn't close the group open.
+var errOTLPEndGroup = errors.New("otlp group closed by a mismatched end-group tag")
+
 // otlpDecodedSize estimates the heap msg takes once decoded from data, as
 // protobuf, or as JSON when asJSON. A protobuf body that isn't a valid
 // encoding is an error, as decoding it would be.
@@ -195,7 +198,7 @@ func otlpGroupLen(b []byte, num protowire.Number, depth int, deepest *int) (int,
 			open = append(open, tag)
 		case protowire.EndGroupType:
 			if tag != open[len(open)-1] {
-				return 0, protowire.ParseError(-5) // an end-group that doesn't match
+				return 0, errOTLPEndGroup
 			}
 			open = open[:len(open)-1]
 		default:
