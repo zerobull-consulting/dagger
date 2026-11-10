@@ -660,8 +660,11 @@ start() {
 	if [[ "$welcomed" == true ]]; then
 		local synced="" sync_deadline=$((SECONDS + sync_wait))
 		while :; do
-			running "$service" || { show_log "$engine" 100; show_log "$service" 200; die "the service exited before its first import sync"; }
-			running "$engine" || { show_log "$engine" 200; show_log "$service" 100; die "the engine exited before the service's first import sync"; }
+			# exited, not ! running: a docker inspect that fails or doesn't
+			# answer says nothing, and is bounded by what is left of the wait
+			# (zerobull-consulting/dagger#125).
+			exited "$service" "$(step_bound "$sync_deadline")" && { show_log "$engine" 100; show_log "$service" 200; die "the service exited before its first import sync"; }
+			exited "$engine" "$(step_bound "$sync_deadline")" && { show_log "$engine" 200; show_log "$service" 100; die "the engine exited before the service's first import sync"; }
 			log="$(timeout "$(step_bound "$sync_deadline")" docker logs --since "$since" "$service" 2>&1 || true)"
 			synced="$(grep -m1 'msg="import sync: first done"' <<<"$log" || true)"
 			[[ -n "$synced" ]] && break

@@ -489,7 +489,8 @@ check "a service that exits while the engine starts fails the start with both lo
 # done (the default), at once; late, 3s after the engine started; failed,
 # done with an error; partial, done with a bundle that failed to merge and
 # no error; never, it isn't logged (an image from before the line). With
-# FAKE_ENGINE_DIES, the engine is running at its first inspect only. Every
+# FAKE_ENGINE_DIES, the engine is running at its first inspect only; with
+# FAKE_INSPECT_FAILS, every inspect of it after the first fails. Every
 # docker run is recorded in $FAKE_DIR/runs, and docker cp
 # writes a fake CLI.
 mkdir -p "$tmp/okbin"
@@ -509,6 +510,8 @@ case "$1 $2" in
 "inspect -f")
 	if [[ -n "${FAKE_ENGINE_DIES:-}" && "$4" == *-engine && -f "$FAKE_DIR/engine.inspected" ]]; then
 		echo false
+	elif [[ -n "${FAKE_INSPECT_FAILS:-}" && "$4" == *-engine && -f "$FAKE_DIR/engine.inspected" ]]; then
+		exit 1
 	else
 		[[ "$4" == *-engine && -f "$FAKE_DIR/engine.started" ]] && : >"$FAKE_DIR/engine.inspected"
 		echo true
@@ -621,6 +624,9 @@ check "... at once, not at the first sync's bound" took_hello_at_most 6
 check "... says so" grep -q "the engine exited before the service's first import sync" "$tmp/hello.out"
 check "... with the engine's log" grep -q "LOG OF remote-cache-engine" "$tmp/hello.out"
 check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "a docker inspect that fails during the first-sync wait isn't an exit (zerobull-consulting/dagger#125)" hello_start welcome FAKE_INSPECT_FAILS=1
+check "... the start waits for the sync" grep -q "the first import sync is done: it merged 2 stored bundle(s)" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
 # An image from before the welcome line predates the first sync's line.
 check "an image from before the welcome line: no first-sync wait" hello_start silent SIDECAR_WELCOME_GRACE=1 SIDECAR_FIRST_SYNC_TIMEOUT=30
 check "... nor its warning" not grep -q "first import sync" "$tmp/hello.out"

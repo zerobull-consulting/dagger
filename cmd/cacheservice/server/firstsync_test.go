@@ -94,8 +94,20 @@ func TestFirstImportSyncNotLoggedWhenCutShort(t *testing.T) {
 	waitUntil(t, 10*time.Second, "the first import sync's line", func() bool {
 		return len(firstSyncs(h.logs, conn)) > 0
 	})
-	// A fresh connection of the same engine, its first sync canceled.
+	// A fresh connection of the same engine, registered in its place, so
+	// only its canceled context keeps its sync from being the first done.
 	fresh := &engineConn{id: conn, ns: c.ns, hello: c.hello, logger: c.logger, svc: h.svc}
+	h.svc.mu.Lock()
+	h.svc.conns[conn] = fresh
+	h.svc.mu.Unlock()
+	defer func() {
+		h.svc.mu.Lock()
+		h.svc.conns[conn] = c
+		h.svc.mu.Unlock()
+	}()
+	if !h.svc.connected(fresh) {
+		t.Fatal("the fresh connection isn't registered")
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	h.svc.syncImports(ctx, fresh)
