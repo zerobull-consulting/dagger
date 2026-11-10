@@ -472,7 +472,7 @@ func readResponse(t *testing.T, br *bufio.Reader) *http.Response {
 // exporters retry, records nothing, and is taken once the budget frees.
 // Requests well within it are never refused, however many: only bytes count.
 //
-// Sizes: the budget is 216 KiB, and every request reserves 16 KiB for
+// Sizes: the budget is 232 KiB, and every request reserves 16 KiB for
 // itself, and a few hundred bytes more for its headers (otlpHeaderReserve),
 // and 64 KiB for the stack of its decode with its message.
 // The held request holds 48 KiB (itself, and a 32 KiB buffer for the
