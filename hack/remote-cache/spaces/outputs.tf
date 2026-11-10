@@ -43,42 +43,74 @@ output "read" {
   })
 }
 
-# A bash script that stores one key's settings in a GitHub repository or
-# environment with gh: the key ID and secret as secrets, the endpoint,
-# region, bucket and prefix as variables (or secrets, with
-# github_all_secrets). Run it with ./spaces.sh github, or
-# `terraform output -raw gh_secret_set | bash`. Each value goes to gh on
-# stdin from printf, a builtin, so no secret lands on a command line.
+# Two bash scripts, one per key, that store the key's settings in a GitHub
+# repository or one of its environments with gh: the key ID and secret as
+# secrets, the endpoint, region, bucket and prefix as variables (or secrets,
+# with github_all_secrets). The write key and the read key each go to their
+# own environment, or under their own names; the admin key never goes to
+# GitHub. Run one with ./spaces.sh github write|read, or
+# `terraform output -raw gh_secret_set_write | bash`. Each value goes to gh
+# on stdin from printf, a builtin, so no secret lands on a command line.
 locals {
-  github_key = var.github_key == "write" ? digitalocean_spaces_key.write : digitalocean_spaces_key.read
+  github = {
+    write = {
+      key         = digitalocean_spaces_key.write
+      environment = var.github_write_environment
+      name_prefix = var.github_write_name_prefix
+    }
+    read = {
+      key         = digitalocean_spaces_key.read
+      environment = var.github_read_environment
+      name_prefix = var.github_read_name_prefix
+    }
+  }
 
-  github_target = join("", [
-    var.github_repository == null ? "" : " --repo ${var.github_repository}",
-    var.github_environment == null ? "" : " --env '${replace(var.github_environment, "'", "'\\''")}'",
-  ])
+  # Both keys' settings would land under the same names in the same place.
+  github_collision = (
+    var.github_write_environment == var.github_read_environment &&
+    var.github_write_name_prefix == var.github_read_name_prefix
+  )
 
-  github_settings = [
-    { name = "ENDPOINT", value = local.endpoint, secret = var.github_all_secrets },
-    { name = "REGION", value = var.region, secret = var.github_all_secrets },
-    { name = "BUCKET", value = digitalocean_spaces_bucket.cache.name, secret = var.github_all_secrets },
-    { name = "PREFIX", value = var.prefix, secret = var.github_all_secrets },
-    { name = "ACCESS_KEY_ID", value = local.github_key.access_key, secret = true },
-    { name = "SECRET_ACCESS_KEY", value = local.github_key.secret_key, secret = true },
-  ]
-}
-
-output "gh_secret_set" {
-  sensitive = true
-  value = join("\n", concat(
+  gh_secret_set = { for role, g in local.github : role => join("\n", concat(
     ["set -euo pipefail"],
-    [for s in local.github_settings : format(
-      "printf '%%s' '%s' | gh %s set %s%s%s",
+    [for s in [
+      { name = "ENDPOINT", value = local.endpoint, secret = var.github_all_secrets },
+      { name = "REGION", value = var.region, secret = var.github_all_secrets },
+      { name = "BUCKET", value = digitalocean_spaces_bucket.cache.name, secret = var.github_all_secrets },
+      { name = "PREFIX", value = var.prefix, secret = var.github_all_secrets },
+      { name = "ACCESS_KEY_ID", value = g.key.access_key, secret = true },
+      { name = "SECRET_ACCESS_KEY", value = g.key.secret_key, secret = true },
+      ] : format(
+      "printf '%%s' '%s' | gh %s set %s%s%s%s",
       replace(s.value, "'", "'\\''"),
       s.secret ? "secret" : "variable",
-      var.github_name_prefix,
+      g.name_prefix,
       s.name,
-      local.github_target,
+      var.github_repository == null ? "" : " --repo ${var.github_repository}",
+      g.environment == null ? "" : " --env '${replace(g.environment, "'", "'\\''")}'",
     )],
     [""],
-  ))
+  )) }
+}
+
+output "gh_secret_set_write" {
+  description = "bash script: store the write key's settings in GitHub (github_write_environment, github_write_name_prefix)."
+  sensitive   = true
+  value       = local.gh_secret_set.write
+
+  precondition {
+    condition     = !local.github_collision
+    error_message = "The write and read keys would be stored under the same names in the same place: give them different github_*_environment values or different github_*_name_prefix values."
+  }
+}
+
+output "gh_secret_set_read" {
+  description = "bash script: store the read key's settings in GitHub (github_read_environment, github_read_name_prefix)."
+  sensitive   = true
+  value       = local.gh_secret_set.read
+
+  precondition {
+    condition     = !local.github_collision
+    error_message = "The write and read keys would be stored under the same names in the same place: give them different github_*_environment values or different github_*_name_prefix values."
+  }
 }

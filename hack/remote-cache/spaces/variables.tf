@@ -33,12 +33,12 @@ variable "key_name_prefix" {
   type        = string
   default     = null
 }
-
-# Where the gh_secret_set output puts the settings. One state (directory or
+# Where the gh_secret_set_write and _read outputs put the settings. One
+# state (directory or workspace) per repository: see README.md, "Into GitHub".
 # workspace) per repository and environment: see README.md, "Into GitHub".
 
 variable "github_repository" {
-  description = "owner/name the gh_secret_set output targets (gh's --repo). Null: the repository gh finds in the current directory."
+  description = "owner/name the gh_secret_set_write and _read outputs target (gh's --repo). Null: the repository gh finds in the current directory."
   type        = string
   default     = null
 
@@ -48,27 +48,28 @@ variable "github_repository" {
   }
 }
 
-variable "github_environment" {
-  description = "GitHub Actions environment the gh_secret_set output targets (gh's --env). Null: repository-level secrets and variables."
+variable "github_write_environment" {
+  description = "GitHub Actions environment gh_secret_set_write targets (gh's --env), such as the default branch's. Null: repository-level secrets and variables."
   type        = string
   default     = null
 }
 
-variable "github_key" {
-  description = "Which key gh_secret_set stores: write (a writer, such as the default branch's jobs) or read (pull-request jobs, a read-only sidecar). Never admin."
+variable "github_read_environment" {
+  description = "GitHub Actions environment gh_secret_set_read targets (gh's --env), such as pull requests'. Null: repository-level secrets and variables."
   type        = string
-  default     = "write"
-
-  validation {
-    condition     = contains(["write", "read"], var.github_key)
-    error_message = "github_key must be write or read: the admin key never goes to CI."
-  }
+  default     = null
 }
 
-variable "github_name_prefix" {
-  description = "Prefix of the secret and variable names gh_secret_set sets. CACHE_S3_ matches the remote-cache action's README; SPACES_ matches remote-cache-spaces.yml (set github_all_secrets too)."
+variable "github_write_name_prefix" {
+  description = "Prefix of the names gh_secret_set_write sets. CACHE_S3_ matches the remote-cache action's README; SPACES_ matches remote-cache-spaces.yml (set github_all_secrets too)."
   type        = string
   default     = "CACHE_S3_"
+}
+
+variable "github_read_name_prefix" {
+  description = "Prefix of the names gh_secret_set_read sets. Must differ from github_write_name_prefix when both target the same place (both repository-level, or the same environment), so the read key doesn't overwrite the write key."
+  type        = string
+  default     = "CACHE_S3_READ_"
 }
 
 variable "github_all_secrets" {
