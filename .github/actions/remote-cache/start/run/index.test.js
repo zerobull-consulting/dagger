@@ -172,6 +172,16 @@ test('a run past its bound leaves nothing it spawned running', async (t) => {
   for (const pid of spawned) assert.ok(dead(pid), `${pid} the script spawned is still running (${procState(pid)})`);
 });
 
+// sidecar.sh keeps its timeout calls in the group only when told the group is
+// killed at the bound (SIDECAR_GROUP_KILLED=1); run any other way, it doesn't.
+test('the script is told its process group is killed at the bound', async (t) => {
+  const { dir, env } = setup(t);
+  const out = path.join(dir, 'out');
+  fs.writeFileSync(env.SIDECAR_SCRIPT, '#!/usr/bin/env bash\necho "$SIDECAR_GROUP_KILLED" >"$OUT"\n', { mode: 0o755 });
+  assert.strictEqual(await require(shim).run('stop', { ...env, OUT: out }, 10000), 0);
+  assert.strictEqual(fs.readFileSync(out, 'utf8').trim(), '1');
+});
+
 // The script is in a process group of its own, so a cancel's signal to the
 // shim reaches it only because the shim passes it on.
 for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]]) {

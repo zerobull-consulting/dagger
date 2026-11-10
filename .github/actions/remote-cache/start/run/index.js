@@ -79,7 +79,10 @@ const maxTimerMs = 2 ** 31 - 1;
 function run(command, env, timeoutMs) {
   const script = scriptOf(env);
   return new Promise((resolve) => {
-    const child = spawn('bash', [script, command], { env, stdio: 'inherit', detached: true });
+    // SIDECAR_GROUP_KILLED: the script may keep its timeout calls in this
+    // group (sidecar.sh), since the group is killed at the bound.
+    const childEnv = { ...env, SIDECAR_GROUP_KILLED: '1' };
+    const child = spawn('bash', [script, command], { env: childEnv, stdio: 'inherit', detached: true });
     const killGroup = (signal) => {
       try {
         process.kill(-child.pid, signal);

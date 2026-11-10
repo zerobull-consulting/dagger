@@ -82,12 +82,16 @@ set -euo pipefail
 # GNU timeout puts itself and its command in a process group of their own,
 # out of reach of start/run's kill of the script's group at its bound, and of
 # the cancel signals it passes on (zerobull-consulting/dagger#209).
-# --foreground keeps them in the script's group. With it, timeout times out
+# --foreground keeps them in the script's group, but then timeout times out
 # only its command, not that command's own children (a docker credential
-# helper or plugin, say, or whatever SIDECAR_CLI starts): a hung one is then
-# cut off by start/run's bound instead, and its group kill. A timeout with no
-# --foreground (BusyBox's) is used as it is.
-if command timeout --foreground 5 true 2>/dev/null; then
+# helper or plugin, say, or whatever SIDECAR_CLI starts). So it is used only
+# where start/run's group kill cuts such a child off instead: start/run sets
+# SIDECAR_GROUP_KILLED=1. Run any other way (the stop action, the demo), or
+# with a timeout that has no --foreground (BusyBox's), timeout is as it is.
+group_killed() {
+	[[ "${SIDECAR_GROUP_KILLED:-}" == 1 ]] && command timeout --foreground 5 true 2>/dev/null
+}
+if group_killed; then
 	timeout() { command timeout --foreground "$@"; }
 fi
 
@@ -716,9 +720,13 @@ start() {
 	cat >"$bin/dagger" <<EOF
 #!/usr/bin/env bash
 # Written by the remote cache sidecar (.github/actions/remote-cache).
-# Its timeout keeps to the caller's process group, as the sidecar's does: the
-# start runs this script under start/run (zerobull-consulting/dagger#209).
-$(declare -f timeout)
+# Its timeout keeps to the caller's process group where the sidecar's does:
+# under start/run, which runs it once (zerobull-consulting/dagger#209); not in
+# the job's later steps.
+$(declare -f group_killed)
+if group_killed; then
+	timeout() { command timeout --foreground "\$@"; }
+fi
 if [[ "\$(timeout 30 docker inspect -f '{{.State.Running}}' $q_service 2>/dev/null)" != true ]]; then
 	echo "remote-cache-sidecar: the cache service $q_service isn't running" >&2
 	timeout 30 docker logs --tail 100 $q_service 2>&1 | sed -E 's/(X-Amz-(Credential|Signature|Security-Token)=)[^&" ]*/\1REDACTED/g' >&2

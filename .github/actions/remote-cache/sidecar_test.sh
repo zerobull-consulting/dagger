@@ -42,9 +42,10 @@ check "an image starting with '-' is refused" not valid_image "--privileged"
 check "a docker call in a wait is bounded by what is left of it" [ "$(step_bound $((SECONDS + 3)))" -le 3 ]
 check "... at most 10s" [ "$(step_bound $((SECONDS + 600)))" = 10 ]
 check "... and at least 1s, past its end" [ "$(step_bound $((SECONDS - 5)))" = 1 ]
-# zerobull-consulting/dagger#209: a bounded docker call stays in the script's
-# process group, which start/run kills at its bound (GNU timeout alone moves
-# to a group of its own).
+# zerobull-consulting/dagger#209: under start/run (SIDECAR_GROUP_KILLED=1), a
+# bounded docker call stays in the script's process group, which start/run
+# kills at its bound (GNU timeout alone moves to a group of its own). Run any
+# other way, timeout is GNU's own, which kills its command's children too.
 # The process group of a /proc/<pid>/stat line on stdin: the 3rd field after
 # the command's name, which is in parentheses.
 stat_pgid() {
@@ -60,7 +61,17 @@ timeout_keeps_group() {
 	outer="$(stat_pgid </proc/$$/stat)"
 	[[ -n "$inner" && "$inner" == "$outer" ]]
 }
-check "a timeout call stays in the script's process group" timeout_keeps_group
+# A fresh bash that sourced sidecar.sh with the settings given, running CMD.
+sourced() {
+	local cmd="$1"
+	shift
+	env "$@" bash -c "source '$here/sidecar.sh'; set +e; $(declare -f stat_pgid timeout_keeps_group); $cmd"
+}
+which_timeout='if declare -F timeout >/dev/null; then echo wrapped; else echo plain; fi'
+check "under start/run, a timeout call stays in the script's process group" \
+	sourced timeout_keeps_group SIDECAR_GROUP_KILLED=1
+check "... and run any other way, timeout is not wrapped" \
+	[ "$(sourced "$which_timeout" SIDECAR_GROUP_KILLED=)" = plain ]
 # A timeout with no --foreground (BusyBox's) is used as it is, not wrapped.
 mkdir -p "$tmp/bbtimeout"
 cat >"$tmp/bbtimeout/timeout" <<'FAKE'
@@ -70,8 +81,8 @@ shift
 exec "$@"
 FAKE
 chmod +x "$tmp/bbtimeout/timeout"
-check "... and a timeout with no --foreground still runs the command" \
-	[ "$(PATH="$tmp/bbtimeout:$PATH" bash -c "source '$here/sidecar.sh'; timeout 5 echo ran" 2>&1)" = ran ]
+check "... and under start/run, a timeout with no --foreground still runs the command" \
+	[ "$(sourced 'timeout 5 echo ran' SIDECAR_GROUP_KILLED=1 PATH="$tmp/bbtimeout:$PATH" 2>&1)" = ran ]
 check "10m is 600s" [ "$(duration_seconds 10m)" = 600 ]
 check "1h30m is 5400s" [ "$(duration_seconds 1h30m)" = 5400 ]
 check "1.5h is refused" not duration_seconds 1.5h
@@ -731,8 +742,30 @@ check "... and says which CLI it uses" grep -q "using the CLI $fake_cli ($first_
 sidecar_wrapper="$tmp/okbin.sc/remote-cache/bin/dagger"
 check "... the wrapper runs that CLI" grep -qF "$fake_cli" "$sidecar_wrapper"
 # zerobull-consulting/dagger#209: the start runs the wrapper under start/run,
-# so its timeout calls stay in the script's process group too.
-check "... and its timeout calls keep to the caller's process group" grep -qF 'command timeout --foreground "$@"' "$sidecar_wrapper"
+# where its timeout calls stay in the group too; the job's later steps run it
+# with GNU's own. A timeout that records how it was called tells them apart.
+mkdir -p "$tmp/rectimeout"
+cat >"$tmp/rectimeout/timeout" <<'FAKE'
+#!/bin/sh
+echo "$*" >>"$TIMEOUT_LOG"
+while [ "${1#-}" != "$1" ]; do shift; done
+shift
+exec "$@"
+FAKE
+chmod +x "$tmp/rectimeout/timeout"
+wrapper_timeout() {
+	rm -f "$tmp/timeout.log"
+	TIMEOUT_LOG="$tmp/timeout.log" PATH="$tmp/rectimeout:$tmp/okbin:$PATH" "$@" "$sidecar_wrapper" call >/dev/null 2>&1
+	if grep -q -- '^--foreground 30 docker inspect' "$tmp/timeout.log"; then
+		echo wrapped
+	elif grep -q -- '^30 docker inspect' "$tmp/timeout.log"; then
+		echo plain
+	fi
+}
+check "... and under start/run, its timeout calls keep to the caller's process group" \
+	[ "$(wrapper_timeout env SIDECAR_GROUP_KILLED=1)" = wrapped ]
+check "... but in the job's later steps, its timeout is GNU's own" \
+	[ "$(wrapper_timeout env SIDECAR_GROUP_KILLED=)" = plain ]
 # The guards survive: a job with a trace and settings of its own.
 wrapped() { TRACEPARENT=00-aa-bb-00 DAGGER_ENGINE=other OTEL_X=1 PATH="$tmp/okbin:$PATH" "$sidecar_wrapper" call; }
 check "... which drops an inherited TRACEPARENT, DAGGER_* and OTEL_*" grep -q "^TRACEPARENT=unset DAGGER_ENGINE=unset OTEL_X=unset" <<<"$(wrapped)"
