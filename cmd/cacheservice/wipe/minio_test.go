@@ -27,6 +27,7 @@ import (
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/s3test"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 )
@@ -327,5 +328,22 @@ func TestMinIODryRunWarnsNestedMarkers(t *testing.T) {
 	code, out := e.main()
 	if code != ExitOK || !strings.Contains(out, "WARNING: 1 ownership markers under the prefix") || !strings.Contains(out, e.target+"/team/cacheservice.json") {
 		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// An upload at exactly the wiped prefix's root (<target>/) can't exist on
+// MinIO: it refuses the key (XMinioInvalidObjectName, seen on the dev
+// MinIO). The command handles one on a store that allows it
+// (TestUploadsByExactKeyRootUpload); this pins MinIO's answer, so a change
+// in it shows here.
+func TestMinIORefusesUploadAtRoot(t *testing.T) {
+	if s := os.Getenv(s3test.EnvStore); s != "" && s != "minio" {
+		t.Skipf("pins MinIO's answer; the store is %s", s)
+	}
+	e := newMinIOEnv(t)
+	k := e.target + "/"
+	_, err := e.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{Bucket: &e.cfg.Bucket, Key: &k})
+	if code := s3util.ErrorCode(err); code != "XMinioInvalidObjectName" {
+		t.Fatalf("an upload at %s: %v (code %q), want XMinioInvalidObjectName", k, err, code)
 	}
 }

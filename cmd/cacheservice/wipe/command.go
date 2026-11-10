@@ -226,18 +226,17 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 	var (
 		deleted, aborted int
 		bytes            int64
-		failures         []Failure
+		failures         failureLog
 	)
-	// progress reports what was done, every failure included (up to
-	// MaxShown), on every way out after the marker.
+	// progress reports what was done, and the failures (up to MaxShown),
+	// on every way out after the marker.
 	progress := func() {
-		fmt.Fprintf(out, "deleted %d objects, %d bytes; aborted %d incomplete multipart uploads; %d failed\n", deleted, bytes, aborted, len(failures))
-		for i, f := range failures {
-			if i == MaxShown {
-				fmt.Fprintf(out, "  ... and %d more failures\n", len(failures)-MaxShown)
-				break
-			}
+		fmt.Fprintf(out, "deleted %d objects, %d bytes; aborted %d incomplete multipart uploads; %d failed\n", deleted, bytes, aborted, failures.n)
+		for _, f := range failures.first {
 			fmt.Fprintf(out, "  FAILED %q: %s\n", f.Key, f.Reason)
+		}
+		if failures.n > len(failures.first) {
+			fmt.Fprintf(out, "  ... and %d more failures\n", failures.n-len(failures.first))
 		}
 	}
 	stop := func(format string, a ...any) int {
@@ -259,13 +258,13 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 
 	// 2. The objects.
 	err = walkObjects(ctx, st, root, func(objs []Object) error {
-		failed, err := st.Delete(ctx, objKeys(objs))
+		keyFailures, err := st.Delete(ctx, objKeys(objs))
 		if err != nil {
 			return err
 		}
-		failures = append(failures, failed...)
-		bad := make(map[string]bool, len(failed))
-		for _, f := range failed {
+		failures.add(keyFailures...)
+		bad := make(map[string]bool, len(keyFailures))
+		for _, f := range keyFailures {
 			bad[f.Key] = true
 		}
 		for _, ob := range objs {
@@ -287,7 +286,7 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 				if ctx.Err() != nil {
 					return context.Cause(ctx)
 				}
-				failures = append(failures, Failure{Key: "upload:" + u.Key, Reason: err.Error()})
+				failures.add(Failure{Key: "upload:" + u.Key, Reason: err.Error()})
 				continue
 			}
 			aborted++
@@ -309,15 +308,27 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		printSummary(out, s)
 	}
 	switch {
-	case len(failures) > 0 && s.Empty():
-		return fail(ExitError, "%d deletes or aborts failed, though the prefix is empty now", len(failures))
-	case len(failures) > 0:
-		return fail(ExitError, "%d deletes or aborts failed; the prefix isn't empty", len(failures))
+	case failures.n > 0 && s.Empty():
+		return fail(ExitError, "%d deletes or aborts failed, though the prefix is empty now", failures.n)
+	case failures.n > 0:
+		return fail(ExitError, "%d deletes or aborts failed; the prefix isn't empty", failures.n)
 	case !s.Empty():
 		return fail(ExitNotEmpty, "the prefix isn't empty after the wipe: is a writer still running on it? Stop it, and wipe again")
 	}
 	fmt.Fprintln(out, "wipe: the prefix is empty")
 	return ExitOK
+}
+
+// failureLog counts every failure, and keeps the first MaxShown for the
+// report: a key denied every delete can't grow it without bound.
+type failureLog struct {
+	n     int
+	first []Failure
+}
+
+func (l *failureLog) add(fs ...Failure) {
+	l.n += len(fs)
+	l.first = append(l.first, fs[:min(len(fs), MaxShown-len(l.first))]...)
 }
 
 // checkAncestors refuses a prefix inside another store's: an ancestor
@@ -335,12 +346,13 @@ func checkAncestors(ctx context.Context, st Store, prefix string) error {
 		_, err := st.Get(ctx, key)
 		switch {
 		case err == nil:
-			where := "the bucket's top"
+			where, instead := "the bucket's top", "empty the bucket in the provider's console" // an empty prefix isn't supported
 			if anc != "" {
 				where = "prefix " + anc + "/"
+				instead = "wipe " + where + " itself"
 			}
 			return fmt.Errorf("prefix %s/ is inside %s, which holds an ownership marker (%s): wiping it would delete part of that store. "+
-				"Check %s, or wipe %s itself", p, where, key, blobstore.EnvPrefix, where)
+				"Set %s outside it, or %s", p, where, key, blobstore.EnvPrefix, instead)
 		case ctx.Err() != nil:
 			return fmt.Errorf("check %s, an ancestor's ownership marker position: %w", key, context.Cause(ctx))
 		case errors.Is(err, metastore.ErrNotFound), errors.Is(err, metastore.ErrDenied):
@@ -458,48 +470,60 @@ func walkObjects(ctx context.Context, st Store, root string, fn func([]Object) e
 }
 
 // walkUploads calls fn with each page of the incomplete multipart uploads
-// under root. On a store that may list them only by exact key, when the
-// listing by prefix finds none, it lists the bucket's and keeps those under
-// root, as gc does.
+// under root. On a store that may list them only by exact key, unless the
+// listing by prefix found one strictly below root (so it lists by prefix),
+// it lists the bucket's and keeps those under root, as gc does. Such a
+// store's listing by prefix may return only the uploads at exactly root,
+// which the bucket's listing then skips: fn sees each upload once.
 func walkUploads(ctx context.Context, st Store, root string, fn func([]Upload) error) error {
-	found, err := walkUploadListing(ctx, st, root, root, fn)
-	if err != nil || found > 0 || !st.UploadsByExactKey() {
+	below, atRoot, err := walkUploadListing(ctx, st, root, root, false, fn)
+	if err != nil || below > 0 || !st.UploadsByExactKey() {
 		return err
 	}
-	_, err = walkUploadListing(ctx, st, "", root, fn)
+	_, _, err = walkUploadListing(ctx, st, "", root, atRoot > 0, fn)
 	return err
 }
 
 // walkUploadListing pages through the uploads the store lists for prefix
-// ("": the bucket's), at most MaxPages, and calls fn with those under root:
-// a listing by root's prefix that returns any other is refused.
-func walkUploadListing(ctx context.Context, st Store, prefix, root string, fn func([]Upload) error) (int, error) {
-	found := 0
+// ("": the bucket's), at most MaxPages, and calls fn with those under root,
+// leaving out those at exactly root with skipRoot. A listing by root's
+// prefix that returns any other is refused. It returns how many it passed
+// to fn strictly below root, and at exactly root.
+func walkUploadListing(ctx context.Context, st Store, prefix, root string, skipRoot bool, fn func([]Upload) error) (below, atRoot int, err error) {
 	keyMarker, idMarker := "", ""
 	for page := 0; page < MaxPages; page++ {
 		ups, nk, ni, err := st.ListUploads(ctx, prefix, keyMarker, idMarker)
 		if err != nil {
-			return found, err
+			return below, atRoot, err
 		}
 		if prefix != "" {
 			if err := under(root, upKeys(ups)); err != nil {
-				return found, err
+				return below, atRoot, err
 			}
 		} else {
 			ups = slices.DeleteFunc(ups, func(u Upload) bool { return !strings.HasPrefix(u.Key, root) })
 		}
-		found += len(ups)
+		if skipRoot {
+			ups = slices.DeleteFunc(ups, func(u Upload) bool { return u.Key == root })
+		}
+		for _, u := range ups {
+			if u.Key == root {
+				atRoot++
+			} else {
+				below++
+			}
+		}
 		if len(ups) > 0 {
 			if err := fn(ups); err != nil {
-				return found, err
+				return below, atRoot, err
 			}
 		}
 		if nk == "" && ni == "" {
-			return found, nil
+			return below, atRoot, nil
 		}
 		keyMarker, idMarker = nk, ni
 	}
-	return found, fmt.Errorf("more than %d pages of multipart uploads: stopped", MaxPages)
+	return below, atRoot, fmt.Errorf("more than %d pages of multipart uploads: stopped", MaxPages)
 }
 
 // under refuses keys a listing returned outside root: the store's answer,

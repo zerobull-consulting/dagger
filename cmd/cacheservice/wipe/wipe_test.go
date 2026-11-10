@@ -694,6 +694,11 @@ func TestAncestorMarkerRefused(t *testing.T) {
 				if code != ExitError || !strings.Contains(out, "holds an ownership marker ("+tc.ancestor+")") {
 					t.Fatalf("exit %d\n%s", code, out)
 				}
+				// The hint is one the operator can follow: this command
+				// doesn't wipe a bucket's top.
+				if tc.ancestor == "cacheservice.json" && (!strings.Contains(out, "empty the bucket in the provider's console") || strings.Contains(out, "wipe the bucket's top")) {
+					t.Errorf("the bucket's top's hint:\n%s", out)
+				}
 				if !slices.Equal(f.keys(), keys) || !slices.Equal(f.uploadKeys(), ups) {
 					t.Fatal("the store changed")
 				}
@@ -806,5 +811,63 @@ func TestFailureButEmpty(t *testing.T) {
 	code := Run(context.Background(), Options{Bucket: "bkt", Prefix: "cache", Confirm: "bkt/cache"}, f, &out, &errOut)
 	if code != ExitError || !strings.Contains(errOut.String(), "though the prefix is empty now") {
 		t.Fatalf("exit %d\n%s%s", code, out.String(), errOut.String())
+	}
+}
+
+// Every key failing its delete: the report counts them all and lists the
+// first MaxShown, and only those are kept.
+func TestFailuresBounded(t *testing.T) {
+	f := newFake()
+	f.deleteFailures = map[string]bool{}
+	for i := range 2*PageSize + 5 {
+		k := fmt.Sprintf("cache/k%05d", i)
+		f.put(k, 1)
+		f.deleteFailures[k] = true
+	}
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	n := 2*PageSize + 5
+	if code != ExitError || strings.Count(out, "  FAILED ") != MaxShown || !strings.Contains(out, fmt.Sprintf("; %d failed", n)) ||
+		!strings.Contains(out, fmt.Sprintf("... and %d more failures", n-MaxShown)) {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	var l failureLog
+	for range 3 {
+		l.add(make([]Failure, PageSize)...)
+	}
+	l.add(Failure{})
+	if l.n != 3*PageSize+1 || len(l.first) != MaxShown || cap(l.first) > 2*MaxShown {
+		t.Fatalf("n %d, kept %d (cap %d)", l.n, len(l.first), cap(l.first))
+	}
+}
+
+// On a store that lists uploads by exact key, an upload at exactly the
+// prefix's root doesn't hide those below it: each is aborted once, and a
+// dry run counts each once.
+func TestUploadsByExactKeyRootUpload(t *testing.T) {
+	newStore := func() *fakeStore {
+		f := newFake()
+		f.exactKey = true
+		seed(f, 1)
+		f.uploads = append(f.uploads, Upload{Key: "cache/", ID: "r1"}, Upload{Key: "cache/", ID: "r2"})
+		return f
+	}
+	f := newStore()
+	_, out := run(t, f, Options{Prefix: "cache", DryRun: true})
+	if !strings.Contains(out, "incomplete multipart uploads: 4\n") {
+		t.Fatalf("dry run:\n%s", out)
+	}
+	f = newStore()
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	if code != ExitOK || !strings.Contains(out, "aborted 4 incomplete multipart uploads; 0 failed") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	slices.Sort(f.aborted)
+	if want := []string{"cache/", "cache/", "cache/ns/main/staging/a", "cache/ns/main/staging/a"}; !slices.Equal(f.aborted, want) {
+		t.Fatalf("aborted %v, want %v", f.aborted, want)
+	}
+	for _, u := range f.uploadKeys() {
+		if strings.HasPrefix(u, "cache/") {
+			t.Fatalf("left %v", f.uploadKeys())
+		}
 	}
 }
