@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"unsafe"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
@@ -20,8 +21,10 @@ import (
 // estimate errs high: each message at its Go struct's size plus an eighth
 // (allocation size classes), each element of a repeated field 16 bytes more
 // (its pointer, and the slice's growth), each string or bytes field its
-// length plus a header, and each known varint or fixed field its wire size,
-// tag included, or the header if that is more. A field the message doesn't
+// length plus a header, each element of a repeated string or bytes field its
+// length and a quarter (size classes) plus four of its headers (its header
+// in the slice, and the slice's growth), and each known varint or fixed field its wire size, tag
+// included, or the header if that is more. A field the message doesn't
 // know (a group, a bytes field, like any field of the wrong wire type for
 // its number) is kept by proto.Unmarshal as raw bytes, appended to one slice
 // per message, so it is charged otlpUnknownGrowth times its wire size (or
@@ -43,6 +46,17 @@ const (
 	// otlpFieldCost is a scalar field's or a string's header, and the least a
 	// varint, fixed or group field is charged.
 	otlpFieldCost = 16
+	// otlpElemHeaders is how many of its headers an element of a repeated
+	// string or bytes field is charged: its header in the field's slice,
+	// which append holds twice over while it grows (the old array and the
+	// new one, about twice the old, and more once rounded up to a size
+	// class). The most held per element, by TestOTLPAppendPeakHeaders, is
+	// 3.12 string headers (at 33 elements, 32 grown to 71) and 3.25 slice
+	// headers (at 75) (zerobull-consulting/dagger#217).
+	otlpElemHeaders = 4
+	// otlpBytesHeader is a bytes value's header, a slice's; a string's is
+	// otlpFieldCost.
+	otlpBytesHeader = int64(unsafe.Sizeof([]byte(nil)))
 	// otlpMaxDepth bounds how deep a body may nest messages, the request
 	// being depth 0; a deeper body is refused with 400 before the estimate
 	// walks it or proto.Unmarshal decodes it, since both recurse once per
@@ -163,6 +177,14 @@ func otlpProtoSize(b []byte, md protoreflect.MessageDescriptor, depth int, deepe
 				return 0, err
 			}
 			size += sub + otlpListElemCost
+		case fd.IsList() && (fd.Kind() == protoreflect.StringKind || fd.Kind() == protoreflect.BytesKind):
+			// An element of a repeated string or bytes field: copied, and its
+			// header appended to the field's slice, which append grows.
+			header := int64(otlpFieldCost)
+			if fd.Kind() == protoreflect.BytesKind {
+				header = otlpBytesHeader
+			}
+			size += otlpAllocSize(int64(len(v))) + otlpElemHeaders*header
 		case fd.IsList():
 			// Packed scalars: each takes at least a byte on the wire, and
 			// at most 8 decoded, plus the slice's growth.
@@ -248,6 +270,15 @@ func otlpJSONDepth(data []byte) int {
 // value: a message, a string, bytes, or a packed list.
 func otlpBytesKind(fd protoreflect.FieldDescriptor) bool {
 	return fd.IsList() || fd.Message() != nil || fd.Kind() == protoreflect.StringKind || fd.Kind() == protoreflect.BytesKind
+}
+
+// otlpAllocSize is at least what the allocator gives a copy of n bytes,
+// which it rounds up to a size class, or to 8 KiB pages past 32 KiB: by up
+// to a quarter (a 32,769-byte string takes 40,960), and to 16 bytes below
+// that (17 bytes take 24, 33 take 48), which a repeated element's headers
+// cover.
+func otlpAllocSize(n int64) int64 {
+	return n + n/4
 }
 
 // otlpUnknownCost is what a field the decoder keeps as unknown bytes adds to
