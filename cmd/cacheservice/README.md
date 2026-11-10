@@ -243,7 +243,10 @@ minute (`exporter.DefaultPausedWait`). **So an export has about 20s after
 the last session's end to finish**; one that takes longer, such as a large
 upload on a slow link, is cut, and goes on in the engine's next session:
 its roots are paused too, and the blobs that arrived stay stored, so the
-next export uploads only the rest.
+next export uploads only the rest. The engine doesn't always say why it
+cut an export off (one waiting for its upload is dropped without a word),
+so the exporter asks once more for an export that ended so: a paused
+engine then refuses its roots, and any other goes on.
 Sessions that overlap keep the engine from asking to settle at all.
 
 **The engine downloads what it is offered at once.** An offered part's

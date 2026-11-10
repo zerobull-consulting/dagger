@@ -142,6 +142,10 @@ type trackedCache struct {
 	// engine number: what the merge left on each entry. Kept apart from
 	// entries, which are forgotten when their spans stop.
 	imports map[uint64]*exportedValue
+	// engineWakes counts the times the cache's engine came back for the
+	// entries that wait for it (wakeEngineWaitLocked): a batch claimed
+	// before the latest one doesn't make its roots wait for the next.
+	engineWakes uint64
 	// seen are the sessions no longer tracked, with when their tracking
 	// ended: every counted span in, or their spans stopped (UnseenSessions).
 	seen map[string]time.Time
@@ -696,6 +700,7 @@ func (t *Tracker) WakeEngineWait(cacheID string, generation uint64, now time.Tim
 }
 
 func (t *Tracker) wakeEngineWaitLocked(c *trackedCache, now time.Time) {
+	c.engineWakes++
 	woke := false
 	for _, e := range c.entries {
 		if !e.engineWaitAt.IsZero() && e.retryAt.After(now) {
@@ -751,6 +756,8 @@ type Batch struct {
 	values map[uint64]*exportedValue
 	// generation is the cache's generation when the batch was claimed.
 	generation uint64
+	// engineWakes is the cache's count of them when the batch was claimed.
+	engineWakes uint64
 	// slot is set when the batch holds its cache's slot (Due, DrainDue):
 	// Done, Interrupted or Requeue frees it.
 	slot bool
@@ -939,7 +946,7 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 			continue
 		}
 		if cur == nil || len(cur.Request.Roots) >= maxBatchRoots {
-			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}, generation: c.generation})
+			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}, generation: c.generation, engineWakes: c.engineWakes})
 			cur = &batches[len(batches)-1]
 		}
 		t.claimLocked(e)
@@ -1104,10 +1111,16 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 	}
 	for _, n := range res.Paused {
 		// The engine's refusal, not the value's: it waits for the engine,
-		// as a root given back for a connection does.
+		// as a root given back for a connection does. An engine that came
+		// back while the export was in flight (Opened, Connected) isn't
+		// waited for again: the root is due now.
 		if e := entry(n); e != nil {
-			at := now.Add(t.cfg.PausedWait)
-			e.retryAt, e.engineWaitAt = at, at
+			if b.engineWakes != c.engineWakes {
+				e.retryAt, e.engineWaitAt = now, time.Time{}
+			} else {
+				at := now.Add(t.cfg.PausedWait)
+				e.retryAt, e.engineWaitAt = at, at
+			}
 			e.flushRetry = givenBack(e.flushRetry)
 		}
 		settled[n] = true
@@ -1188,7 +1201,7 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 	if c == nil {
 		return b, nil
 	}
-	b.generation = c.generation
+	b.generation, b.engineWakes = c.generation, c.engineWakes
 	for _, n := range req.Roots {
 		if e := c.entries[n]; e != nil && e.inFlight {
 			return Batch{}, fmt.Errorf("root %d is already being exported", n)

@@ -55,6 +55,14 @@ type fakeEngine struct {
 	// cutUploads, when set, fails every blob but the first of each upload
 	// with it, unsent, as an upload the engine cut off does.
 	cutUploads string
+	// errOnce answers the next request of a type with an error reply, once;
+	// an upload so answered finds its export dropped. pauseAfter then makes
+	// the engine refuse every root of its later exports as paused.
+	errOnce    map[protocol.Type]string
+	pauseAfter bool
+	paused     bool
+	// requests counts the requests received, by type.
+	requests map[protocol.Type]int
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -67,9 +75,37 @@ func (e *fakeEngine) Generation() uint64 { return e.cache.Generation }
 func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.RawMessage) (protocol.Envelope, error) {
 	e.mu.Lock()
 	replyErr, hold := e.replyErr, e.hold
+	if e.requests == nil {
+		e.requests = map[protocol.Type]int{}
+	}
+	e.requests[typ]++
+	once, cutOnce := e.errOnce[typ]
+	if cutOnce {
+		delete(e.errOnce, typ)
+		e.paused = e.pauseAfter
+		if typ == protocol.TypeUpload {
+			e.exports = map[string]fakeengine.Capture{}
+			e.inFlight = 0
+		}
+	}
+	paused := e.paused
 	e.mu.Unlock()
 	if replyErr != "" {
 		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: replyErr})
+	}
+	if cutOnce {
+		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: once})
+	}
+	if paused && typ == protocol.TypeExport {
+		var req protocol.Export
+		if err := json.Unmarshal(body, &req); err != nil {
+			return protocol.Envelope{}, err
+		}
+		skipped := make([]protocol.SkippedRoot, len(req.Roots))
+		for i, n := range req.Roots {
+			skipped[i] = protocol.SkippedRoot{Number: n, Reason: protocol.SkipRefused, Message: EnginePausedMessage}
+		}
+		return protocol.NewEnvelope(1, 1, protocol.TypeExported, protocol.Exported{Skipped: skipped})
 	}
 	switch typ {
 	case protocol.TypeExport:
@@ -115,6 +151,9 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 		}
 		e.uploads = append(e.uploads, req.URLs)
 		onUpload, cut := e.onUpload, e.cutUploads
+		if cut != "" && e.pauseAfter {
+			e.paused = true
+		}
 		e.mu.Unlock()
 		if onUpload != nil && len(req.URLs) > 0 {
 			onUpload()
@@ -1052,6 +1091,84 @@ func TestExportPausedDuringUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Present) != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// An engine that gives up its remote-cache work doesn't always say so of the
+// export it cuts off: one waiting for its upload is dropped without a word,
+// so the upload finds no export, and a capture building layers ends with
+// its context's error. The export is asked again, once, and the paused
+// engine refuses its roots: paused, with no failure.
+func TestExportCutByPausedEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		typ     protocol.Type
+		message string
+	}{
+		{"dropped before its upload", protocol.TypeUpload, `no export "export-1"`},
+		{"canceled while capturing", protocol.TypeExport, "context canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			e.addBuild()
+			e.eng.errOnce = map[protocol.Type]string{tc.typ: tc.message}
+			e.eng.pauseAfter = true
+			res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+			if err != nil {
+				t.Fatalf("an export the engine cut off as it paused failed: %v", err)
+			}
+			if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+				t.Fatalf("unexpected result: %+v", res)
+			}
+			if got := e.eng.requests[protocol.TypeExport]; got != 2 {
+				t.Fatalf("%d export requests, want 2", got)
+			}
+		})
+	}
+}
+
+// The blobs a paused engine was sending fail with their context's error,
+// not the pause's: the export is asked again, and its roots are paused.
+func TestExportUploadCanceledByPausedEngine(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.cutUploads = "upload: context canceled"
+	e.eng.pauseAfter = true
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if got := e.eng.requests[protocol.TypeUpload]; got != 1 {
+		t.Fatalf("%d uploads, want 1: no upload attempt was spent on the cut", got)
+	}
+}
+
+// A cut that no pause explains is one more try of the export, which goes
+// on; an engine that keeps cutting it off fails its roots.
+func TestExportCutWithoutPause(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.errOnce = map[protocol.Type]string{protocol.TypeUpload: `no export "export-1"`}
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Paused) != 0 || len(res.Failed) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+
+	e = newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.replyErr = "context canceled"
+	res, err = e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failed) != 2 || !strings.Contains(res.Failed[0].Error, "cut the export off 2 times") || len(res.Stored) != 0 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 }

@@ -414,7 +414,13 @@ const (
 	retryCollected
 	// retryHeld: the bundle had held rows, and was released unmerged.
 	retryHeld
+	// retryCut: the engine cut the export off (errEngineCut).
+	retryCut
 )
+
+// maxCutTries bounds the tries of an export the engine keeps cutting off.
+// One more try is enough to tell a pause: the engine refuses its roots.
+const maxCutTries = 2
 
 // exportWithRetries exports roots, and tries again while blobs fail to
 // upload, up to UploadAttempts tries, and while GC's fence refuses the
@@ -425,7 +431,7 @@ const (
 func (x *Exporter) exportWithRetries(ctx context.Context, eng Engine, roots []uint64, outputs []protocol.ExportOutput) (Result, error) {
 	var all Result
 	wait := x.cfg.RetryBackoff
-	uploads, collections, helds := 0, 0, 0
+	uploads, collections, helds, cuts := 0, 0, 0, 0
 	for {
 		res, retry, reason, err := x.exportOnce(ctx, eng, roots, outputs)
 		all.Merge(res)
@@ -443,6 +449,16 @@ func (x *Exporter) exportWithRetries(ctx context.Context, eng Engine, roots []ui
 				all.fail(retry, fmt.Errorf("the engine sent held rows %d times in a row", helds))
 				return all, nil
 			}
+			continue
+		case retryCut:
+			// Asked again at once: an engine that gave up its remote-cache
+			// work refuses the roots as paused, and any other goes on.
+			cuts++
+			if cuts >= maxCutTries {
+				all.fail(retry, fmt.Errorf("the engine cut the export off %d times in a row", cuts))
+				return all, nil
+			}
+			x.log.Info("export: the engine cut it off; asking again", "cacheID", eng.CacheID(), "roots", len(retry))
 			continue
 		case retryCollected:
 			collections++
@@ -485,6 +501,9 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		// export: no root's failure.
 		res.Paused = append(res.Paused, roots...)
 		return res, nil, retryUpload, nil
+	}
+	if errors.Is(err, errEngineCut) && ctx.Err() == nil {
+		return res, roots, retryCut, nil
 	}
 	if err != nil {
 		return res, nil, retryUpload, err
@@ -604,17 +623,24 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 		res.Paused = append(res.Paused, survivors...)
 		return res, nil, retryUpload, nil
 	}
+	if errors.Is(err, errEngineCut) && ctx.Err() == nil {
+		// The engine dropped the export before the upload reached it.
+		return res, survivors, retryCut, nil
+	}
 	if err != nil {
 		return res, nil, retryUpload, err
 	}
 	// An engine that gives up its remote-cache work during an upload still
-	// answers it: the blobs that arrived done, the others failed with that
-	// error.
-	paused := false
+	// answers it: the blobs that arrived done, those it never sent failed
+	// with that error, and those it was sending with their context's.
+	paused, cut := false, false
 	for _, f := range uploaded.Failed {
 		if strings.Contains(f.Message, EnginePausedMessage) {
 			paused = true
 			continue
+		}
+		if strings.Contains(f.Message, context.Canceled.Error()) {
+			cut = true
 		}
 		x.log.Warn("export: blob upload failed", "digest", f.Digest, "error", f.Message)
 	}
@@ -635,6 +661,9 @@ func (x *Exporter) exportOnce(ctx context.Context, eng Engine, roots []uint64, o
 			"roots", len(survivors), "blobs", len(urls), "missing", missing)
 		res.Paused = append(res.Paused, survivors...)
 		return res, nil, retryUpload, nil
+	}
+	if missing > 0 && cut {
+		return res, survivors, retryCut, nil
 	}
 	if missing > 0 {
 		return res, survivors, retryUpload, nil
@@ -935,9 +964,19 @@ func (x *Exporter) encode(body any) (json.RawMessage, error) {
 // engine canceled the export when it gave up its remote-cache work.
 var errEnginePaused = errors.New(EnginePausedMessage)
 
+// errEngineCut is an error reply of an export the engine cut off, without
+// the error that says why. An engine that gives up its remote-cache work
+// cancels its exports in progress with EnginePausedMessage, but not every
+// step says so: a capture that builds layers ends with its context's error,
+// and an export that waits for its upload ends without a word, so that the
+// upload finds no export. The export is asked again, once: a paused engine
+// then refuses its roots (retryCut).
+var errEngineCut = errors.New("the engine cut the export off")
+
 // replyError is the error of an error reply, nil for any other. An error
-// reply saying the reply was too large is errTooLarge, and one that carries
-// EnginePausedMessage is errEnginePaused.
+// reply saying the reply was too large is errTooLarge, one that carries
+// EnginePausedMessage is errEnginePaused, and one of a canceled context or
+// of an export the engine no longer has is errEngineCut, with its message.
 func replyError(env protocol.Envelope) error {
 	if env.Type != protocol.TypeError {
 		return nil
@@ -951,6 +990,9 @@ func replyError(env protocol.Envelope) error {
 	}
 	if strings.Contains(e.Message, EnginePausedMessage) {
 		return errEnginePaused
+	}
+	if strings.Contains(e.Message, context.Canceled.Error()) || strings.HasPrefix(e.Message, "no export ") {
+		return fmt.Errorf("%w: %s", errEngineCut, e.Message)
 	}
 	return errors.New(e.Message)
 }

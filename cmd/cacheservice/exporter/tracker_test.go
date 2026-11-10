@@ -968,6 +968,30 @@ func TestTrackerPausedRootsWaitForOpen(t *testing.T) {
 	}
 }
 
+// An engine that opened while the export it refused as paused was still in
+// flight isn't waited for again: the open came before the roots waited for
+// it, and the next may be a session away.
+func TestTrackerPausedAfterOpenIsDueNow(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Opened("c", 1, t0.Add(time.Second))
+	at := t0.Add(2 * time.Second)
+	tr.Done(b[0], Result{Paused: []uint64{1}}, at)
+	due := tr.Due(at)
+	if got := roots(due); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after a paused result that an open preceded: %v, want [1]", got)
+	}
+	if e := tr.EntriesAt("c", at)[0]; e.Failures != 0 || e.Refused != "" {
+		t.Fatalf("the root is settled as %+v, want only due", e)
+	}
+	// Refused again with no open since: it waits.
+	tr.Done(due[0], Result{Paused: []uint64{1}}, at)
+	if got := roots(tr.Due(at.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("a paused root exported with no open since its batch: %v", got)
+	}
+}
+
 // UnseenSessions counts the sessions the tracker saw nothing of: not those
 // it tracks, nor those it stopped tracking lately.
 func TestTrackerUnseenSessions(t *testing.T) {
