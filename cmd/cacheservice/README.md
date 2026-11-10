@@ -72,8 +72,8 @@ The list is the manifest [`compat/engines.txt`](compat/engines.txt),
 embedded in the binary:
 
 ```
-base v1.0.0-beta.25
-accept v1.0.0-beta.25 sha256:39abecfe… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
+base v1.0.0-beta.26
+accept v1.0.0-beta.26 sha256:53c0411c… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
 reject v1.0.0-beta.NN zerobull-consulting/dagger#NNN
 ```
 
@@ -105,7 +105,7 @@ hand, see [Engine](../../hack/remote-cache/README.md#engine).
 
 **The match** is an exact string match of the hello's `engineVersion`
 against the `accept` lines: no ranges, prefixes or normalization. An empty
-version, a dev engine's (`v1.0.0-beta.26-dev-<commit>`, `+dirty`), a
+version, a dev engine's (`v1.0.0-beta.27-dev-<commit>`, `+dirty`), a
 rejected one or any release not listed is refused. It applies to every
 engine, whatever its token or namespace, and before anything else of the
 connection: a refused engine is never registered, owns no cache ID, and
@@ -156,7 +156,7 @@ the checkout, and says so in the run's output. The default is strict.
 revision, not `internal/version/VERSION` (which tracks upstream main):
 
 ```json
-{"base": "dev", "accept": ["v1.0.0-beta.25", "v1.0.0-beta.24"], "revision": "<commit>"}
+{"base": "dev", "accept": ["v1.0.0-beta.26"], "revision": "<commit>"}
 ```
 
 It is in the welcome (`{"service": {...}}`, alongside `protocol.Welcome`'s
@@ -177,7 +177,9 @@ The revision is the image's `REVISION`, else the build's VCS revision, else
 service built on `v1.0.0-beta.25` stored nothing from such an engine
 ([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)).
 This is what the service does about each change. It serves engines of that
-bundle version only: a `v1.0.0-beta.25` engine is no longer accepted.
+bundle version only: a `v1.0.0-beta.25` engine is no longer accepted, and
+keeps the service image tagged for it, `dagger-remote-cache:v1.0.0-beta.25`,
+the last build that accepted it (see [Image](#image)).
 
 **Bundles are version 7** (`metastore.BundleVersion`). A version 7 bundle
 can lean on what its recipient holds, or on its own other outputs. A stored
@@ -3400,7 +3402,7 @@ D4 and D6), `linux/amd64` only, from
 The name doesn't depend on this repository, so a later extraction keeps the
 pull paths.
 
-- **`:<engine version>`**, such as `:v1.0.0-beta.25`: a **floating** tag,
+- **`:<engine version>`**, such as `:v1.0.0-beta.26`: a **floating** tag,
   one per `accept` line, on the newest verified build that accepts that
   engine. Pull this tag for the engine you run. A version that a newer
   build no longer accepts keeps its tag on the last build that did.
@@ -3497,7 +3499,7 @@ There is no `HEALTHCHECK`: the image has no shell, and the engine reconnects
 with backoff. To try it, unauthenticated and with no store (export path off):
 
 ```bash
-docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25
+docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26
 ```
 
 The engine that connects to it is a stock Dagger release whose version is
@@ -3526,7 +3528,7 @@ On GitHub Actions, use the composite action, which does everything below
 - uses: zerobull-consulting/dagger/.github/actions/remote-cache/start@<commit SHA>
   with:
     role: writer                    # read-only in pull-request jobs
-    version: v1.0.0-beta.25         # the engine and the CLI; selects the service image too
+    version: v1.0.0-beta.26         # the engine and the CLI; selects the service image too
     s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
     s3-region: ${{ vars.CACHE_S3_REGION }}
     s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -3583,7 +3585,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_ENDPOINT -e CACHESERVICE_S3_REGION -e CACHESERVICE_S3_BUCKET \
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
-  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25 \
+  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26 \
   -scope default -drain-timeout 10m -drain-linger 15s -gc-mode=batch
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
@@ -3625,7 +3627,7 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   -e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
   -e DAGGER_CLOUD_URL="$url" \
   -e DAGGER_CLOUD_TOKEN=sidecar-engine \
-  registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834 --debug
+  registry.dagger.io/engine:v1.0.0-beta.26@sha256:53c0411ca73af93ceb88e97834a992754786d4919505394b699cc34fb76dd3e4 --debug
 ```
 
 - `DAGGER_CLOUD_TOKEN` is a placeholder (any string but `oidc`): without a

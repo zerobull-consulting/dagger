@@ -19,7 +19,7 @@
 //     another's chain by prefix gets its own chain
 //     (dagql.ResolveChainPrefixes), so that the stored bundle stands on its
 //     own.
-//     If the scope's index already refuses the bundle as a late export from
+//  3. If the scope's index already refuses the bundle as a late export from
 //     an older generation of the cache (metastore.Index.CheckGeneration),
 //     the service releases the chains and settles the roots as refused,
 //     uploading nothing. Otherwise it works out which layer blobs the
@@ -27,13 +27,13 @@
 //     sends upload with a presigned PUT for each of the rest, to staging
 //     keys under a new blobstore.Stage of this try's own. An empty map
 //     needs nothing, and releases the chains.
-//  3. The engine PUTs each blob and answers uploaded: which blobs are done,
+//  4. The engine PUTs each blob and answers uploaded: which blobs are done,
 //     and which failed.
-//  4. The service verifies each blob the engine reported done, and promotes
+//  5. The service verifies each blob the engine reported done, and promotes
 //     it to its digest key only if its content hashes to the digest
 //     (blobstore.Promote). A blob that doesn't is never stored, and counts
 //     as failed.
-//  5. Only once every blob is stored (verified) does the service publish the
+//  6. Only once every blob is stored (verified) does the service publish the
 //     bundle and record its values in the scope's index. If a blob failed,
 //     the export is tried again from step 1, since the engine released the
 //     chains with its answer. Blobs stored by the earlier try are not asked

@@ -33,7 +33,7 @@ jobs:
           # A job on the default branch. A pull-request job's is the same,
           # with role: read-only and a read-only key.
           role: writer
-          version: v1.0.0-beta.25   # the engine and the CLI; optional, see below
+          version: v1.0.0-beta.26   # the engine and the CLI; optional, see below
           s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
           s3-region: ${{ vars.CACHE_S3_REGION }}
           s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -140,7 +140,7 @@ of its own.
 | Input | Required | Default | What it is |
 | --- | --- | --- | --- |
 | `role` | yes | | `writer`: exports what the job builds, with `-gc-mode=batch` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
-| `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.25`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the CLI, the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
+| `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.26`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the CLI, the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
 | `service-image` | no | `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>` | Overrides the service image. The step fails if it refuses the engine. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
 | `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. A `Read/Write/Delete` key for a writer, a `Read` key for a read-only sidecar; **never the admin key** that sets lifecycle rules (on Spaces, a full-access key): the action never sets them, so no job needs it ([The keys](../../../cmd/cacheservice/README.md#the-keys)). |

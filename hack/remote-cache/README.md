@@ -419,7 +419,7 @@ service is published as
 engine, moved only once that build passed the e2e and the sidecar demo
 against every one of its `accept` lines
 ([Image](../../cmd/cacheservice/README.md#image)). So for an engine
-`v1.0.0-beta.25`, run `dagger-remote-cache:v1.0.0-beta.25`. The sidecar
+`v1.0.0-beta.26`, run `dagger-remote-cache:v1.0.0-beta.26`. The sidecar
 action's `version` input, and the demo's `VERSION`, pick both images this
 way.
 
@@ -487,7 +487,7 @@ docker run -d --name dagger-engine-rc --privileged \
   -e DAGGER_CLOUD_URL=https://<service> \
   -e DAGGER_CLOUD_TOKEN=<engine token> \
   -v dagger-engine-rc:/var/lib/dagger \
-  registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834
+  registry.dagger.io/engine:v1.0.0-beta.26@sha256:53c0411ca73af93ceb88e97834a992754786d4919505394b699cc34fb76dd3e4
 ```
 
 `DAGGER_CLOUD_TOKEN` must be set (any string but `oidc`), or the client stays
@@ -506,7 +506,7 @@ That is a Linux binary. On another host, such as macOS, install the same
 release's CLI instead:
 
 ```bash
-curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=v1.0.0-beta.25 BIN_DIR=. sh
+curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=v1.0.0-beta.26 BIN_DIR=. sh
 ```
 
 Then run it against that engine, with `DAGGER_CLOUD_TOKEN` and
@@ -554,7 +554,7 @@ own prefix in the bucket (`test/e2e/<run>/`), and gives each engine a new, empty
 cache volume. It:
 
 1. builds the run's engine image on the release image `E2E_ENGINE_IMAGE`
-   (`registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest), adding only
+   (`registry.dagger.io/engine:v1.0.0-beta.26`, pinned by digest), adding only
    `{"gc":{"enabled":false}}` and a `mirror.gcr.io` mirror for `docker.io`
    in `/etc/dagger/engine.json`, and the CA bundle of `E2E_CA_FILE` if set;
    and copies the `dagger` CLI out of it (`docker create`, then `docker cp`
@@ -670,7 +670,7 @@ e2e-down` removes the engines and volumes later.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `E2E_DIR` | `$TMPDIR/dagger-remote-cache-e2e` | The image's build context (`image/`), the CLI copied out of each engine image (`cli/<image ID>/`; another image's copy is removed once unused for a day), the binaries `E2E_BUILD_ENGINE=1` builds (`bin/`), and each run's files (`runs/`) |
-| `E2E_ENGINE_IMAGE` | The manifest's first accept line, as CI's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.25`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on. A stock image whose version the service doesn't accept fails the run at once, saying so |
+| `E2E_ENGINE_IMAGE` | The manifest's first accept line, as CI's `STOCK_ENGINE`: `registry.dagger.io/engine:v1.0.0-beta.26`, pinned by digest (`DefaultEngineImage`) | The release image the run's engine image is built on. A stock image whose version the service doesn't accept fails the run at once, saying so |
 | `E2E_BUILD_ENGINE` | unset | `1` builds the engine, `dagger-init-session` and the CLI from this repo and copies them over `E2E_ENGINE_IMAGE` |
 | `E2E_SKIP_BUILD` | unset | With `E2E_BUILD_ENGINE=1`, `1` reuses the binaries in `E2E_DIR/bin`; without it, the run fails |
 | `E2E_IMAGE` | `dagger-remote-cache-e2e-engine` | The run's engine image's tag. Engines start from the image's ID, so a run building the same tag meanwhile doesn't change a running one's engine |
@@ -693,7 +693,7 @@ they differ (this branch merges upstream main, whose client can be ahead of
 the release), the `real engines (e2e)` job and the `sidecar demo` job both
 warn, from one script
 ([`compare-client.sh`](compare-client.sh), which takes `STOCK_ENGINE` and
-`STOCK_ENGINE_TAG` from the environment): `the engine's side of the remote cache differs from v1.0.0-beta.25's`,
+`STOCK_ENGINE_TAG` from the environment): `the engine's side of the remote cache differs from v1.0.0-beta.26's`,
 with the files (the client, its adapter in `engine/server`, and the `dagql`
 bundle code). The step fails only on a pin that contradicts itself: a
 `STOCK_ENGINE_TAG` that isn't `STOCK_ENGINE`'s tag, or a digest the registry
@@ -708,7 +708,7 @@ It builds the three binaries with `CGO_ENABLED=0` (the engine with the
 whose other files (`dagger-init`, `crun`, `tini`, the QEMU helpers) stay the
 release's. Each run logs the CLI's `dagger version` and every engine's
 version from its hello (`engine A connected to main: engine version
-"v1.0.0-beta.25"`), so a log says which engine it tested.
+"v1.0.0-beta.26"`), so a log says which engine it tested.
 
 An engine built this way reports a development version, which no accept
 line names, so the run's services welcome it with
