@@ -376,6 +376,13 @@ wipe leaves new keys behind, and the wipe then exits 3. A writer that claims
 an ancestor prefix during the wipe stops it before its next delete, with
 exit 1, since that store's keys may be under the prefix
 (`TestAncestorClaimedDuringWipeStops`, `TestAncestorClaimedBeforeAbortsStops`).
+So does a writer that claims the prefix itself after the wipe deleted its
+marker: the new marker, and the keys written after it, are left alone, and it
+exits 1 (`TestMarkerReclaimedAfterStep1Stops`, `TestMarkerReclaimedBetweenPagesStops`,
+`TestMarkerReclaimedBeforeAbortsStops`, `TestMarkerReclaimedBetweenUploadPagesStops`).
+This only narrows what a mistake costs: the check is one request before each
+delete request, so a writer that claims the prefix in the moment between the
+two is not caught. Never run a writer on a prefix being wiped.
 
 `cacheservice wipe` empties the prefix, of any layout (layout 1 included,
 which has no marker). It reads the same `CACHESERVICE_S3_*` settings as the
@@ -410,6 +417,18 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   then the incomplete multipart uploads; then it lists the prefix again.
   If the marker can't be read (a dry run too) or deleted, nothing else is
   deleted, and it exits 1.
+- **Checked again before each delete request:** before each page of objects
+  and before each page of uploads to abort, the wipe reads the ancestors' markers
+  again, then the prefix's own. An ancestor's marker, or the prefix's own
+  marker back after the wipe deleted it, is a writer's: the wipe stops with
+  nothing more deleted, says a writer claimed the prefix during the wipe and
+  that its marker and what it wrote were left alone, and exits 1. A marker
+  it can't read stops it too: when it can't tell, it doesn't delete. This
+  costs one more GET per page of 1,000 keys or uploads, beside the ancestor
+  reads. When a delete request fails, the count in "deleted N objects" is
+  reported as "at least": the keys of that page deleted one by one before the
+  failure (those XML can't carry, below) aren't in it
+  (`TestBatchRequestFailureKeepsKeyFailures`).
 - **Not inside another store:** a prefix under one whose ancestor (the
   bucket's top included) holds an ownership marker is refused, by a dry run
   and a wipe, naming that marker: wiping it would delete part of that store.
@@ -421,8 +440,10 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   `<prefix>/` returned, so `cache2/` and the bucket's top are untouched when
   wiping `cache` (`TestWipeEmptiesPrefix`, `TestMinIOWipe`).
 - **Exit codes:** 0 a dry run reported, or the prefix is empty after the
-  wipe; 1 an error, a refusal, or a key or upload that failed (up to 20 are
-  listed); 2 usage or confirmation; 3 every request succeeded but the prefix isn't empty
+  wipe; 1 an error, a refusal, a wipe stopped because a writer claimed the
+  prefix or an ancestor during it, or a key or upload that failed (up to 20
+  are listed, also when a later request stopped the wipe); 2 usage or
+  confirmation; 3 every request succeeded but the prefix isn't empty
   after the wipe (a writer is running). `-timeout` (default 30m, room for
   about one to two million keys) bounds the run, and each request is bounded
   to 30s.
@@ -439,7 +460,8 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   (both seen on MinIO; `TestMinIOControlCharKeyDeleted`,
   `TestMinIODeleteObjectsKeepsControlCharKey`).
 - **What the store answers is printed escaped:** keys are quoted, and errors
-  and failure reasons have their control characters escaped
+  and failure reasons have their control characters escaped, the marker's
+  key too
   (`TestStoreStringsEscaped`).
 
 **Later: import from one prefix, export to another.** Images are pinned by
