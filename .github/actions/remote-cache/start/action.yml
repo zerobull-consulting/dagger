@@ -3,7 +3,8 @@ description: >-
   Gets the dagger CLI (dagger/dagger-for-github), runs the remote cache
   service and a stock engine of the same version on this runner, and puts a
   wrapper of the CLI first on PATH for later steps; ready once the service
-  has welcomed the engine. The sidecar is stopped, draining its exports, at
+  has welcomed the engine and its first import sync is done (or 30s after
+  the welcome, with a warning). The sidecar is stopped, draining its exports, at
   the end of the job, whatever happened; remote-cache/stop stops it earlier.
 
 inputs:

@@ -1314,7 +1314,9 @@ once, when it ends, even when it merged nothing: `msg="import sync: first
 done" merged=N failed=N`, with `error=true` when it failed (the failure has
 its own `import sync failed` warning). `GET /debug/engines` says the same in
 each engine's `firstSyncDone`. A sync cut short by the connection's end
-isn't the first done. Later syncs are logged as `import sync` only when they
+isn't the first done, and neither is any sync of a connection revoked
+before its first sync ran: a revoked connection syncs nothing, so it never
+logs the line, and the engine's next connection has its own. Later syncs are logged as `import sync` only when they
 merged or failed something
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 

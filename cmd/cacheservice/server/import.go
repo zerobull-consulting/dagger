@@ -157,8 +157,10 @@ func (s *Service) syncImports(ctx context.Context, c *engineConn) importer.Resul
 	}
 	// The first sync that ran to its end, even one that merged nothing or
 	// failed: a failure is logged above, and waiting on would not end it.
-	// One cut short by the connection's end isn't: nothing waits on it.
-	if ctx.Err() == nil && !c.firstSyncDone.Swap(true) {
+	// One cut short by the connection's end isn't, whether its context
+	// ended or the connection dropped first: nothing waits on it, and the
+	// engine's next connection has its own first sync.
+	if ctx.Err() == nil && s.connected(c) && !c.firstSyncDone.Swap(true) {
 		attrs := []any{"merged", len(res.Merged), "failed", len(res.Failed)}
 		if err != nil {
 			attrs = append(attrs, "error", true)

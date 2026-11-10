@@ -657,6 +657,7 @@ start() {
 		local synced="" sync_deadline=$((SECONDS + sync_wait))
 		while :; do
 			running "$service" || { show_log "$engine" 100; show_log "$service" 200; die "the service exited before its first import sync"; }
+			running "$engine" || { show_log "$engine" 200; show_log "$service" 100; die "the engine exited before the service's first import sync"; }
 			log="$(timeout "$(step_bound "$sync_deadline")" docker logs --since "$since" "$service" 2>&1 || true)"
 			synced="$(grep -m1 'msg="import sync: first done"' <<<"$log" || true)"
 			[[ -n "$synced" ]] && break
@@ -664,9 +665,12 @@ start() {
 			sleep 1
 		done
 		if [[ -z "$synced" ]]; then
-			warn "the service ($service_image) logged no first import sync within ${sync_wait}s of the welcome: going on, and a build that starts now can miss entries not merged yet (zerobull-consulting/dagger#103). A service image from before that line never logs it: use the version input's service image, or a newer one"
-		elif [[ "$synced" == *" error=true"* ]]; then
-			warn "the service's first import sync failed, so builds may miss the remote cache: $(redact <<<"$synced" | sed -E 's/^time=[^ ]* //'); see the service's log"
+			local why="a service image from before that line never logs it: use the version input's service image, or a newer one"
+			[[ "$service_floating" == true ]] &&
+				why="either the version's service image is a release from before that line, which never logs it, or its first sync is slow: see the service's log"
+			warn "the service ($service_image) logged no first import sync within ${sync_wait}s of the welcome: going on, and a build that starts now can miss entries not merged yet (zerobull-consulting/dagger#103); $why"
+		elif [[ "$synced" == *" error=true"* || ! "$synced" =~ \ failed=0( |$) ]]; then
+			warn "the service's first import sync failed, in whole or in part, so builds may miss the remote cache until a later sync: $(redact <<<"$synced" | sed -E 's/^time=[^ ]* //'); see the service's log"
 		else
 			echo "remote-cache-sidecar: the first import sync is done: it merged $(sed -nE 's/.* merged=([0-9]+).*/\1/p' <<<"$synced") stored bundle(s)"
 		fi

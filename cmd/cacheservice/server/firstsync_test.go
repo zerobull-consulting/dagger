@@ -106,3 +106,27 @@ func TestFirstImportSyncNotLoggedWhenCutShort(t *testing.T) {
 		t.Fatalf("%d first-sync lines, want 1", n)
 	}
 }
+
+// A sync of a connection that dropped while it ran, its context still
+// live, isn't the first sync done either: the engine's next connection has
+// its own (zerobull-consulting/dagger#103).
+func TestFirstImportSyncNotLoggedWhenDropped(t *testing.T) {
+	h := newReadOnlyHarness(t, emptyStores(t), readOnlyOptions())
+	conn := h.connect(fakeengine.New("cache-b", 1))
+	c, err := h.svc.conn(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 10*time.Second, "the first import sync's line", func() bool {
+		return len(firstSyncs(h.logs, conn)) > 0
+	})
+	// The same connection number, no longer the registered connection.
+	dropped := &engineConn{id: conn, ns: c.ns, hello: c.hello, logger: c.logger, svc: h.svc}
+	h.svc.syncImports(t.Context(), dropped)
+	if dropped.firstSyncDone.Load() {
+		t.Fatal("a dropped connection's sync marked the first sync done")
+	}
+	if n := len(firstSyncs(h.logs, conn)); n != 1 {
+		t.Fatalf("%d first-sync lines, want 1", n)
+	}
+}
