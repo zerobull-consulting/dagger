@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
@@ -376,26 +380,34 @@ func TestWriterRefusesPrefixWithUpload(t *testing.T) {
 	}
 }
 
-// denyGets answers GETs of some keys with an error other than not found, as
-// a key allowed only its own prefix gets 403 above it.
-type denyGets struct {
+// failGets answers GETs of some keys with an error, as a key allowed only
+// its own prefix gets 403 above it, or as a store that fails.
+type failGets struct {
 	*counting
-	deny map[string]bool
+	fail map[string]error
 }
 
-func (d *denyGets) Get(ctx context.Context, key string) ([]byte, string, error) {
-	if d.deny[key] {
-		return nil, "", errors.New("AccessDenied")
+func (d *failGets) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if err, ok := d.fail[key]; ok {
+		return nil, "", fmt.Errorf("get %s: %w", key, err)
 	}
 	return d.counting.Get(ctx, key)
+}
+
+// s3Error is an S3 error as the SDK returns it: an HTTP status and a code.
+func s3Error(status int, code string) error {
+	return &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      &smithy.GenericAPIError{Code: code, Message: code},
+	}
 }
 
 // A prefix inside one that holds a marker belongs to the service there:
 // both kinds of instance refuse it, naming the ancestor, and write nothing.
 // So does one under a marker at the bucket's top. A marker of any content
-// counts. An ancestor whose marker can't be read is skipped: the check is
-// best effort, and a nested claim costs no data, only the ancestor's GC,
-// which stops on it.
+// counts. An ancestor whose marker the key may not read (403) is skipped:
+// a nested claim costs no data, only the ancestor's GC, which stops on it.
+// Any other error reading it refuses (TestAncestorUnreadRefused).
 func TestNestedPrefixRefused(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct{ marker, prefix, ancestor string }{
@@ -417,10 +429,13 @@ func TestNestedPrefixRefused(t *testing.T) {
 			}
 		}
 	}
-	// An ancestor's marker the key can't read: skipped.
-	st := &denyGets{counting: newCounting(), deny: map[string]bool{"cacheservice.json": true}}
-	if state, _, err := Check(ctx, st, "cache", true, now); err != nil || state != Claimed {
-		t.Fatalf("an unreadable ancestor: %v, %v; want claimed", state, err)
+	// An ancestor's marker the key may not read: skipped, whether the error
+	// says so by its status or by its code.
+	for _, denied := range []error{s3Error(http.StatusForbidden, "AccessDenied"), s3Error(http.StatusForbidden, "SignatureDoesNotMatch"), s3Error(0, "AccessDenied")} {
+		st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": denied}}
+		if state, _, err := Check(ctx, st, "cache", true, now); err != nil || state != Claimed {
+			t.Fatalf("an ancestor the key may not read (%v): %v, %v; want claimed", denied, state, err)
+		}
 	}
 	// A sibling's marker isn't an ancestor's.
 	st2 := newCounting()
@@ -458,4 +473,44 @@ func (c *claimBeforeUploads) ListUploadKeys(ctx context.Context, prefix string, 
 		c.AddUpload("p/ns/default/blobs/sha256/" + strings.Repeat("0", 64))
 	}
 	return c.counting.ListUploadKeys(ctx, prefix, max)
+}
+
+// An ancestor's marker that can't be read for an error other than not found
+// or access denied (a 5xx, a timeout, a dropped connection) refuses the
+// prefix, for both kinds of instance: the check can't tell whether a
+// service owns the ancestor. The error names the ancestor's key and wraps
+// the store's, and nothing is written. Ancestors after it aren't read.
+func TestAncestorUnreadRefused(t *testing.T) {
+	ctx := context.Background()
+	for name, cause := range map[string]error{
+		"5xx":        s3Error(http.StatusInternalServerError, "InternalError"),
+		"503":        s3Error(http.StatusServiceUnavailable, "SlowDown"),
+		"timeout":    context.DeadlineExceeded,
+		"connection": errors.New("connection reset by peer"),
+	} {
+		for _, tc := range []struct{ prefix, fail string }{
+			{"cache/team", "cacheservice.json"},
+			{"cache/team", "cache/cacheservice.json"},
+		} {
+			for _, writer := range []bool{true, false} {
+				st := &failGets{counting: newCounting(), fail: map[string]error{tc.fail: cause}}
+				_, _, err := Check(ctx, st, tc.prefix, writer, now)
+				var unread *ErrAncestorUnread
+				if !errors.As(err, &unread) || unread.Key != tc.fail || !errors.Is(err, cause) {
+					t.Fatalf("%s at %s, writer %v: %v; want ErrAncestorUnread of %s wrapping %v", name, tc.fail, writer, err, tc.fail, cause)
+				}
+				if !strings.Contains(err.Error(), tc.fail) || !strings.Contains(err.Error(), "cache/team/") {
+					t.Fatalf("%s: the error doesn't name the ancestor's key and the prefix: %v", name, err)
+				}
+				if c := st.snapshot(); c["put"] != 0 || c["uploads"] != 0 {
+					t.Fatalf("%s, writer %v: requests %v", name, writer, c)
+				}
+			}
+		}
+	}
+	// A missing marker at one ancestor and a 403 at another: both skipped.
+	st := &failGets{counting: newCounting(), fail: map[string]error{"cacheservice.json": s3Error(http.StatusForbidden, "AccessDenied")}}
+	if state, _, err := Check(ctx, st, "cache/team", true, now); err != nil || state != Claimed {
+		t.Fatalf("403 then not found: %v, %v; want claimed", state, err)
+	}
 }

@@ -5,8 +5,10 @@ package s3util
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -18,6 +20,16 @@ func HTTPStatus(err error) int {
 		return re.HTTPStatusCode()
 	}
 	return 0
+}
+
+// Denied reports an error of a key that isn't allowed the request: a 403,
+// or an AccessDenied error code.
+func Denied(err error) bool {
+	if HTTPStatus(err) == http.StatusForbidden {
+		return true
+	}
+	var ae smithy.APIError
+	return errors.As(err, &ae) && ae.ErrorCode() == "AccessDenied"
 }
 
 // HasStatus reports whether err carries an HTTP response with status.

@@ -134,7 +134,7 @@ func errorCode(err error) string {
 
 // denied reports an error of a key that isn't allowed the request.
 func denied(err error) bool {
-	return s3util.HTTPStatus(err) == http.StatusForbidden || errorCode(err) == "AccessDenied"
+	return s3util.Denied(err)
 }
 
 // explainRead is an error reading the configuration, with what to do.
