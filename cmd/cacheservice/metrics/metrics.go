@@ -355,7 +355,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"scope"}),
 		drains: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "drain_duration_seconds",
-			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal).",
+			Help:    "Time of each drain, by outcome: complete (nothing left it could export), deadline (-drain-timeout passed) or canceled (a second signal, or a drain that began after the export path stopped): both cut short, usually with work left, which the drain report's left and drain_unexported_roots_total count.",
 			Buckets: promotionBuckets,
 		}, []string{"outcome"}),
 		drainStoredRoots: prometheus.NewCounter(prometheus.CounterOpts{
@@ -837,10 +837,12 @@ func (m *Metrics) ExportCollected(scope string) {
 const (
 	// DrainComplete left nothing it could export.
 	DrainComplete = "complete"
-	// DrainDeadline ended at its deadline (-drain-timeout).
+	// DrainDeadline was cut short at its deadline (-drain-timeout),
+	// usually with work left.
 	DrainDeadline = "deadline"
-	// DrainCanceled ended because its context was canceled (a second
-	// signal).
+	// DrainCanceled was cut short because its context was canceled (a
+	// second signal), or it began after the export path stopped, usually
+	// with work left.
 	DrainCanceled = "canceled"
 )
 
