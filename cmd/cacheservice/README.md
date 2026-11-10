@@ -3042,9 +3042,19 @@ cache's export slot runs once it has it. While the drain waits, `GET
 /debug/drain` counts them in `explicit`. Roots such an export stores while
 draining are counted in the report's `stored`. One still running when the
 drain ends (at its deadline, or canceled) is counted in the report's
-`explicit`, logged as `explicitLeft`, and runs on until it ends or the stop
-that follows cuts it off (an export cut off publishes nothing); what it
-stores after the drain ended isn't in the report. Pinned by
+`explicit`, logged as `explicitLeft`, and runs on until it ends or the
+service's paths stop, which cancels it (an export cut off publishes
+nothing); what it stores after the drain ended isn't in the report. The
+paths stop as the linger that follows the drain starts, or, without a
+linger, as the shutdown starts, before it waits for the HTTP servers: an
+explicit request still running then is canceled, answers 503, and the
+shutdown waits for it to end with the rest of the service's work. One asked
+for once the stop began answers 503 too
+(`TestStopCancelsAndWaitsForExplicitHooks`,
+`TestShutdownCancelsExplicitExport`,
+[#202](https://github.com/zerobull-consulting/dagger/issues/202)). An
+import sync still waits for the one under way of the same engine cache
+whatever its context says (`TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx`). Pinned by
 `TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
 `TestDrainRunsExplicitExportWaitingForSlot`, the
 `TestDrainEndsAtDeadlineWith…` tests and

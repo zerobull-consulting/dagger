@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"slices"
@@ -48,11 +49,16 @@ type drainState struct {
 	conns []lingerWait
 	// linger is the linger that followed the drain, once it started.
 	linger *LingerReport
-	// explicit is how many explicit exports and imports (Service.Export,
-	// Service.Import) were admitted and still run. They are admitted under
-	// mu, as the drain starts, so one is either counted here before the
-	// drain starts, and waited for, or refused (admitExplicit).
-	explicit int
+	// explicit counts the explicit exports and imports (Service.Export,
+	// Service.Import) admitted and still running; the drain and the stop's
+	// Wait wait for them (zerobull-consulting/dagger#72,
+	// zerobull-consulting/dagger#202). They are admitted under mu, as the
+	// drain starts, so one is either counted here before the drain starts,
+	// and waited for, or refused (admitExplicit). explicitClosed is set,
+	// under mu, once Wait began: none is admitted after it, so no Add races
+	// Wait.
+	explicit       workGroup
+	explicitClosed bool
 	// explicitEnded wakes a drain when an explicit request ends. New makes
 	// it.
 	explicitEnded chan struct{}
@@ -89,9 +95,10 @@ type DrainReport struct {
 	Engines int `json:"engines"`
 	// Explicit is how many explicit exports and imports, admitted before
 	// the drain started, still ran when it ended: none, unless it ended at
-	// its deadline or was canceled. They run on until they end, or the stop
-	// that follows cuts them off (CloseEngines); what they store after the
-	// drain ended isn't in its report.
+	// its deadline or was canceled. They run on until they end, or the
+	// paths' context ends, which cancels them (in the binary, as the linger
+	// that follows the drain starts, or as the shutdown does); what they
+	// store after the drain ended isn't in its report.
 	Explicit int `json:"explicit,omitempty"`
 }
 
@@ -177,7 +184,7 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //     admitted before it started, up to its deadline, as for the exports it
 //     runs. It doesn't cancel them: one still running when it ends is
 //     counted in its report (DrainReport.Explicit), and runs on until it
-//     ends or the stop that follows cuts it off. Roots an explicit export
+//     ends or the paths' context ends, which cancels it. Roots an explicit export
 //     stores while draining are counted in DrainReport.Stored. From the
 //     drain's start, both hooks are refused (ErrDraining).
 //
@@ -260,8 +267,8 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		// explicit request runs, whatever ctx says. Else it was cut short:
 		// deadline once ctx's deadline passed (on ctx's timer or the export
 		// path's clock), canceled otherwise. An explicit request still
-		// running isn't waited for: it runs on its own request's context,
-		// until it ends or the stop cuts it off (CloseEngines).
+		// running isn't waited for: the paths' context ending canceled it,
+		// and the stop's Wait waits for it to end.
 		s.logger.Info("drain: nothing to export (the service is stopping)")
 		now := p.now()
 		left := s.drainLeft(now, deadline)
@@ -367,23 +374,34 @@ func (s *Service) waitExplicit(ctx context.Context, deadline time.Time, ended <-
 }
 
 // admitExplicit admits an explicit export or import (Service.Export,
-// Service.Import), unless the service drains: ErrDraining. A drain that
-// starts once it was admitted waits for it, until the drain's deadline. The
-// caller calls done when it ends.
-func (s *Service) admitExplicit() (done func(), err error) {
+// Service.Import), unless the service drains (ErrDraining) or its stop
+// began (ErrStopping): stop, the path's context, ended, or Wait began. A
+// drain that starts once it was admitted waits for it, until the drain's
+// deadline, and so does Wait. The caller runs it on run, which ends with
+// ctx or stop, and calls done when it ends.
+func (s *Service) admitExplicit(ctx, stop context.Context) (run context.Context, done func(), err error) {
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
 	// Under drain.mu, which Drain sets draining under.
 	if s.draining.Load() {
-		return nil, ErrDraining
+		return nil, nil, ErrDraining
 	}
-	s.drain.explicit++
+	if s.drain.explicitClosed || stop.Err() != nil {
+		return nil, nil, ErrStopping
+	}
+	s.drain.explicit.Add()
 	ended := s.drain.explicitEnded
+	// Canceled with ErrStopping as its cause, so a request the stop cut off
+	// answers 503, as one refused does (stoppedCause).
+	run, cancel := context.WithCancelCause(ctx)
+	stopCancel := context.AfterFunc(stop, func() { cancel(ErrStopping) })
 	var once sync.Once
-	return func() {
+	return run, func() {
 		once.Do(func() {
+			stopCancel()
+			cancel(nil)
 			s.drain.mu.Lock()
-			s.drain.explicit--
+			s.drain.explicit.Done()
 			s.drain.mu.Unlock()
 			select {
 			case ended <- struct{}{}:
@@ -393,11 +411,30 @@ func (s *Service) admitExplicit() (done func(), err error) {
 	}, nil
 }
 
+// waitExplicitHooks waits for the explicit exports and imports, after the
+// contexts that run them have ended, and admits none after.
+func (s *Service) waitExplicitHooks() {
+	s.drain.mu.Lock()
+	s.drain.explicitClosed = true
+	s.drain.mu.Unlock()
+	s.drain.explicit.Wait()
+}
+
+// stoppedCause is err, marked ErrStopping when the stop canceled run, the
+// context an explicit request ran on (admitExplicit), so its error answers
+// 503.
+func stoppedCause(run context.Context, err error) error {
+	if err == nil || errors.Is(err, ErrStopping) || !errors.Is(context.Cause(run), ErrStopping) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrStopping, err)
+}
+
 // explicitRunning is how many explicit exports and imports run.
 func (s *Service) explicitRunning() int {
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
-	return s.drain.explicit
+	return s.drain.explicit.Running()
 }
 
 // drainEnded reports whether a drain is over before its next pass, and its
@@ -482,7 +519,7 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		Left:     left,
 		Refused:  maps.Clone(s.drain.refused),
 		Engines:  s.drain.engines,
-		Explicit: s.drain.explicit,
+		Explicit: s.drain.explicit.Running(),
 	}
 	s.drain.ended = &rep
 	s.drain.mu.Unlock()
@@ -587,7 +624,7 @@ func (s *Service) DrainStatus() DrainStatus {
 	}
 	s.drain.mu.Lock()
 	started, deadline, ended := s.drain.started, s.drain.deadline, s.drain.ended
-	explicit := s.drain.explicit
+	explicit := s.drain.explicit.Running()
 	if l := s.drain.linger; l != nil {
 		cp := *l
 		cp.Caches = slices.Clone(l.Caches)
