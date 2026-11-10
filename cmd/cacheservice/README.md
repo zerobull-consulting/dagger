@@ -1364,9 +1364,12 @@ spans; what is in S3 is not lost, and a re-export uploads nothing already
 stored. An export pending or in flight when the service stops is lost until a
 later session names its entries. That is accepted, not planned to change
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45), pinned by
-`TestServiceRestartForgetsPendingExport`): exports stream as entries settle,
-so little is pending at any time, and a flush before a planned stop stores
-the rest.
+`TestServiceRestartForgetsPendingExport`). An entry is exported once
+`-export-settle` has passed with no cache span naming it, or at the latest
+`-export-max-delay` after it changed, so what a stop without a drain can lose
+is what changed within those bounds, plus an export in flight. A clean stop
+drains first and stores the rest (see
+[Stopping and draining](#stopping-and-draining)).
 
 ## Import path
 

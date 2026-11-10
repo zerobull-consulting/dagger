@@ -386,12 +386,12 @@ func TestServiceRestartMergesPrunedEntriesAgainOnce(t *testing.T) {
 }
 
 // Accepted, not planned to change (#45; #12, case 3): the export path learns
-// entries only from session spans, and keeps them in memory. An export pending or in flight when the
-// service stops without a drain (a crash, SIGKILL, or -drain-timeout 0) is
-// lost: the restarted service doesn't know the entries, and exports them
-// only once a later session's spans name them again. What was stored is not
-// lost, and the restarted service resumes exporting new sessions at once. A
-// clean stop drains first, and stores it
+// entries only from session spans, and keeps them in memory. An export
+// pending or in flight when the service stops without a drain (a crash,
+// SIGKILL, or -drain-timeout 0) is lost: the restarted service doesn't know
+// the entries, and exports them only once a later session's spans name them
+// again. What was stored is not lost, and the restarted service resumes
+// exporting new sessions at once. A clean stop drains first, and stores it
 // (TestDrainedRestartStoresPendingExport). Decided in
 // https://github.com/zerobull-consulting/dagger/issues/45.
 func TestServiceRestartForgetsPendingExport(t *testing.T) {
