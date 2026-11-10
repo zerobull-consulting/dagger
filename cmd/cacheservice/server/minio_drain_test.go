@@ -27,7 +27,7 @@ func TestMinIODrain(t *testing.T) {
 		digests := h.build()
 		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 		rep := drainFor(h.svc, 30*time.Second)
-		if !indexHas(t, h, 10, 11) || rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 {
+		if !indexHas(t, h, 10, 11) || rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 {
 			t.Fatalf("the quiet session wasn't stored by the drain: %+v", rep)
 		}
 		if !hasAll(t, h.blobs, digests) {

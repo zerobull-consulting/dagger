@@ -394,6 +394,148 @@ func TestTrackerSkippedRoots(t *testing.T) {
 	}
 }
 
+// A caller that loops flushes doesn't retry a failing root at its own rate:
+// a flush cuts short a failure wait only if a flush didn't cause the try
+// that started it, so the root waits out the backoff after a second failed
+// try, and a flush after its next try, the backoff's own, may cut it short
+// again. A busy root, which doesn't count toward MaxFailures, is due at
+// every flush (zerobull-consulting/dagger#160).
+func TestTrackerLoopedFlushesDontRushFailures(t *testing.T) {
+	tr := NewTracker(TrackerConfig{Settle: testSettle, MaxDelay: testMaxDelay, ForgetAfter: testForget,
+		BusyBackoff: time.Second, MaxBusyBackoff: 8 * time.Second, MaxFailures: 5})
+	tr.Observe(state(1, 10, fsPart), t0)
+	// loop flushes 20 times, 10ms apart, answering each try with answer,
+	// and returns the tries.
+	now := t0
+	loop := func(answer func(Batch) Result) int {
+		tries := 0
+		for range 20 {
+			end := tr.StartFlush("c", now)
+			for _, b := range tr.Due(now) {
+				tries++
+				tr.Done(b, answer(b), now)
+			}
+			end()
+			now = now.Add(10 * time.Millisecond)
+		}
+		return tries
+	}
+	fail := func(Batch) Result { return Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}} }
+	failures := func() int { return tr.Entries("c")[0].Failures }
+
+	// The first flush's try fails, and the second flush cuts its wait
+	// short; that try fails too, and no flush cuts the wait it started.
+	if tries := loop(fail); tries != 2 || failures() != 2 {
+		t.Fatalf("looped flushes: %d tries, %d failures, want 2 and 2", tries, failures())
+	}
+	// The backoff's own try (2s after the second): a flush may cut the
+	// wait after it short again, once.
+	now = now.Add(2 * time.Second)
+	if bs := tr.Due(now); len(bs) != 1 {
+		t.Fatalf("not due once its backoff passed: %d batches", len(bs))
+	} else {
+		tr.Done(bs[0], fail(bs[0]), now)
+	}
+	if tries := loop(fail); tries != 1 || failures() != 4 {
+		t.Fatalf("looped flushes after the backoff's try: %d tries, %d failures, want 1 and 4", tries, failures())
+	}
+
+	// A busy root is due at every flush.
+	tr.Observe(state(2, 10, fsPart), t0)
+	busy := func(b Batch) Result {
+		var res Result
+		for _, n := range b.Request.Roots {
+			if n == 2 {
+				res.Busy = append(res.Busy, protocol.SkippedRoot{Number: 2, Reason: protocol.SkipBusy})
+			} else {
+				res.Failed = append(res.Failed, FailedRoot{Number: n, Error: "upload"})
+			}
+		}
+		return res
+	}
+	if tries := loop(busy); tries != 20 {
+		t.Fatalf("looped flushes of a busy root: %d tries, want 20", tries)
+	}
+	if e := tr.Entries("c"); e[1].Failures != 0 || e[0].Failures != 4 {
+		t.Fatalf("entries %+v", e)
+	}
+}
+
+// A failed root whose wait no flush cuts short (see
+// TestTrackerLoopedFlushesDontRushFailures) is due at the next flush once
+// its value changed: the failures counted were the old value's.
+func TestTrackerFlushRetriesChangedValueAfterFlushFailure(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	fail := func(now time.Time) int {
+		end := tr.StartFlush("c", now)
+		defer end()
+		bs := tr.Due(now)
+		for _, b := range bs {
+			tr.Done(b, Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, now)
+		}
+		return len(bs)
+	}
+	// The first flush's try fails, the second flush cuts its wait short,
+	// and that try fails too: the third flush leaves the wait it started.
+	if n := fail(t0) + fail(t0); n != 2 {
+		t.Fatalf("%d tries, want 2", n)
+	}
+	if n := fail(t0); n != 0 {
+		t.Fatal("the flush cut short a wait a flush's try started")
+	}
+	o := state(1, 10, fsPart)
+	o.Replacements = 1
+	tr.Observe(o, t0)
+	end := tr.StartFlush("c", t0)
+	defer end()
+	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("the changed value isn't due at the flush: %v", got)
+	}
+}
+
+// A flush's try given back before it ran (Requeue, or Interrupted with the
+// root unsettled) is still the flush's when it runs: if it fails, the next
+// flush leaves the wait it started.
+func TestTrackerFlushTryGivenBackStaysTheFlushs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		giveBack func(*Tracker, Batch, time.Time)
+	}{
+		{"requeued", func(tr *Tracker, b Batch, now time.Time) { tr.Requeue(b, now.Add(time.Hour)) }},
+		{"interrupted", func(tr *Tracker, b Batch, now time.Time) { tr.Interrupted(b, Result{}, now, now.Add(time.Hour)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTestTracker()
+			tr.Observe(state(1, 10, fsPart), t0)
+			failed := Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}
+			// A try of its own, failed: a wait no flush caused.
+			b := tr.All("c", t0)
+			tr.Done(b[0], failed, t0)
+			// A flush cuts it short; its try is given back to wait for
+			// the engine, which then connects.
+			end := tr.StartFlush("c", t0)
+			bs := tr.Due(t0)
+			if len(bs) != 1 {
+				t.Fatalf("not due at the flush: %d batches", len(bs))
+			}
+			tc.giveBack(tr, bs[0], t0)
+			end()
+			tr.WakeEngineWait("c", 1, t0)
+			bs = tr.Due(t0)
+			if len(bs) != 1 {
+				t.Fatalf("not due once the engine connected: %d batches", len(bs))
+			}
+			tr.Done(bs[0], failed, t0)
+			end = tr.StartFlush("c", t0)
+			defer end()
+			if got := roots(tr.Due(t0)); len(got) != 0 {
+				t.Fatalf("the flush cut short the wait its own try started: %v", got)
+			}
+		})
+	}
+}
+
 func TestTrackerFailuresBackOffThenStop(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)

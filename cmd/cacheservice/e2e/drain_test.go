@@ -66,8 +66,8 @@ func (s *state) drain(t *testing.T) {
 
 	Check(t, connected && idxMid.NextNumber == idxBefore.NextNumber && slices.Equal(bundlesMid, bundlesBefore),
 		"while the drain waited on the stalled upload, A stayed connected and nothing of the export was published")
-	Check(t, rep.Outcome == metrics.DrainComplete && rep.Stored[cacheA] > 0 && rep.LeftRoots() == 0,
-		"the drain completed in %s: %d of A's roots stored, %d left (deadline %s)", took.Round(10*time.Millisecond), rep.Stored[cacheA], rep.LeftRoots(), drainTimeout)
+	Check(t, rep.Outcome == metrics.DrainComplete && rep.StoredOf(env.Scope, cacheA) > 0 && rep.LeftRoots() == 0,
+		"the drain completed in %s: %d of A's roots stored, %d left (deadline %s)", took.Round(10*time.Millisecond), rep.StoredOf(env.Scope, cacheA), rep.LeftRoots(), drainTimeout)
 	Check(t, len(stored) > 0 && len(holding) > 0,
 		"A's export was stored before the drain returned, with the layer that was in flight (%v in bundles %v)", shorts(digestStrings(stalled)), shorts(holding))
 	env.CheckConsistent(t, "after the drain")

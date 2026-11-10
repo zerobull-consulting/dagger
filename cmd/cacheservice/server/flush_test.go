@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
@@ -302,6 +303,71 @@ func TestFlushRetries(t *testing.T) {
 	rep = h.flush("10s")
 	if rep.Outcome != metrics.FlushComplete || rep.Stored != 1 || !indexHas(t, h, 10) {
 		t.Fatalf("not busy: report %+v", rep)
+	}
+}
+
+// The flush's deadline and its wait are on one clock, the export path's:
+// with that clock standing still, a flush whose timeout passed on the wall
+// clock waits on for a retry the export path's clock says is due before
+// the deadline, and stores it once that clock moves to it
+// (zerobull-consulting/dagger#160).
+func TestFlushWaitsOnExportPathClock(t *testing.T) {
+	clock := gc.NewNow(time.Now())
+	const backoff = 500 * time.Millisecond
+	h, _ := newDrainHarness(t, func(c *ExportConfig) {
+		c.Now = clock.Now
+		c.Tracker.BusyBackoff = backoff
+		c.Tracker.MaxBusyBackoff = backoff
+	})
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Busy: true})
+	// The session ended with its span in: no session holds the flush.
+	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
+	done := startFlush(t, flushURL(h.srv.URL, h.cache.ID, "1s"), "engine-token")
+	waitUntil(t, 5*time.Second, "the flush's try to be answered busy", func() bool {
+		for _, e := range h.ns().tracker.Entries(h.cache.ID) {
+			if e.RetryAt != "" {
+				return true
+			}
+		}
+		return false
+	})
+	// Past the timeout on the wall clock; the export path's hasn't moved.
+	time.Sleep(1500 * time.Millisecond)
+	flushRunning(t, done, "on the wall clock, before its deadline on the export path's clock")
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	clock.Add(backoff)
+	res := waitFlush(t, done, 10*time.Second)
+	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushComplete || res.rep.Stored != 1 || !indexHas(t, h, 10) {
+		t.Fatalf("flush: %d %+v", res.code, res.rep)
+	}
+}
+
+// Known gap: a flush can't wait for a session it hasn't heard of. A
+// session's spans hold a flush only once the service has seen one of them,
+// so a flush that comes before any span of a session reaches the service
+// finds nothing left, and returns complete at once; the session's spans,
+// arriving after it returned, wait for Settle as usual. Closing it needs the
+// engine to hold back every span of a session until after its client
+// returned (zerobull-consulting/dagger#160).
+func TestKnownGapFlushDoesNotWaitForUnseenSession(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	start := time.Now()
+	rep := h.flush("10s")
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the flush took %s: it waited for a session it hadn't heard of", took)
+	}
+	if rep.Outcome != metrics.FlushComplete || rep.Stored != 0 || rep.Left != (FlushLeft{}) {
+		t.Fatalf("report %+v", rep)
+	}
+	// The session's spans arrive once the flush returned: the flush that
+	// would have waited for them is over, and they wait for Settle.
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+	waitUntil(t, 5*time.Second, "the late session's roots to be tracked", func() bool {
+		return len(h.ns().tracker.Entries(h.cache.ID)) == 2
+	})
+	if indexHas(t, h, 10) || h.cache.Exports() != 0 {
+		t.Fatal("the late session was exported before Settle: the gap is closed, update the README")
 	}
 }
 

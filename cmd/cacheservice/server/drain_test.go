@@ -116,7 +116,7 @@ func TestDrainExportsQuietSession(t *testing.T) {
 	if !indexHas(t, h, 10, 11) {
 		t.Fatal("the quiet session's entries weren't stored when Drain returned")
 	}
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.LeftRoots() != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.LeftRoots() != 0 {
 		t.Fatalf("report %+v", rep)
 	}
 	if took > testQuiet/4 {
@@ -126,7 +126,7 @@ func TestDrainExportsQuietSession(t *testing.T) {
 	if len(started) != 1 || started[0]["cacheID"] != h.cache.ID || started[0]["sessions"] != "1" || started[0]["pending"] != "2" {
 		t.Fatalf("drain start logged %v", started)
 	}
-	if stored := rec.find("drain: stored"); len(stored) != 1 || stored[0]["roots"] != "2" {
+	if stored := rec.find("drain: stored"); len(stored) != 1 || stored[0]["namespace"] != testScope || stored[0]["cacheID"] != h.cache.ID || stored[0]["roots"] != "2" {
 		t.Fatalf("drain stored logged %v", stored)
 	}
 	if done := rec.find("drain: done"); len(done) != 1 || done[0]["outcome"] != metrics.DrainComplete || done[0]["leftRoots"] != "0" {
@@ -160,7 +160,7 @@ func TestDrainTakesLateSpansOfEndedSession(t *testing.T) {
 	if !indexHas(t, h, 10, 11) {
 		t.Fatal("the span that arrived during the drain wasn't exported")
 	}
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.Refused[metrics.DrainRefusedSpan] != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.Refused[metrics.DrainRefusedSpan] != 0 {
 		t.Fatalf("report %+v", rep)
 	}
 	if took := time.Since(start); took > settle/2 {
@@ -204,7 +204,7 @@ func TestDrainWaitsForExportInFlight(t *testing.T) {
 			if !indexHas(t, h, 10, 11) {
 				t.Fatal("the export in flight wasn't stored when Drain returned")
 			}
-			if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.LeftRoots() != 0 {
+			if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.LeftRoots() != 0 {
 				t.Fatalf("report %+v", rep)
 			}
 		})
@@ -371,7 +371,7 @@ func TestDrainRetriesRootOnBackoff(t *testing.T) {
 			done := startDrain(t, h.svc, 20*time.Second)
 			waitUntil(t, 10*time.Second, "the export to fail during the drain", failed)
 			rep := waitDrain(t, done, 15*time.Second)
-			if !indexHas(t, h, 10, 11) || rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 {
+			if !indexHas(t, h, 10, 11) || rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 {
 				t.Fatalf("the root that failed during the drain wasn't retried and stored: %+v", rep)
 			}
 			if took := time.Since(start); took < tc.backoff {
@@ -549,7 +549,7 @@ func TestDrainDebugStatus(t *testing.T) {
 	release()
 	waitDrain(t, done, 10*time.Second)
 	st = debugDrain(t, h)
-	if !st.Draining || st.Report == nil || st.Report.Outcome != metrics.DrainComplete || !slices.Equal(keysOf(st.Report.Stored), []string{h.cache.ID}) {
+	if !st.Draining || st.Report == nil || st.Report.Outcome != metrics.DrainComplete || !slices.Equal(st.Report.Stored, []DrainStored{{Namespace: testScope, CacheID: h.cache.ID, Roots: 2}}) {
 		t.Fatalf("after the drain: %+v", st)
 	}
 }
@@ -601,11 +601,42 @@ func TestDrainNewNamespaceTakesNoNewSession(t *testing.T) {
 	}
 	release()
 	rep := waitDrain(t, done, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[a.ID] != 2 || rep.Stored[b.ID] != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf("team-a", a.ID) != 2 || len(rep.Stored) != 1 {
 		t.Fatalf("report %+v", rep)
 	}
 	if !h.svc.connected(conn) {
 		t.Fatal("the drain closed A's connection")
+	}
+}
+
+// Two namespaces whose engines both said hello with the same cache ID are
+// two caches: the drain's report counts what it stored of each on its own
+// (zerobull-consulting/dagger#160).
+func TestDrainStoredByNamespaceAndCacheID(t *testing.T) {
+	h := newAuthHarness(t)
+	a := fakeengine.New("cache-shared", 1)
+	authBuild(a, "a")
+	b := fakeengine.New("cache-shared", 1)
+	b.Add(fakeengine.Entry{Number: 20, Recipe: "from(alpine)", Layers: [][]byte{testLayer("base")}})
+	h.connect(a, "tok-a")
+	h.connect(b, "tok-b")
+	// Their sessions' ends never come, and Settle is a minute: the drain
+	// exports them.
+	h.postSpans("tok-a", a, "session-a", cacheSpan(10), cacheSpan(11, "10"))
+	h.postSpans("tok-b", b, "session-b", cacheSpan(20))
+	waitUntil(t, 5*time.Second, "both caches' roots to be tracked", func() bool {
+		return len(h.ns("team-a").tracker.Entries(a.ID)) == 2 && len(h.ns("team-b").tracker.Entries(b.ID)) == 1
+	})
+	rep := drainFor(h.svc, 10*time.Second)
+	want := []DrainStored{
+		{Namespace: "team-a", CacheID: "cache-shared", Roots: 2},
+		{Namespace: "team-b", CacheID: "cache-shared", Roots: 1},
+	}
+	if rep.Outcome != metrics.DrainComplete || !slices.Equal(rep.Stored, want) || rep.StoredRoots() != 3 {
+		t.Fatalf("report %+v, want stored %+v", rep, want)
+	}
+	if rep.StoredOf("team-a", "cache-shared") != 2 || rep.StoredOf("team-b", "cache-shared") != 1 || rep.StoredOf("team-c", "cache-shared") != 0 {
+		t.Fatalf("StoredOf: %+v", rep.Stored)
 	}
 }
 
@@ -695,7 +726,7 @@ func TestDrainCountsStoredBeforeItEnds(t *testing.T) {
 	h.build()
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 	rep := drainFor(h.svc, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 {
 		t.Fatalf("the drain's report misses the roots its export stored: %+v", rep)
 	}
 }
@@ -761,7 +792,7 @@ func TestDrainWaitsForExplicitExport(t *testing.T) {
 		t.Fatalf("the explicit export: %v", err)
 	}
 	rep := waitDrain(t, drained, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.Stored[h.cache.ID] != 1 {
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.StoredOf(testScope, h.cache.ID) != 1 {
 		t.Fatalf("drain report %+v", rep)
 	}
 }
@@ -812,7 +843,7 @@ func TestDrainRunsExplicitExportWaitingForSlot(t *testing.T) {
 	rep := waitDrain(t, drained, 10*time.Second)
 	// Roots 10 and 11, by the scheduler's export, and 99, by the explicit
 	// one.
-	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.Stored[h.cache.ID] != 3 {
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.StoredOf(testScope, h.cache.ID) != 3 {
 		t.Fatalf("drain report %+v", rep)
 	}
 }
@@ -985,7 +1016,7 @@ func TestDrainSecondCallDoesNotCancelFirst(t *testing.T) {
 
 	release()
 	rep := waitDrain(t, done, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.LeftRoots() != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.LeftRoots() != 0 {
 		t.Fatalf("the first Drain's report %+v", rep)
 	}
 	if st := h.svc.DrainStatus(); st.Report == nil || st.Report.Outcome != metrics.DrainComplete {

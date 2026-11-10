@@ -431,7 +431,7 @@ func TestMinIOBinaryDrainsOnSIGTERM(t *testing.T) {
 		t.Fatalf("the quiet session's export wasn't stored before the process exited (%s)", took)
 	}
 	logs := b.logs.String()
-	for _, want := range []string{"msg=stopping signal=terminated", "msg=\"drain: started\"", "msg=\"drain: stored\" cacheID=cache-a roots=2", "msg=\"drain: done\" outcome=complete"} {
+	for _, want := range []string{"msg=stopping signal=terminated", "msg=\"drain: started\"", "msg=\"drain: stored\" namespace=default cacheID=cache-a roots=2", "msg=\"drain: done\" outcome=complete"} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("the log has no %q", want)
 		}

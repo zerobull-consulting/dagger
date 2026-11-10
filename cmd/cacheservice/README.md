@@ -2826,17 +2826,37 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
 - **What it does.** Every dirty entry of the cache is due at once, without
   waiting for `-export-settle`, and stays so while the flush runs, so what
   becomes dirty meanwhile is exported too. Roots waiting out a retry's
-  backoff (busy, failed, interrupted) are due now, once; a retry after that
-  waits its normal backoff. A session whose spans may still come (one that
+  backoff (busy, failed, interrupted) are due now, once, except a failed
+  root whose wait a flush's own failed try started (below); a retry after
+  that waits its normal backoff. A session whose spans may still come (one that
   hasn't ended, or ended with some of the cache spans its carrier counted
   missing) is waited for until it ended with every span in, or
   `-export-settle` (at most 2s) passed since its last span: so a flush right
   after the client returned waits for its last spans and its carrier, which
-  are on their way. Its late spans are taken and exported. A flush starts
-  each failing root's retry at once: a caller that loops flushes retries
-  them at its own rate. The scheduler runs the exports, one
-  at a time per engine cache: the flush starts none of its own. Other
-  caches are scheduled as usual.
+  are on their way. Its late spans are taken and exported. A caller that
+  loops flushes doesn't retry a failing root at its own rate: a flush cuts
+  short a failed root's wait only if a flush didn't cause the try that
+  started it, so after a second failed try in a row the root waits out its
+  backoff (or its value changes), and reaches the last of its 5 failed tries (after which it isn't
+  tried again until its value changes) at most twice as fast as its
+  backoff alone would take it there
+  (`TestTrackerLoopedFlushesDontRushFailures`). A busy root, which doesn't
+  count toward that limit, is retried at every flush. The scheduler runs
+  the exports, one at a time per engine cache: the flush starts none of its
+  own. Other caches are scheduled as usual.
+- **It can't wait for spans it hasn't heard of.** A session holds a flush
+  only once the service has seen at least one of its spans. A flush that
+  comes before any span of a session reaches the service doesn't wait for
+  it: with nothing else left, it returns `complete` at once, and the
+  session's spans, arriving after, wait for `-export-settle` as usual
+  (`TestKnownGapFlushDoesNotWaitForUnseenSession`). Closing this needs the
+  engine's OTLP batching to hold back every span of a session until after
+  its client returned, a change to the engine. On a real engine
+  (`TestRealEngines/flush`, in
+  [zerobull-consulting/dagger#157](https://github.com/zerobull-consulting/dagger/pull/157)),
+  the flush right after the CLI returned found and exported all three
+  roots
+  ([zerobull-consulting/dagger#160](https://github.com/zerobull-consulting/dagger/issues/160)).
 - **It isn't a drain.** New engines, sessions and spans are taken as usual.
   An engine still running builds can keep a flush busy until its timeout.
 - **When it returns:** once nothing of the cache is dirty, waiting for
@@ -2953,10 +2973,16 @@ wait for), `deadline` or `canceled`. `GET /debug/drain` shows it under
 
 The drain logs, when it starts, what each engine cache (by cache ID, never
 the token) has pending, in flight and waiting for a retry, and when it ends,
-the roots stored by cache ID, and what was left unexported by cache ID and
-root count (`drain: left unexported`, a warning), with its outcome:
+the roots stored by namespace and cache ID (two namespaces whose engines
+say hello with the same cache ID are two caches), and what was left
+unexported by namespace, cache ID and root count (`drain: left
+unexported`, a warning), with its outcome:
 `complete`, `deadline` or `canceled`. `GET /debug/drain` shows the same while
-it runs, and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
+it runs, and its report once it ended: `stored` is a list of `{"namespace",
+"cacheID", "roots"}`, one per engine cache that stored any, sorted by
+namespace and cache ID as `left` is (it was an object keyed by cache ID
+alone before
+[zerobull-consulting/dagger#160](https://github.com/zerobull-consulting/dagger/issues/160)), and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
 `drain_stored_roots_total`, `drain_unexported_roots_total` and
 `drain_refused_total` measure it.
 
@@ -3100,7 +3126,7 @@ paths record into them through their metadata store. All are prefixed
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
 | `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
 | `flush_duration_seconds` | | Time of each flush |
-| `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry |
+| `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry. Each flush adds what it left, so overlapping flushes of one cache each count the same roots: a count per flush, not of the roots lost |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
 | `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full), `timeout` (408) or `too_deep` (400, nested past the limit). Nothing of them is recorded |
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |

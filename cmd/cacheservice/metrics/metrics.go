@@ -381,7 +381,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		flushLeftRoots: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: ns, Name: "flush_unexported_roots_total",
-			Help: "Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry.",
+			Help: "Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry. Each flush adds what it left, so overlapping flushes of one cache each count the same roots: a count per flush, not of the roots lost.",
 		}),
 		otlpRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "otlp_refused_total",

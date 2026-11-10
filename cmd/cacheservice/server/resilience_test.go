@@ -460,7 +460,7 @@ func TestDrainedRestartStoresPendingExport(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the drained stop didn't return")
 	}
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[a.ID] != 3 || rep.LeftRoots() != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, a.ID) != 3 || rep.LeftRoots() != 0 {
 		t.Fatalf("drain report %+v", rep)
 	}
 	if n := indexEntries(t, meta); n != 3 {
