@@ -1651,7 +1651,11 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   client's, and none failed (the server ends an idle HTTP/2 connection with a
   GOAWAY, and the client dials another). That run is not a test, as it passes
   in both orders. The engine WebSocket
-  is unaffected, as a hijacked connection is out of the server's hands. There
+  is unaffected, as a hijacked connection is out of the server's hands. The
+  same timeout applies to the debug and metrics listeners, whose clients are
+  scrapers sending GETs: Go's transport retries an idempotent request that
+  fails on a reused connection the server closed, so those are covered (read
+  from the code, not run; not checked for other scrapers). There
   is no cap on the number of connections: a client can still hold many open
   while it is sending, and what bounds that is left to the network.
 - **Headers are bounded.** Every listener (`server.NewHTTPServer`: the
@@ -1712,7 +1716,7 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   applies to the engine WebSocket on the same listener, which stays
   connected past both (same test): the server sets no `ReadTimeout`, which
   would cut it off. Idle keep-alive connections are closed after
-  `server.IdleTimeout` (below).
+  `server.IdleTimeout` (above).
 - **Engine IDs are validated before they key anything.** An engine cache ID
   (the `<cacheID>` of a span's or event's `dagger.io/engine.cache`, an
   engine start's wiped cache, an engine's hello) and a span's session

@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -710,9 +711,10 @@ func TestIdleTimeoutAboveExporterIdleConnTimeout(t *testing.T) {
 // A client with the exporters' transport settings (IdleConnTimeout below the
 // server's IdleTimeout, as in the engine) keeps POSTing across gaps longer
 // than its idle timeout without a transport error: it closes the connection
-// first, and dials another. Over plain HTTP, so HTTP/1.1; the HTTP/2 path
-// (-tls-cert) is in the README, "Idle connections are closed". Times are scaled down from 90s and IdleTimeout
-// with the ratio kept.
+// first, and dials another (each POST after the first is checked to have
+// got a new connection). Over plain HTTP, so HTTP/1.1; the HTTP/2 path
+// (-tls-cert) is in the README, "Idle connections are closed". Times are
+// scaled down from 90s and IdleTimeout, with their ratio kept.
 func TestExporterClientPostsAcrossIdleGaps(t *testing.T) {
 	clientIdle := 300 * time.Millisecond
 	serverIdle := time.Duration(float64(clientIdle) * float64(IdleTimeout) / float64(ExporterIdleConnTimeout))
@@ -730,9 +732,19 @@ func TestExporterClientPostsAcrossIdleGaps(t *testing.T) {
 	// client has closed the connection, the server hasn't.
 	gap := clientIdle + (serverIdle-clientIdle)/2
 	for i := range 5 {
-		resp, err := client.Post(srv.URL+"/v1/metrics", "application/x-protobuf", bytes.NewReader(body))
+		reused := false
+		trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }}
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(t.Context(), trace), http.MethodPost, srv.URL+"/v1/metrics", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("POST %d: %v", i, err)
+		}
+		if reused {
+			t.Errorf("POST %d reused a connection: the client should have closed it in the gap, so the test isn't about the closing order", i)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
