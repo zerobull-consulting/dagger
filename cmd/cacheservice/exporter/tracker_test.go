@@ -1074,7 +1074,7 @@ func TestTrackerQuietHoldsExports(t *testing.T) {
 	newQuiet := func() *Tracker {
 		tr := newTestTracker()
 		tr.Observe(state(1, 10, fsPart), t0)
-		tr.Quiet("c", until)
+		tr.Quiet("c", until, tr.EngineWakes("c"))
 		return tr
 	}
 	tr := newQuiet()
@@ -1092,6 +1092,17 @@ func TestTrackerQuietHoldsExports(t *testing.T) {
 	tr.Opened("c", 1, t0.Add(time.Minute/2))
 	if got := roots(tr.Due(until.Add(-time.Second))); !slices.Equal(got, []uint64{1}) {
 		t.Fatalf("due after an open ended the quiet: %v, want [1]", got)
+	}
+
+	// A settle decided before an open, and applied after it, sets no
+	// quiet: it would put back the one the open ended.
+	tr = newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	wakes := tr.EngineWakes("c")
+	tr.Opened("c", 1, t0)
+	tr.Quiet("c", until, wakes)
+	if got := roots(tr.Due(until.Add(-time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after a quiet from before the open was refused: %v, want [1]", got)
 	}
 
 	tr = newQuiet()

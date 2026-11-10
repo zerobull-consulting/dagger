@@ -710,12 +710,29 @@ func (t *Tracker) Opened(cacheID string, generation uint64, now time.Time) {
 // once that moment has passed with none, it takes exports until its next
 // session. So what comes due meanwhile, as a retry or a late span's entry,
 // waits for it.
-func (t *Tracker) Quiet(cacheID string, until time.Time) {
+//
+// wakes is EngineWakes as read before the caller decided the engine was
+// settled: if the engine opened a period or connected since, that decision
+// is of an earlier period, and the quiet isn't set. Without it, an open
+// that lands between the decision and this call would end the quiet first,
+// and this call would then put the earlier period's back.
+func (t *Tracker) Quiet(cacheID string, until time.Time, wakes uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if c := t.caches[cacheID]; c != nil && until.After(c.quietUntil) {
+	if c := t.caches[cacheID]; c != nil && c.engineWakes == wakes && until.After(c.quietUntil) {
 		c.quietUntil = until
 	}
+}
+
+// EngineWakes counts the times the engine of cacheID opened a new idle
+// period or connected (Opened, Connected, WakeEngineWait), for Quiet.
+func (t *Tracker) EngineWakes(cacheID string) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c := t.caches[cacheID]; c != nil {
+		return c.engineWakes
+	}
+	return 0
 }
 
 // WakeEngineWait makes the entries of a cache that wait for its engine due at

@@ -105,7 +105,7 @@ hand, see [Engine](../../hack/remote-cache/README.md#engine).
 
 **The match** is an exact string match of the hello's `engineVersion`
 against the `accept` lines: no ranges, prefixes or normalization. An empty
-version, a dev engine's (`v1.0.0-beta.27-dev-<commit>`, `+dirty`), a
+version, a dev engine's (`v1.0.0-beta.26-dev-<commit>`, `+dirty`), a
 rejected one or any release not listed is refused. It applies to every
 engine, whatever its token or namespace, and before anything else of the
 connection: a refused engine is never registered, owns no cache ID, and

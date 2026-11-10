@@ -247,6 +247,9 @@ func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle
 	for {
 		// Before the status: a kick after it wakes the wait below.
 		changed := p.changed()
+		// Before the period: an open after this is seen by Quiet below,
+		// since it records its period before it wakes the tracker.
+		wakes := tracker.EngineWakes(cacheID)
 		current, opened := c.period.current()
 		if current != req.Period {
 			return errStaleSettle
@@ -260,7 +263,7 @@ func (s *Service) settle(ctx context.Context, c *engineConn, req protocol.Settle
 		if st.Pending == 0 && st.InFlight == 0 && st.Retrying == 0 && st.Sessions == 0 && unseen == 0 {
 			// What comes due from here on, as the later tries do, waits
 			// for the engine's bound to pass.
-			tracker.Quiet(cacheID, quietUntil)
+			tracker.Quiet(cacheID, quietUntil, wakes)
 			return nil
 		}
 		select {
