@@ -376,7 +376,7 @@ func TestWaitWaitsForGCRunAskedFor(t *testing.T) {
 			close(bucket.release)
 		}
 	}()
-	if err := h.svc.EnableGC(h.ctx, GCConfig{Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+	if err := h.svc.EnableGC(h.ctx, GCConfig{Mode: GCModeBatch, Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
 		t.Fatal(err)
 	}
 	ran := make(chan error, 1)

@@ -74,9 +74,11 @@ D4):
 
 So the service can be a newer build than the action's commit. The action
 passes the service only flags every build has kept (`-scope`,
-`-drain-timeout`, `-drain-linger`, `-gc-interval`, `-export`, `-v`,
-`-debug-listen`, `-debug-token-file`); removing or renaming one of them is
-a breaking change for pinned actions. To run one exact build, set
+`-drain-timeout`, `-drain-linger`, `-export`, `-v`,
+`-debug-listen`, `-debug-token-file`), and, with `role: writer`,
+`-gc-mode=batch`, which builds from before zerobull-consulting/dagger#248
+don't know (they exit at startup on an unknown flag); removing or renaming one of them is a breaking change for
+pinned actions. To run one exact build, set
 `service-image` to `dagger-remote-cache:<commit SHA>`, such as the action's
 own commit.
 
@@ -133,7 +135,7 @@ of its own.
 
 | Input | Required | Default | What it is |
 | --- | --- | --- | --- |
-| `role` | yes | | `writer`: exports what the job builds, with `-gc-interval=0` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
+| `role` | yes | | `writer`: exports what the job builds, with `-gc-mode=batch` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
 | `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.25`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the CLI, the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
 | `service-image` | no | `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>` | Overrides the service image. The step fails if it refuses the engine. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |

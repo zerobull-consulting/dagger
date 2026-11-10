@@ -34,32 +34,24 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/server"
 )
 
-// The combinations -export=false can't honor.
+// The combinations -export=false can't honor. (Its -gc-mode and
+// -gc-interval combinations are TestResolveGCMode's.)
 func TestCheckReadOnly(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		exports, imports bool
 		noStore          bool
-		gcInterval       time.Duration
-		set              []string
 		wantErr          []string
 	}{
-		{name: "defaults", exports: true, imports: true, gcInterval: gc.DefaultInterval},
-		{name: "import off", exports: true, imports: false, gcInterval: gc.DefaultInterval},
-		{name: "export off, default gc interval", imports: true, gcInterval: gc.DefaultInterval},
-		{name: "export off, explicit gc interval 0", imports: true, set: []string{"gc-interval"}},
-		{name: "export off, explicit gc interval", imports: true, gcInterval: time.Hour, set: []string{"gc-interval"}, wantErr: []string{"-gc-interval=1h0m0s", "-export=false"}},
+		{name: "defaults", exports: true, imports: true},
+		{name: "import off", exports: true, imports: false},
+		{name: "export off", imports: true},
 		{name: "both off", wantErr: []string{"-export=false", "-import=false"}},
-		{name: "both off, explicit gc interval", gcInterval: time.Hour, set: []string{"gc-interval"}, wantErr: []string{"-export=false", "-import=false"}},
-		{name: "export off, no bucket", imports: true, noStore: true, gcInterval: gc.DefaultInterval, wantErr: []string{"-export=false", blobstore.EnvBucket}},
-		{name: "defaults, no bucket", exports: true, imports: true, noStore: true, gcInterval: gc.DefaultInterval},
+		{name: "export off, no bucket", imports: true, noStore: true, wantErr: []string{"-export=false", blobstore.EnvBucket}},
+		{name: "defaults, no bucket", exports: true, imports: true, noStore: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			set := map[string]bool{}
-			for _, f := range tc.set {
-				set[f] = true
-			}
-			err := checkReadOnly(tc.exports, tc.imports, !tc.noStore, tc.gcInterval, set)
+			err := checkReadOnly(tc.exports, tc.imports, !tc.noStore)
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatal(err)
@@ -113,7 +105,9 @@ func TestBinaryReadOnlyStartupErrors(t *testing.T) {
 		noBucket bool
 	}{
 		{"import off too", []string{"-export=false", "-import=false"}, []string{"-export=false", "-import=false"}, false},
-		{"explicit gc interval", []string{"-gc-interval=1h", "-export=false"}, []string{"-gc-interval=1h0m0s", "-export=false"}, false},
+		{"explicit gc interval", []string{"-gc-interval=1h", "-export=false"}, []string{"-gc-interval=1h0m0s", "-gc-mode=off", "-export=false"}, false},
+		{"explicit gc mode service", []string{"-gc-mode=service", "-export=false"}, []string{"-gc-mode=service", "-export=false"}, false},
+		{"explicit gc mode batch", []string{"-gc-mode=batch", "-export=false"}, []string{"-gc-mode=batch", "-export=false"}, false},
 		{"no bucket", []string{"-export=false"}, []string{"-export=false", blobstore.EnvBucket}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -156,19 +150,79 @@ func TestBinaryReadOnlyStartupErrors(t *testing.T) {
 	}
 }
 
-// -export=false with the default -gc-interval starts, with GC off: the
-// default alone isn't an error. With the root key here; the read-only key's
-// test is TestMinIOBinaryReadOnlyKey.
-func TestMinIOBinaryReadOnlyDefaultGCInterval(t *testing.T) {
-	b := startBinaryWith(t, binaryOpts{gcDefault: true}, "-export=false")
-	b.waitLog(10*time.Second, "msg=mode export=off import=on gc=off readOnly=true")
-	for _, want := range []string{"msg=\"gc off\"", "conditional write check skipped"} {
-		if !strings.Contains(b.logs.String(), want) {
-			t.Errorf("the log has no %q", want)
-		}
+// The refused -gc-mode and -gc-interval combinations exit 2, name the flags,
+// and come before anything connects to the bucket.
+func TestBinaryGCModeStartupErrors(t *testing.T) {
+	bin := buildBinary(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"interval 0", []string{"-gc-interval=0"}, []string{"-gc-interval=0", "-gc-mode"}},
+		{"negative interval", []string{"-gc-interval=-1m"}, []string{"-gc-interval=-1m0s", "negative"}},
+		{"interval with batch", []string{"-gc-mode=batch", "-gc-interval=1h"}, []string{"-gc-interval=1h0m0s", "-gc-mode=batch"}},
+		{"interval with off", []string{"-gc-mode=off", "-gc-interval=1h"}, []string{"-gc-interval=1h0m0s", "-gc-mode=off"}},
+		{"unknown mode", []string{"-gc-mode=daily"}, []string{"-gc-mode=", "daily", "service", "batch", "off"}},
+		{"service, read-only", []string{"-gc-mode=service", "-export=false"}, []string{"-gc-mode=service", "-export=false"}},
+		{"batch, read-only", []string{"-gc-mode=batch", "-export=false"}, []string{"-gc-mode=batch", "-export=false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint, conns := countingStore(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, bin, append([]string{"-listen", anyPort, "-debug-listen", ""}, tc.args...)...)
+			var environ []string
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "CACHESERVICE_S3_") {
+					environ = append(environ, kv)
+				}
+			}
+			cmd.Env = append(environ,
+				blobstore.EnvEndpoint+"="+endpoint,
+				blobstore.EnvBucket+"=dagger-cache",
+				blobstore.EnvPrefix+"=test",
+				blobstore.EnvRegion+"=us-east-1",
+				"CACHESERVICE_S3_ACCESS_KEY_ID=x",
+				"CACHESERVICE_S3_SECRET_ACCESS_KEY=y",
+			)
+			out, err := cmd.CombinedOutput()
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+				t.Fatalf("exit %v, want 2; log:\n%s", err, out)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("the error doesn't name %s:\n%s", want, out)
+				}
+			}
+			if n := conns.Load(); n != 0 {
+				t.Errorf("the store got %d connections before the service exited", n)
+			}
+		})
 	}
-	if code, body := b.post("/debug/gc"); code != http.StatusConflict || !strings.Contains(body, "read-only (-export=false)") {
-		t.Errorf("POST /debug/gc: %d %q, want 409, read-only", code, body)
+}
+
+// -export=false with the default -gc-mode starts, with GC off: the default
+// alone isn't an error, and neither is an explicit -gc-mode=off. With the root key here; the read-only key's
+// test is TestMinIOBinaryReadOnlyKey.
+func TestMinIOBinaryReadOnlyDefaultGCMode(t *testing.T) {
+	for _, args := range [][]string{{"-export=false"}, {"-export=false", "-gc-mode=off"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			b := startBinaryWith(t, binaryOpts{gcDefault: true}, args...)
+			b.waitLog(10*time.Second, "msg=mode export=off import=on gc=off readOnly=true")
+			for _, want := range []string{"msg=\"gc off\"", "conditional write check skipped"} {
+				if !strings.Contains(b.logs.String(), want) {
+					t.Errorf("the log has no %q", want)
+				}
+			}
+			// The reason is the read-only one, even with an explicit off.
+			for _, q := range []string{"", "?dry-run"} {
+				if code, body := b.post("/debug/gc" + q); code != http.StatusConflict || !strings.Contains(body, "read-only (-export=false)") {
+					t.Errorf("POST /debug/gc%s: %d %q, want 409, read-only", q, code, body)
+				}
+			}
+		})
 	}
 }
 
@@ -180,20 +234,59 @@ func TestMinIOBinaryDefaultsStartAsBefore(t *testing.T) {
 		args []string
 		mode string
 	}{
-		{"defaults", nil, "msg=mode export=on import=on gc=on readOnly=false"},
-		{"import off", []string{"-import=false"}, "msg=mode export=on import=off gc=on readOnly=false"},
+		{"defaults", nil, "msg=mode export=on import=on gc=service readOnly=false"},
+		{"import off", []string{"-import=false"}, "msg=mode export=on import=off gc=service readOnly=false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := startBinaryWith(t, binaryOpts{gcDefault: true}, tc.args...)
 			b.waitLog(10*time.Second, tc.mode)
 			logs := b.logs.String()
-			for _, want := range []string{"msg=\"export path on\"", "msg=\"gc on\" interval=" + gc.DefaultInterval.String()} {
+			for _, want := range []string{"msg=\"export path on\"", "msg=\"gc on\" mode=service interval=" + gc.DefaultInterval.String()} {
 				if !strings.Contains(logs, want) {
 					t.Errorf("the log has no %q", want)
 				}
 			}
 			if strings.Contains(logs, "conditional write check skipped") {
 				t.Error("the conditional write check was skipped")
+			}
+		})
+	}
+}
+
+// Each -gc-mode, started as a binary: the startup log says the mode, off
+// warns, and POST /debug/gc (and ?dry-run) answers 200, 200 and 409.
+func TestMinIOBinaryGCModes(t *testing.T) {
+	for _, tc := range []struct {
+		mode    string
+		extra   []string
+		logs    []string
+		status  int
+		reason  string
+		noMatch string
+	}{
+		{"service", nil, []string{"msg=mode export=on import=on gc=service readOnly=false", "msg=\"gc on\" mode=service interval=1h0m0s"}, http.StatusOK, "", ""},
+		{"batch", nil, []string{"msg=mode export=on import=on gc=batch readOnly=false", "msg=\"gc on\" mode=batch interval=0s"}, http.StatusOK, "", ""},
+		{"off", nil, []string{"msg=mode export=on import=on gc=off readOnly=false", "level=WARN msg=\"gc off\" mode=off"}, http.StatusConflict, "-gc-mode=off", "read-only"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			b := startBinaryWith(t, binaryOpts{gcDefault: true}, "-gc-mode="+tc.mode)
+			b.waitLog(10*time.Second, tc.logs[0])
+			for _, want := range tc.logs {
+				if !strings.Contains(b.logs.String(), want) {
+					t.Errorf("the log has no %q:\n%s", want, b.logs.String())
+				}
+			}
+			for _, q := range []string{"", "?dry-run"} {
+				code, body := b.post("/debug/gc" + q)
+				if code != tc.status {
+					t.Fatalf("POST /debug/gc%s: %d %q, want %d", q, code, body, tc.status)
+				}
+				if tc.reason != "" && (!strings.Contains(body, tc.reason) || strings.Contains(body, tc.noMatch)) {
+					t.Errorf("POST /debug/gc%s: %q, want a reason with %q and without %q", q, body, tc.reason, tc.noMatch)
+				}
+				if tc.status == http.StatusOK && !strings.Contains(body, `"mode":"`+tc.mode+`"`) {
+					t.Errorf("POST /debug/gc%s: %q doesn't report the mode", q, body)
+				}
 			}
 		})
 	}

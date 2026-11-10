@@ -91,12 +91,14 @@
 //     never writes to or deletes from the bucket, so it runs with a
 //     read-only key: no export path (spans are received and dropped), no
 //     conditional write check at startup, no GC, and no import records in
-//     the index. It refuses -import=false, no CACHESERVICE_S3_BUCKET, and
-//     an explicit nonzero -gc-interval. See README.md, "Read-only
+//     the index. It is -gc-mode=off. It refuses -import=false, no
+//     CACHESERVICE_S3_BUCKET, and an explicit -gc-mode=service or batch.
+//     See README.md, "Read-only
 //     instances".
 //
-//   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
-//     -gc-interval: per namespace in the bucket, it expires entries past
+//   - with CACHESERVICE_S3_BUCKET set, garbage collection (-gc-mode=service,
+//     the default: every -gc-interval; batch: only on POST /debug/gc, a
+//     'cacheservice gc' job collects; off: none): per namespace in the bucket, it expires entries past
 //     their expiry, -max-age or -max-bytes (per namespace with
 //     -namespaces-file, which SIGHUP reloads too), and deletes what no live
 //     entry names, and staged and incomplete multipart uploads older than
@@ -189,6 +191,7 @@ func main() {
 		maxAge        string
 		maxBytes      string
 		gcInterval    time.Duration
+		gcModeFlag    string
 		gcDryRun      bool
 		gcGrace       time.Duration
 		gcStagingAge  time.Duration
@@ -217,7 +220,8 @@ func main() {
 	flag.StringVar(&nsFile, "namespaces-file", "", "file of per-namespace limits, one '<namespace> max-age=<duration> max-bytes=<size>' per line, '*' for the defaults; SIGHUP reloads it (empty: -max-age and -max-bytes for every namespace)")
 	flag.StringVar(&maxAge, "max-age", "0", "default max age of a namespace's roots, from when an export last recorded them, such as 720h (0: no limit)")
 	flag.StringVar(&maxBytes, "max-bytes", "0", "default max size of what a namespace keeps, such as 500GiB (0: no limit)")
-	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25% (0: only POST /debug/gc; needs "+blobstore.EnvBucket+"); GC is off with -export=false, which refuses an explicit nonzero value")
+	flag.StringVar(&gcModeFlag, "gc-mode", string(server.GCModeService), gcModeUsage+" (needs "+blobstore.EnvBucket+")")
+	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25%, with -gc-mode=service (the default; 0 and negative values are refused, and so is any explicit value with batch or off)")
 	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
 	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
 	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
@@ -258,12 +262,17 @@ func main() {
 		logger.Warn(w)
 	}
 
-	if err := checkReadOnly(exports, imports, os.Getenv(blobstore.EnvBucket) != "", gcInterval, explicitFlags()); err != nil {
+	if err := checkReadOnly(exports, imports, os.Getenv(blobstore.EnvBucket) != ""); err != nil {
+		logger.Error(err.Error())
+		os.Exit(2)
+	}
+	gcMode, err := resolveGCMode(gcModeFlag, gcInterval, exports, explicitFlags())
+	if err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
 	}
 
-	debugListen, err := checkDebugListen(debugListen, debugToken, tokensFile, explicitFlags()["debug-listen"], logger)
+	debugListen, err = checkDebugListen(debugListen, debugToken, tokensFile, explicitFlags()["debug-listen"], logger)
 	if err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
@@ -361,12 +370,12 @@ func main() {
 				NoImport:   !imports,
 				ImportPoll: importPoll,
 			}
-			// A read-only instance never deletes from the bucket: GC is
-			// off whatever -gc-interval says (its default; an explicit
-			// one was refused above).
+			// A read-only instance never deletes from the bucket: its mode
+			// is off whatever -gc-mode says (an explicit service or batch
+			// was refused above), and it takes no GC options.
 			if exports {
-				opts.GC = &server.GCConfig{
-					Interval: gcInterval,
+				gcCfg := &server.GCConfig{
+					Mode: gcMode,
 					Collector: gc.Config{
 						DryRun:     gcDryRun,
 						Grace:      gcGrace,
@@ -374,6 +383,10 @@ func main() {
 						MaxDeletes: gcMaxDeletes,
 					},
 				}
+				if gcMode == server.GCModeService {
+					gcCfg.Interval = gcInterval
+				}
+				opts.GC = gcCfg
 			}
 			err = svc.EnableS3(ctx, cfg, opts)
 		}
@@ -388,7 +401,7 @@ func main() {
 	} else {
 		logger.Info("export path off: set " + blobstore.EnvBucket + " to store exports in S3")
 	}
-	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", !exports)
+	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", gcModeLog(store, gcMode), "readOnly", !exports)
 
 	// Every listener bounds reading a request's headers in time
 	// (server.ReadHeaderTimeout) and in size (server.MaxHeaderBytes), and
@@ -779,11 +792,9 @@ func explicitFlags() map[string]bool {
 
 // checkReadOnly refuses the flag combinations -export=false can't honor:
 // with -import=false too, or with no bucket (store), the service would have
-// nothing to do; and an explicit nonzero -gc-interval asks for GC, which a
-// read-only instance never runs (it never deletes from the bucket). The
-// default -gc-interval alone is fine: GC is then off. set holds the flags
-// set on the command line.
-func checkReadOnly(exports, imports, store bool, gcInterval time.Duration, set map[string]bool) error {
+// nothing to do. (An explicit -gc-mode or -gc-interval with it is
+// resolveGCMode's to refuse.)
+func checkReadOnly(exports, imports, store bool) error {
 	if exports {
 		return nil
 	}
@@ -793,10 +804,16 @@ func checkReadOnly(exports, imports, store bool, gcInterval time.Duration, set m
 	if !store {
 		return errors.New("-export=false without " + blobstore.EnvBucket + ": a read-only instance only imports from the bucket, so it would have nothing to do; set " + blobstore.EnvBucket + ", or drop -export=false")
 	}
-	if set["gc-interval"] && gcInterval != 0 {
-		return fmt.Errorf("-gc-interval=%s and -export=false: a read-only instance never runs garbage collection, which deletes from the bucket; drop -gc-interval, or set it to 0", gcInterval)
-	}
 	return nil
+}
+
+// gcModeLog is the "gc" value of the startup log: the mode, or off with no
+// bucket to collect.
+func gcModeLog(store bool, m server.GCMode) string {
+	if !store {
+		return string(server.GCModeOff)
+	}
+	return string(m)
 }
 
 func onOff(on bool) string {

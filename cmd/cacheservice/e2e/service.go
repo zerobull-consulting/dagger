@@ -122,7 +122,7 @@ func (e *Env) StartService(name string, opts ServiceOptions) *Service {
 	}
 	if !opts.ReadOnly {
 		// Only when a scenario asks (CollectGarbage).
-		s3opts.GC = &server.GCConfig{Collector: gc.Config{Grace: opts.GCGrace}}
+		s3opts.GC = &server.GCConfig{Mode: server.GCModeBatch, Collector: gc.Config{Grace: opts.GCGrace}}
 	}
 	if err := svc.EnableS3(ctx, cfg, s3opts); err != nil {
 		cancel()

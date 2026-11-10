@@ -13,19 +13,52 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
 )
 
+// GCMode says who collects garbage in a bucket.
+type GCMode string
+
+const (
+	// GCModeService runs GC in the service, every GCConfig.Interval, and
+	// when asked (POST /debug/gc). The default of -gc-mode.
+	GCModeService GCMode = "service"
+	// GCModeBatch has no schedule in the service: a job (cacheservice gc)
+	// collects the bucket. POST /debug/gc still runs GC, on demand.
+	GCModeBatch GCMode = "batch"
+	// GCModeOff collects nothing, and refuses POST /debug/gc (409): the
+	// bucket grows without bound.
+	GCModeOff GCMode = "off"
+)
+
+// GCModes lists the modes, as -gc-mode spells them.
+var GCModes = []GCMode{GCModeService, GCModeBatch, GCModeOff}
+
+// ParseGCMode reads a -gc-mode value. An unknown one is an error that lists
+// the modes.
+func ParseGCMode(v string) (GCMode, error) {
+	for _, m := range GCModes {
+		if string(m) == v {
+			return m, nil
+		}
+	}
+	return "", fmt.Errorf("-gc-mode=%q: want one of %s, %s or %s", v, GCModeService, GCModeBatch, GCModeOff)
+}
+
 // GCConfig configures garbage collection.
 type GCConfig struct {
+	// Mode is who collects. It must be set: GCModeService needs a positive
+	// Interval, and GCModeBatch and GCModeOff need none.
+	Mode GCMode
 	// Collector configures the collector. Its Limits and Logger are the
 	// service's when unset; Metrics too.
 	Collector gc.Config
-	// Interval is the time between runs, jittered by ±25%. Zero runs only
-	// when asked (CollectGarbage, POST /debug/gc).
+	// Interval is the time between runs, jittered by ±25%, in GCModeService.
+	// GCModeBatch and GCModeOff take none.
 	Interval time.Duration
 }
 
 // gcPath is garbage collection, when it is on.
 type gcPath struct {
 	cfg       gc.Config
+	mode      GCMode
 	collector *gc.Collector
 	// ctx runs every GC run, scheduled or asked for; stop ends it, and
 	// with it the run under way, when the service starts draining.
@@ -105,17 +138,33 @@ func (s *Service) Limits(ns string) gc.Limits {
 	return s.limits.file.For(ns)
 }
 
-// EnableGC turns on garbage collection, and runs it every cfg.Interval
-// until ctx ends. It collects every namespace in the bucket, not only those
-// with tokens, with the service's limits.
+// EnableGC sets up garbage collection for cfg.Mode. In GCModeService it runs
+// every cfg.Interval until ctx ends; in GCModeBatch it only runs when asked
+// (CollectGarbage, POST /debug/gc); in GCModeOff it collects nothing, and
+// CollectGarbage answers ErrGCModeOff. It collects every namespace in the
+// bucket, not only those with tokens, with the service's limits.
 func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 	if s.readOnly {
 		return ErrGCReadOnly
 	}
-	// Only 0 turns the schedule off: a negative interval is a typo, and
-	// taking it as 0 would leave retention off without a word.
-	if cfg.Interval < 0 {
-		return fmt.Errorf("gc: negative interval %s (0 runs GC only when asked)", cfg.Interval)
+	switch cfg.Mode {
+	case GCModeService:
+		// A zero or negative interval is a typo: the schedule is the mode's
+		// whole point, and "no schedule" is GCModeBatch or GCModeOff.
+		if cfg.Interval <= 0 {
+			return fmt.Errorf("gc: interval %s in mode %s: want a positive interval; for no schedule use -gc-mode=%s or -gc-mode=%s", cfg.Interval, cfg.Mode, GCModeBatch, GCModeOff)
+		}
+	case GCModeBatch, GCModeOff:
+		if cfg.Interval != 0 {
+			return fmt.Errorf("gc: interval %s in mode %s: it has no schedule, so an interval would do nothing", cfg.Interval, cfg.Mode)
+		}
+	default:
+		return fmt.Errorf("gc: unknown mode %q", cfg.Mode)
+	}
+	if cfg.Mode == GCModeOff {
+		s.gc = &gcPath{mode: GCModeOff}
+		s.logger.Warn("gc off", "mode", GCModeOff, "reason", "nothing collects this bucket, so it grows without bound; -gc-mode=batch is for a cacheservice gc job, -gc-mode=service for the service's own schedule")
+		return nil
 	}
 	c := cfg.Collector
 	if c.Limits == nil {
@@ -135,16 +184,16 @@ func (s *Service) EnableGC(ctx context.Context, cfg GCConfig) error {
 		return err
 	}
 	ctx, stop := context.WithCancel(ctx)
-	p := &gcPath{cfg: c, collector: collector, ctx: ctx, stop: stop}
+	p := &gcPath{cfg: c, mode: cfg.Mode, collector: collector, ctx: ctx, stop: stop}
 	s.gc = p
-	if cfg.Interval > 0 {
+	if cfg.Mode == GCModeService {
 		p.wg.Add()
 		go func() {
 			defer p.wg.Done()
 			collector.Loop(ctx, cfg.Interval)
 		}()
 	}
-	s.logger.Info("gc on", "interval", cfg.Interval, "dryRun", c.DryRun)
+	s.logger.Info("gc on", "mode", cfg.Mode, "interval", cfg.Interval, "dryRun", c.DryRun)
 	return nil
 }
 
@@ -155,6 +204,8 @@ var (
 	// read-only service (SetReadOnly, -export=false): GC deletes from the
 	// bucket, which such a service never does.
 	ErrGCReadOnly = errors.New("gc is off: the instance is read-only (-export=false), and never deletes from the bucket")
+	// ErrGCModeOff is returned by CollectGarbage in GCModeOff.
+	ErrGCModeOff = errors.New("gc is off: -gc-mode=off, so nothing collects this bucket; use -gc-mode=batch or -gc-mode=service to run GC")
 )
 
 // CollectGarbage runs garbage collection now, over every namespace, and
@@ -168,6 +219,9 @@ func (s *Service) CollectGarbage(ctx context.Context, dryRun bool) ([]gc.Report,
 	p := s.gc
 	if p == nil {
 		return nil, ErrGCOff
+	}
+	if p.mode == GCModeOff {
+		return nil, ErrGCModeOff
 	}
 	if s.draining.Load() {
 		return nil, ErrDraining
@@ -220,7 +274,7 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	if errors.Is(err, ErrGCReadOnly) {
+	if errors.Is(err, ErrGCReadOnly) || errors.Is(err, ErrGCModeOff) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
@@ -229,9 +283,10 @@ func (s *Service) serveGC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := struct {
+		Mode    GCMode      `json:"mode"`
 		Reports []gc.Report `json:"reports"`
 		Error   string      `json:"error,omitempty"`
-	}{Reports: reports}
+	}{Mode: s.gc.mode, Reports: reports}
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		out.Error = err.Error()

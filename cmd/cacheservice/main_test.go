@@ -164,7 +164,7 @@ type binaryOpts struct {
 	// accessKey and secretKey are the service's credentials; empty: the
 	// environment's (MinIO's root user).
 	accessKey, secretKey string
-	// gcDefault leaves -gc-interval at its default, instead of 0.
+	// gcDefault leaves -gc-mode at its default (service), instead of batch.
 	gcDefault bool
 	// cache is the fake engine to connect; nil: cache-a. noEngine
 	// connects none, and doesn't wait for the service to listen.
@@ -206,8 +206,10 @@ func startBinaryWith(t *testing.T, opts binaryOpts, args ...string) *binaryTest 
 	secretKey := cmp.Or(opts.secretKey, envOr("CACHESERVICE_S3_SECRET_ACCESS_KEY", "dagger-dev-secret"))
 
 	base := []string{"-listen", anyPort, "-debug-listen", anyPort}
-	if !opts.gcDefault {
-		base = append(base, "-gc-interval", "0")
+	// A read-only instance is off by itself, and refuses an explicit
+	// service or batch.
+	if !opts.gcDefault && !slices.Contains(args, "-export=false") {
+		base = append(base, "-gc-mode", "batch")
 	}
 	cmd := exec.Command(bin, append(base, args...)...)
 	cmd.Env = append(os.Environ(),

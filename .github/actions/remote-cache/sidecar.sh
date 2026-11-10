@@ -521,8 +521,9 @@ start() {
 
 	local flags=(-scope "$namespace" -drain-timeout "$drain" -drain-linger "${linger_seconds}s")
 	if [[ "$role" == writer ]]; then
-		# Scheduled GC belongs to its own job (zerobull-consulting/dagger#61).
-		flags+=(-gc-interval=0)
+		# Scheduled GC belongs to its own job (zerobull-consulting/dagger#61):
+		# the service has no schedule, and POST /debug/gc still runs GC.
+		flags+=(-gc-mode=batch)
 	else
 		# A pull-request job: never writes to or deletes from the bucket.
 		flags+=(-export=false)

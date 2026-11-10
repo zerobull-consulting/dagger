@@ -853,6 +853,12 @@ check "debug-port: its file is readable by the service's UID" [ "$(stat -c %a "$
 check "debug-port: its directory only by this user" [ "$(stat -c %a "$dbg_dir")" = 700 ]
 check "debug-port: the service gets the file, read-only" grep -qxF -- "$dbg_dir/debug-token:/run/secrets/debug-token:ro" <<<"$dbg_args"
 check "debug-port: and -debug-token-file" grep -qxF -- "-debug-token-file" <<<"$dbg_args"
+check "writer: the service gets -gc-mode=batch" grep -qxF -- "-gc-mode=batch" <<<"$dbg_args"
+check "writer: and no -gc-interval" not grep -q -- "-gc-interval" <<<"$dbg_args"
+fake_start dbgbin SIDECAR_NAME=ro SIDECAR_ROLE=read-only >/dev/null
+ro_args="$(cat "$tmp/dbgbin.fake/service.args" 2>/dev/null)"
+check "read-only: the service gets -export=false" grep -qxF -- "-export=false" <<<"$ro_args"
+check "read-only: and neither -gc-mode nor -gc-interval" not grep -qE -- "^-gc-(mode|interval)" <<<"$ro_args"
 check "start passes the linger the stop's bounds assume" grep -qx -- "-drain-linger" <<<"$dbg_args"
 check "... 15s" bash -c 'grep -A1 -x -- "-drain-linger" <<<"$1" | tail -1 | grep -qx 15s' _ "$dbg_args"
 check "... and records it for the stop" grep -qx linger_seconds=15 "$tmp/dbgbin.sc/remote-cache/state"
