@@ -1576,9 +1576,9 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     per key and 32 per value (measured against the heap of parsed requests:
     `TestOTLPHeaderReserveCoversParsedHeaders`), the host, and the request URI
     twice. Real engines' requests come to about 1.5 to 3.2 KiB (see **Headers are
-    bounded**, below), small beside the 16 KiB; but a client sending 48 KiB
-    of headers and then stalling its body holds that much of the budget, not
-    16 KiB
+    bounded**, below), small beside the 16 KiB; but a client sending 24 KiB
+    of headers and then stalling its body holds that much of the budget
+    beside the 16 KiB, not the 16 KiB alone (one over 32 KiB is refused, below)
     ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
     `TestOTLPRequestHeadersInBudget`, `TestOTLPHeaderReserve`). The estimate
     counts the names a chunked request declares in its `Trailer` header too,
