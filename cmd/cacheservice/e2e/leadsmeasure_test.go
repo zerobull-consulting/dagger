@@ -282,3 +282,23 @@ func TestQuietGaps(t *testing.T) {
 		t.Fatalf("gaps %+v; want entry 9's 120s, then entry 7's 15s and 1s (not its 40s, after it was retained)", gaps)
 	}
 }
+
+// A call span that says retained but ends earlier than the one the tracker
+// took its flag from doesn't make the tracker keep the entry, however late it
+// arrives, so a gap before it is not at risk.
+func TestAtRiskUsesTheEffectiveRetainedFlag(t *testing.T) {
+	recs := []LogRecord{
+		spanRecEnd(0, "100", "c1/1", "7", true, false, "1", "1"), // the latest-ending call span: not retained
+		spanRecEnd(time.Second, "10", "c1/1", "7", false, false, "1", "1"),
+		spanRecEnd(31*time.Second, "50", "c1/1", "7", true, true, "1", "1"), // ends earlier, arrives later
+	}
+	gaps := lazyToCall(recs)
+	if len(gaps) != 1 || gaps[0].gap != 30*time.Second || !gaps[0].unretained || gaps[0].atRisk() {
+		t.Fatalf("gaps %+v; want one 30s gap of an unretained entry, not at risk", gaps)
+	}
+	// The same call span ending later does make the tracker keep it.
+	recs[2] = spanRecEnd(31*time.Second, "150", "c1/1", "7", true, true, "1", "1")
+	if gaps := lazyToCall(recs); len(gaps) != 1 || !gaps[0].atRisk() {
+		t.Errorf("gaps %+v; want one at risk", gaps)
+	}
+}

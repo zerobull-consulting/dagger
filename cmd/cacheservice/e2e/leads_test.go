@@ -198,13 +198,17 @@ type lazyGap struct {
 	// unretained is whether the engine didn't yet keep the entry when the
 	// lazy span came (no call span before it said retained).
 	unretained bool
+	// retains is whether the call span makes the tracker keep the entry: it
+	// says retained, and ends no earlier than the call span the tracker last
+	// took its retained flag from.
+	retains bool
 }
 
 // atRisk is whether the gap can lose the entry's parts: the engine didn't
 // keep the entry when the lazy span came, and the call span then says it
 // does, so the entry is worth exporting only from there. A call span that
 // says the entry isn't retained has nothing to lose.
-func (g lazyGap) atRisk() bool { return g.unretained && g.call.retained }
+func (g lazyGap) atRisk() bool { return g.unretained && g.retains }
 
 // lazyToCall measures lead 2 for one service: for each call span preceded
 // by lazy-evaluation spans with no call span between, the gap from the last
@@ -224,7 +228,7 @@ func lazyToCall(recs []LogRecord) []lazyGap {
 				continue
 			}
 			if !lastLazy.at.IsZero() {
-				out = append(out, lazyGap{k, s.at.Sub(lastLazy.at), lastLazy, s, !retained})
+				out = append(out, lazyGap{k, s.at.Sub(lastLazy.at), lastLazy, s, !retained, s.end >= stateEnd && s.retained})
 				lastLazy = entrySpan{}
 			}
 			if s.end >= stateEnd {
