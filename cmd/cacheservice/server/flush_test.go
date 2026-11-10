@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
+	"github.com/dagger/dagger/cmd/cacheservice/gc"
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
@@ -302,6 +303,42 @@ func TestFlushRetries(t *testing.T) {
 	rep = h.flush("10s")
 	if rep.Outcome != metrics.FlushComplete || rep.Stored != 1 || !indexHas(t, h, 10) {
 		t.Fatalf("not busy: report %+v", rep)
+	}
+}
+
+// The flush's deadline and its wait are on one clock, the export path's:
+// with that clock standing still, a flush whose timeout passed on the wall
+// clock waits on for a retry the export path's clock says is due before
+// the deadline, and stores it once that clock moves to it
+// (zerobull-consulting/dagger#160).
+func TestFlushWaitsOnExportPathClock(t *testing.T) {
+	clock := gc.NewNow(time.Now())
+	const backoff = 500 * time.Millisecond
+	h, _ := newDrainHarness(t, func(c *ExportConfig) {
+		c.Now = clock.Now
+		c.Tracker.BusyBackoff = backoff
+		c.Tracker.MaxBusyBackoff = backoff
+	})
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Busy: true})
+	// The session ended with its span in: no session holds the flush.
+	h.postSpans("session-1", cacheSpan(10), carrierSpan(1))
+	done := startFlush(t, flushURL(h.srv.URL, h.cache.ID, "1s"), "engine-token")
+	waitUntil(t, 5*time.Second, "the flush's try to be answered busy", func() bool {
+		for _, e := range h.ns().tracker.Entries(h.cache.ID) {
+			if e.RetryAt != "" {
+				return true
+			}
+		}
+		return false
+	})
+	// Past the timeout on the wall clock; the export path's hasn't moved.
+	time.Sleep(1500 * time.Millisecond)
+	flushRunning(t, done, "on the wall clock, before its deadline on the export path's clock")
+	h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}})
+	clock.Add(backoff)
+	res := waitFlush(t, done, 10*time.Second)
+	if res.code != http.StatusOK || res.rep.Outcome != metrics.FlushComplete || res.rep.Stored != 1 || !indexHas(t, h, 10) {
+		t.Fatalf("flush: %d %+v", res.code, res.rep)
 	}
 }
 

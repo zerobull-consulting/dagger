@@ -183,7 +183,9 @@ func (s *Service) flushRefusal() error {
 // the cache's engine isn't connected or disconnects (not_connected); and
 // when ctx is canceled or the export path stops (canceled). It never
 // cancels an export: one in flight when it returns runs on. A timeout of 0
-// makes nothing due, and only reports.
+// makes nothing due, and only reports. The timeout is measured on the
+// export path's clock, which the tracker's retries and session waits use
+// too, so what the report counts as due before it is what was waited for.
 //
 // The error is a refusal: flushRefusal's.
 func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, timeout time.Duration) (FlushReport, error) {
@@ -214,8 +216,10 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 
 	endFlush := tracker.StartFlush(cacheID, p.now())
 	defer endFlush()
-	tctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// The deadline and the wait are on one clock, the export path's, as
+	// the tracker's retries are: the wait ends when that clock reaches the
+	// deadline, checked at each wake (a timer set to what is left of it,
+	// the poll, or a kick), never on a wall-clock timeout of its own.
 	p.changedWaiters.Add(1)
 	defer p.changedWaiters.Add(-1)
 	poll := time.NewTicker(min(p.tick, maxDrainPoll))
@@ -241,17 +245,19 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		case !now.Before(deadline):
 			return end(metrics.FlushTimeout), nil
 		}
+		left := time.NewTimer(deadline.Sub(now))
 		select {
 		case <-changed:
 		case <-poll.C:
+		case <-left.C:
 		case <-p.ctx.Done():
+			left.Stop()
 			return end(metrics.FlushCanceled), nil
-		case <-tctx.Done():
-			if ctx.Err() != nil {
-				return end(metrics.FlushCanceled), nil
-			}
-			return end(metrics.FlushTimeout), nil
+		case <-ctx.Done():
+			left.Stop()
+			return end(metrics.FlushCanceled), nil
 		}
+		left.Stop()
 	}
 }
 
