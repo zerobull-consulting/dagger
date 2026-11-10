@@ -60,6 +60,21 @@ const (
 	// which outlives any request timeout, is unaffected once upgraded.
 	ReadHeaderTimeout = 10 * time.Second
 
+	// ExporterIdleConnTimeout is how long the engine's Cloud exporters
+	// (engine/telemetry cloudExportTransport, IdleConnTimeout) keep an idle
+	// connection before closing it. The engine is not imported here, so the
+	// value is copied; it was measured by running that transport against a
+	// test server, which saw it close an idle connection after 90.08s.
+	ExporterIdleConnTimeout = 90 * time.Second
+
+	// IdleTimeout bounds a keep-alive connection between requests on every
+	// listener (NewHTTPServer). It is above ExporterIdleConnTimeout so the
+	// exporters' client closes an idle connection first: a server-side close
+	// can race a client reusing the connection for a POST, which Go's
+	// transport doesn't retry once it has written the body. A hijacked
+	// connection (the engine WebSocket) is out of the server's hands.
+	IdleTimeout = ExporterIdleConnTimeout + 30*time.Second
+
 	// MaxHeaderBytes bounds a request's line and headers on every listener
 	// (NewHTTPServer), where net/http's default is 1 MiB. net/http allows
 	// 4 KiB more than this for its read buffer, so up to about 68 KiB are
@@ -94,13 +109,17 @@ const (
 	otlpRetryAfter = 1
 )
 
+// idleTimeout is the IdleTimeout NewHTTPServer sets: IdleTimeout, unless a
+// test changed it.
+var idleTimeout = IdleTimeout
+
 // NewHTTPServer is an http.Server for one of the service's handlers, with the
-// limits every listener sets: ReadHeaderTimeout and MaxHeaderBytes, and no
+// limits every listener sets: ReadHeaderTimeout, IdleTimeout and MaxHeaderBytes, and no
 // ReadTimeout or WriteTimeout, which would cut off the engine WebSocket. The
 // OTLP routes bound their bodies themselves (OTLPReadTimeout), and count
 // their headers in the decode budget (otlpHeaderReserve).
 func NewHTTPServer(addr string, h http.Handler) *http.Server {
-	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout, MaxHeaderBytes: MaxHeaderBytes}
+	return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: ReadHeaderTimeout, IdleTimeout: idleTimeout, MaxHeaderBytes: MaxHeaderBytes}
 }
 
 // otlpRoute is one OTLP POST route: its name, a constant used as its metric

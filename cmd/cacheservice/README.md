@@ -1633,6 +1633,21 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   one beside them; two at-limit requests at once may have one refused, and
   retried. Without the budget, N requests at the limit would hold N times
   the limit, and their messages more.
+- **Idle connections are closed.** Every listener (`server.NewHTTPServer`)
+  sets `IdleTimeout` to 120s (`server.IdleTimeout`): a keep-alive connection
+  with no request on it is closed after that
+  (`TestIdleKeepAliveConnectionClosed`). It is above the 90s the engine's
+  Cloud exporters keep an idle connection (`IdleConnTimeout` of
+  `cloudExportTransport` in `engine/telemetry`, measured: a test server saw
+  that transport close an idle connection after 90.08s), so the exporters'
+  client closes first. Were the server's below the client's, a client reusing
+  a connection as the server closed it would get a transport error that Go
+  doesn't retry for a POST: in a test with the server's at half the client's,
+  5 of 5 runs failed with `EOF` or `connection reset by peer`
+  (`TestExporterClientReusesConnectionsAcrossIdleGaps`). The engine WebSocket
+  is unaffected, as a hijacked connection is out of the server's hands. There
+  is no cap on the number of connections: a client can still hold many open
+  while it is sending, and what bounds that is left to the network.
 - **Headers are bounded.** Every listener (`server.NewHTTPServer`: the
   engine and OTLP listener, the debug listener and the metrics listener)
   sets `MaxHeaderBytes` to 64 KiB (`server.MaxHeaderBytes`), where net/http's
@@ -1690,10 +1705,8 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   bounds a request's headers to 10s (`server.ReadHeaderTimeout`). Neither
   applies to the engine WebSocket on the same listener, which stays
   connected past both (same test): the server sets no `ReadTimeout`, which
-  would cut it off. Idle keep-alive connections aren't bounded, as before;
-  they hold no part of the budget
-  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
-  `TestIdleKeepAliveConnectionsUnbounded`).
+  would cut it off. Idle keep-alive connections are closed after
+  `server.IdleTimeout` (below).
 - **Engine IDs are validated before they key anything.** An engine cache ID
   (the `<cacheID>` of a span's or event's `dagger.io/engine.cache`, an
   engine start's wiped cache, an engine's hello) and a span's session
@@ -1739,9 +1752,6 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   ([zerobull-consulting/dagger#219](https://github.com/zerobull-consulting/dagger/issues/219),
   `TestOTLPRefusedTokenHeadersNotInBudgetKnownGap`).
 
-- Idle keep-alive connections aren't bounded
-  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
-  `TestIdleKeepAliveConnectionsUnbounded`).
 - Walking a deeply nested body (OTLP values nest) takes stack the budget
   doesn't count; its structs are counted
   ([zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86),
