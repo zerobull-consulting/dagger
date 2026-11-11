@@ -29,7 +29,7 @@ It starts MinIO on the Docker bridge gateway, where containers reach it
 runs [`run.sh`](run.sh):
 
 1. **writer phase:** a writer sidecar, the demo, then the stop, which
-   drains;
+   flushes;
 2. **read-only phase:** a fresh engine and a read-only sidecar
    (`-export=false`, with the read-only user), and the demo again.
 
@@ -38,7 +38,7 @@ runs [`run.sh`](run.sh):
 does, never wall time:
 
 - writer: `build` executes and prints a stamp, `app` is warm; after the
-  stop, exports were stored and the drain completed;
+  stop, exports were stored and its flush left nothing it could export;
 - read-only: the service is read-only and merged the writer's entries; the
   engine's cache isn't the writer's; `build` is a hit with 0 executed and the
   writer's stamp; `app` is cold and executes; nothing is exported.
