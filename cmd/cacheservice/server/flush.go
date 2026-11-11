@@ -52,19 +52,26 @@ type FlushLeft struct {
 	// timeout passed, and Later those whose try is due after it.
 	Retrying int `json:"retrying"`
 	Later    int `json:"later"`
+	// Paused are the roots the engine refused because it has given up its
+	// remote-cache work until its next session: the flush neither waits
+	// for them nor tries them again, and they are lost if the engine is
+	// stopped before a session starts on it. They aren't among Roots.
+	Paused int `json:"paused,omitempty"`
 }
 
-// Roots is how many roots were left.
+// Roots is how many roots were left that the service can still export: all
+// but Paused.
 func (l FlushLeft) Roots() int { return l.Dirty + l.InFlight + l.Retrying + l.Later }
 
 func flushLeftOf(st exporter.DrainState) FlushLeft {
-	return FlushLeft{Dirty: st.Pending, WaitingSpans: st.Sessions, InFlight: st.InFlight, Retrying: st.Retrying, Later: st.Later}
+	return FlushLeft{Dirty: st.Pending, WaitingSpans: st.Sessions, InFlight: st.InFlight, Retrying: st.Retrying, Later: st.Later, Paused: st.Paused}
 }
 
 // FlushReport is what a flush did, for one engine cache.
 type FlushReport struct {
-	// Outcome is metrics.FlushComplete (nothing left), FlushTimeout,
-	// FlushNotConnected or FlushCanceled.
+	// Outcome is metrics.FlushComplete (nothing left), FlushPaused (only
+	// roots a paused engine refuses left), FlushTimeout, FlushNotConnected
+	// or FlushCanceled.
 	Outcome string `json:"outcome"`
 	// CacheID is the cache flushed; empty when the token form found none.
 	CacheID string `json:"cacheID,omitempty"`
@@ -177,7 +184,10 @@ func (s *Service) flushRefusal() error {
 //     engine still running builds can keep it busy until its timeout.
 //
 // It returns once nothing is dirty, waiting for spans, in flight or due by
-// the timeout for the cache (complete), or once the timeout passes, or only
+// the timeout for the cache (complete; paused when roots are left that the
+// engine refuses because it has given up its remote-cache work until its
+// next session, which the flush neither waits for nor tries again), or once
+// the timeout passes, or only
 // retries due after it are left (timeout); at once, with what is left, when
 // the cache's engine isn't connected or disconnects (not_connected); and
 // when ctx is canceled or the export path stops (canceled). It never
@@ -208,7 +218,7 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 	if timeout <= 0 {
 		st := tracker.FlushStatus(cacheID, p.now(), deadline)
 		if flushEmpty(st) {
-			return end(metrics.FlushComplete), nil
+			return end(flushDone(st)), nil
 		}
 		return end(metrics.FlushTimeout), nil
 	}
@@ -232,7 +242,7 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 		now := p.now()
 		st := tracker.FlushStatus(cacheID, now, deadline)
 		switch {
-		case flushEmpty(st):
+		case flushEmpty(st) && st.Paused == 0:
 			return end(metrics.FlushComplete), nil
 		case p.ctx.Err() != nil, s.closing.Load():
 			// The stop began (the paths' context ended, or CloseEngines
@@ -241,6 +251,10 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 			return end(metrics.FlushCanceled), nil
 		case !connected():
 			return end(metrics.FlushNotConnected), nil
+		case flushEmpty(st):
+			// Only paused roots left, of an engine still connected: one
+			// that went away takes them with it, and is reported so above.
+			return end(metrics.FlushPaused), nil
 		case st.InFlight == 0 && st.Pending == 0 && st.Retrying == 0 && st.Sessions == 0:
 			// Only retries due after the timeout: not waited for.
 			return end(metrics.FlushTimeout), nil
@@ -260,10 +274,20 @@ func (s *Service) flush(ctx context.Context, ns *namespace, cacheID string, time
 	}
 }
 
-// flushEmpty reports whether a cache has nothing left a flush waits for or
-// reports: no root left, and no session waited for.
+// flushEmpty reports whether a cache has nothing left a flush can do
+// anything for: no root left but those its engine refuses as paused, and no
+// session waited for.
 func flushEmpty(st exporter.DrainState) bool {
 	return st.Roots() == 0 && st.Sessions == 0
+}
+
+// flushDone is the outcome of a flush that ended with flushEmpty: complete,
+// or paused when it left roots its engine refuses until its next session.
+func flushDone(st exporter.DrainState) string {
+	if st.Paused > 0 {
+		return metrics.FlushPaused
+	}
+	return metrics.FlushComplete
 }
 
 // endFlush logs and measures a flush's end, and returns its report.
@@ -278,7 +302,7 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 		Stored:  stored,
 		Left:    left,
 	}
-	s.metrics.FlushEnded(outcome, took, left.Roots())
+	s.metrics.FlushEnded(outcome, took, left.Roots(), left.Paused)
 	level := s.logger.Info
 	if left.Roots() > 0 || outcome == metrics.FlushTimeout || outcome == metrics.FlushCanceled {
 		level = s.logger.Warn
@@ -286,7 +310,7 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 	level("flush: done", "namespace", ns.name, "cacheID", cacheID, "outcome", outcome,
 		"took", took.Round(time.Millisecond), "storedRoots", stored, "leftRoots", left.Roots(),
 		"dirty", left.Dirty, "waitingSpans", left.WaitingSpans, "inFlight", left.InFlight,
-		"retrying", left.Retrying, "later", left.Later)
+		"retrying", left.Retrying, "later", left.Later, "paused", left.Paused)
 	return rep
 }
 
@@ -294,7 +318,7 @@ func (s *Service) endFlush(ns *namespace, cacheID string, run *flushRun, start t
 // connections is welcomed: nothing was flushed.
 func (s *Service) notConnectedReport(ns *namespace, start time.Time) FlushReport {
 	took := time.Since(start)
-	s.metrics.FlushEnded(metrics.FlushNotConnected, took, 0)
+	s.metrics.FlushEnded(metrics.FlushNotConnected, took, 0, 0)
 	// The same fields as every flush's (endFlush), with no cache.
 	s.logger.Info("flush: done", "namespace", ns.name, "cacheID", "", "outcome", metrics.FlushNotConnected,
 		"took", took.Round(time.Millisecond), "storedRoots", 0, "leftRoots", 0,

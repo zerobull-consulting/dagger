@@ -102,11 +102,24 @@ type DrainReport struct {
 	Explicit int `json:"explicit,omitempty"`
 }
 
-// LeftRoots is how many roots were left unexported.
+// LeftRoots is how many roots were left unexported that the service could
+// still have exported: not those of a paused engine (PausedRoots).
 func (r DrainReport) LeftRoots() int {
 	n := 0
 	for _, l := range r.Left {
 		n += l.Roots()
+	}
+	return n
+}
+
+// PausedRoots is how many roots were left because their engine refuses
+// them: it has given up its remote-cache work until its next session, so
+// the drain neither waited for them nor tried them again
+// (exporter.DrainState.Paused).
+func (r DrainReport) PausedRoots() int {
+	n := 0
+	for _, l := range r.Left {
+		n += l.Paused
 	}
 	return n
 }
@@ -293,7 +306,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 	for _, l := range startLeft {
 		s.logger.Info("drain: started", "namespace", l.Namespace, "cacheID", l.CacheID, "connected", l.Connected,
-			"sessions", l.Sessions, "pending", l.Pending, "inFlight", l.InFlight, "retrying", l.Retrying+l.Later)
+			"sessions", l.Sessions, "pending", l.Pending, "inFlight", l.InFlight, "retrying", l.Retrying+l.Later, "paused", l.Paused)
 	}
 	if deadline.IsZero() {
 		s.logger.Info("drain: no deadline")
@@ -441,10 +454,14 @@ func (s *Service) explicitRunning() int {
 // outcome: canceled when ctx was canceled, or the export path stopped;
 // deadline when ctx's deadline passed, or now is past deadline.
 func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bool) {
+	// Read once: a deadline that passes between two reads would be seen
+	// as no deadline by the first and as an end by the second, and taken
+	// for a cancellation.
+	err := ctx.Err()
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
 		return metrics.DrainDeadline, true
-	case ctx.Err() != nil, paths.Err() != nil:
+	case err != nil, paths.Err() != nil:
 		return metrics.DrainCanceled, true
 	case !deadline.IsZero() && !now.Before(deadline):
 		return metrics.DrainDeadline, true
@@ -457,10 +474,12 @@ func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bo
 // canceled, and deadline when now is past deadline. Unlike drainEnded, it
 // doesn't look at the export path.
 func ctxEnded(ctx context.Context, now, deadline time.Time) (string, bool) {
+	// Read once, as in drainEnded.
+	err := ctx.Err()
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
 		return metrics.DrainDeadline, true
-	case ctx.Err() != nil:
+	case err != nil:
 		return metrics.DrainCanceled, true
 	case !deadline.IsZero() && !now.Before(deadline):
 		return metrics.DrainDeadline, true
@@ -523,12 +542,17 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 	}
 	s.drain.ended = &rep
 	s.drain.mu.Unlock()
-	s.metrics.DrainEnded(outcome, took, rep.LeftRoots())
+	s.metrics.DrainEnded(outcome, took, rep.LeftRoots(), rep.PausedRoots())
 
 	for _, st := range rep.Stored {
 		s.logger.Info("drain: stored", "namespace", st.Namespace, "cacheID", st.CacheID, "roots", st.Roots)
 	}
 	for _, l := range left {
+		if l.Paused > 0 {
+			// Not a failure of the drain: nothing it could do stores them.
+			s.logger.Info("drain: left for an engine that gave up its remote-cache work", "namespace", l.Namespace, "cacheID", l.CacheID,
+				"roots", l.Paused, "connected", l.Connected)
+		}
 		if l.Roots() == 0 {
 			continue
 		}
@@ -540,7 +564,7 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		level = s.logger.Warn
 	}
 	level("drain: done", "outcome", outcome, "took", took.Round(time.Millisecond),
-		"storedRoots", rep.StoredRoots(), "leftRoots", rep.LeftRoots(),
+		"storedRoots", rep.StoredRoots(), "leftRoots", rep.LeftRoots(), "pausedRoots", rep.PausedRoots(),
 		"refusedConnections", rep.Refused[metrics.DrainRefusedConnection], "refusedSpans", rep.Refused[metrics.DrainRefusedSpan],
 		"engines", rep.Engines, "explicitLeft", rep.Explicit)
 	return rep
