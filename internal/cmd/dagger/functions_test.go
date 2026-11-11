@@ -254,25 +254,3 @@ func testObjectTypeDef(name, sourceModuleName, description string) *modTypeDef {
 		},
 	}
 }
-
-func TestPrintPlainResultNumbers(t *testing.T) {
-	for _, tc := range []struct {
-		in   any
-		want string
-	}{
-		{float64(63700575), "63700575"},
-		{float64(42), "42"},
-		{float64(-1234567), "-1234567"},
-		{1.5, "1.5"},
-		{float64(1e21), "1e+21"},
-		{1e300, "1e+300"},
-		{1e-30, "1e-30"},
-		{true, "true"},
-	} {
-		t.Run(tc.want, func(t *testing.T) {
-			var out bytes.Buffer
-			require.NoError(t, printPlainResult(&out, tc.in))
-			require.Equal(t, tc.want, out.String())
-		})
-	}
-}
