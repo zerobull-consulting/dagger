@@ -1,0 +1,82 @@
+pub description = "Build and publish the remote cache service's image (cmd/cacheservice/Dockerfile)"
+
+type Cacheservice {
+  """
+  The image's build context: what cmd/cacheservice/Dockerfile.dockerignore
+  allows, plus sdk/go, which go.mod replaces dagger.io/dagger with. A package
+  the service starts importing from outside these directories must be added
+  here and there.
+  """
+  source: Directory! @defaultPath(path: "/") @ignorePatterns(patterns: [
+    "*",
+    "!go.mod",
+    "!go.sum",
+    "!cmd/cacheservice",
+    "!dagql",
+    "!engine",
+    "!internal",
+    "!sdk/go",
+    "!util",
+    "**/*_test.go",
+    "**/testdata",
+    "cmd/cacheservice/e2e",
+    "**/*.md",
+  ])
+
+  """
+  The service's image, built from cmd/cacheservice/Dockerfile.
+
+  The release is the upstream release this build is (the manifest's base line,
+  hack/remote-cache/engines.sh base); empty, the image reports its base as
+  "dev". The revision is the commit it is built from; empty, it records none.
+  """
+  pub image(
+    release: String! = "",
+    revision: String! = "",
+    platform: Platform,
+  ): Container! {
+    source.dockerBuild(
+      dockerfile: "cmd/cacheservice/Dockerfile",
+      platform: platform ?? defaultPlatform,
+      buildArgs: [
+        {{name: "RELEASE", value: release}},
+        {{name: "REVISION", value: revision}},
+      ],
+    )
+  }
+
+  """
+  Build the image without pushing it, as publish would.
+  """
+  pub releaseDryRun: Void @check {
+    image.sync
+    null
+  }
+
+  """
+  Push the image in a tarball (docker save or OCI) to an address, such as
+  ghcr.io/org/dagger-remote-cache:<commit>. Returns the pushed reference with
+  its digest. Pushing the same tarball to another address gives the same
+  digest, which the caller can compare.
+
+  The tarball is the image the release workflow's matrix tested, so what is
+  pushed is what was verified, not a rebuild of it.
+  """
+  @cache(policy: FunctionCachePolicy.NEVER)
+  pub publish(
+    tarball: File!,
+    address: String!,
+    """
+    The registry to log in to, such as ghcr.io; with username and password.
+    """
+    registry: String! = "",
+    username: String! = "",
+    password: Secret,
+  ): String! {
+    let ctr = container.import(tarball)
+    if (password != null) {
+      ctr = ctr.withRegistryAuth(registry, username, password)
+    }
+    ctr.publish(address, forcedCompression: ImageLayerCompression.GZIP)
+  }
+}

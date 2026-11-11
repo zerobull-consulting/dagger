@@ -36,7 +36,7 @@ name: Remote cache tests
         type: string
         required: true
       service-image-artifact:
-        description: "The artifact of this run holding the service image to test (image.tar.gz, tagged cacheservice:release)"
+        description: "The artifact of this run holding the service image to test (image.tar, the cacheservice module's image tarball)"
         type: string
         required: true
 permissions:
@@ -417,11 +417,10 @@ jobs:
       - name: Build the service's image
         env:
           REVISION: ${{ github.sha }}
-          RELEASE_IMAGE: ${{ inputs.service-image-artifact && format('{0}/release-image/image.tar.gz', runner.temp) || '' }}
+          RELEASE_IMAGE: ${{ inputs.service-image-artifact && format('{0}/release-image/image.tar', runner.temp) || '' }}
         run: |
           if [[ -n "$RELEASE_IMAGE" ]]; then
-            timeout 300 docker load -i "$RELEASE_IMAGE"
-            docker tag cacheservice:release cacheservice:ci
+            ./hack/remote-cache/load-image.sh "$RELEASE_IMAGE" cacheservice:ci
           else
             docker build -f cmd/cacheservice/Dockerfile \
               --build-arg REVISION="$REVISION" -t cacheservice:ci .
