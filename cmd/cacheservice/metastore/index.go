@@ -380,18 +380,55 @@ func (idx *Index) allocate() uint64 {
 // version the engine it serves writes and imports. Under the lockstep policy
 // (zerobull-consulting/dagger#117) that engine is this module's dagql, and
 // TestBundleVersionMatchesEngineCapture pins the two together.
-const BundleVersion = 3
+//
+// Version 7 (v1.0.0-beta.26, zerobull-consulting/dagger#227) lets a bundle
+// lean on what its recipient holds or on its own other outputs: a held row
+// (TransferredValue.Held), an output that names another's chain
+// (TransferredOutput.Prefix), and chains whose layers the bundle lists once
+// (ValueBundle.Layers). The service stores none of these: see
+// ValidateBundle.
+const BundleVersion = 7
+
+// ErrHeldRows is ValidateBundle's refusal of a bundle with a held row. An
+// export that gets one releases it and asks for the roots again: the engine
+// then sends the rows in full (see package exporter).
+var ErrHeldRows = errors.New("the bundle has held rows")
 
 // ValidateBundle checks what Record relies on in a bundle: it has roots,
 // its ordinals run from 1 to the number of values, each value names its
 // sender's number, and every dependency, root and output names one of its
 // values. It doesn't check the records themselves.
+//
+// A stored bundle is merged into any engine, whole, so it has to stand on its
+// own. ValidateBundle refuses one that doesn't:
+//
+//   - a held row (ErrHeldRows) carries no record: it names, by recipe, a
+//     value its recipient is expected to hold. Another engine than the one
+//     that exported it holds no such value, and would refuse the whole merge
+//     as stale;
+//   - an output with a chain prefix, or with layers listed in the bundle's
+//     own, isn't resolved: dagql.ResolveChainPrefixes gives each such output
+//     its chain, which the exporter does before it stores a bundle. The
+//     blobs a bundle names are read from its chains (BundleBlobs).
 func ValidateBundle(bundle *dagql.ValueBundle) error {
 	if bundle == nil {
 		return errors.New("nil bundle")
 	}
 	if bundle.Version != BundleVersion {
 		return fmt.Errorf("unsupported bundle version %d, want %d", bundle.Version, BundleVersion)
+	}
+	if len(bundle.Layers) > 0 || len(bundle.Addresses) > 0 {
+		return errors.New("bundle lists its chains' layers apart from them (dagql.ShareChainLayers): not resolved")
+	}
+	for _, v := range bundle.Values {
+		if v.Held != "" {
+			return fmt.Errorf("value %d (sender number %d): %w", v.Ordinal, v.SenderNumber, ErrHeldRows)
+		}
+	}
+	for _, o := range bundle.Outputs {
+		if o.Prefix != nil || o.Layers != nil {
+			return fmt.Errorf("output %d names its chain by prefix or by the bundle's layers: not resolved", o.Ordinal)
+		}
 	}
 	if len(bundle.Roots) == 0 {
 		return errors.New("bundle has no roots")
