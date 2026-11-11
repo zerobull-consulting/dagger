@@ -267,7 +267,7 @@ func TestDrainDoesNotStartRetryPastItsDeadline(t *testing.T) {
 		c.Tracker.MaxDelay = time.Hour
 	})
 	digests := h.build()
-	h.cache.CorruptUploads(digests[1], 3)
+	corruptPuts(t, digests[1], 3)
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 	h.postSpans("session-2", carrierSpan(5))
 	// The deadline is 500ms away on the export path's clock; the retry,

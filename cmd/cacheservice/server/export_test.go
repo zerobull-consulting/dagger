@@ -163,7 +163,7 @@ func scoped(t *testing.T, store blobstore.Store) blobstore.Store {
 func newMemStores(t *testing.T) (*blobstore.MemStore, *metastore.Store) {
 	t.Helper()
 	blobs := blobstore.NewMemStore("")
-	blobSrv := httptest.NewServer(blobs)
+	blobSrv := httptest.NewServer(corruptingPuts(blobs))
 	t.Cleanup(blobSrv.Close)
 	blobs.SetBaseURL(blobSrv.URL)
 	meta, err := metastore.New(metastore.Config{Objects: metastore.NewMemObjects()})

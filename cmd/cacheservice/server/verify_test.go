@@ -35,7 +35,7 @@ func TestVerifyLyingUploadNotPublished(t *testing.T) {
 	h, blobs := newMemExportHarness(t, nil)
 	layers := h.buildRecipes()
 	base, exec := digest.FromBytes(layers[0]), digest.FromBytes(layers[1])
-	h.cache.CorruptUploads(exec, -1)
+	corruptPuts(t, exec, -1)
 
 	code, res := h.debugExport(buildExport)
 	if code != 200 {
@@ -60,7 +60,7 @@ func TestVerifyLyingUploadNotPublished(t *testing.T) {
 	waitMetric(t, h.svc, "cacheservice_blob_promotions_total", map[string]string{"scope": testScope, "outcome": "mismatch"}, exporterAttempts)
 	waitMetric(t, h.svc, "cacheservice_export_blobs_total", map[string]string{"result": "rejected"}, exporterAttempts)
 
-	h.cache.CorruptUploads(exec, 0)
+	corruptPuts(t, exec, 0)
 	code, res = h.debugExport(buildExport)
 	if code != 200 || len(res.Stored) != 2 || len(res.Bundles) != 1 {
 		t.Fatalf("honest export: %d %+v", code, res)
@@ -302,7 +302,7 @@ func TestVerifyNamespacesApart(t *testing.T) {
 	a, b := fakeengine.New("cache-a", 1), fakeengine.New("cache-b", 1)
 	layersA, layersB := authBuild(a, "a"), authBuild(b, "b")
 	base, execA, execB := digest.FromBytes(layersA[0]), digest.FromBytes(layersA[1]), digest.FromBytes(layersB[1])
-	a.CorruptUploads(execA, 1)
+	corruptPuts(t, execA, 1)
 	h.connect(a, "tok-a")
 	h.connect(b, "tok-b")
 	h.export(a, "tok-a")
