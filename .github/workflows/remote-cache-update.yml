@@ -1,0 +1,123 @@
+name: Remote cache update
+# Fills the remote cache bucket PR checks read from: on every push to
+# feature/remote-cache, a writer sidecar (the pr-checks-readwrite environment,
+# the only one with a write key) runs the Dagger pipelines the checks run, and
+# stores their results under the bucket's prefix (cache-<engine version>).
+#
+# Today that is one pipeline, a build of cmd/cacheservice
+# (hack/remote-cache/speedup/run.sh). Each job moved to Dagger adds its own
+# pipeline here, and reads the cache with a read-only sidecar
+# (pr-checks-readonly) on pull requests.
+#
+# Only feature/remote-cache runs it: the job is skipped on any other ref of a
+# manual run. That `if` is in the branch's own copy of this file, so it is not
+# the guard: restrict the environment's deployment branches to
+# feature/remote-cache (Settings > Environments) too.
+#
+# The engine version is pinned, not read from the manifest's first accept line,
+# so a new accept line doesn't change what fills the cache. It must be an accept
+# line of cmd/cacheservice/compat/engines.txt, or the start fails; when a new
+# one is verified, move VERSION and the environments' CACHE_S3_PREFIX
+# (cache-<version>) together, since one engine's entries are for that engine.
+"on":
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+# One writer at a time: the service owns the prefix, and two writers on it
+# would race their exports. A push that arrives while one runs waits, but GitHub
+# keeps only the newest waiting run: with a run going and two more pushes, the
+# first of those never runs. The newest commit always does, and that is the one
+# readers want.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+env:
+  VERSION: v1.0.0-beta.26
+  # What some runners export: an unsampled trace. The CLI the start sets up
+  # must not continue it, or the service learns no entries and nothing is
+  # exported (see the sidecar demo job).
+  TRACEPARENT: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00
+jobs:
+  update:
+    name: update the cache
+    if: github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    environment: pr-checks-readwrite
+    # The worst case of the steps below, which this timeout also bounds: the
+    # start (30m: two image pulls of 15m, in parallel in practice), the build
+    # (20m) and the stop (12m: the drain's 10m and 2m more), plus slack.
+    timeout-minutes: 65
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Verify the sidecar is stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: cache-update
+      # One engine's entries are for that engine: the prefix names the pinned
+      # version (cache-beta.26 for v1.0.0-beta.26), so a VERSION moved without
+      # the environment's CACHE_S3_PREFIX can't write one engine's entries
+      # under another's prefix.
+      - name: Check the prefix is for this engine version
+        env:
+          PREFIX: ${{ vars.CACHE_S3_PREFIX }}
+        run: |
+          want="cache-${VERSION#*-}"
+          if [[ "$PREFIX" != "$want" ]]; then
+            echo "::error::CACHE_S3_PREFIX is '$PREFIX', but engine $VERSION stores under '$want': move the environments' prefix and VERSION together"
+            exit 1
+          fi
+      - name: Start the writer sidecar
+        id: writer
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: writer
+          name: cache-update
+          version: ${{ env.VERSION }}
+          verbose: "true"
+          s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
+          s3-region: ${{ vars.CACHE_S3_REGION }}
+          s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
+          s3-prefix: ${{ vars.CACHE_S3_PREFIX }}
+          s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
+      - name: Build cmd/cacheservice
+        timeout-minutes: 20
+        env:
+          SERVICE: ${{ steps.writer.outputs.service-container }}
+          DAGGER: ${{ steps.writer.outputs.dagger }}
+        run: ./hack/remote-cache/speedup/run.sh update "$RUNNER_TEMP/update" "$SERVICE"
+      # The drain stores the exports: it must be done before the job ends, and
+      # before the check below reads the service's log.
+      - name: Stop the writer sidecar
+        id: stop
+        if: always()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: cache-update
+      # A commit whose entry is already stored (a re-run) builds as a cache hit
+      # and exports nothing: there is nothing to check was stored.
+      - name: Check the export was stored
+        env:
+          LOGS: ${{ steps.stop.outputs.logs }}
+        run: |
+          read -r hit executed <"$RUNNER_TEMP/update/update.spans"
+          if ((executed == 0)); then
+            echo "the build was a cache hit ($hit hit, 0 executed): nothing to store"
+            exit 0
+          fi
+          ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/update/stored"
+      # The logs name the bucket and the prefix; only on failure.
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-update-logs
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/update/update.log
+          if-no-files-found: ignore
