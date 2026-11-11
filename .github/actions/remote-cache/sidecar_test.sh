@@ -165,15 +165,12 @@ check "start refuses an unknown version" start_refuses SIDECAR_VERSION=v0.0.1
 check "start refuses engine-image with version" start_refuses SIDECAR_VERSION="$first_version" SIDECAR_ENGINE_IMAGE=e SIDECAR_SERVICE_IMAGE=s
 check "start refuses engine-image without service-image" start_refuses SIDECAR_ENGINE_IMAGE=e
 
-# --- stop, against a fake docker ---
+# --- stop, against a fake docker and a fake curl ---
 # The service and the engine run while $FAKE_DIR/<service|engine>.running
-# exists. Every call is logged to $FAKE_DIR/calls, and the engine's stop
-# records whether the service's drain was done by then. Settings:
-#   FAKE_DRAIN    after: the service logs "drain: done" from the second
-#                 look at its log after the SIGTERM; never: it never does
-#   FAKE_SERVICE  after-engine: it exits once the engine stopped (its
-#                 engine.stop arrived); by-itself: 1s after the SIGTERM,
-#                 whatever the engine does (its linger's bound); stays:
+# exists. Every call is logged to $FAKE_DIR/calls, curl's too (as "curl
+# ..."); the engine's stop records whether the service still ran then, and
+# the flush whether the engine did. Settings:
+#   FAKE_SERVICE  on-term (the default): it exits on its SIGTERM; stays:
 #                 only on docker stop
 #   FAKE_ENGINE   stops, or hangs: docker stop fails, and it keeps running
 #   FAKE_EXIT     the service's exit code
@@ -182,6 +179,10 @@ check "start refuses engine-image without service-image" start_refuses SIDECAR_E
 #   FAKE_FLAKY    true: after the SIGTERM, docker inspect of the service
 #                 fails its first 3 times; early: its first 3 inspects fail,
 #                 before the SIGTERM
+#   FAKE_FLUSH    complete (the default): the flush stores 3 roots, and
+#                 leaves none; timeout: it ends at its timeout with roots
+#                 left; refused: 503; down: nothing listens (curl exit 7);
+#                 hangs: no answer before curl's --max-time (exit 28)
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
@@ -211,64 +212,99 @@ case "$1 $2" in
 "network rm") [[ "${FAKE_RM_FAIL:-}" == network || "${FAKE_RM_FAIL:-}" == both ]] && { echo "network has active endpoints" >&2; exit 1; }; exit 0 ;;
 "kill -s")
 	: >"$FAKE_DIR/signaled"
-	if [[ "$FAKE_SERVICE" == by-itself ]]; then
-		(sleep "${FAKE_EXIT_AFTER:-1}" && rm -f "$svc") >/dev/null 2>&1 &
-	fi
-	;;
-"logs --since")
-	looks=$(($(cat "$FAKE_DIR/looks" 2>/dev/null || echo 0) + 1))
-	echo "$looks" >"$FAKE_DIR/looks"
-	if [[ "$FAKE_DRAIN" == after && "$looks" -ge 2 ]]; then
-		: >"$FAKE_DIR/drained"
-		echo 'time=x level=INFO msg="drain: done" outcome=complete'
-	fi
+	[[ "${FAKE_SERVICE:-on-term}" == on-term ]] && rm -f "$svc"
 	;;
 "stop --time")
 	case "$4" in
 	*-engine)
-		if [[ -f "$FAKE_DIR/drained" ]]; then
-			echo "ENGINE STOPPED AFTER THE DRAIN" >>"$FAKE_DIR/calls"
+		if [[ -f "$svc" ]]; then
+			echo "ENGINE STOPPED WHILE THE SERVICE RAN" >>"$FAKE_DIR/calls"
 		else
-			echo "ENGINE STOPPED BEFORE THE DRAIN" >>"$FAKE_DIR/calls"
+			echo "ENGINE STOPPED AFTER THE SERVICE" >>"$FAKE_DIR/calls"
 		fi
 		[[ "$FAKE_ENGINE" == hangs ]] && exit 1
 		rm -f "$eng"
-		[[ "$FAKE_SERVICE" == after-engine ]] && rm -f "$svc"
 		;;
 	*-service) rm -f "$svc" ;;
 	esac
 	exit 0
 	;;
-"logs "*) echo 'time=x level=INFO msg="drain: done" outcome=complete' ;;
+"logs "*) echo 'time=x level=INFO msg=stopping signal=terminated drainTimeout=0s' ;;
 *) exit 0 ;;
 esac
 FAKE
 chmod +x "$tmp/bin/docker"
-# stop_with <exit code> [FAKE_*=...]: a stop of a running sidecar whose
-# state says the service drains for at most 3s and lingers for at most 1s,
-# so the stop waits 3+5s for the drain and 3+1+10s in all. It leaves its
-# output in $tmp/stop.out, the calls in $tmp/fake/calls, and how long it
-# took, in seconds, in $tmp/stop.took.
+cat >"$tmp/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+echo "curl $*" >>"$FAKE_DIR/calls"
+[[ -f "$FAKE_DIR/engine.running" ]] && echo "FLUSHED WHILE THE ENGINE RAN" >>"$FAKE_DIR/calls"
+args=("$@") out=/dev/null maxtime=1
+for ((i = 0; i < ${#args[@]}; i++)); do
+	case "${args[i]}" in
+	-o) out="${args[i + 1]}" ;;
+	--max-time) maxtime="${args[i + 1]}" ;;
+	esac
+done
+case "${FAKE_FLUSH:-complete}" in
+complete)
+	printf '{\n  "outcome": "complete",\n  "cacheID": "c1",\n  "took": "12ms",\n  "stored": 3,\n  "left": {\n    "dirty": 0,\n    "waitingSpans": 0,\n    "inFlight": 0,\n    "retrying": 0,\n    "later": 0\n  }\n}\n' >"$out"
+	printf 200
+	;;
+timeout)
+	printf '{\n  "outcome": "timeout",\n  "cacheID": "c1",\n  "took": "1.001s",\n  "stored": 1,\n  "left": {\n    "dirty": 2,\n    "waitingSpans": 0,\n    "inFlight": 1,\n    "retrying": 0,\n    "later": 0,\n    "paused": 4\n  }\n}\n' >"$out"
+	printf 200
+	;;
+refused)
+	echo "the service is draining" >"$out"
+	printf 503
+	;;
+down)
+	echo "curl: (7) Failed to connect to 10.9.0.1 port 30000" >&2
+	printf 000
+	exit 7
+	;;
+hangs)
+	sleep "$maxtime"
+	echo "curl: (28) Operation timed out after ${maxtime}000 milliseconds" >&2
+	printf 000
+	exit 28
+	;;
+esac
+FAKE
+chmod +x "$tmp/bin/curl"
+# stop_with <exit code> [old-state | old-state-bare] [VAR=value...]: a stop
+# of a running writer sidecar whose state says the flush may take 1s. It
+# leaves its output in $tmp/stop.out, the calls in $tmp/fake/calls, and how
+# long it took, in seconds, in $tmp/stop.took. old-state: the state an older
+# start wrote, with linger_seconds and no settle_seconds; old-state-bare: one
+# older still, with neither. T_SETTLE and T_ROLE change the state's settle
+# and role; T_SUMMARY is a step summary file; T_CREATED what the state says
+# the start created.
 stop_with() {
-	local code="$1" state_linger="linger_seconds=1" stop_seconds=14
+	local code="$1" old=""
 	shift
-	# A start from before the linger wrote no linger_seconds, and a
-	# stop_seconds of the drain plus 10s.
-	[[ "${1:-}" == old-state ]] && { state_linger="" stop_seconds=13; shift; }
+	case "${1:-}" in
+	old-state | old-state-bare) old="$1" && shift ;;
+	esac
 	rm -rf "$tmp/fake" "$tmp/sc"
 	local t=$SECONDS rc
 	(
 		export PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp/fake" SIDECAR_DIR="$tmp/sc" SIDECAR_NAME=t
-		export FAKE_DRAIN=after FAKE_SERVICE=after-engine FAKE_ENGINE=stops FAKE_EXIT="$code"
+		export FAKE_SERVICE=on-term FAKE_ENGINE=stops FAKE_EXIT="$code"
 		(($#)) && export "$@"
-		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
-		# T_SUMMARY: a step summary file; T_CREATED: what the state says the start created.
+		keys="stop_seconds=$((${T_SETTLE:-1} + 105)) settle_seconds=${T_SETTLE:-1} url=http://10.9.0.1:30000"
+		case "$old" in
+		old-state) keys="stop_seconds=625 linger_seconds=15" ;;
+		old-state-bare) keys="stop_seconds=610" ;;
+		esac
+		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_ACTIONS
 		[[ -n "${T_SUMMARY:-}" ]] && export GITHUB_STEP_SUMMARY="$T_SUMMARY"
 		mkdir -p "$FAKE_DIR" "$SIDECAR_DIR/t/logs"
 		: >"$FAKE_DIR/service.running"
 		: >"$FAKE_DIR/engine.running"
+		# shellcheck disable=SC2086 # one key=value per word
 		printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-			"stop_seconds=$stop_seconds" $state_linger "logs=$SIDECAR_DIR/t/logs" role=writer \
+			$keys "logs=$SIDECAR_DIR/t/logs" "role=${T_ROLE:-writer}" \
 			${T_CREATED:-created=network created=service created=volume created=engine} >"$SIDECAR_DIR/t/state"
 		stop
 	) >"$tmp/stop.out" 2>&1
@@ -297,16 +333,52 @@ in_file_order() {
 	b="$(grep -nF -m1 -- "$3" "$1" | cut -d: -f1)"
 	[[ -n "$a" && -n "$b" && "$a" -lt "$b" ]]
 }
-cleaned_up() { called "rm -f t-engine" && called "volume rm -f t-engine-state" && called "network rm t-net" && [[ ! -e "$tmp/sc/t/state" ]]; }
+cleaned_up() { called "rm -f t-service" && called "rm -f t-engine" && called "volume rm -f t-engine-state" && called "network rm t-net" && [[ ! -e "$tmp/sc/t/state" ]]; }
+kept_logs() { [[ -f "$tmp/sc/t/logs/service.log" && -f "$tmp/sc/t/logs/engine.log" ]]; }
 took_at_most() { [[ "$(cat "$tmp/stop.took")" -le "$1" ]]; }
+flushed() { calls | grep -q '^curl '; }
 
-check "a clean stop passes" stop_with 0
-check "... it signals the service, waits for its drain, stops the engine, then waits for the service" \
-	in_order "kill -s TERM t-service" "logs --since" "stop --time 30 t-engine" "inspect -f {{.State.Running}} t-service"
-check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+rm -f "$tmp/summary"
+check "a clean stop passes" stop_with 0 T_SUMMARY="$tmp/summary"
+check "... it flushes, stops the engine, then signals the service (zerobull-consulting/dagger#137)" \
+	in_order "curl " "stop --time 30 t-engine" "kill -s TERM t-service" "inspect -f {{.State.Running}} t-service"
+check "... the flush is the token form, on the service's URL, with the settle timeout" \
+	grep -qF -- "-u sidecar-engine: --max-time 6 -o $tmp/sc/t/logs/flush.json -w %{http_code} http://10.9.0.1:30000/v1/engines/flush?timeout=1s" <<<"$(calls)"
+check "... while the engine runs" called "FLUSHED WHILE THE ENGINE RAN"
+check "... and the engine is stopped while the service runs" called "ENGINE STOPPED WHILE THE SERVICE RAN"
 check "... the service gets no second signal" not called "stop --time 5 t-service"
 check "... in seconds" took_at_most 3
-check "... and keeps both logs" [ -f "$tmp/sc/t/logs/service.log" -a -f "$tmp/sc/t/logs/engine.log" ]
+check "... and keeps both logs" kept_logs
+check "... and the flush's report" [ -f "$tmp/sc/t/logs/flush.json" ]
+check "... says what the flush did" grep -q "the flush: complete, in 12ms: stored 3 root(s); left 0 dirty, 0 in flight, 0 retrying, 0 later, 0 paused, 0 session(s) waiting for spans" "$tmp/stop.out"
+check "... and so does its step summary" grep -q "^- flush: complete, in 12ms: stored 3 root(s); left 0 dirty" "$tmp/summary"
+check "... with the exit codes" grep -q "^- service exit code: 0" "$tmp/summary"
+check "... without a warning" not grep -q "warning:" "$tmp/stop.out"
+# A flush that doesn't complete, or gets no answer, never fails the stop: it
+# says so, and the stop goes on.
+rm -f "$tmp/summary"
+check "a flush that times out with roots left: the stop still passes" stop_with 0 FAKE_FLUSH=timeout T_SUMMARY="$tmp/summary"
+check "... warns, with the counts" grep -q "warning: the flush: timeout, in 1.001s: stored 1 root(s); left 2 dirty, 1 in flight, 0 retrying, 0 later, 4 paused" "$tmp/stop.out"
+check "... in the step summary too" grep -q "^- flush: timeout, in 1.001s: stored 1 root(s); left 2 dirty, 1 in flight" "$tmp/summary"
+check "... and still stops the engine, then the service" in_order "curl " "stop --time 30 t-engine" "kill -s TERM t-service"
+check "a flush the service refuses: the stop still passes" stop_with 0 FAKE_FLUSH=refused
+check "... says why" grep -q "warning: the flush: refused: HTTP 503: the service is draining" "$tmp/stop.out"
+check "a service that doesn't answer the flush: the stop still passes" stop_with 0 FAKE_FLUSH=down
+check "... says so" grep -q "warning: the flush: failed: the service didn't answer in time, or at all (curl exit 7: curl: (7) Failed to connect" "$tmp/stop.out"
+check "... and cleans up" cleaned_up
+check "a flush that gets no answer: the stop goes on at its bound" stop_with 0 FAKE_FLUSH=hangs
+check "... the settle timeout plus 5s" took_at_most 9
+check "... says so" grep -q "warning: the flush: failed: .*curl exit 28" "$tmp/stop.out"
+check "... then stops the engine and the service" in_order "curl " "stop --time 30 t-engine" "kill -s TERM t-service"
+rm -f "$tmp/summary"
+check "settle-timeout 0: no flush, and the stop passes" stop_with 0 T_SETTLE=0 T_SUMMARY="$tmp/summary"
+check "... no flush" not flushed
+check "... says so" grep -q "the flush: skipped (settle-timeout 0)" "$tmp/stop.out"
+check "... in the step summary too" grep -q "^- flush: skipped (settle-timeout 0)" "$tmp/summary"
+check "... and still stops the engine, then the service" in_order "stop --time 30 t-engine" "kill -s TERM t-service"
+check "a read-only sidecar: no flush, and the stop passes" stop_with 0 T_ROLE=read-only
+check "... no flush" not flushed
+check "... says why" grep -q "the flush: skipped (read-only" "$tmp/stop.out"
 # zerobull-consulting/dagger#104: a failed removal is reported, with its
 # name and kind; it doesn't change the stop's exit status.
 check "a stop whose volume can't be removed still passes" stop_with 0 FAKE_RM_FAIL=volume
@@ -321,6 +393,7 @@ check "... in its output" not grep -q "left behind" "$tmp/stop.out"
 rm -f "$tmp/summary"
 check "a partial start whose network can't be removed still passes" stop_with 0 FAKE_RM_FAIL=network T_CREATED="created=network" T_SUMMARY="$tmp/summary"
 check "... and its step summary names the network" grep -q "left behind.*network t-net" "$tmp/summary"
+check "... and it flushes nothing" not flushed
 check "a stop that can't remove two things names both" stop_with 0 FAKE_RM_FAIL=both
 check "... separated" grep -q "left behind: volume t-engine-state, network t-net;" "$tmp/stop.out"
 # A docker that hangs on the exit code is cut off at the bound, not waited on.
@@ -336,37 +409,28 @@ check "... and says so" grep -q "exit code is unknown" "$tmp/stop.out"
 check "a stop that exits 1 fails" not stop_with 1
 check "a stop that exits 137 fails" not stop_with 137
 
-check "a service that never reports its drain done: the stop still passes" stop_with 0 FAKE_DRAIN=never
-check "... it waits for the drain only up to its bound" took_at_most 10
-check "... then stops the engine" called "ENGINE STOPPED BEFORE THE DRAIN"
-check "... says so" grep -q "didn't report its drain done in time" "$tmp/stop.out"
-check "... and cleans up" cleaned_up
-
-check "a service that doesn't exit by the stop's bound fails the stop" not stop_with 0 FAKE_SERVICE=stays
-check "... after waiting for it only up to the bound" took_at_most 18
+check "a service that doesn't exit within its bound after its SIGTERM fails the stop" not stop_with 0 FAKE_SERVICE=stays
+check "... after waiting for it only up to that bound (10s)" took_at_most 13
 check "... it was stopped" called "stop --time 5 t-service"
-check "... says why" grep -q "past its own bound" "$tmp/stop.out"
+check "... says why" grep -q "still stopping 10s after its SIGTERM, past its own 5s bound" "$tmp/stop.out"
 check "... and cleans up" cleaned_up
 
-check "a docker inspect that fails during the drain isn't taken for the service's exit" stop_with 0 FAKE_FLAKY=true
-check "... the engine is still stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
-check "a docker inspect that fails before the stop: the service is still signaled, and the stop passes" stop_with 0 FAKE_FLAKY=early
-check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
-check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
-check "a slow probe before the SIGTERM doesn't eat the service's time: it isn't stopped by force" stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=5 FAKE_SERVICE=by-itself FAKE_EXIT_AFTER=3
+check "a docker inspect that fails after the SIGTERM isn't taken for the service's exit: the stop passes" stop_with 0 FAKE_FLAKY=true
 check "... no second signal" not called "stop --time 5 t-service"
+check "a docker inspect that fails before the stop: the service is still flushed and signaled, and the stop passes" stop_with 0 FAKE_FLAKY=early
+check "... in order" in_order "curl " "stop --time 30 t-engine" "kill -s TERM t-service"
+check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
 # zerobull-consulting/dagger#125: a daemon that hangs during the probe
-# before the SIGTERM. Each of its three inspects would hang 60s; the probe is
+# before the flush. Each of its three inspects would hang 60s; the probe is
 # bounded at about 10s in all, so the whole stop, cleanup included, takes
 # that plus its usual seconds, well inside its documented bound. A probe cut
 # off by its bound is never taken for the service's exit: the service is
-# still signaled, and the engine still waits for its drain.
+# still flushed and signaled.
 check "a daemon that hangs during the probe: the stop passes (zerobull-consulting/dagger#125)" \
 	stop_with 0 FAKE_FLAKY=early FAKE_PROBE_SLEEP=60
 check "... its probe is bounded: the whole stop takes at most 10s plus its usual seconds" took_at_most 14
-check "... the probe isn't taken for the service's exit: it's signaled, and its drain waited for" \
-	in_order "kill -s TERM t-service" "logs --since" "stop --time 30 t-engine"
-check "... the engine is stopped only once the drain is done" called "ENGINE STOPPED AFTER THE DRAIN"
+check "... the probe isn't taken for the service's exit: it's flushed, and signaled after the engine's stop" \
+	in_order "curl " "stop --time 30 t-engine" "kill -s TERM t-service"
 check "... says so" grep -q "docker didn't say whether the service is running" "$tmp/stop.out"
 check "... and cleans up" cleaned_up
 # container_state alone, against a docker that never answers: its budget
@@ -390,10 +454,22 @@ chmod +x "$tmp/probeslow/docker"
 check "... a daemon that answers in 4s is still heard: the service has stopped" \
 	[ "$(PATH="$tmp/probeslow:$PATH" container_state x-service 10)" = stopped ]
 
-check "a state from a start before the linger: the stop passes" stop_with 0 old-state
-check "... with that start's bounds: its drain, no linger" grep -q "it drains for up to 3s, then answers the engine's last event for up to 0s; the stop waits 13s" "$tmp/stop.out"
+# zerobull-consulting/dagger#137: a state an older start wrote (its service
+# drains, and lingers) isn't stopped the new way: the stop fails, naming the
+# cause, and still keeps the logs and removes what that start created. A new
+# state is told by the key the new start writes (settle_seconds), whatever
+# else the state has.
+for old in old-state old-state-bare; do
+	rm -f "$tmp/summary"
+	check "a state from an older start ($old): the stop fails" not stop_with 0 "$old" T_SUMMARY="$tmp/summary"
+	check "... saying why" grep -q "written by an older start of the action (it has no settle_seconds): this run's pending exports weren't flushed" "$tmp/stop.out"
+	check "... in the step summary too" grep -q "^- \*\*failed:\*\* the state at .* was written by an older start" "$tmp/summary"
+	check "... without a flush" not flushed
+	check "... and the cleanup ran: both logs kept" kept_logs
+	check "... and the containers, the volume and the network removed" cleaned_up
+done
 
-check "an engine that won't stop: the stop still passes once the service exits" stop_with 0 FAKE_ENGINE=hangs FAKE_SERVICE=by-itself
+check "an engine that won't stop: the stop still passes once the service exits" stop_with 0 FAKE_ENGINE=hangs
 check "... says so" grep -q "the engine was still running after docker stop" "$tmp/stop.out"
 check "... and removes the engine" cleaned_up
 
@@ -415,7 +491,7 @@ removed_after_stop() {
 	local created="$1"
 	rm -rf "$tmp/rm" && mkdir -p "$tmp/rm/fake" "$tmp/rm/sc/t/logs"
 	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-		stop_seconds=20 linger_seconds=15 "logs=$tmp/rm/sc/t/logs" role=writer $created >"$tmp/rm/sc/t/state"
+		stop_seconds=105 settle_seconds=0 "logs=$tmp/rm/sc/t/logs" role=writer $created >"$tmp/rm/sc/t/state"
 	(
 		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/rm/fake" SIDECAR_DIR="$tmp/rm/sc" SIDECAR_NAME=t
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
@@ -867,9 +943,24 @@ ro_args="$(cat "$tmp/robin.fake/service.args" 2>/dev/null)"
 check "read-only: the service was started, with its -scope" grep -qxF -- "-scope" <<<"$ro_args"
 check "read-only: the service gets -export=false" grep -qxF -- "-export=false" <<<"$ro_args"
 check "read-only: and neither -gc-mode nor -gc-interval" not grep -qE -- "^-gc-(mode|interval)" <<<"$ro_args"
-check "start passes the linger the stop's bounds assume" grep -qx -- "-drain-linger" <<<"$dbg_args"
-check "... 15s" bash -c 'grep -A1 -x -- "-drain-linger" <<<"$1" | tail -1 | grep -qx 15s' _ "$dbg_args"
-check "... and records it for the stop" grep -qx linger_seconds=15 "$tmp/dbgbin.sc/remote-cache/state"
+# zerobull-consulting/dagger#137: the stop flushes, so the service runs with
+# no drain, and so with no linger.
+check "start runs the service with no drain" bash -c 'grep -A1 -x -- "-drain-timeout" <<<"$1" | tail -1 | grep -qx 0' _ "$dbg_args"
+check "... and passes no -drain-linger" not grep -qx -- "-drain-linger" <<<"$dbg_args"
+check "... records the settle timeout for the stop: 10s by default" grep -qx settle_seconds=10 "$tmp/dbgbin.sc/remote-cache/state"
+check "... and the stop's bound: the settle timeout, 5s for the flush's answer, 90s for the engine's stop and 10s for the service's" \
+	grep -qx stop_seconds=115 "$tmp/dbgbin.sc/remote-cache/state"
+check "... and the service's URL, for the flush" grep -qx url=http://10.9.0.1:30000 "$tmp/dbgbin.sc/remote-cache/state"
+check "... and no linger" not grep -q linger_seconds "$tmp/dbgbin.sc/remote-cache/state"
+fake_start dbgbin SIDECAR_NAME=settle2m SIDECAR_SETTLE_TIMEOUT=2m >/dev/null 2>&1
+check "settle-timeout 2m: the state says 120s" grep -qx settle_seconds=120 "$tmp/dbgbin.sc/settle2m/state"
+fake_start dbgbin SIDECAR_NAME=settle0 SIDECAR_SETTLE_TIMEOUT=0 >/dev/null 2>&1
+check "settle-timeout 0: the state says 0, so no flush" grep -qx settle_seconds=0 "$tmp/dbgbin.sc/settle0/state"
+check "start refuses a settle-timeout that isn't a duration" start_refuses SIDECAR_SETTLE_TIMEOUT=10
+check "start refuses a settle-timeout over 10m, the longest flush the service takes" start_refuses SIDECAR_SETTLE_TIMEOUT=11m
+drain_ignored_out="$(fake_start dbgbin SIDECAR_NAME=olddrain SIDECAR_DRAIN_TIMEOUT=10m 2>&1)"
+check "SIDECAR_DRAIN_TIMEOUT is no longer read: a warning says so" grep -q "warning: SIDECAR_DRAIN_TIMEOUT (drain-timeout) is no longer read, and is ignored" <<<"$drain_ignored_out"
+check "... and the service still runs with no drain" bash -c 'grep -A1 -x -- "-drain-timeout" "$1" | tail -1 | grep -qx 0' _ "$tmp/dbgbin.fake/service.args"
 check "debug-port: published on the host's loopback only" grep -qxF -- "127.0.0.1:8091:8091" <<<"$dbg_args"
 check "debug-port: the token is on no command line" not grep -qF -- "$dbg_token" <<<"$dbg_args"
 check "debug-port: nor in the start's output" not grep -qF -- "$dbg_token" <<<"$debug_out"
@@ -902,7 +993,7 @@ stop_secrets() {
 	echo x >"$tmp/st/sc/t/secrets/debug-token"
 	[[ "$2" == other ]] && echo y >"$tmp/st/sc/t/secrets/other"
 	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
-		stop_seconds=20 linger_seconds=15 "logs=$tmp/st/sc/t/logs" role=writer $created >"$tmp/st/sc/t/state"
+		stop_seconds=105 settle_seconds=0 "logs=$tmp/st/sc/t/logs" role=writer $created >"$tmp/st/sc/t/state"
 	(
 		export PATH="$tmp/rmbin:$PATH" FAKE_DIR="$tmp/st/fake" SIDECAR_DIR="$tmp/st/sc" SIDECAR_NAME=t
 		unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY
@@ -931,8 +1022,250 @@ second_start_refused() {
 }
 check "a second start with a name in use is refused, and touches nothing of the first" second_start_refused
 
+# --- signals: start and stop each trap TERM, INT and HUP (#244) ---
+# start/run passes a cancelled job's SIGINT, SIGTERM or SIGHUP on to the
+# script's whole process group, so the docker call it is in dies with it.
+# A docker that keeps what it creates as files: exists.<name> (holding the
+# sidecar label's value) and, for a container, running.<name>. With
+# FAKE_HANG, the call named hangs after the daemon did its work, as a
+# create can when the signal comes: network or volume (their create),
+# service or engine (their docker run), or engine-stop (the engine's
+# docker stop). FAKE_RM_SLEEP makes each removal take that long. Every call
+# is logged to $FAKE_DIR/calls.
+mkdir -p "$tmp/sigbin"
+cat >"$tmp/sigbin/docker" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_DIR/calls"
+d="$FAKE_DIR" last="${!#}"
+hang() { : >"$d/hanging"; sleep 30; exit 1; }
+label_of() { local a; for a in "$@"; do [[ "$a" == remote-cache-sidecar=* ]] && echo "${a#remote-cache-sidecar=}"; done; return 0; }
+case "$1 $2" in
+"container inspect" | "volume inspect" | "network inspect")
+	[[ -f "$d/exists.$last" ]] || exit 1
+	case "$*" in
+	*IPAM*) echo 10.9.0.1 ;;
+	*Labels*) cat "$d/exists.$last" ;;
+	esac
+	;;
+"image inspect" | "pull -q") exit 0 ;;
+"network create" | "volume create")
+	label_of "$@" >"$d/exists.$last"
+	[[ "${FAKE_HANG:-}" == "$1" ]] && hang
+	exit 0
+	;;
+"run -d")
+	name=""
+	for ((i = 1; i < $#; i++)); do [[ "${!i}" == --name ]] && { j=$((i + 1)); name="${!j}"; }; done
+	label_of "$@" >"$d/exists.$name"
+	: >"$d/running.$name"
+	[[ "${FAKE_HANG:-}" == service && "$name" == *-service ]] && hang
+	[[ "${FAKE_HANG:-}" == engine && "$name" == *-engine ]] && hang
+	exit 0
+	;;
+"port "*) echo 10.9.0.1:30000 ;;
+"inspect -f")
+	case "$3" in
+	*Running*) [[ -f "$d/running.$4" ]] && echo true || echo false ;;
+	*ExitCode*) echo 0 ;;
+	esac
+	;;
+"kill -s") rm -f "$d/running.$4" ;;
+"stop --time")
+	[[ "${FAKE_HANG:-}" == engine-stop && "$4" == *-engine ]] && hang
+	rm -f "$d/running.$4"
+	;;
+"rm -f" | "volume rm" | "network rm")
+	: >"$d/rm-started"
+	[[ -n "${FAKE_RM_SLEEP:-}" ]] && sleep "$FAKE_RM_SLEEP"
+	[[ -f "$d/exists.$last" ]] || { echo "no such object: $last" >&2; exit 1; }
+	rm -f "$d/exists.$last" "$d/running.$last"
+	;;
+"logs "*) echo 'time=x level=INFO msg=listening addr=:8090' ;;
+*) exit 0 ;;
+esac
+FAKE
+chmod +x "$tmp/sigbin/docker"
+# A process with SIGINT at its default: a background job of this script
+# starts with it ignored, which bash can't trap; start/run's child doesn't.
+default_int=()
+env --default-signal=INT true 2>/dev/null && default_int=(env --default-signal=INT)
+# signaled <SIG> <start|stop> [VAR=value...]: runs `sidecar.sh <command>` as
+# start/run does (in a process group of its own, with
+# SIDECAR_GROUP_KILLED=1), against sigbin's docker, in $tmp/sig; once the
+# fake docker hangs, sends SIG to the whole group, as start/run passes a
+# cancel's on. With T_SECOND, it sends that signal too, once the cleanup's
+# first removal began. Its output is in $tmp/sig.out, its exit code in
+# $tmp/sig.rc, and how long it took after the signal, in seconds, in
+# $tmp/sig.took.
+signaled() {
+	local sig="$1" cmd="$2" pid rc i t
+	shift 2
+	rm -f "$tmp/sig/fake/hanging" "$tmp/sig/fake/rm-started"
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc" SIDECAR_GROUP_KILLED=1
+		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s SIDECAR_START_TIMEOUT=5
+		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
+		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
+		unset GITHUB_ACTIONS GITHUB_ENV GITHUB_OUTPUT GITHUB_STEP_SUMMARY T_SECOND
+		(($#)) && export "$@"
+		[[ -n "${T_SUMMARY:-}" ]] && export GITHUB_STEP_SUMMARY="$T_SUMMARY"
+		exec setsid "${default_int[@]}" "$here/sidecar.sh" "$cmd"
+	) >"$tmp/sig.out" 2>&1 &
+	pid=$!
+	for ((i = 0; i < 100; i++)); do
+		[[ -f "$tmp/sig/fake/hanging" ]] && break
+		sleep 0.1
+	done
+	t=$SECONDS
+	kill -"$sig" -- -"$pid" 2>/dev/null
+	if [[ -n "${T_SECOND:-}" ]]; then
+		for ((i = 0; i < 100; i++)); do
+			[[ -f "$tmp/sig/fake/rm-started" ]] && break
+			sleep 0.1
+		done
+		kill -"$T_SECOND" -- -"$pid" 2>/dev/null
+	fi
+	wait "$pid"
+	rc=$?
+	echo "$rc" >"$tmp/sig.rc"
+	echo $((SECONDS - t)) >"$tmp/sig.took"
+}
+sig_rc() { [[ "$(cat "$tmp/sig.rc")" == "$1" ]]; }
+sig_calls() { cat "$tmp/sig/fake/calls" 2>/dev/null; }
+sig_called() { sig_calls | grep -qxF -- "$1"; }
+sig_state() { cat "$tmp/sig/sc/${1:-remote-cache}/state" 2>/dev/null; }
+# What docker still has: the names of the exists.* files.
+sig_left() { (cd "$tmp/sig/fake" && for f in exists.*; do [[ -e "$f" ]] && echo "${f#exists.}"; done) | tr '\n' ' '; }
+# sig_stop: the stop that follows (start's post step), unsignaled.
+sig_stop() {
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc"
+		unset GITHUB_ACTIONS GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		(($#)) && export "$@"
+		"$here/sidecar.sh" stop
+	) >"$tmp/sig.stop.out" 2>&1
+}
+sig_fresh() { rm -rf "$tmp/sig" && mkdir -p "$tmp/sig/fake"; }
+
+# A signal during the network's create, after the daemon made it: the state
+# says the start began to create it, and the stop removes it, so the next
+# start on a kept runner finds its name free.
+sig_fresh
+signaled TERM start FAKE_HANG=network
+check "a SIGTERM during the network's create ends the start, with 143" sig_rc 143
+check "... at once" [ "$(cat "$tmp/sig.took")" -le 3 ]
+check "... says so" grep -q "the start got SIGTERM, and stopped; what it created or began to create is in its state" "$tmp/sig.out"
+check "... and the state says it began to create the network" grep -qx creating=network <<<"$(sig_state)"
+check "... which docker has" [ "$(sig_left)" = "remote-cache-net " ]
+check "the stop that follows removes it" sig_stop
+check "... it says why" grep -q "the start was cut off while it created the network; docker has it" "$tmp/sig.stop.out"
+check "... and removed it" sig_called "network rm remote-cache-net"
+check "... so docker has nothing of the sidecar's left" [ -z "$(sig_left)" ]
+check "... nor is the state" [ -z "$(sig_state)" ]
+
+# A SIGHUP during the service's docker run: the container is there, the
+# state says created=network and creating=service.
+sig_fresh
+signaled HUP start FAKE_HANG=service SIDECAR_SETTLE_TIMEOUT=0
+check "a SIGHUP during the service's docker run ends the start, with 129" sig_rc 129
+check "... the state says it began to create the service" grep -qx creating=service <<<"$(sig_state)"
+check "... and created the network" grep -qx created=network <<<"$(sig_state)"
+check "... both of which docker has" [ "$(sig_left)" = "remote-cache-net remote-cache-service " ]
+check "the stop that follows removes both" sig_stop
+check "... the service" sig_called "rm -f remote-cache-service"
+check "... and the network" sig_called "network rm remote-cache-net"
+check "... and docker has nothing of the sidecar's left" [ -z "$(sig_left)" ]
+check "... and keeps the service's log" [ -f "$tmp/sig/sc/remote-cache/logs/service.log" ]
+
+if ((${#default_int[@]})); then
+	# A SIGINT (a cancelled job's first) during the engine's state volume's
+	# create.
+	sig_fresh
+	signaled INT start FAKE_HANG=volume SIDECAR_SETTLE_TIMEOUT=0
+	check "a SIGINT during the volume's create ends the start, with 130" sig_rc 130
+	check "... the state says it began to create the volume" grep -qx creating=volume <<<"$(sig_state)"
+	check "the stop that follows removes the volume, the service and the network" sig_stop
+	check "... and docker has nothing of the sidecar's left" [ -z "$(sig_left)" ]
+else
+	echo "skip  a SIGINT during the start: this env has no --default-signal"
+fi
+
+# A create the daemon never did is no one's to remove; nor is a network of
+# that name with another sidecar's label (or none).
+sig_fresh
+mkdir -p "$tmp/sig/sc/remote-cache/logs"
+echo other >"$tmp/sig/fake/exists.remote-cache-net"
+printf '%s\n' service=remote-cache-service engine=remote-cache-engine volume=remote-cache-engine-state \
+	network=remote-cache-net stop_seconds=105 settle_seconds=0 "logs=$tmp/sig/sc/remote-cache/logs" role=writer \
+	creating=network creating=volume >"$tmp/sig/sc/remote-cache/state"
+check "a state that says the start began to create a network and a volume, neither of them its: the stop passes" sig_stop
+check "... and removes neither" [ -z "$(sig_calls | grep -E '^(network|volume) rm' || true)" ]
+check "... nor reports them left behind" not grep -q "left behind" "$tmp/sig.stop.out"
+check "... the other sidecar's network is still there" [ "$(sig_left)" = "remote-cache-net " ]
+
+# A signal during the stop (here, during the engine's docker stop): the
+# stop keeps both logs and removes everything, then exits 128 plus the
+# signal.
+sig_stop_state() {
+	sig_fresh
+	mkdir -p "$tmp/sig/sc/t/logs"
+	local n
+	for n in t-service t-engine; do echo t >"$tmp/sig/fake/exists.$n" && : >"$tmp/sig/fake/running.$n"; done
+	echo t >"$tmp/sig/fake/exists.t-engine-state"
+	echo t >"$tmp/sig/fake/exists.t-net"
+	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
+		stop_seconds=105 settle_seconds=0 "logs=$tmp/sig/sc/t/logs" role=writer \
+		created=network created=service created=volume created=engine >"$tmp/sig/sc/t/state"
+}
+sig_cleaned_up() {
+	sig_called "rm -f t-service" && sig_called "rm -f t-engine" && sig_called "volume rm -f t-engine-state" &&
+		sig_called "network rm t-net" && [[ -z "$(sig_left)" && -z "$(sig_state t)" ]]
+}
+sig_stop_state
+rm -f "$tmp/summary"
+signaled TERM stop SIDECAR_NAME=t FAKE_HANG=engine-stop T_SUMMARY="$tmp/summary"
+check "a SIGTERM during the stop: it exits 143" sig_rc 143
+check "... after its cleanup, in seconds" [ "$(cat "$tmp/sig.took")" -le 5 ]
+check "... says so" grep -q "the stop got SIGTERM: keeping the logs and removing the sidecar" "$tmp/sig.out"
+check "... removed the containers, the volume, the network and the state" sig_cleaned_up
+check "... kept both logs" [ -f "$tmp/sig/sc/t/logs/service.log" -a -f "$tmp/sig/sc/t/logs/engine.log" ]
+check "... and fails, saying why, in the step summary too" grep -q "^- \*\*failed:\*\* the stop got SIGTERM before it ended: it kept the logs and removed what the start created" "$tmp/summary"
+# A cancelled job's runner sends SIGINT, then SIGTERM: a second signal
+# during the cleanup doesn't cut it off.
+sig_stop_state
+signaled HUP stop SIDECAR_NAME=t FAKE_HANG=engine-stop FAKE_RM_SLEEP=1 T_SECOND=TERM
+check "a SIGHUP during the stop, then a SIGTERM during its cleanup: it exits 129" sig_rc 129
+check "... the second signal didn't cut the cleanup off: everything is removed" sig_cleaned_up
+check "... and both logs kept" [ -f "$tmp/sig/sc/t/logs/service.log" -a -f "$tmp/sig/sc/t/logs/engine.log" ]
+check "... within the cleanup's bound" [ "$(cat "$tmp/sig.took")" -le 15 ]
+# The cleanup's own bound: a removal that hangs is cut off at the cleanup's
+# time, and the stop still exits.
+cleanup_bounded() {
+	sig_stop_state
+	local t=$SECONDS
+	# The stop's locals, which the sourced stop_signaled reads.
+	# shellcheck disable=SC2034
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc" SIDECAR_NAME=t FAKE_RM_SLEEP=30
+		set +e
+		source "$here/sidecar.sh"
+		signal_cleanup_seconds=3
+		on_signals stop_signaled
+		local name=t state="$tmp/sig/sc/t/state" st_logs="" st_service="" st_engine="" st_volume="" st_network=""
+		local st_stop_seconds="" st_settle_seconds="" st_url="" st_role="" st_created=" " st_creating=" " st_old_state=false
+		local leftovers="" cleanup_done=" " code="" flush_result=""
+		read_state "$state"
+		stop_signaled TERM 15
+	) >"$tmp/sig.bound.out" 2>&1
+	local rc=$?
+	# Its 3s, then 1s for each call after it, and the killed calls' 2s.
+	[[ $rc == 143 && $((SECONDS - t)) -le 10 ]]
+}
+check "the cleanup after a signal is bounded: removals that hang are cut off, and the stop exits 143" cleanup_bounded
+check "... and says what it left behind" grep -q "but for container t-service, container t-engine, volume t-engine-state, network t-net" "$tmp/sig.bound.out"
+
 # --- check.sh stored reports a writer that stored nothing ---
-printf '%s\n' 'time=x level=INFO msg="drain: done" outcome=complete' >"$tmp/no-exports.log"
+printf '%s\n' 'time=x level=INFO msg="flush: done" namespace=default cacheID=c1 outcome=complete took=1ms storedRoots=0 leftRoots=0' >"$tmp/no-exports.log"
 stored_out="$("$here/../../../hack/remote-cache/demo/check.sh" stored "$tmp/no-exports.log" "$tmp/stored" 2>&1)"
 stored_rc=$?
 check "check.sh stored fails on a log without exports" [ "$stored_rc" -ne 0 ]

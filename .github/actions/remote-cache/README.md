@@ -9,9 +9,10 @@ them earlier.
   [`dagger/dagger-for-github`](https://github.com/dagger/dagger-for-github),
   starts the service and the engine, and puts a wrapper of the CLI first on
   `PATH` for the job's later steps. At the end of the job, whatever
-  happened, it stops them by itself, after the service drains its exports.
+  happened, it stops them by itself, after a flush of the engine's pending
+  exports.
 - [**`stop`**](stop/action.yml) stops them earlier, when a step needs the
-  drain done (the export stored, the next phase's fresh engine), or with a
+  flush done (the export stored, the next phase's fresh engine), or with a
   timeout of its own.
 
 What each step does, and how to run the same outside GitHub, is in
@@ -24,7 +25,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     # Bounds the stop at the end of the job too: set it above the job's work
-    # plus drain-timeout (10m) plus 2 minutes (see "The stop at the end of the job").
+    # plus settle-timeout (10s) plus 3 minutes (see "The stop at the end of the job").
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
@@ -74,9 +75,9 @@ D4):
 
 So the service can be a newer build than the action's commit. The action
 passes the service only flags every build has kept (`-scope`,
-`-drain-timeout`, `-drain-linger`, `-export`, `-v`, `-debug-listen`,
-`-debug-token-file`); removing or renaming one of them is a breaking change
-for pinned actions. The exception is `role: writer`, which also passes
+`-drain-timeout`, `-export`, `-v`, `-debug-listen`, `-debug-token-file`), and
+its stop calls only `POST /v1/engines/flush`; removing or renaming one of them
+is a breaking change for pinned actions. The exception is `role: writer`, which also passes
 `-gc-mode=batch`: it needs a service image built at or after
 zerobull-consulting/dagger#248, with no backwards compatibility. The
 version's floating tag is one once the publish workflow has moved it to a
@@ -147,11 +148,19 @@ of its own.
 | `s3-prefix` | no | empty: the whole bucket | The prefix the service [owns](../../../cmd/cacheservice/README.md#bucket-ownership): nothing else may write under it. Segments of letters, digits, `.`, `_` and `-`, separated by `/`, none of them `.` or `..`, with no leading or trailing `/`. |
 | `s3-path-style` | no | the service's | `true` for path-style addressing, such as MinIO's, or `false`. |
 | `namespace` | no | `default` | The namespace entries are stored in and imported from (`-scope`). Writers and readers that should share a cache use the same one. |
-| `drain-timeout` | no | `10m` | How long the stop lets the service finish its exports (`-drain-timeout`): hours, minutes and seconds, such as `10m` or `1h30m`. The job's `timeout-minutes` must allow for it. |
+| `settle-timeout` | no | `10s` | How long the stop's [flush](#stop) may take: hours, minutes and seconds, such as `10s` or `2m`, at most `10m`; `0` skips the flush. The job's `timeout-minutes` must allow for it. |
 | `name` | no | `remote-cache` | Prefix of the containers (`<name>-service`, `<name>-engine`), the engine's state volume and the network. Set another one to run a second sidecar in the same job after the first is stopped, and pass the same to `stop`. |
 | `debug-port` | no | not published | Publishes the service's debug API on the runner's `127.0.0.1:<port>`, behind a token generated for this start (see [The debug API](#the-debug-api)). |
 | `engine-config` | no | [`engine.json`](engine.json) | The engine's `engine.json`. The default turns the engine's GC off (see below) and pulls `docker.io` images through `mirror.gcr.io`, as the release's does. |
 | `verbose` | no | `false` | `true`: the service logs every cache span (`-v`); CI's demo counts them. |
+
+**`drain-timeout` is gone**
+([zerobull-consulting/dagger#137](https://github.com/zerobull-consulting/dagger/issues/137)):
+the stop flushes the engine's exports before it stops the engine, and the
+service runs with no drain. A workflow that still passes it gets GitHub's
+`Unexpected input(s) 'drain-timeout'` warning, and the value is ignored;
+replace it with `settle-timeout` if the flush needs longer than 10s, and
+lower the `timeout-minutes` you sized for the drain.
 
 The start refuses a container, volume or network of its names that is
 already there, before it creates anything, and the stop removes only what
@@ -237,7 +246,9 @@ needs the header.
 - **During the job:** every `dagger` run through the wrapper fails if the
   service has exited.
 - **Stop:** fails when the service exited before the stop, or its stop
-  wasn't clean.
+  wasn't clean, or the sidecar was started by an older `start` (see
+  [stop](#stop)). A flush that doesn't complete is a warning, not a
+  failure.
 
 ## The installer's probe
 
@@ -267,31 +278,46 @@ The stop is the one described below, and it has **no `timeout-minutes` of its
 own**: the post step is not a step of yours. The job's `timeout-minutes`
 bounds it (the shim also bounds its own child process, by the stop's
 documented bound plus 5 minutes). So set the job's timeout above the job's
-work plus `drain-timeout` (10m) plus 2 minutes: the drain's wait, the
-engine's stop (cut off at 90s), then the cleanup. A job cancelled while the
-sidecar drains gets the runner's cancellation grace (about 5 minutes) for the
-stop, so a long drain can be cut off then; set a shorter `drain-timeout`
-where cancelled jobs matter. The shim passes a SIGINT, SIGTERM or SIGHUP it
-gets on to the script's whole process group, and `sidecar.sh` traps none, so
-a start or stop that gets one ends at once, its cleanup with it.
+work plus `settle-timeout` (10s) plus 3 minutes: the flush, the engine's
+stop (cut off at 90s), the service's, then the cleanup. A job cancelled
+gets the runner's cancellation grace (about 5 minutes) for the stop, which
+is more than the stop takes with the default `settle-timeout`.
+
+**Signals.** The shim passes a SIGINT, SIGTERM or SIGHUP it gets on to the
+script's whole process group, so the Docker call the script is in dies with
+it, and `sidecar.sh` traps all three
+([zerobull-consulting/dagger#244](https://github.com/zerobull-consulting/dagger/issues/244)).
+A **start** that gets one exits at once, with 128 plus the signal's number:
+it records each container, volume and network as begun (`creating=` in its
+state) before it creates it, and as created after, so whatever the daemon
+made before the signal is the stop's to remove. The stop takes one only if
+Docker has it under its name with this sidecar's label, so the next start on
+a kept runner finds its names free. A **stop** that gets one ignores any that
+follow (a cancelled job's runner sends SIGINT, then SIGTERM), finishes its
+cleanup, keeping both logs and removing what the start created, within 60s,
+each Docker call bounded and out of the signals' reach, then fails the step
+with 128 plus the signal's number, saying so in its step summary.
 
 **What the stop can't store.** Since `v1.0.0-beta.26` an engine gives up
 its remote-cache work 20s after its last session ended, if an export is
 still running then, and takes it up again only when a session starts. In a
 job there is none after the last `dagger` call, so what the engine hadn't
 finished exporting by then, such as a large layer on a slow link, is not
-stored by this job: the drain doesn't wait for it, logs
-`drain: left for an engine that gave up its remote-cache work` with the
-count, and still ends `complete`. The store is left whole, and a later job
-that builds the same values exports them (see
+stored by this job: the flush neither waits for it nor asks for it again,
+and ends `paused`, with those roots counted as `paused`. The store is left
+whole, and a later job that builds the same values exports them (see
 [Engines from v1.0.0-beta.26](../../../cmd/cacheservice/README.md#engines-from-v100-beta26)).
+Nor does the flush wait for what takes longer than `settle-timeout`: it
+ends `timeout`, says what it left, and the engine's stop takes the rest with
+it.
 
 ## stop
 
 ```yaml
 - if: always()
-  # drain-timeout (10m) plus 2 minutes: the drain, the engine's stop, the cleanup.
-  timeout-minutes: 12
+  # settle-timeout (10s) plus 3 minutes: the flush, the engine's stop, the
+  # service's, the cleanup.
+  timeout-minutes: 4
   uses: zerobull-consulting/dagger/.github/actions/remote-cache/stop@<commit SHA>
   with:
     name: remote-cache   # the same name as the start's
@@ -302,38 +328,63 @@ because a step needs the export done. `start`'s post step then finds no
 state and does nothing; stopping twice is safe (the second finds nothing to
 stop).
 
-It stops the service first: a SIGTERM, then a wait for `drain: done` in its
-log, for up to `drain-timeout` plus 5s. Then the engine, with `docker stop
---time 30`: the service, done draining, still answers the engine's events
-for up to 15s (the `-drain-linger` the start passes), so the engine's own stop
-delivers its last cache event (`engine.stop`) and ends in seconds, cleanly
-([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
-Then it waits for the service to exit, which it does once that event
-arrived, up to `drain-timeout` plus 25s from the SIGTERM in all: the
-service's whole stop takes at most `drain-timeout` plus its linger plus 5s
-(see [Stopping and draining](../../../cmd/cacheservice/README.md#stopping-and-draining)).
-A service still running then is stopped, and fails the step. A `docker
-inspect` that fails during a wait is never taken for the service's exit:
-the engine isn't stopped before the drain is done. Every wait is bounded,
-and a wait that runs out doesn't skip the rest: the stop keeps both
-logs (with presigned URLs' credentials and signatures redacted), and
-removes the containers, the engine's state volume and the network. A
-removal that fails is named in the stop's output and step summary (its kind
-and name, as `left behind: volume <name>`); it doesn't fail the step. With
-nothing to drain, the stop takes about 10s, most of it the engine's.
+It stops in three steps
+([zerobull-consulting/dagger#137](https://github.com/zerobull-consulting/dagger/issues/137)):
+
+1. **The flush**, while the service and the engine are both fully up:
+   `POST /v1/engines/flush?timeout=<settle-timeout>` on the service's port,
+   with the engine's token (see
+   [Flushing one engine cache](../../../cmd/cacheservice/README.md#flushing-one-engine-cache)).
+   The service exports what is pending for the engine now, without waiting
+   for it to settle, waits for the spans of a session that just ended, and
+   answers once nothing is left or the timeout passed. The report is kept
+   next to the logs (`flush.json`), and its outcome and counts are in the
+   stop's output and step summary. A flush that ends `timeout` (or `paused`,
+   or `not_connected`), that the service refuses, or that gets no answer
+   within `settle-timeout` plus 5s is a warning, and the stop goes on: it
+   never fails the step. `settle-timeout: 0` skips it, and so does a
+   read-only sidecar, which exports nothing.
+2. **The engine**, with `docker stop --time 30` (cut off at 90s), while the
+   service still answers its events, so the engine's own stop delivers its
+   last cache event (`engine.stop`) and ends in seconds, cleanly
+   ([zerobull-consulting/dagger#102](https://github.com/zerobull-consulting/dagger/issues/102)).
+3. **The service**, with a SIGTERM. The start runs it with `-drain-timeout
+   0`, so it doesn't drain or linger: it stops at once, within its
+   shutdown's 5s, and exits 0
+   (see [Stopping and draining](../../../cmd/cacheservice/README.md#stopping-and-draining)).
+   The stop waits 10s for it; a service still running then is stopped, and
+   fails the step.
+
+A `docker inspect` that fails during a wait is never taken for the
+service's exit. Every wait is bounded, and a wait that runs out doesn't skip
+the rest: the stop keeps both logs (with presigned URLs' credentials and
+signatures redacted), and removes the containers, the engine's state volume
+and the network. A removal that fails is named in the stop's output and step
+summary (its kind and name, as `left behind: volume <name>`); it doesn't
+fail the step. With nothing to flush, the stop takes about 10s, most of it
+the engine's.
 
 The steps run one after another, so the whole stop takes at most its probe
 of the service (whether it is still running: about 10s in all, against a
 Docker daemon that doesn't answer, and a probe that gets no answer is never
 taken for the service's exit;
 [zerobull-consulting/dagger#125](https://github.com/zerobull-consulting/dagger/issues/125)),
-then the drain's wait (`drain-timeout` plus 5s), then the engine's stop (30s, its `docker
-stop` cut off at 90s), then the wait for the service (which has exited by
-then, unless it overran its own bound) and the cleanup, which take seconds.
-Give the step a `timeout-minutes` of at least `drain-timeout` plus 2
-minutes: 12 for `10m`. The start passes the service
-`-drain-linger`, which a service image from before the linger doesn't take:
-pin the images to the action's commit, as above.
+then the flush (`settle-timeout` plus 5s), the engine's stop (30s, its
+`docker stop` cut off at 90s), the wait for the service (10s), and the
+cleanup, which takes seconds. The state records the flush, the engine's and
+the service's bounds as `stop_seconds` (`settle-timeout` plus 105s), which
+the shim's own bound adds 5 minutes to. Give the step a `timeout-minutes` of
+at least `settle-timeout` plus 3 minutes: 4 for `10s`. A service image from
+before the flush (zerobull-consulting/dagger#136) refuses it: pin the
+images to the action's commit, as above.
+
+**A sidecar started by an older `start`.** A state file without
+`settle_seconds`, written by a `start` from before this stop (whose service
+drains and lingers), isn't stopped the new way: the stop fails the step,
+saying the state was written by an older start and this run's pending
+exports weren't flushed, and still keeps both logs and removes the
+containers, the engine's state volume and the network. Run `start` and
+`stop` from the same commit.
 
 **Exit codes**, the service's:
 
@@ -341,17 +392,17 @@ pin the images to the action's commit, as above.
 | --- | --- | --- |
 | 0 | A clean stop: everything ended within the bound. | passes |
 | 1 | The stop was unclean: the bound cut the shutdown off with work still running, something else (such as engine connections still closing) left it unclean, a signal arrived during the shutdown, or an HTTP server failed, including one that failed as the stop ended. A shutdown that ends in error is logged as `stopped uncleanly`, with the reason in `error=` and what was running (the message says the shutdown's bound passed only when it did); a signal during the shutdown is logged as `signal during the shutdown: exiting at once`, and a step that overran its own bound as `stopped: the shutdown overran its bound`. | fails |
-| 137 | Killed before its stop ended, not by the stop (such as out of memory). What it was exporting is lost. | fails |
-| any | Still running past the stop's bound, `drain-timeout` plus 25s: the stop stopped it. | fails |
+| 137 | Killed before its stop ended, not by the stop (such as out of memory). | fails |
+| any | Still running 10s after its SIGTERM, past its own 5s bound: the stop stopped it. | fails |
 | any | The service had exited before the stop. | fails |
 
 Known gaps of the action: the leads in
 [zerobull-consulting/dagger#104](https://github.com/zerobull-consulting/dagger/issues/104).
 
-The stop's step summary has the exit code, and its log the drain's and the
-linger's lines (`drain: stored`, `drain: done outcome=...`, `linger: done
-outcome=...`). The logs name the bucket and
-the prefix: upload them, as CI does on failure, only where that's fine.
+The stop's step summary has the flush's outcome and counts and the exit
+codes, and its log the flush's and the stop's lines (`flush: done
+outcome=...`, `stopping`, `stopped`). The logs name the bucket and the
+prefix: upload them, as CI does on failure, only where that's fine.
 
 ## Tested by
 
