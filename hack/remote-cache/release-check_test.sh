@@ -388,7 +388,13 @@ add_run 7013 "$sha" "$title26" completed failure
 early='{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "x", "steps": [{"name": "Checkout", "conclusion": "failure"}]}'
 ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
 check "plan: a run that failed before testing isn't red" has "$tmp/out" "state=verify"
-check "plan: saying why" has "$tmp/out" "failed before testing (real engines (e2e))"
+check "plan: saying why" has "$tmp/out" "jobs failed before testing: real engines (e2e)"
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'real engines (e2e)' success)" "$(job 'sidecar demo' success)")"
+check "plan: a red unit test job is red (it runs the sync's code)" has "$tmp/out" "state=red"
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'sidecar demo' success)")"
+check "plan: a failed run missing an engine job decides nothing" has "$tmp/out" "state=verify"
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'real engines (e2e)' cancelled)" "$(job 'sidecar demo' success)")"
+check "plan: nor does a failed run in which no job failed" has "$tmp/out" "no job in it failed"
 add_run 7014 "$sha" "$title26" completed failure
 ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
 check "plan: two runs that failed before testing stop the dispatches" has "$tmp/out" "state=bounded"

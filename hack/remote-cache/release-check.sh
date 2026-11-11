@@ -391,15 +391,29 @@ run_jobs() {
 	return 1
 }
 
-# early_failure <run id>: the run's jobs that failed before testing anything
-# (their checkout, or the pin step refusing the candidate), which says
-# nothing about the code, comma-separated; nothing if none did. A jobs read
-# that fails fails the plan.
-early_failure() {
-	local jobs
+# undecided_failure <run id>: why a failed run says nothing about the code,
+# or nothing if it is red. It says nothing if its jobs listing is
+# incomplete or lacks an engine job (engine_jobs_unlisted), if no job in it
+# failed or timed out, or if a job failed before testing anything (its
+# checkout, or the pin step refusing the candidate). Any other failed job is
+# red, the unit and MinIO jobs' too: they run the sync branch's code. A jobs
+# read that fails fails the plan.
+undecided_failure() {
+	local jobs why
 	jobs="$(run_jobs "$1")" || die "couldn't read the verifying run $server/$repo/actions/runs/$1's jobs: not deciding on it"
-	jq -r '[.jobs[] | select(.conclusion == "failure") |
-		select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs"
+	why="$(engine_jobs_unlisted "$jobs")"
+	if [[ -n "$why" ]]; then
+		echo "$why"
+		return
+	fi
+	why="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
+		select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
+	if [[ -n "$why" ]]; then
+		echo "jobs failed before testing: $why"
+		return
+	fi
+	jq -e 'any(.jobs[]; .conclusion == "failure" or .conclusion == "timed_out")' <<<"$jobs" >/dev/null ||
+		echo "no job in it failed"
 }
 
 # verdict <version> <digest> <sha>: the state of the sync branch's head
@@ -434,12 +448,12 @@ verdict() {
 	failure | timed_out)
 		# verdict runs in a command substitution, where set -e doesn't
 		# reach: a failed read exits by hand.
-		why="$(early_failure "$id")" || exit 1
+		why="$(undecided_failure "$id")" || exit 1
 		if [[ -z "$why" ]]; then
 			echo "red $url"
 			return
 		fi
-		say "the verifying run $url failed before testing ($why): it decides nothing"
+		say "the verifying run $url failed, but $why: it decides nothing"
 		;;
 	success)
 		if jobs="$(run_jobs "$id")"; then
@@ -457,14 +471,14 @@ verdict() {
 	esac
 	# The latest run of this head ended undecided (cancelled, say): try
 	# again, a bounded number of times. Every completed run that ended
-	# undecided counts; a red one doesn't, but one that failed before
-	# testing does.
+	# undecided counts; a red one doesn't, but a failed one that decides
+	# nothing (undecided_failure) does.
 	local rid rconclusion early
 	undecided=0
 	while read -r rid rconclusion; do
 		case "$rconclusion" in
 		failure | timed_out)
-			early="$(early_failure "$rid")" || exit 1
+			early="$(undecided_failure "$rid")" || exit 1
 			[[ -z "$early" ]] || undecided=$((undecided + 1))
 			;;
 		*) undecided=$((undecided + 1)) ;;
@@ -880,7 +894,8 @@ cmd_ready() {
 		say "#$pr is ready already"
 		return
 	fi
-	mark_ready "$pr"
+	# The comments first and the PR marked ready last, as in accept: a run
+	# that stops in between leaves a draft, which the next hour retries.
 	echo "\`$(sync_branch "$v")\` has \`$v\`'s accept line, pushed by an earlier run that stopped before marking this ready. Merge it **with a merge commit** (\`gh pr merge --merge\`), never a squash, once its checks pass." >"$scratch/ready.md"
 	comment "$pr" "$scratch/ready.md"
 	issue="$(open_issue "$v")"
@@ -889,6 +904,7 @@ cmd_ready() {
 		echo "Green: #$pr has \`$v\`'s accept line and is ready to merge (with a merge commit), which closes this." >"$scratch/issue-ready.md"
 		comment "$issue" "$scratch/issue-ready.md"
 	fi
+	mark_ready "$pr"
 }
 
 cmd_accept() {

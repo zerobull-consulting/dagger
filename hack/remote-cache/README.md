@@ -919,8 +919,9 @@ new release ──▶ sync branch: tag merged, base moved, draft PR
      commit and its title (`Remote cache tests: candidate <version>
      <digest>`). The latest run of the head decides:
      - **in progress:** waited on;
-     - **red** (failed or timed out, past its checkout and engine pin
-       steps): the `compat-break` issue
+     - **red** (failed or timed out, with a complete jobs listing, both
+       engine jobs in it, and a job that failed past its checkout and engine
+       pin steps; the unit and MinIO jobs count): the `compat-break` issue
        (`compat-break: engine <version> fails against the cache service`,
        with `GITHUB_TOKEN`) is filed with the failing jobs, the advisory diff
        and the PR, and the PR's description gets `Closes #<issue>`; each
@@ -936,8 +937,9 @@ new release ──▶ sync branch: tag merged, base moved, draft PR
        told. If the bundle or protocol version changed between the
        manifest's `base` and the release, the accept list resets to that
        one version;
-     - **undecided** (cancelled, failed in its checkout or engine pin step,
-       or green with an engine job skipped): verified again, at most twice
+     - **undecided** (cancelled; failed in its checkout or engine pin step,
+       with an engine job missing, or with no job failed; or green with an
+       engine job skipped): verified again, at most twice
        per head (red runs don't count); then the summary says to re-run it
        by hand.
 
