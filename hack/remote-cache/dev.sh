@@ -11,8 +11,6 @@
 #                  the stock release, or with E2E_BUILD_ENGINE=1 built from here
 #   dev.sh e2e-down  remove the engines a run with E2E_KEEP=1 left
 #   dev.sh demo    run the sidecar demo (demo/run.sh) against MinIO
-#   dev.sh speedup [phase...]  run the speedup pipelines (speedup/local.sh)
-#                  through a writer, then a read-only sidecar, against MinIO
 #   dev.sh demo-store  start MinIO where containers reach it, with the demo's
 #                  read-only user, and print its settings as key=value lines
 #
@@ -174,14 +172,6 @@ demo)
 	eval "$(print_env)"
 	export DEMO_READONLY_ACCESS_KEY_ID=dagger-demo-readonly DEMO_READONLY_SECRET_ACCESS_KEY=dagger-demo-readonly-secret
 	exec "$here/demo/run.sh"
-	;;
-speedup)
-	demo_store
-	eval "$(print_env)"
-	# Under demo/, the read-only user's prefix.
-	export CACHESERVICE_S3_PREFIX="${CACHESERVICE_S3_PREFIX:-demo/speedup-$(date -u +%Y%m%d-%H%M%S)-$$}"
-	export READONLY_ACCESS_KEY_ID=dagger-demo-readonly READONLY_SECRET_ACCESS_KEY=dagger-demo-readonly-secret
-	exec "$here/speedup/local.sh" "${@:2}"
 	;;
 e2e-down)
 	label=dagger-remote-cache-e2e
