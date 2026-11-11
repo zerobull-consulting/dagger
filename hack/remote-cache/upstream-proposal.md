@@ -7,6 +7,7 @@
 - [Problem](#problem)
 - [What this is, and is not](#what-this-is-and-is-not)
 - [Limits](#limits)
+- [One consumer](#one-consumer)
 - [Options for the tree](#options-for-the-tree)
 - [Layout, if any of it lands](#layout-if-any-of-it-lands)
 - [How it is tested](#how-it-is-tested)
@@ -37,8 +38,23 @@ It was built by one person, with AI assistance, in a few weeks, and is used in C
 | **Object storage only** | S3-compatible stores: MinIO is tested in CI; DigitalOcean Spaces by hand. |
 | **A sidecar** | The service starts beside the engine in a job and stops with it. It does not run as a shared, always-on service in anything we have tested. |
 | **Concurrent writers** | Safe by design, best avoided. Index updates are conditional writes with retry (`UpdateIndex`, up to 50 attempts), racing exports are resolved by `If-None-Match` (`TestVerifyRacingExports`, `TestWritersRaceOnEmptyPrefix`). Throughput under contention is not measured. The fork's workflows run one writer per prefix. |
-| **Break-even** | Observed startup and drain time for the service is about 30 seconds. That makes it a good fit for caching work like dependency installation from a package manager lockfile, or toolchain builds that can be separated from application code, and a poor fit for small, quick items that a runner-local cache already serves repeatedly. It also loses on a job where the inputs have changed, either the application's dependencies or a base image: that job pays the service's overhead and gets no cache hits. The action reports the start time and `hack/remote-cache/speedup/run.sh` counts cache hits against executed steps. A private consumer, a small (~60k lines) Next.js web application, uses it to cache an Alpine customization and an npm install. For the pull requests that do not change dependencies, about two thirds of them, a run totals about 15 billed minutes across a few parallel jobs without the cache and about 10 with it, mostly from caching the image customization and the dependencies. The jobs run in parallel for quick pull request feedback, so the cache turns 4 minutes of turnaround into 3. The same cache serves several pipelines, each with a slightly different set of packages. The 10 billed minutes include starting the sidecar for each parallel job, and the author combined several test jobs into one pipeline to pay that startup less often. The monthly development cadence is 110 pull requests on average. 40 of them, about a third, are Dependabot security updates, which cost about 30 seconds more to run with the sidecar because they update an npm dependency. Over a month that is roughly 70 pull requests saving about 5 billed minutes each (about 350 minutes) against 40 costing about 30 seconds more each (about 20 minutes). The cache is updated (written and garbage collected) once nightly; all pull request checks and some production deployments are readers, so there is one writer. It is a key part of its solo developer's velocity. |
+| **Break-even** | Observed startup and drain time for the service is about 30 seconds. That makes it a good fit for caching work like dependency installation from a package manager lockfile, or toolchain builds that can be separated from application code, and a poor fit for small, quick items that a runner-local cache already serves repeatedly. It also loses on a job where the inputs have changed, either the application's dependencies or a base image: that job pays the service's overhead and gets no cache hits. The action reports the start time and `hack/remote-cache/speedup/run.sh` counts cache hits against executed steps. |
 | **One engine version** | The service accepts the engine version it was built with. The protocol's handshake carries `EngineVersion`; how a tree-built service would enforce it is to be settled. |
+
+## One consumer
+
+A private consumer, a small (~60k lines) Next.js web application, uses the service to cache an Alpine customization and an npm install. The author controls it, and it is the only data point.
+
+| | |
+| --- | --- |
+| **The suite** | The same suite, a few parallel jobs, runs on every pull request, human or Dependabot. Several pipelines share the cache, each with a slightly different set of packages. The author combined several test jobs into one pipeline to pay the sidecar's startup less often. |
+| **A pull request that changes only application source** | About 10 billed minutes, from cache hits on the image customization and the dependencies. The cache turns 4 minutes of turnaround into 3. The 10 includes starting the sidecar for each parallel job. |
+| **A Dependabot pull request** | About 15 billed minutes. It updates an npm dependency, even a minor one, which application changes almost never do, so it misses; and it costs about 30 seconds more than it would without the sidecar. |
+| **Volume** | 110 pull requests a month on average; 40 are Dependabot security updates (about a third). |
+| **Who writes** | The cache is updated (written and garbage collected) once nightly. All pull request checks and some production deployments only read, so there is one writer. |
+| **Net, billed time** | Roughly 70 pull requests saving about 5 billed minutes each (15 against 10), about 350 minutes, against 40 costing about 30 seconds more each, about 20 minutes. |
+
+The author reports it as a key part of their velocity on that project.
 
 ## Options for the tree
 
