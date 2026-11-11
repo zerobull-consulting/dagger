@@ -406,8 +406,8 @@ undecided_failure() {
 		echo "$why"
 		return
 	fi
-	why="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
-		select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
+	why="$(jq -r '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") |
+		select(any(.steps[]?; (.conclusion == "failure" or .conclusion == "timed_out") and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
 	if [[ -n "$why" ]]; then
 		echo "jobs failed before testing: $why"
 		return
@@ -428,6 +428,10 @@ verdict() {
 	runs="$(api "repos/$repo/actions/workflows/remote-cache-tests.yml/runs?event=workflow_dispatch&head_sha=$sha&per_page=100")" ||
 		die "couldn't read the verifying runs of ${sha:0:12}"
 	jq -e '.workflow_runs | type == "array"' <<<"$runs" >/dev/null || die "the verifying runs of ${sha:0:12} aren't a list"
+	# More runs than were listed decides nothing: an unlisted run could be
+	# the latest, or one that counts toward the bound.
+	jq -e '(.total_count // (.workflow_runs | length)) <= (.workflow_runs | length)' <<<"$runs" >/dev/null ||
+		die "the head ${sha:0:12} has more verifying runs than were listed: re-run or clear them by hand"
 	runs="$(jq -c --arg t "$(run_title "$v" "$d")" '[.workflow_runs[] | select(.display_title == $t)] | sort_by(.id)' <<<"$runs")"
 	if [[ "$(jq length <<<"$runs")" == 0 ]]; then
 		echo verify

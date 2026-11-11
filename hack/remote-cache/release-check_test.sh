@@ -127,7 +127,8 @@ case "$method $path" in
 "GET repos/o/r/actions/workflows/remote-cache-tests.yml/runs?"*)
 	# $FAKE/runs.json: [{id, head_sha, display_title, status, conclusion}].
 	sha="${path#*head_sha=}"; sha="${sha%%&*}"
-	jq --arg s "$sha" '{workflow_runs: [.[] | select(.head_sha == $s)]}' "$FAKE/runs.json" ;;
+	# FAKE_RUNS_TOTAL: the listing's total_count (none by default).
+	jq --arg s "$sha" --arg t "${FAKE_RUNS_TOTAL:-}" '{workflow_runs: [.[] | select(.head_sha == $s)]} + (if $t == "" then {} else {total_count: ($t | tonumber)} end)' "$FAKE/runs.json" ;;
 "GET repos/o/r/actions/runs/"*/jobs*)
 	[[ -n "${FAKE_JOBS_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
 	# FAKE_JOBS: the jobs array as it is; otherwise the four jobs of a
@@ -398,6 +399,11 @@ check "plan: nor does a failed run in which no job failed" has "$tmp/out" "no jo
 add_run 7014 "$sha" "$title26" completed failure
 ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
 check "plan: two runs that failed before testing stop the dispatches" has "$tmp/out" "state=bounded"
+timedout='{"name": "sidecar demo", "conclusion": "timed_out", "html_url": "x", "steps": [{"name": "The engine pin, from the manifest", "conclusion": "timed_out"}]}'
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'real engines (e2e)' success)" "$timedout")"
+check "plan: a pin step that timed out is a failure before testing too" has "$tmp/out" "jobs failed before testing: sidecar demo"
+ARGS=(plan); rc env FAKE_RUNS_TOTAL=150
+check "plan: more verifying runs than were listed fails the plan" test "$status" -ne 0
 ARGS=(plan); rc env FAKE_JOBS_FAIL=1
 check "plan: a red run whose jobs can't be read fails the plan" test "$status" -ne 0
 
