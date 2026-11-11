@@ -109,10 +109,8 @@ func TestMinIOGCOwnership(t *testing.T) {
 	}{
 		{name: "a key in a namespace", foreign: func(e *minioEnv) { e.put("ns/team-a/notes.txt", []byte("x")) }},
 		{name: "an upload in a namespace", foreign: func(e *minioEnv) { e.upload("ns/team-a/backups/db.tar") }},
-		// A staging key may hold an upload (a large service-hashed
-		// promotion's private copy), but nothing below it may.
-		{name: "an upload below a staged key", foreign: func(e *minioEnv) {
-			e.upload("ns/team-a/" + layout.StagingRel(string(blobstore.NewStage()), digest.FromString("y")) + "/x")
+		{name: "a staged key as an upload", foreign: func(e *minioEnv) {
+			e.upload("ns/team-a/" + layout.StagingRel(string(blobstore.NewStage()), digest.FromString("y")))
 		}},
 		{name: "another application's key", root: true, foreign: func(e *minioEnv) { e.put("reports/2026.csv", []byte("x")) }},
 		{name: "the old layout", root: true, foreign: func(e *minioEnv) {

@@ -129,12 +129,8 @@ type Importer struct {
 	log  *slog.Logger
 	sign Signer
 
-	mu     sync.Mutex
-	caches map[string]*cacheState
-	// syncLocks are the caches' sync locks, by cache ID, apart from their
-	// states so that Forget, which drops a state, doesn't drop its lock.
-	// An entry lives while a sync holds or waits for it.
-	syncLocks   map[string]*syncLock
+	mu          sync.Mutex
+	caches      map[string]*cacheState
 	bundles     map[string]*dagql.ValueBundle
 	resolutions map[string]*metastore.Resolution
 }
@@ -171,7 +167,6 @@ func New(cfg Config) (*Importer, error) {
 		log:         log,
 		sign:        StoreSigner(cfg.Blobs),
 		caches:      map[string]*cacheState{},
-		syncLocks:   map[string]*syncLock{},
 		bundles:     map[string]*dagql.ValueBundle{},
 		resolutions: map[string]*metastore.Resolution{},
 	}, nil
@@ -180,7 +175,15 @@ func New(cfg Config) (*Importer, error) {
 // cacheState is what the importer knows of one engine cache, at one
 // generation.
 type cacheState struct {
-	// The fields are guarded by Importer.mu.
+	// sync serializes syncs that hold this state, from any of its
+	// connections: a one-slot semaphore, so a sync waits for it only as long
+	// as its context lives. Forget drops the state, so a sync after a Forget
+	// has a new one and doesn't wait for a sync still running on the old
+	// (TestKnownGapSyncAfterForgetOverlapsRunningSync). Made with the state
+	// (stateLocked, the only constructor): a nil channel would block forever.
+	sync chan struct{}
+
+	// The fields below are guarded by Importer.mu.
 	generation uint64
 	// merged are the bundles merged, by Candidate.Key.
 	merged map[string]*MergedBundle
@@ -346,7 +349,7 @@ type FailedBundle struct {
 func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	st := im.caches[cacheID]
 	if st == nil {
-		st = &cacheState{}
+		st = &cacheState{sync: make(chan struct{}, 1)}
 		im.caches[cacheID] = st
 	}
 	if st.merged != nil && st.generation > generation {
@@ -366,56 +369,20 @@ func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	return st
 }
 
-// syncLock serializes the syncs of one engine cache, from any of its
-// connections and across its states: a one-slot semaphore, so a sync waits
-// for it only as long as its context lives. It is keyed by cache ID outside
-// the cache's state, so a sync after a Forget (as when a wipe is reported
-// while a sync runs) waits for the sync still running on the forgotten
-// state; that one finds its state gone and stops with errStateReset.
-type syncLock struct {
-	slot chan struct{}
-	// refs counts the syncs holding or waiting for the lock. Guarded by
-	// Importer.mu.
-	refs int
-}
-
-// syncLockLocked returns cacheID's sync lock, counting the caller as a user
-// until it calls releaseSyncLock. Requires mu.
-func (im *Importer) syncLockLocked(cacheID string) *syncLock {
-	l := im.syncLocks[cacheID]
-	if l == nil {
-		l = &syncLock{slot: make(chan struct{}, 1)}
-		im.syncLocks[cacheID] = l
-	}
-	l.refs++
-	return l
-}
-
-// releaseSyncLock ends a use syncLockLocked counted, and drops the lock when
-// no sync holds or waits for it, so the map holds only locks in use.
-func (im *Importer) releaseSyncLock(cacheID string, l *syncLock) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	l.refs--
-	if l.refs == 0 && im.syncLocks[cacheID] == l {
-		delete(im.syncLocks, cacheID)
-	}
-}
-
-// lock takes the sync lock, waiting for the sync that holds it only while
-// ctx lives, and returns the context's cause when it ends. A ctx already
-// done when the call starts returns its cause without taking the lock, even
-// a free one. One that ends while the lock is taken may win the select
-// against a free slot, so ctx is checked again after, and the slot given
-// back.
-func (l *syncLock) lock(ctx context.Context) error {
+// lockSync takes the cache's sync lock, waiting for the sync that holds it
+// only while ctx lives, and returns the context's cause when it ends. A ctx
+// already done when the call starts returns its cause without taking the
+// lock, even a free one. One that ends while the lock is taken may win the
+// select against a free slot, so ctx is checked again after, and the slot
+// given back.
+func (st *cacheState) lockSync(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
 	select {
-	case l.slot <- struct{}{}:
+	case st.sync <- struct{}{}:
 		if ctx.Err() != nil {
-			<-l.slot
+			<-st.sync
 			return context.Cause(ctx)
 		}
 		return nil
@@ -424,12 +391,11 @@ func (l *syncLock) lock(ctx context.Context) error {
 	}
 }
 
-// unlock releases the sync lock lock took, once.
-func (l *syncLock) unlock() { <-l.slot }
+// unlockSync releases the sync lock lockSync took, once.
+func (st *cacheState) unlockSync() { <-st.sync }
 
 // Forget drops what the importer knows of an engine cache, as when its cache
-// was wiped. The cache's sync lock stays while a sync holds or waits for it,
-// so a later sync waits for one still running.
+// was wiped.
 func (im *Importer) Forget(cacheID string) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
@@ -480,17 +446,14 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	cacheID, generation := eng.CacheID(), eng.Generation()
 	im.mu.Lock()
 	st := im.stateLocked(cacheID, generation)
+	im.mu.Unlock()
 	if st == nil {
-		im.mu.Unlock()
 		return res, errStateReset
 	}
-	l := im.syncLockLocked(cacheID)
-	im.mu.Unlock()
-	defer im.releaseSyncLock(cacheID, l)
-	if err := l.lock(ctx); err != nil {
+	if err := st.lockSync(ctx); err != nil {
 		return res, err
 	}
-	defer l.unlock()
+	defer st.unlockSync()
 	// The state may have moved on while this sync waited for the lock.
 	im.mu.Lock()
 	current := im.currentLocked(eng, st)

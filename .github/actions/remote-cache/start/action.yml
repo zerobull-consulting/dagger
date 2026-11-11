@@ -4,7 +4,7 @@ description: >-
   service and a stock engine of the same version on this runner, and puts a
   wrapper of the CLI first on PATH for later steps; ready once the service
   has welcomed the engine and its first import sync is done (or 30s after
-  the welcome, with a warning). The sidecar is stopped, flushing its exports, at
+  the welcome, with a warning). The sidecar is stopped, draining its exports, at
   the end of the job, whatever happened; remote-cache/stop stops it earlier.
 
 inputs:
@@ -64,21 +64,17 @@ inputs:
     description: "The namespace entries are stored in and imported from (the service's -scope)"
     required: false
     default: "default"
-  settle-timeout:
+  drain-timeout:
     description: >-
-      How long the stop's flush may take: before it stops the engine, the
-      stop asks the service, still fully up, to export what is pending for
-      the engine now (POST /v1/engines/flush), for up to this, a duration
-      such as 10s or 2m, at most 10m. 0 skips the flush. A flush that times
-      out or gets no answer is reported, and doesn't fail the stop. The stop
-      at the end of the job is not a step of yours, so it has no
+      How long the stop lets the service finish its exports (-drain-timeout).
+      The stop at the end of the job is not a step of yours, so it has no
       timeout-minutes of its own: the job's timeout bounds it, so set one
-      above the job's work plus this plus 3 minutes (the flush, then the
-      engine's stop, cut off at 90s, then the service's, then the cleanup).
-      (drain-timeout is gone: a workflow that still passes it gets an
-      unexpected-input warning, and it is ignored.)
+      above the job's work plus this plus 2 minutes (the drain's wait, this
+      plus 5s, then the engine's stop, cut off at 90s, then the cleanup). As a
+      last resort the shim also kills a stop that runs past this plus 5
+      minutes and 25s.
     required: false
-    default: "10s"
+    default: "10m"
   name:
     description: >-
       Prefix of the containers, volume and network; set another one to run a
@@ -222,7 +218,7 @@ runs:
         SIDECAR_CLI: ${{ steps.cli.outputs.cli }}
         SIDECAR_SERVICE_IMAGE: ${{ inputs.service-image }}
         SIDECAR_NAMESPACE: ${{ inputs.namespace }}
-        SIDECAR_SETTLE_TIMEOUT: ${{ inputs.settle-timeout }}
+        SIDECAR_DRAIN_TIMEOUT: ${{ inputs.drain-timeout }}
         SIDECAR_NAME: ${{ inputs.name }}
         SIDECAR_DEBUG_PORT: ${{ inputs.debug-port }}
         SIDECAR_VERBOSE: ${{ inputs.verbose }}
