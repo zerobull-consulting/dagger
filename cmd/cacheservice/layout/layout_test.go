@@ -61,13 +61,17 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// Only blob keys may hold incomplete multipart uploads: promotions start
-// them, at the digest key.
+// Only blob and staging keys may hold incomplete multipart uploads:
+// promotions start them, at the digest key, and at the staging key of a
+// large service-hashed blob's private copy.
 func TestIsUploadRel(t *testing.T) {
 	if !IsUploadRel(BlobRel(d)) {
 		t.Error("blob key refused")
 	}
-	for _, rel := range []string{StagingRel(stage, d), IndexName, BundleRel(id), "backups/db.tar"} {
+	if !IsUploadRel(StagingRel(stage, d)) {
+		t.Error("staging key refused")
+	}
+	for _, rel := range []string{StagingRel(stage, d) + "/x", "staging/" + stage, IndexName, BundleRel(id), "backups/db.tar"} {
 		if IsUploadRel(rel) {
 			t.Errorf("upload at %q accepted", rel)
 		}

@@ -392,7 +392,9 @@ the writers and GC both use:
 <prefix>/ns/<ns>/conditional-write-check/<16 hex>         the startup probe, deleted after it
 ```
 
-Incomplete multipart uploads exist only at blob keys (a promotion's copy).
+Incomplete multipart uploads exist only at blob keys (a promotion's copy)
+and at staging keys (the private copy a service-hashed promotion makes of a
+blob over 5 GiB, see [Verification and promotion](#verification-and-promotion)).
 Namespaces live only under `ns/`, with the names
 [the tokens file](#the-tokens-file) takes. Anything else under the prefix
 isn't the service's.
@@ -632,8 +634,9 @@ and reaches the blob's digest key only once the service has checked its
 content ([#23](https://github.com/zerobull-consulting/dagger/issues/23)).
 Usually the store hashes it as it copies it; the exception is a
 service-hashed promotion (a blob over 5 GiB, `CACHESERVICE_S3_HASH_IN_SERVICE`,
-or a store that returns no checksum), which reads the blob once through the
-service, over its network to S3, with a 32 KiB buffer (see
+or a store that returns no checksum), which copies the blob to a private key
+in the store, and reads that copy once through the service, over its network
+to S3, with a 32 KiB buffer (see
 [Verification and promotion](#verification-and-promotion)).
 
 **Keys.** The service uses each namespace's view of the store (`Namespace`),
@@ -714,22 +717,33 @@ and so does AWS S3 for objects up to 5 GB (`TestMinIOStoreHashesCopies`).
   the service.
 - A blob over 5 GiB needs several parts (`UploadPartCopy`'s limit), whose
   checksums are per part and can't be combined into the blob's. The service
-  then reads the staged object and hashes it itself, and copies it in parts
-  of 1 GiB (larger when that would make over S3's 10,000 parts), each
-  conditioned on the ETag it read (`CopySourceIfMatch`), so a staged object
-  overwritten in between is not what gets promoted
-  (`TestMinIOPromoteManyParts`, with the limits lowered to 5 MiB). A store
-  may ignore that condition, as DigitalOcean Spaces does, so the service also
-  takes each part's MD5 as it reads and compares it with the ETag the store
-  returns for that part's copy. A difference is a mismatch, and the upload
-  never completes (`TestPromoteChecksCopiedParts`,
-  `TestMinIOPromoteStagedOverwritten`). This can't apply to a store whose
-  ETags aren't MD5s, such as AWS S3 with SSE-KMS; the staged object's own ETag
-  shows that, and only the condition protects the copy there. Since MD5 isn't
-  collision resistant, someone who holds the presigned PUT, prepares a
-  same-MD5 pair and wins the race could still get past it on a store that
-  ignores the condition
-  ([zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)).
+  then hashes it itself, from a **private copy**: it first copies the staged
+  object to a staging key under a stage of its own
+  (`<prefix>/ns/<ns>/staging/<new stage>/<alg>/<hex>`), new for the
+  promotion and never presigned, so no upload URL reaches it. It reads and
+  hashes that copy, and copies it to the digest key in parts of 1 GiB
+  (larger when that would make over S3's 10,000 parts). What reaches the
+  digest key is what the service hashed, even when someone who holds the
+  still-valid presigned PUT overwrites the staged object meanwhile
+  (`TestPromoteHashesPrivateCopy`, `TestMinIOPromoteStagedOverwritten`,
+  `TestMinIOPromoteManyParts` with the limits lowered to 5 MiB). Nothing
+  rests on a store condition or an ETag: a store that ignores
+  `CopySourceIfMatch` (DigitalOcean Spaces does), a same-MD5 pair, or ETags
+  that aren't MD5s (AWS S3 with SSE-KMS) change nothing
+  (`TestPromoteSameMD5Overwrite`, `TestPromoteNonMD5ETagsIgnoredCondition`;
+  before, the service hashed the staged object and compared each copied
+  part's ETag with its MD5,
+  [zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)).
+  The copy to the private key is one `CopyObject` up to 5 GiB, else a
+  multipart upload of part copies at the private key. It is still
+  conditioned on the staged object's ETag, so a store that honors the
+  condition fails early on an overwrite; one that doesn't makes a copy
+  that doesn't hash to the digest, a mismatch. The private copy is deleted
+  once the promotion is over; one a stopped service leaves is an ordinary
+  staged upload, which the [lifecycle rule](#lifecycle-rule-for-staging) or
+  GC expires, and a multipart copy it leaves is aborted the same way as a
+  promotion's at a blob key. The cost is one more copy in the store per
+  service-hashed blob.
 - So is every blob with `CACHESERVICE_S3_HASH_IN_SERVICE=true`, for a store
   whose copy checksums can't be trusted, and every blob once a store returns
   a part copy without a checksum: the service then hashes from that point
@@ -753,22 +767,25 @@ service-hashed one streams the object through a 32 KiB buffer, so at most
 
 **Time to promotion.** A blob reaches the shared cache after the engine's
 `uploaded` reply (which waits for every upload of the export), plus its own
-promotion. Promotion costs a fixed ~13 ms (6 requests: a HEAD of each key, the
-multipart upload's create, copy and complete, and the staged object's
-delete) plus the copy, which grows with the size. Measured against the local MinIO
-(`TestMinIOPromoteLatency`, 2026-11-02; `CACHESERVICE_TEST_PROMOTE_MB=1024`
-adds the 1 GiB row, which takes about 50s and writes 4 GiB):
+promotion. A store-hashed promotion costs a fixed ~13 ms (6 requests: a HEAD
+of each key, the multipart upload's create, copy and complete, and the staged
+object's delete) plus the copy, which grows with the size. A service-hashed
+one makes 3 more requests (the private copy, its read, and its delete) and
+copies the blob twice. Measured against the local MinIO
+(`TestMinIOPromoteLatency`, 2026-11-11, after the private copy;
+`CACHESERVICE_TEST_PROMOTE_MB=1024` adds the 1 GiB row, which takes about
+40s and writes 5 GiB):
 
 | Blob size | Store-hashed | Service-hashed |
 | --- | --- | --- |
-| 64 KiB | 13 ms | 14 ms |
-| 1 MiB | 20 ms | 21 ms |
-| 16 MiB | 103 ms | 147 ms |
-| 64 MiB | 381 ms | 465 ms |
-| 1 GiB | 5.5 s | 6.9 s |
+| 64 KiB | 13 ms | 17 ms |
+| 1 MiB | 14 ms | 27 ms |
+| 16 MiB | 74 ms | 162 ms |
+| 64 MiB | 251 ms | 710 ms |
+| 1 GiB | 3.6 s | 8.5 s |
 
-So roughly `13 ms + size / 185 MiB/s` when the store hashes, and
-`13 ms + size / 150 MiB/s` when the service does, on one local disk. Store
+So roughly `13 ms + size / 285 MiB/s` when the store hashes, and
+`17 ms + size / 120 MiB/s` when the service does, on one local disk. Store
 copies on AWS S3 run in the store, at its internal copy rate; a
 service-hashed promotion also reads the blob once over the service's network
 to S3. `blob_promotion_duration_seconds` measures it in production (see
@@ -964,7 +981,7 @@ under S3's 255; `CheckSafe` checks every ID again before writing.
 `InvalidArgument`, see `hack/remote-cache/README.md`, "What each store
 does"). `apply` fails, writes nothing, and names that as the likely cause
 of a 400: run it with `-abort-rule=false` there. MinIO drops stale uploads itself after 24 hours (its `api
-stale_uploads_expiry`), and GC aborts stale ones at blob keys. A Spaces key
+stale_uploads_expiry`), and GC aborts stale ones at blob and staging keys. A Spaces key
 that isn't full-access gets 403, which `apply` explains as needing the admin
 key. Tested against MinIO (`TestMinIOLifecycle`: plan, apply, a foreign rule
 kept, a second apply writing nothing, a removed namespace losing its rule
@@ -1058,7 +1075,8 @@ static credentials,
 (false) from `CACHESERVICE_S3_*`. Without static credentials it uses the AWS
 SDK's default chain. The service's credentials need `s3:GetObject` and
 `s3:DeleteObject` on staging keys (a copy reads its source), `s3:PutObject`
-and `s3:AbortMultipartUpload` on digest keys (the multipart copy), besides
+and `s3:AbortMultipartUpload` on digest keys (the multipart copy) and on
+staging keys (a service-hashed promotion's private copy), besides
 what the metadata store needs, and what garbage collection needs (see
 [Retention and garbage collection](#retention-and-garbage-collection)). The
 startup's ownership check needs `s3:ListBucket` on the prefix, and, on an
@@ -2847,8 +2865,15 @@ the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
   and removes `gc_staging_rule_missing` (`TestStagingRuleMetricUnknown`).
 
 Stale incomplete multipart uploads (`ListMultipartUploads`) at a
-namespace's blob keys are aborted whatever the rules (`TestStagingAndUploads`,
-`TestMinIOGC`). An upload anywhere else is not the service's: it is never
+namespace's blob keys, and at its staging keys (the private copy of a
+service-hashed promotion over 5 GiB), are aborted whatever the rules
+(`TestStagingAndUploads`, `TestMinIOGC`). An image from before
+[zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)
+takes an upload at a staging key for a violation: during a rolling upgrade,
+or after a rollback, its GC skips a namespace while such an upload is there
+(a large service-hashed promotion in progress, or one a stopped service
+left, until the abort rule or a newer GC aborts it), and deletes nothing in
+it. An upload anywhere else is not the service's: it is never
 aborted, at any age, and stops collection as any unexpected key does
 (`TestUnexpectedUploadNeverAborted`, `TestMinIOGCOwnership`); the bucket's
 own abort rule, if it has one, still applies to it. MinIO lists

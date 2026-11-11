@@ -43,7 +43,8 @@ func (u *unexpected) add(key string) {
 type survey struct {
 	// namespaces are the valid names under ns/ that hold objects.
 	namespaces []string
-	// uploads are the incomplete multipart uploads at blob keys, by
+	// uploads are the incomplete multipart uploads at blob and staging
+	// keys (layout.IsUploadRel), by
 	// namespace; badUploads those in a namespace at keys of no known
 	// shape.
 	uploads    map[string][]Upload
