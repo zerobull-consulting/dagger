@@ -43,7 +43,6 @@ type artifactExecutionItem struct {
 	Path          []string
 	Directives    []string
 	LoadError     string
-	CheckGroup    string
 	Workspace     *struct{ ID core.ID }
 	DimensionKeys []struct{ Dimension string }
 }
@@ -66,22 +65,16 @@ func evaluateArtifacts(ctx context.Context, dag *dagger.Client, artifacts *core.
 	var response struct {
 		Selection struct{ Items []artifactExecutionItem }
 	}
-	query := `query($id: ID!) { selection: node(id: $id) { ... on Artifacts {
-		 items: __evaluationItems { id uri(dimensionKeys: true) path directives loadError checkGroup: __checkGroup workspace { id } dimensionKeys { dimension } }
-		} } }`
-	err = dag.Do(preparationCtx, &dagger.Request{Query: query, Variables: map[string]any{"id": id}}, &dagger.Response{Data: &response})
-	if isMissingCheckGroupField(err) {
-		// Older engines keep their existing reporting behavior.
-		query = strings.Replace(query, "checkGroup: __checkGroup ", "", 1)
-		err = dag.Do(preparationCtx, &dagger.Request{Query: query, Variables: map[string]any{"id": id}}, &dagger.Response{Data: &response})
-	}
+	err = dag.Do(preparationCtx, &dagger.Request{
+		Query: `query($id: ID!) { selection: node(id: $id) { ... on Artifacts {
+		 items: __evaluationItems { id uri(dimensionKeys: true) path directives loadError workspace { id } dimensionKeys { dimension } }
+		} } }`, Variables: map[string]any{"id": id},
+	}, &dagger.Response{Data: &response})
 	if err != nil {
 		finishArtifactPreparation(ctx, err)
 		return nil, err
 	}
 	finishArtifactPreparation(ctx, nil)
-	groups := newCheckGroups(ctx, response.Selection.Items)
-	defer groups.close()
 	results := make([]artifactValueResult, len(response.Selection.Items))
 	// Each With method copies the job list. Configure each job from empty
 	// defaults and collect it once, so building the list stays linear.
@@ -102,11 +95,7 @@ func evaluateArtifacts(ctx context.Context, dag *dagger.Client, artifacts *core.
 		if isGenerator {
 			attrs = append(attrs, attribute.String(telemetry.GeneratorNameAttr, item.URI))
 		}
-		job := defaults.WithTracing(!isCheck).WithRollupLogs(!isGenerator).WithJob(item.URI, func(ctx context.Context) (jobErr error) {
-			if group := groups[item.checkGroupKey()]; group != nil {
-				ctx = group.context(ctx)
-				defer func() { group.finish(jobErr) }()
-			}
+		job := defaults.WithTracing(!isCheck).WithRollupLogs(!isGenerator).WithJob(item.URI, func(ctx context.Context) error {
 			err := ctx.Err()
 			if err == nil && limit != nil && !remote {
 				err = limit.Acquire(ctx, 1)

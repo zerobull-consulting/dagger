@@ -256,13 +256,10 @@ defmodule Dagger.File do
   @doc """
   Force evaluation in the engine.
   """
-  @spec sync(t(), [{:key_by_content, boolean() | nil}]) ::
-          {:ok, Dagger.File.t()} | {:error, term()}
-  def sync(%__MODULE__{} = file, optional_args \\ []) do
+  @spec sync(t()) :: {:ok, Dagger.File.t()} | {:error, term()}
+  def sync(%__MODULE__{} = file) do
     query_builder =
-      file.query_builder
-      |> QB.select("sync")
-      |> QB.maybe_put_arg("keyByContent", optional_args[:key_by_content])
+      file.query_builder |> QB.select("sync")
 
     with {:ok, id} <- Client.execute(file.client, query_builder) do
       {:ok,

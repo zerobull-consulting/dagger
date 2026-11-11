@@ -4,8 +4,6 @@ import (
 	_ "embed"
 	"strings"
 
-	"dagger.io/dagger/core"
-
 	"dagger/engine-dev/consts"
 	"dagger/engine-dev/internal/dagger"
 )
@@ -35,18 +33,18 @@ func (build *Builder) qemuBins() (*dagger.Directory, []string) {
 		names = append(names, "buildkit-qemu-"+arch)
 	}
 
-	src := core.HTTP(
+	src := dag.HTTP(
 		"https://download.qemu.org/qemu-"+consts.QemuVersion+".tar.xz",
 		dagger.HTTPOpts{Checksum: consts.QemuChecksum},
 	)
 	// tonistiigi/binfmt's patches make execve in an emulated process re-run
 	// QEMU on the new program, so emulation works without binfmt_misc. Ours
 	// on top runs host binaries directly instead of emulating them.
-	binfmtPatches := core.Git("https://github.com/tonistiigi/binfmt").
+	binfmtPatches := dag.Git("https://github.com/tonistiigi/binfmt").
 		Commit(consts.BinfmtCommit).
 		Tree().
 		Directory("patches")
-	patches := core.NewDirectory().
+	patches := dag.Directory().
 		WithDirectory("0-cpu-max-arm", binfmtPatches.Directory("cpu-max-arm")).
 		WithDirectory("1-meson", binfmtPatches.Directory("meson")).
 		WithDirectory("2-direct-execve", binfmtPatches.Directory("buildkit-direct-execve-v"+consts.QemuPatchSeries)).
@@ -54,12 +52,12 @@ func (build *Builder) qemuBins() (*dagger.Directory, []string) {
 
 	// Cross-compile on the build platform with xx rather than building under
 	// emulation for other target platforms.
-	return core.NewContainer().
+	return dag.Container().
 		From(consts.AlpineImage).
 		WithExec([]string{"apk", "add", "--no-cache",
 			"clang", "lld", "llvm", "make", "ninja", "pkgconf", "python3", "perl", "bash", "patch", "xz",
 		}).
-		WithDirectory("/", core.NewContainer().From(consts.XxImage).Rootfs()).
+		WithDirectory("/", dag.Container().From(consts.XxImage).Rootfs()).
 		WithEnvVariable("TARGETPLATFORM", string(build.platform)).
 		// The target packages' install scripts would run target binaries;
 		// static linking doesn't need them.

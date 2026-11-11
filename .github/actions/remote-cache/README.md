@@ -33,7 +33,7 @@ jobs:
           # A job on the default branch. A pull-request job's is the same,
           # with role: read-only and a read-only key.
           role: writer
-          version: v1.0.0-beta.26   # the engine and the CLI; optional, see below
+          version: v1.0.0-beta.25   # the engine and the CLI; optional, see below
           s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
           s3-region: ${{ vars.CACHE_S3_REGION }}
           s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -140,7 +140,7 @@ of its own.
 | Input | Required | Default | What it is |
 | --- | --- | --- | --- |
 | `role` | yes | | `writer`: exports what the job builds, with `-gc-mode=batch` (scheduled GC is a job of its own, [zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)). `read-only`: `-export=false`, never writes to or deletes from the bucket; give it a [read-only key](../../../cmd/cacheservice/README.md#a-read-only-key). |
-| `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.26`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the CLI, the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
+| `version` | no | the manifest's first `accept` line | The engine version, such as `v1.0.0-beta.25`: an `accept` line of `cmd/cacheservice/compat/engines.txt` at the action's commit. Selects the CLI, the engine (by the manifest's digest) and the service (`dagger-remote-cache:<version>`). |
 | `service-image` | no | `ghcr.io/zerobull-consulting/dagger-remote-cache:<version>` | Overrides the service image. The step fails if it refuses the engine. |
 | `s3-endpoint`, `s3-region`, `s3-bucket` | yes | | The store. |
 | `s3-access-key-id`, `s3-secret-access-key` | yes | | The key, from the caller's secrets. Never defaulted. A `Read/Write/Delete` key for a writer, a `Read` key for a read-only sidecar; **never the admin key** that sets lifecycle rules (on Spaces, a full-access key): the action never sets them, so no job needs it ([The keys](../../../cmd/cacheservice/README.md#the-keys)). |
@@ -274,17 +274,6 @@ stop, so a long drain can be cut off then; set a shorter `drain-timeout`
 where cancelled jobs matter. The shim passes a SIGINT, SIGTERM or SIGHUP it
 gets on to the script's whole process group, and `sidecar.sh` traps none, so
 a start or stop that gets one ends at once, its cleanup with it.
-
-**What the stop can't store.** Since `v1.0.0-beta.26` an engine gives up
-its remote-cache work 20s after its last session ended, if an export is
-still running then, and takes it up again only when a session starts. In a
-job there is none after the last `dagger` call, so what the engine hadn't
-finished exporting by then, such as a large layer on a slow link, is not
-stored by this job: the drain doesn't wait for it, logs
-`drain: left for an engine that gave up its remote-cache work` with the
-count, and still ends `complete`. The store is left whole, and a later job
-that builds the same values exports them (see
-[Engines from v1.0.0-beta.26](../../../cmd/cacheservice/README.md#engines-from-v100-beta26)).
 
 ## stop
 

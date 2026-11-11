@@ -48,12 +48,13 @@ func newBuildkitClient(ctx context.Context, remote *url.URL, connector drivers.C
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	info, err := c.WaitInfo(ctx)
-	if err != nil {
+	if err := c.Wait(ctx); err != nil {
 		return nil, nil, err
 	}
-	if info == nil {
-		return nil, nil, fmt.Errorf("remote is not a valid dagger server (no info API)")
+
+	info, err := c.Info(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if info.BuildkitVersion.Package != engine.Package {

@@ -40,6 +40,7 @@ type scratchObservedManager struct {
 	calls        atomic.Int64
 	failScratch  atomic.Bool
 	failCanceled atomic.Bool
+	failPin      atomic.Bool
 	failSync     atomic.Bool
 	afterScratch func()
 	mu           sync.Mutex
@@ -77,6 +78,9 @@ func (m *scratchObservedManager) GetBySnapshotID(ctx context.Context, id string,
 }
 
 func (m *scratchObservedManager) PinSnapshot(ctx context.Context, id string) (bkcache.ImmutableRef, error) {
+	if m.failPin.Swap(false) {
+		return nil, errScratchTest
+	}
 	return m.observe(m.SnapshotManager.PinSnapshot(ctx, id))
 }
 
@@ -228,7 +232,7 @@ func TestScratchDirectoryLazyOperation(t *testing.T) {
 }
 
 func TestScratchDirectoryAcquisition(t *testing.T) {
-	for _, mode := range []string{"cold", "canonical-only", "warm", "pending-restart", "manager-failure", "manager-canceled", "sync-retry"} {
+	for _, mode := range []string{"cold", "canonical-only", "warm", "pending-restart", "manager-failure", "manager-canceled", "prepare-failure", "sync-retry"} {
 		t.Run(mode, func(t *testing.T) {
 			aStore, bStore := testutil.NewStore(t), testutil.NewStore(t)
 			actx, a, asrv := scratchTestCache(t, aStore, "", "a")
@@ -300,11 +304,14 @@ func TestScratchDirectoryAcquisition(t *testing.T) {
 			if mode == "manager-canceled" {
 				observed.failCanceled.Store(true)
 			}
+			if mode == "prepare-failure" {
+				observed.failPin.Store(true)
+			}
 			if mode == "sync-retry" {
 				observed.failSync.Store(true)
 			}
 			started := time.Now()
-			if mode == "manager-failure" || mode == "manager-canceled" || mode == "sync-retry" {
+			if mode == "manager-failure" || mode == "manager-canceled" || mode == "prepare-failure" || mode == "sync-retry" {
 				err := b.Evaluate(ctx, result)
 				if mode == "manager-canceled" {
 					require.ErrorIs(t, err, context.Canceled)
@@ -337,11 +344,11 @@ func TestScratchDirectoryAcquisition(t *testing.T) {
 			if mode == "warm" {
 				want = 0
 			}
-			if mode == "manager-failure" || mode == "manager-canceled" {
+			if mode == "manager-failure" || mode == "manager-canceled" || mode == "prepare-failure" {
 				want = 2
 			}
 			require.EqualValues(t, want, observed.calls.Load())
-			require.Zero(t, scratchCount(t, ctx, b, "b", row), "the merged scratch directory is computed by its recipe, never searched for")
+			require.Equal(t, want, scratchCount(t, ctx, b, "b", row))
 			t.Logf("scratch mode=%s acquisition=%s scratch-calls=%d provider-reads=0", mode, time.Since(started), observed.calls.Load())
 			entries := demandedDirectoryEntries(t, ctx, result)
 			require.Empty(t, entries)

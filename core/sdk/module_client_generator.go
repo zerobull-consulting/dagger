@@ -28,7 +28,9 @@ func (sdk *clientGeneratorModule) RequiredClientGenerationFiles(
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize sdk module %s required client generation files: %w", sdk.mod.mod.Self().Name(), err)
 	}
-	err = sdkInst.selectSDK(ctx, &res, dagql.Selector{
+	dag := sdkInst.dag
+
+	err = dag.Select(ctx, sdkInst.sdk, &res, dagql.Selector{
 		Field: "requiredClientGenerationFiles",
 	})
 
@@ -84,7 +86,7 @@ func (sdk *clientGeneratorModule) GenerateClient(
 		},
 	}
 
-	err = sdkInst.selectSDK(ctx, &inst, dagql.Selector{
+	err = dag.Select(ctx, sdkInst.sdk, &inst, dagql.Selector{
 		Field: "generateClient",
 		Args:  generateClientsArgs,
 	})

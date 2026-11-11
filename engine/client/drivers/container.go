@@ -397,10 +397,6 @@ func (d containerConnector) EngineID() string {
 	return ""
 }
 
-func (d containerConnector) ClaimID() string {
-	return ""
-}
-
 const (
 	// trim image digests to 16 characters to makeoutput more readable
 	hashLen                      = 16

@@ -139,7 +139,7 @@ func (l *Loader) namedSDK(
 
 	switch sdkNamedParsed {
 	case sdkGo:
-		return l.loadBuiltinGoSDK(ctx, root, sdk)
+		return &goSDK{root: root, rawConfig: sdk.Config}, nil
 	case sdkDang:
 		return &dangSDK{root: root, rawConfig: sdk.Config}, nil
 	case sdkPython:

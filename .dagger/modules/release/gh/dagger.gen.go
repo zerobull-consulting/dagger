@@ -3,25 +3,35 @@
 package main
 
 import (
-	core "dagger.io/dagger/core"
-
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"os"
+	"sort"
 
-	"github.com/dagger/querybuilder"
+	telemetry "github.com/dagger/otel-go"
+	"github.com/vektah/gqlparser/v2/gqlerror"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"dagger/gh/internal/dagger"
+
+	"github.com/dagger/querybuilder"
 )
+
+var dag = dagger.Connect()
 
 func Tracer() trace.Tracer {
 	return otel.Tracer("dagger.io/sdk.go")
 }
 
+// used for local MarshalJSON implementations
 var marshalCtx = context.Background()
 
+// called by main()
 func setMarshalContext(ctx context.Context) {
 	marshalCtx = ctx
 	dagger.SetMarshalContext(ctx)
@@ -34,8 +44,13 @@ type DaggerObject interface {
 
 type ExecError = dagger.ExecError
 
-func ptr[T any](v T) *T { return &v }
+// ptr returns a pointer to the given value.
+func ptr[T any](v T) *T {
+	return &v
+}
 
+// convertSlice converts a slice of one type to a slice of another type using a
+// converter function
 func convertSlice[I any, O any](in []I, f func(I) O) []O {
 	out := make([]O, len(in))
 	for i, v := range in {
@@ -222,33 +237,99 @@ func (r *Latest) UnmarshalJSON(bs []byte) error {
 	return nil
 }
 
-func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, fnName string, inputArgs map[string][]byte) (_ any, err error) {
-	setMarshalContext(ctx)
-	_ = inputArgs
-	if parentName == "" {
-		switch fnName {
-		case "Gh", "gh":
-			parentName = "Gh"
-			fnName = ""
-		case "PullRequest", "pullRequest":
-			parentName = "PullRequest"
-			fnName = ""
-		case "PullRequestReview", "pullRequestReview":
-			parentName = "PullRequestReview"
-			fnName = ""
-		case "Release", "release":
-			parentName = "Release"
-			fnName = ""
-		case "Repo", "repo":
-			parentName = "Repo"
-			fnName = ""
-		}
+func main() {
+	ctx := context.Background()
+
+	// Direct slog to the new stderr. This is only for dev time debugging, and
+	// runtime errors/warnings.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	})))
+
+	if err := dispatch(ctx); err != nil {
+		os.Exit(2)
 	}
+}
+
+func convertError(rerr error) *dagger.Error {
+	if gqlErr := findSingleGQLError(rerr); gqlErr != nil {
+		dagErr := dag.Error(gqlErr.Message)
+		if gqlErr.Extensions != nil {
+			keys := make([]string, 0, len(gqlErr.Extensions))
+			for k := range gqlErr.Extensions {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				val, err := json.Marshal(gqlErr.Extensions[k])
+				if err != nil {
+					fmt.Println("failed to marshal error value:", err)
+				}
+				dagErr = dagErr.WithValue(k, dagger.JSON(val))
+			}
+		}
+		return dagErr
+	}
+	return dag.Error(rerr.Error())
+}
+
+func findSingleGQLError(rerr error) *gqlerror.Error {
+	switch x := rerr.(type) {
+	case *gqlerror.Error:
+		return x
+	case interface{ Unwrap() []error }:
+		return nil
+	case interface{ Unwrap() error }:
+		return findSingleGQLError(x.Unwrap())
+	default:
+		return nil
+	}
+}
+func dispatch(ctx context.Context) (rerr error) {
+	ctx = telemetry.InitEmbedded(ctx, resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("dagger-go-sdk"),
+		// TODO version?
+	))
+	defer telemetry.Close()
+
+	// A lot of the "work" actually happens when we're marshalling the return
+	// value, which entails getting object IDs, which happens in MarshalJSON,
+	// which has no ctx argument, so we use this lovely global variable.
+	setMarshalContext(ctx)
+
+	fnCall := dag.CurrentFunctionCall()
+	defer func() {
+		if rerr != nil {
+			if err := fnCall.ReturnError(ctx, convertError(rerr)); err != nil {
+				fmt.Println("failed to return error:", err, "\noriginal error:", rerr)
+			}
+		}
+	}()
+
+	parentName, fnName, parentJson, inputArgs, err := fnCall.DispatchInputs(ctx)
+	if err != nil {
+		return fmt.Errorf("get fn call: %w", err)
+	}
+
+	result, err := invoke(ctx, parentJson, parentName, fnName, inputArgs)
+	if err != nil {
+		return err
+	}
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	if err := fnCall.ReturnValue(ctx, dagger.JSON(resultBytes)); err != nil {
+		return fmt.Errorf("store return value: %w", err)
+	}
+	return nil
+}
+func invoke(ctx context.Context, parentJSON []byte, parentName string, fnName string, inputArgs map[string][]byte) (_ any, err error) {
+	_ = inputArgs
 	switch parentName {
 	case "Gh":
-		if fnName == "New" {
-			fnName = ""
-		}
 		switch fnName {
 		case "Clone":
 			var parent Gh
@@ -277,7 +358,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg args", err))
 				}
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -326,7 +407,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg cmd", err))
 				}
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -347,7 +428,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			if err != nil {
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -368,7 +449,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			if err != nil {
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
-			var caCert *core.File
+			var caCert *dagger.File
 			if inputArgs["caCert"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["caCert"]), &caCert)
 				if err != nil {
@@ -424,7 +505,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			if err != nil {
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
-			var source *core.Directory
+			var source *dagger.Directory
 			if inputArgs["source"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["source"]), &source)
 				if err != nil {
@@ -438,7 +519,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			if err != nil {
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -452,7 +533,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			if err != nil {
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -473,14 +554,14 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg host", err))
 				}
 			}
-			var caCert *core.File
+			var caCert *dagger.File
 			if inputArgs["caCert"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["caCert"]), &caCert)
 				if err != nil {
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg caCert", err))
 				}
 			}
-			var source *core.Directory
+			var source *dagger.Directory
 			if inputArgs["source"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["source"]), &source)
 				if err != nil {
@@ -492,12 +573,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			return nil, fmt.Errorf("unknown function %s", fnName)
 		}
 	case "PullRequest":
-		if fnName == "New" {
-			fnName = ""
-		}
 		switch fnName {
-		case "":
-			return &PullRequest{}, nil
 		case "Create":
 			var parent PullRequest
 			err = json.Unmarshal(parentJSON, &parent)
@@ -525,7 +601,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg body", err))
 				}
 			}
-			var bodyFile *core.File
+			var bodyFile *dagger.File
 			if inputArgs["bodyFile"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["bodyFile"]), &bodyFile)
 				if err != nil {
@@ -602,7 +678,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg reviewers", err))
 				}
 			}
-			var template *core.File
+			var template *dagger.File
 			if inputArgs["template"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["template"]), &template)
 				if err != nil {
@@ -616,7 +692,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg title", err))
 				}
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -644,7 +720,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg pullRequest", err))
 				}
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -679,7 +755,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg body", err))
 				}
 			}
-			var bodyFile *core.File
+			var bodyFile *dagger.File
 			if inputArgs["bodyFile"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["bodyFile"]), &bodyFile)
 				if err != nil {
@@ -691,12 +767,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			return nil, fmt.Errorf("unknown function %s", fnName)
 		}
 	case "PullRequestReview":
-		if fnName == "New" {
-			fnName = ""
-		}
 		switch fnName {
-		case "":
-			return &PullRequestReview{}, nil
 		case "Approve":
 			var parent PullRequestReview
 			err = json.Unmarshal(parentJSON, &parent)
@@ -722,12 +793,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			return nil, fmt.Errorf("unknown function %s", fnName)
 		}
 	case "Release":
-		if fnName == "New" {
-			fnName = ""
-		}
 		switch fnName {
-		case "":
-			return &Release{}, nil
 		case "Create":
 			var parent Release
 			err = json.Unmarshal(parentJSON, &parent)
@@ -748,7 +814,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg title", err))
 				}
 			}
-			var files []*core.File
+			var files []*dagger.File
 			if inputArgs["files"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["files"]), &files)
 				if err != nil {
@@ -783,7 +849,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg notes", err))
 				}
 			}
-			var notesFile *core.File
+			var notesFile *dagger.File
 			if inputArgs["notesFile"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["notesFile"]), &notesFile)
 				if err != nil {
@@ -832,7 +898,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg notesFromTag", err))
 				}
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -858,12 +924,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 			return nil, fmt.Errorf("unknown function %s", fnName)
 		}
 	case "Repo":
-		if fnName == "New" {
-			fnName = ""
-		}
 		switch fnName {
-		case "":
-			return &Repo{}, nil
 		case "Clone":
 			var parent Repo
 			err = json.Unmarshal(parentJSON, &parent)
@@ -884,7 +945,7 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg args", err))
 				}
 			}
-			var token *core.Secret
+			var token *dagger.Secret
 			if inputArgs["token"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["token"]), &token)
 				if err != nil {
@@ -895,6 +956,198 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 		default:
 			return nil, fmt.Errorf("unknown function %s", fnName)
 		}
+	case "":
+		return dag.Module().
+			WithDescription("GitHub CLI\n").
+			WithObject(
+				dag.TypeDef().WithObject("Gh", dagger.TypeDefWithObjectOpts{SourceMap: dag.SourceMap("main.go", 12, 6)}).
+					WithFunction(
+						dag.Function("Clone",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Clone a GitHub repository.").
+							WithSourceMap(dag.SourceMap("main.go", 133, 1)).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("main.go", 137, 2)})).
+					WithFunction(
+						dag.Function("Exec",
+							dag.TypeDef().WithObject("Container")).
+							WithDescription("Run a GitHub CLI command (accepts a list of arguments without \"gh\").").
+							WithSourceMap(dag.SourceMap("main.go", 169, 1)).
+							WithArg("args", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)), dagger.FunctionWithArgOpts{Description: "Arguments to pass to GitHub CLI.", SourceMap: dag.SourceMap("main.go", 171, 2)}).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("main.go", 176, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("main.go", 181, 2)})).
+					WithFunction(
+						dag.Function("PullRequest",
+							dag.TypeDef().WithObject("PullRequest")).
+							WithDescription("Work with GitHub pull requests.").
+							WithSourceMap(dag.SourceMap("pull-request.go", 12, 1))).
+					WithFunction(
+						dag.Function("Release",
+							dag.TypeDef().WithObject("Release")).
+							WithDescription("Manage releases.").
+							WithSourceMap(dag.SourceMap("release.go", 12, 1))).
+					WithFunction(
+						dag.Function("Repo",
+							dag.TypeDef().WithObject("Repo")).
+							WithDescription("Work with GitHub repositories.").
+							WithSourceMap(dag.SourceMap("repo.go", 6, 1))).
+					WithFunction(
+						dag.Function("Run",
+							dag.TypeDef().WithObject("Container")).
+							WithDescription("Run a GitHub CLI command (accepts a single command string without \"gh\").").
+							WithSourceMap(dag.SourceMap("main.go", 151, 1)).
+							WithArg("cmd", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "Command to run.", SourceMap: dag.SourceMap("main.go", 153, 2)}).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("main.go", 158, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("main.go", 163, 2)})).
+					WithFunction(
+						dag.Function("Terminal",
+							dag.TypeDef().WithObject("Container")).
+							WithDescription("Open an interactive terminal.").
+							WithSourceMap(dag.SourceMap("main.go", 203, 1)).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("main.go", 207, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("main.go", 212, 2)})).
+					WithFunction(
+						dag.Function("WithCACert",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Set an additional CA certificate for the GitHub host.").
+							WithSourceMap(dag.SourceMap("main.go", 109, 1)).
+							WithArg("caCert", dag.TypeDef().WithObject("File"), dagger.FunctionWithArgOpts{Description: "Additional CA certificate for the GitHub host.", SourceMap: dag.SourceMap("main.go", 111, 2)})).
+					WithFunction(
+						dag.Function("WithGitExec",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Run a git command (accepts a list of arguments without \"git\").").
+							WithSourceMap(dag.SourceMap("main.go", 189, 1)).
+							WithArg("args", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)), dagger.FunctionWithArgOpts{Description: "Arguments to pass to GitHub CLI.", SourceMap: dag.SourceMap("main.go", 191, 2)})).
+					WithFunction(
+						dag.Function("WithHost",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Set a GitHub host as context.").
+							WithSourceMap(dag.SourceMap("main.go", 97, 1)).
+							WithArg("host", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "GitHub host.", SourceMap: dag.SourceMap("main.go", 99, 2)})).
+					WithFunction(
+						dag.Function("WithRepo",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Set a GitHub repository as context.").
+							WithSourceMap(dag.SourceMap("main.go", 85, 1)).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("main.go", 87, 2)})).
+					WithFunction(
+						dag.Function("WithSource",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Load a Git repository source (with .git directory).").
+							WithSourceMap(dag.SourceMap("main.go", 121, 1)).
+							WithArg("source", dag.TypeDef().WithObject("Directory"), dagger.FunctionWithArgOpts{Description: "Git repository source (with .git directory).", SourceMap: dag.SourceMap("main.go", 123, 2)})).
+					WithFunction(
+						dag.Function("WithToken",
+							dag.TypeDef().WithObject("Gh")).
+							WithDescription("Set a GitHub token.").
+							WithSourceMap(dag.SourceMap("main.go", 73, 1)).
+							WithArg("token", dag.TypeDef().WithObject("Secret"), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("main.go", 75, 2)})).
+					WithField("Source", dag.TypeDef().WithObject("Directory"), dagger.TypeDefWithFieldOpts{Description: "Git repository source (with .git directory).", SourceMap: dag.SourceMap("main.go", 34, 2)}).
+					WithConstructor(
+						dag.Function("New",
+							dag.TypeDef().WithObject("Gh")).
+							WithSourceMap(dag.SourceMap("main.go", 37, 1)).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("main.go", 41, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("main.go", 46, 2)}).
+							WithArg("host", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub host.", SourceMap: dag.SourceMap("main.go", 51, 2)}).
+							WithArg("caCert", dag.TypeDef().WithObject("File").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Additional CA certificate for the GitHub host.", SourceMap: dag.SourceMap("main.go", 56, 2)}).
+							WithArg("source", dag.TypeDef().WithObject("Directory").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Git repository source (with .git directory).", SourceMap: dag.SourceMap("main.go", 61, 2)}))).
+			WithObject(
+				dag.TypeDef().WithObject("PullRequest", dagger.TypeDefWithObjectOpts{SourceMap: dag.SourceMap("pull-request.go", 16, 6)}).
+					WithFunction(
+						dag.Function("Create",
+							dag.TypeDef().WithKind(dagger.TypeDefKindVoidKind).WithOptional(true)).
+							WithDescription("Create a pull request on GitHub.").
+							WithSourceMap(dag.SourceMap("pull-request.go", 22, 1)).
+							WithArg("assignees", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Assign people by their login. Use \"@me\" to self-assign.", SourceMap: dag.SourceMap("pull-request.go", 28, 2)}).
+							WithArg("base", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "The branch into which you want your code merged.", SourceMap: dag.SourceMap("pull-request.go", 33, 2)}).
+							WithArg("body", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Body for the pull request.", SourceMap: dag.SourceMap("pull-request.go", 38, 2)}).
+							WithArg("bodyFile", dag.TypeDef().WithObject("File").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Read body text from file.", SourceMap: dag.SourceMap("pull-request.go", 43, 2)}).
+							WithArg("draft", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Mark pull request as a draft.", SourceMap: dag.SourceMap("pull-request.go", 48, 2)}).
+							WithArg("fill", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Use commit info for title and body. (Requires repository source)", SourceMap: dag.SourceMap("pull-request.go", 53, 2)}).
+							WithArg("fillFirst", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Use first commit info for title and body. (Requires repository source)", SourceMap: dag.SourceMap("pull-request.go", 58, 2)}).
+							WithArg("fillVerbose", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Use commits msg+body for description. (Requires repository source)", SourceMap: dag.SourceMap("pull-request.go", 63, 2)}).
+							WithArg("head", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "The branch that contains commits for your pull request (default [current branch], required when no repository source is available).", SourceMap: dag.SourceMap("pull-request.go", 68, 2)}).
+							WithArg("labels", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Add labels by name.", SourceMap: dag.SourceMap("pull-request.go", 73, 2)}).
+							WithArg("milestone", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Add the pull request to a milestone by name.", SourceMap: dag.SourceMap("pull-request.go", 78, 2)}).
+							WithArg("noMaintainerEdit", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Disable maintainer's ability to modify pull request.", SourceMap: dag.SourceMap("pull-request.go", 83, 2)}).
+							WithArg("projects", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Add the pull request to projects by name.", SourceMap: dag.SourceMap("pull-request.go", 88, 2)}).
+							WithArg("reviewers", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Request reviews from people or teams by their handle.", SourceMap: dag.SourceMap("pull-request.go", 93, 2)}).
+							WithArg("template", dag.TypeDef().WithObject("File").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Template file to use as starting body text.", SourceMap: dag.SourceMap("pull-request.go", 98, 2)}).
+							WithArg("title", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Title for the pull request.", SourceMap: dag.SourceMap("pull-request.go", 103, 2)}).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("pull-request.go", 108, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("pull-request.go", 113, 2)})).
+					WithFunction(
+						dag.Function("Exists",
+							dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind)).
+							WithDescription("Check if a PR exists").
+							WithSourceMap(dag.SourceMap("pull-request.go", 205, 1)).
+							WithArg("pullRequest", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "Pull request number, url or branch name.", SourceMap: dag.SourceMap("pull-request.go", 209, 2)}).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("pull-request.go", 214, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("pull-request.go", 219, 2)})).
+					WithFunction(
+						dag.Function("Review",
+							dag.TypeDef().WithObject("PullRequestReview")).
+							WithDescription("Add a review to a pull request.").
+							WithSourceMap(dag.SourceMap("pull-request.go", 243, 1)).
+							WithArg("pullRequest", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "Pull request number, url or branch name.", SourceMap: dag.SourceMap("pull-request.go", 245, 2)}).
+							WithArg("body", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Specify the body of a review.", SourceMap: dag.SourceMap("pull-request.go", 250, 2)}).
+							WithArg("bodyFile", dag.TypeDef().WithObject("File").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Read body text from file.", SourceMap: dag.SourceMap("pull-request.go", 255, 2)}))).
+			WithObject(
+				dag.TypeDef().WithObject("Release", dagger.TypeDefWithObjectOpts{SourceMap: dag.SourceMap("release.go", 16, 6)}).
+					WithFunction(
+						dag.Function("Create",
+							dag.TypeDef().WithKind(dagger.TypeDefKindVoidKind).WithOptional(true)).
+							WithDescription("Create a new GitHub Release for a repository.").
+							WithSourceMap(dag.SourceMap("release.go", 30, 1)).
+							WithArg("tag", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "Tag this release should point to or create.", SourceMap: dag.SourceMap("release.go", 34, 2)}).
+							WithArg("title", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{Description: "Release title.", SourceMap: dag.SourceMap("release.go", 37, 2)}).
+							WithArg("files", dag.TypeDef().WithListOf(dag.TypeDef().WithObject("File")).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Release assets to upload.", SourceMap: dag.SourceMap("release.go", 42, 2)}).
+							WithArg("draft", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Save the release as a draft instead of publishing it.", SourceMap: dag.SourceMap("release.go", 47, 2)}).
+							WithArg("preRelease", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Mark the release as a prerelease.", SourceMap: dag.SourceMap("release.go", 52, 2)}).
+							WithArg("target", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Target branch or full commit SHA (default: main branch).", SourceMap: dag.SourceMap("release.go", 57, 2)}).
+							WithArg("notes", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Release notes.", SourceMap: dag.SourceMap("release.go", 62, 2)}).
+							WithArg("notesFile", dag.TypeDef().WithObject("File").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Read release notes from file.", SourceMap: dag.SourceMap("release.go", 67, 2)}).
+							WithArg("discussionCategory", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Start a discussion in the specified category.", SourceMap: dag.SourceMap("release.go", 72, 2)}).
+							WithArg("generateNotes", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Automatically generate title and notes for the release.", SourceMap: dag.SourceMap("release.go", 77, 2)}).
+							WithArg("notesStartTag", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Tag to use as the starting point for generating release notes.", SourceMap: dag.SourceMap("release.go", 82, 2)}).
+							WithArg("latest", dag.TypeDef().WithEnum("Latest").WithOptional(true), dagger.FunctionWithArgOpts{Description: "Mark this release as \"Latest\" (default: automatic based on date and version).", SourceMap: dag.SourceMap("release.go", 88, 2), DefaultValue: dagger.JSON("\"Auto\"")}).
+							WithArg("verifyTag", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Abort in case the git tag doesn't already exist in the remote repository.", SourceMap: dag.SourceMap("release.go", 93, 2)}).
+							WithArg("notesFromTag", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Tag to use as the starting point for generating release notes.", SourceMap: dag.SourceMap("release.go", 98, 2)}).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("release.go", 103, 2)}).
+							WithArg("repo", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub repository (e.g. \"owner/repo\").", SourceMap: dag.SourceMap("release.go", 108, 2)}).
+							WithArg("updateExisting", dag.TypeDef().WithKind(dagger.TypeDefKindBooleanKind).WithOptional(true), dagger.FunctionWithArgOpts{Description: "If a release for the tag already exists, update its title, notes,\ntarget, draft, prerelease and latest settings and re-upload its assets,\ninstead of failing. Lets an interrupted release be rerun.", SourceMap: dag.SourceMap("release.go", 115, 2)}))).
+			WithObject(
+				dag.TypeDef().WithObject("Repo", dagger.TypeDefWithObjectOpts{SourceMap: dag.SourceMap("repo.go", 10, 6)}).
+					WithFunction(
+						dag.Function("Clone",
+							dag.TypeDef().WithObject("Directory")).
+							WithDescription("Clone a GitHub repository locally.").
+							WithSourceMap(dag.SourceMap("repo.go", 16, 1)).
+							WithArg("repository", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind), dagger.FunctionWithArgOpts{SourceMap: dag.SourceMap("repo.go", 17, 2)}).
+							WithArg("args", dag.TypeDef().WithListOf(dag.TypeDef().WithKind(dagger.TypeDefKindStringKind)).WithOptional(true), dagger.FunctionWithArgOpts{Description: "Additional arguments to pass to the \"git clone\" command.", SourceMap: dag.SourceMap("repo.go", 22, 2)}).
+							WithArg("token", dag.TypeDef().WithObject("Secret").WithOptional(true), dagger.FunctionWithArgOpts{Description: "GitHub token.", SourceMap: dag.SourceMap("repo.go", 27, 2)}))).
+			WithObject(
+				dag.TypeDef().WithObject("PullRequestReview", dagger.TypeDefWithObjectOpts{Description: "TODO: revisit if these should be private", SourceMap: dag.SourceMap("pull-request.go", 266, 6)}).
+					WithFunction(
+						dag.Function("Approve",
+							dag.TypeDef().WithKind(dagger.TypeDefKindVoidKind).WithOptional(true)).
+							WithDescription("Approve a pull request.").
+							WithSourceMap(dag.SourceMap("pull-request.go", 281, 1))).
+					WithFunction(
+						dag.Function("Comment",
+							dag.TypeDef().WithKind(dagger.TypeDefKindVoidKind).WithOptional(true)).
+							WithDescription("Comment on a pull request.").
+							WithSourceMap(dag.SourceMap("pull-request.go", 286, 1))).
+					WithFunction(
+						dag.Function("RequestChanges",
+							dag.TypeDef().WithKind(dagger.TypeDefKindVoidKind).WithOptional(true)).
+							WithDescription("Request changes on a pull request.").
+							WithSourceMap(dag.SourceMap("pull-request.go", 291, 1)))).
+			WithEnum(
+				dag.TypeDef().WithEnum("Latest", dagger.TypeDefWithEnumOpts{SourceMap: dag.SourceMap("release.go", 21, 6)}).
+					WithEnumMember("Auto", dagger.TypeDefWithEnumMemberOpts{Value: "LATEST_AUTO", SourceMap: dag.SourceMap("release.go", 26, 2)}).
+					WithEnumMember("False", dagger.TypeDefWithEnumMemberOpts{Value: "LATEST_FALSE", SourceMap: dag.SourceMap("release.go", 25, 2)}).
+					WithEnumMember("True", dagger.TypeDefWithEnumMemberOpts{Value: "LATEST_TRUE", SourceMap: dag.SourceMap("release.go", 24, 2)})), nil
 	default:
 		return nil, fmt.Errorf("unknown object %s", parentName)
 	}

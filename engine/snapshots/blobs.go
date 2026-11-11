@@ -5,7 +5,6 @@ import (
 	"maps"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -13,7 +12,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/plugins/diff/walking"
 	cerrdefs "github.com/containerd/errdefs"
-	"github.com/dagger/dagger/engine/wcprof"
 	"github.com/dagger/dagger/internal/buildkit/util/bklog"
 	"github.com/dagger/dagger/internal/buildkit/util/compression"
 	"github.com/dagger/dagger/internal/buildkit/util/converter"
@@ -21,7 +19,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"golang.org/x/sync/semaphore"
 )
 
 var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
@@ -29,8 +26,6 @@ var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
 type ensureExportBlobResult struct {
 	desc     ocispecs.Descriptor
 	hasLayer bool
-	// computed is set when the export computed the layer's blob.
-	computed bool
 }
 
 // snapshotBlobGCLabel is the label on a layer snapshot that names the blob
@@ -116,30 +111,19 @@ func (cm *snapshotManager) ensureExportBlob(
 	parentSnapshotID string,
 	ref *immutableRef,
 	refCfg compression.Config,
-	gate *semaphore.Weighted,
-	stats *ExportStats,
-) (_ ocispecs.Descriptor, _, _ bool, rerr error) {
+) (_ ocispecs.Descriptor, _ bool, rerr error) {
 	if ref == nil {
-		return ocispecs.Descriptor{}, false, false, errors.New("ensure export blob: nil ref")
+		return ocispecs.Descriptor{}, false, errors.New("ensure export blob: nil ref")
 	}
 
 	// A caller owns its own pins while waiting and doing I/O. Serializing by
 	// snapshot avoids sharing a canceled caller's ref or lease with waiters.
-	waitStart := time.Now()
 	unlock, err := cm.exportLayerLocker.acquire(ctx, ref.SnapshotID())
-	waited := time.Now()
-	stats.LockWait += waited.Sub(waitStart)
-	wcprof.RecordWaitAt(ctx, "snapshots.exportLayer", wcprof.WaitReasonLock, waitStart, waited)
 	if err != nil {
-		return ocispecs.Descriptor{}, false, false, err
+		return ocispecs.Descriptor{}, false, err
 	}
 	defer unlock()
 	result, err := func() (_ ensureExportBlobResult, err error) {
-		// diffOp is the profile op of computing the layer's blob, when it is
-		// computed: the digest and size it produced, under the export. It
-		// ends where the diff's time does, or with the export's error.
-		var diffOp *wcprof.Op
-		defer func() { diffOp.EndErr(err) }()
 		blobDigest := ref.md.getBlob()
 		if blobDigest == "" {
 			// A ref reopened after a restart is rehydrated with no blob
@@ -161,9 +145,8 @@ func (cm *snapshotManager) ensureExportBlob(
 				if err != nil {
 					return ensureExportBlobResult{}, err
 				}
-				converted := false
 				if refCfg.Force {
-					desc, converted, err = getBlobWithCompressionWithRetry(ctx, ref, refCfg)
+					desc, err = getBlobWithCompressionWithRetry(ctx, ref, refCfg)
 					if err != nil {
 						return ensureExportBlobResult{}, err
 					}
@@ -177,27 +160,11 @@ func (cm *snapshotManager) ensureExportBlob(
 				if err := cm.labelSnapshotBlob(ctx, ref.SnapshotID(), blobDigest); err != nil {
 					return ensureExportBlobResult{}, err
 				}
-				if err := cm.recordSnapshotContent(ctx, ref.SnapshotID(), desc); err != nil {
+				if err := cm.recordSnapshotContent(ref.SnapshotID(), desc); err != nil {
 					return ensureExportBlobResult{}, err
 				}
-				stats.LayersReused++
-				return ensureExportBlobResult{desc: desc, hasLayer: true, computed: converted}, nil
+				return ensureExportBlobResult{desc: desc, hasLayer: true}, nil
 			}
-		}
-
-		// Building the blob reads the layer and compresses it: a gate shared
-		// by exports bounds how many build at once, engine-wide. It is held
-		// until the blob is recorded, and never while waiting above.
-		if gate != nil {
-			gateStart := time.Now()
-			acquireErr := gate.Acquire(ctx, 1)
-			gated := time.Now()
-			stats.BuildWait += gated.Sub(gateStart)
-			wcprof.RecordWaitAt(ctx, "snapshots.exportBuild", wcprof.WaitReasonLock, gateStart, gated)
-			if acquireErr != nil {
-				return ensureExportBlobResult{}, acquireErr
-			}
-			defer gate.Release(1)
 		}
 
 		usage, err := cm.Snapshotter.Usage(ctx, ref.SnapshotID())
@@ -251,13 +218,6 @@ func (cm *snapshotManager) ensureExportBlob(
 			defer releaseUpper()
 		}
 
-		diffStart := time.Now()
-		diffCtx, op := wcprof.BeginOp(ctx, wcprof.OpKindIO, "snapshot.export.diff", wcprof.OpOpts{Start: diffStart})
-		diffOp = op
-		if op != nil {
-			// The snapshot diffed: its blob is the op's ident, once known.
-			wcprof.Fact(diffCtx, op.ID(), "snapshot:"+ref.SnapshotID(), 0)
-		}
 		var desc ocispecs.Descriptor
 		var enableOverlay, fallback, logWarnOnErr bool
 		if forceOvlStr := os.Getenv("BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF"); forceOvlStr != "" {
@@ -276,7 +236,7 @@ func (cm *snapshotManager) ensureExportBlob(
 			}
 		}
 		if enableOverlay {
-			computed, ok, err := ref.tryComputeOverlayBlob(diffCtx, lower, upper, mediaType, ref.ID(), compressorFunc)
+			computed, ok, err := ref.tryComputeOverlayBlob(ctx, lower, upper, mediaType, ref.ID(), compressorFunc)
 			if !ok || err != nil {
 				if !fallback {
 					if !ok {
@@ -285,7 +245,7 @@ func (cm *snapshotManager) ensureExportBlob(
 					return ensureExportBlobResult{}, errors.Wrapf(err, "failed to compute overlay diff")
 				}
 				if logWarnOnErr {
-					bklog.G(diffCtx).Warnf("failed to compute blob by overlay differ (ok=%v): %v", ok, err)
+					bklog.G(ctx).Warnf("failed to compute blob by overlay differ (ok=%v): %v", ok, err)
 				}
 			} else {
 				desc = computed
@@ -293,18 +253,18 @@ func (cm *snapshotManager) ensureExportBlob(
 		}
 
 		if desc.Digest == "" && !isTypeWindows(ref) && refCfg.Type.NeedsComputeDiffBySelf(refCfg) {
-			desc, err = walking.NewWalkingDiff(cm.ContentStore).Compare(diffCtx, lower, upper,
+			desc, err = walking.NewWalkingDiff(cm.ContentStore).Compare(ctx, lower, upper,
 				diff.WithMediaType(mediaType),
 				diff.WithReference(ref.ID()),
 				diff.WithCompressor(compressorFunc),
 			)
 			if err != nil {
-				bklog.G(diffCtx).WithError(err).Warnf("failed to compute blob by buildkit differ")
+				bklog.G(ctx).WithError(err).Warnf("failed to compute blob by buildkit differ")
 			}
 		}
 
 		if desc.Digest == "" {
-			desc, err = cm.Differ.Compare(diffCtx, lower, upper,
+			desc, err = cm.Differ.Compare(ctx, lower, upper,
 				diff.WithMediaType(mediaType),
 				diff.WithReference(ref.ID()),
 				diff.WithCompressor(compressorFunc),
@@ -318,18 +278,12 @@ func (cm *snapshotManager) ensureExportBlob(
 			desc.Annotations = map[string]string{}
 		}
 		if finalize != nil {
-			annotations, err := finalize(diffCtx, cm.ContentStore)
+			annotations, err := finalize(ctx, cm.ContentStore)
 			if err != nil {
 				return ensureExportBlobResult{}, errors.Wrapf(err, "failed to finalize compression")
 			}
 			maps.Copy(desc.Annotations, annotations)
 		}
-		diffEnd := time.Now()
-		diffTime := diffEnd.Sub(diffStart)
-		diffOp.SetIdent(desc.Digest.String())
-		diffOp.SetBytes(desc.Size)
-		diffOp.EndAt(wcprof.OutcomeOK, 0, diffEnd)
-		diffOp = nil
 		info, err := cm.ContentStore.Info(ctx, desc.Digest)
 		if err != nil {
 			return ensureExportBlobResult{}, err
@@ -385,48 +339,42 @@ func (cm *snapshotManager) ensureExportBlob(
 			return ensureExportBlobResult{}, err
 		}
 		ref.mu.Unlock()
-		if err := cm.recordSnapshotContent(ctx, ref.SnapshotID(), desc); err != nil {
+		if err := cm.recordSnapshotContent(ref.SnapshotID(), desc); err != nil {
 			return ensureExportBlobResult{}, err
 		}
-		stats.LayersDiffed++
-		stats.RawBytes += usage.Size
-		stats.BlobBytes += desc.Size
-		stats.DiffTime += diffTime
 		return ensureExportBlobResult{
 			desc:     desc,
 			hasLayer: true,
-			computed: true,
 		}, nil
 	}()
 	if err != nil {
-		return ocispecs.Descriptor{}, false, false, err
+		return ocispecs.Descriptor{}, false, err
 	}
-	return result.desc, result.hasLayer, result.computed, nil
+	return result.desc, result.hasLayer, nil
 }
 
 func isTypeWindows(sr *immutableRef) bool {
 	return sr.GetLayerType() == "windows"
 }
 
-// ensureCompression ensures the specified ref has the blob of the specified compression Type,
-// and reports whether it converted the stored blob to get it.
+// ensureCompression ensures the specified ref has the blob of the specified compression Type.
 // The caller holds exportLayerLocker and a private resource lease. Both the
 // source blob and the result remain pinned through later provider consumption.
-func ensureCompression(ctx context.Context, ref *immutableRef, comp compression.Config) (converted bool, _ error) {
+func ensureCompression(ctx context.Context, ref *immutableRef, comp compression.Config) error {
 	desc, err := ref.ociDesc(ctx, true)
 	if err != nil {
-		return false, err
+		return err
 	}
 	layerConvertFunc, err := converter.New(ctx, ref.cm.ContentStore, desc, comp)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if layerConvertFunc == nil {
-		return false, ref.linkBlob(ctx, desc)
+		return ref.linkBlob(ctx, desc)
 	}
 	newDesc, err := layerConvertFunc(ctx, ref.cm.ContentStore, desc)
 	if err != nil {
-		return false, errors.Wrapf(err, "failed to convert")
+		return errors.Wrapf(err, "failed to convert")
 	}
-	return true, ref.linkBlob(ctx, *newDesc)
+	return ref.linkBlob(ctx, *newDesc)
 }

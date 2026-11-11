@@ -179,26 +179,17 @@ func (s *state) disconnect(t *testing.T) {
 	s.checkServing(t, s.main, s.b, bundleIDs(stored), query, want, "disconnect-run-b")
 }
 
-// engineRestart (#12, case 2): A restarts while its upload is in flight.
-// Since v1.0.0-beta.26 the engine's stop lets its exports in progress
-// finish, for up to its stop budget less a reserve (engine/server's
-// RemoteCacheAdapter.Stop), before it closes its connection: so the export
-// isn't cut short. While the upload is stalled, the stopping engine stays
-// connected and nothing is published; once the upload goes on, the export
-// is stored on the old connection, as the old generation's, and A comes
-// back cleanly. A clean restart keeps the cache ID and entry numbers and
-// bumps the generation (ENTRY_DISCOVERY.md), so the entries stay recorded
-// under their numbers, and the new generation exports nothing of them
-// again.
-//
-// The container's stop timeout has to cover that wait (Engine.Restart):
-// an engine killed while it waits comes back with a new, empty cache.
+// engineRestart (#12, case 2): A restarts while its upload is in flight. A
+// clean restart keeps the cache ID and entry numbers and bumps the
+// generation (ENTRY_DISCOVERY.md), so the export cut short is run again on
+// the new generation, under the same numbers, and is stored as that
+// generation's.
 func (s *state) engineRestart(t *testing.T) {
 	env, a := s.env, s.a
 	cacheA, genA := a.CacheID(), a.Generation()
 	stall, query, want, stalled, logMark := s.midUpload(t, "engine-restart-run-a")
 	idxBefore, bundlesBefore := env.Index(), env.BundleIDs()
-	// The entries the stalled export carries, by A's engine numbers.
+	// The entries the cut export carries, by A's engine numbers.
 	var pending []uint64
 	entries, err := s.main.Entries(a.Conn)
 	if err != nil {
@@ -214,20 +205,19 @@ func (s *state) engineRestart(t *testing.T) {
 	t.Logf("restarting A with the upload of %v in flight", shorts(digestStrings(stalled)))
 	start := time.Now()
 	wait := a.RestartAsync()
-	// The stop has begun, and waits for the export: A stays connected.
-	time.Sleep(engineStopHold)
-	_, connectedMid := s.main.EngineInfo(old)
-	idxMid, bundlesMid := env.Index(), env.BundleIDs()
-	env.Proxy.Remove(stall)
 	env.WaitFor(time.Minute, "A's connection to drop", func() (bool, error) {
 		_, ok := s.main.EngineInfo(old)
 		return !ok, nil
 	})
-	// What the old connection stored, before the new one could store more.
-	stored := storedSince(s.main, logMark, cacheA)
+	idxMid, bundlesMid := env.Index(), env.BundleIDs()
+	env.Proxy.Remove(stall)
 	wait()
 	restart := time.Since(start)
+	env.WaitFor(env.Settings.Timeout, "A's export to be stored after its restart", func() (bool, error) {
+		return len(storedSince(s.main, logMark, cacheA)) > 0, nil
+	})
 	s.waitStored(s.main, a, "all of A's retained entries to be stored")
+	stored := storedSince(s.main, logMark, cacheA)
 	var holding []string
 	for _, d := range stalled {
 		holding = append(holding, s.bundlesHolding(stored, d)...)
@@ -235,47 +225,35 @@ func (s *state) engineRestart(t *testing.T) {
 	holding = sortedCopy(holding)
 	holding = slices.Compact(holding)
 	idx := env.Index()
-	oldGen := 0
+	newGen := 0
 	for _, e := range idx.Entries {
-		if slices.Contains(holding, e.Bundle) && e.Source.CacheID == cacheA && e.Source.Generation == genA {
-			oldGen++
+		if slices.Contains(holding, e.Bundle) && e.Source.CacheID == cacheA && e.Source.Generation == a.Generation() {
+			newGen++
 		}
 	}
-	// Each engine number the export carried is stored under it: the numbers
-	// held across the restart.
+	// Each engine number the cut export carried is stored under it, as
+	// generation 2's: the numbers held across the restart.
 	var renumbered []uint64
-	if c := idx.Caches[cacheA]; c != nil {
-		for _, n := range pending {
-			if _, ok := c.Numbers[n]; !ok {
-				renumbered = append(renumbered, n)
-			}
+	for _, n := range pending {
+		if m, ok := idx.Caches[cacheA].Numbers[n]; !ok || m.Generation != a.Generation() {
+			renumbered = append(renumbered, n)
 		}
-	} else {
-		renumbered = pending
 	}
-	again := storedSince(s.main, logMark, cacheA)
 
 	Check(t, a.CacheID() == cacheA && a.Generation() == genA+1,
-		"A restarted cleanly in %s: same cache %s (now %s), generation %d (was %d)", restart.Round(100*time.Millisecond), Short(cacheA), Short(a.CacheID()), a.Generation(), genA)
-	Check(t, len(stalled) > 0 && connectedMid && idxMid.NextNumber == idxBefore.NextNumber && len(idxMid.Entries) == len(idxBefore.Entries) && slices.Equal(bundlesMid, bundlesBefore),
-		"while the stopping engine waited on the stalled upload, A stayed connected (%v) and nothing of the export was published: the index (%d entries) and the %d bundles are as before it",
-		connectedMid, len(idxMid.Entries), len(bundlesMid))
-	Check(t, len(connLogs(s.main, logMark, "export interrupted", old)) == 0 && len(connLogs(s.main, logMark, "export failed", old)) == 0,
-		"the export on the stopping engine's connection was neither interrupted nor failed")
-	Check(t, len(holding) > 0 && oldGen > 0,
-		"the export was stored before the engine stopped, as generation %d's, with the layer that was in flight (%d index entries of that generation in bundles %v)",
-		genA, oldGen, shorts(holding))
+		"A restarted cleanly in %s: same cache %s, generation %d (was %d)", restart.Round(100*time.Millisecond), Short(a.CacheID()), a.Generation(), genA)
+	Check(t, len(connLogs(s.main, logMark, "export interrupted", old)) > 0 && len(connLogs(s.main, logMark, "export failed", old)) == 0,
+		"the export on the old generation's connection was interrupted, not failed")
+	Check(t, len(stalled) > 0 && idxMid.NextNumber == idxBefore.NextNumber && len(idxMid.Entries) == len(idxBefore.Entries) && slices.Equal(bundlesMid, bundlesBefore),
+		"nothing of the cut export was published: the index (%d entries) and the %d bundles are as before it", len(idxMid.Entries), len(bundlesMid))
 	Check(t, len(pending) > 0 && len(renumbered) == 0,
-		"the export's engine entries %v are each recorded under the same number after the restart (not: %v)", pending, renumbered)
-	Check(t, len(again) == len(stored),
-		"generation %d exported nothing of them again (%d exports stored before the restart, %d after)", a.Generation(), len(stored), len(again))
+		"the cut export's engine entries %v are each recorded under the same number as generation %d's (not: %v)", pending, a.Generation(), renumbered)
+	Check(t, len(holding) > 0 && newGen > 0,
+		"the export ran again on generation %d, under the same entry numbers, and was stored with the layer that was in flight (%d index entries of generation %d in bundles %v)",
+		a.Generation(), newGen, a.Generation(), shorts(holding))
 	env.CheckConsistent(t, "after the engine restart")
 	s.checkServing(t, s.main, s.b, bundleIDs(stored), query, want, "engine-restart-run-b")
 }
-
-// engineStopHold is how long engineRestart keeps A's upload stalled after
-// it asked the engine to stop.
-const engineStopHold = 3 * time.Second
 
 // s3Faults (#12, case 4): S3 throttles and fails requests. First a few
 // requests of one export answer 503 SlowDown or 500 InternalError: the blob

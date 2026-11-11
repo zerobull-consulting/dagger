@@ -3,25 +3,35 @@
 package main
 
 import (
-	core "dagger.io/dagger/core"
-
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"os"
+	"sort"
 
-	"github.com/dagger/querybuilder"
+	telemetry "github.com/dagger/otel-go"
+	"github.com/vektah/gqlparser/v2/gqlerror"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"main/internal/dagger"
+
+	"github.com/dagger/querybuilder"
 )
+
+var dag = dagger.Connect()
 
 func Tracer() trace.Tracer {
 	return otel.Tracer("dagger.io/sdk.go")
 }
 
+// used for local MarshalJSON implementations
 var marshalCtx = context.Background()
 
+// called by main()
 func setMarshalContext(ctx context.Context) {
 	marshalCtx = ctx
 	dagger.SetMarshalContext(ctx)
@@ -34,8 +44,13 @@ type DaggerObject interface {
 
 type ExecError = dagger.ExecError
 
-func ptr[T any](v T) *T { return &v }
+// ptr returns a pointer to the given value.
+func ptr[T any](v T) *T {
+	return &v
+}
 
+// convertSlice converts a slice of one type to a slice of another type using a
+// converter function
 func convertSlice[I any, O any](in []I, f func(I) O) []O {
 	out := make([]O, len(in))
 	for i, v := range in {
@@ -58,31 +73,107 @@ func (r *Dockerd) UnmarshalJSON(bs []byte) error {
 	return nil
 }
 
-func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, fnName string, inputArgs map[string][]byte) (_ any, err error) {
-	setMarshalContext(ctx)
-	_ = inputArgs
-	if parentName == "" {
-		switch fnName {
-		case "Dockerd", "dockerd":
-			parentName = "Dockerd"
-			fnName = ""
-		}
+func main() {
+	ctx := context.Background()
+
+	// Direct slog to the new stderr. This is only for dev time debugging, and
+	// runtime errors/warnings.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	})))
+
+	if err := dispatch(ctx); err != nil {
+		os.Exit(2)
 	}
+}
+
+func convertError(rerr error) *dagger.Error {
+	if gqlErr := findSingleGQLError(rerr); gqlErr != nil {
+		dagErr := dag.Error(gqlErr.Message)
+		if gqlErr.Extensions != nil {
+			keys := make([]string, 0, len(gqlErr.Extensions))
+			for k := range gqlErr.Extensions {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				val, err := json.Marshal(gqlErr.Extensions[k])
+				if err != nil {
+					fmt.Println("failed to marshal error value:", err)
+				}
+				dagErr = dagErr.WithValue(k, dagger.JSON(val))
+			}
+		}
+		return dagErr
+	}
+	return dag.Error(rerr.Error())
+}
+
+func findSingleGQLError(rerr error) *gqlerror.Error {
+	switch x := rerr.(type) {
+	case *gqlerror.Error:
+		return x
+	case interface{ Unwrap() []error }:
+		return nil
+	case interface{ Unwrap() error }:
+		return findSingleGQLError(x.Unwrap())
+	default:
+		return nil
+	}
+}
+func dispatch(ctx context.Context) (rerr error) {
+	ctx = telemetry.InitEmbedded(ctx, resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("dagger-go-sdk"),
+		// TODO version?
+	))
+	defer telemetry.Close()
+
+	// A lot of the "work" actually happens when we're marshalling the return
+	// value, which entails getting object IDs, which happens in MarshalJSON,
+	// which has no ctx argument, so we use this lovely global variable.
+	setMarshalContext(ctx)
+
+	fnCall := dag.CurrentFunctionCall()
+	defer func() {
+		if rerr != nil {
+			if err := fnCall.ReturnError(ctx, convertError(rerr)); err != nil {
+				fmt.Println("failed to return error:", err, "\noriginal error:", rerr)
+			}
+		}
+	}()
+
+	parentName, fnName, parentJson, inputArgs, err := fnCall.DispatchInputs(ctx)
+	if err != nil {
+		return fmt.Errorf("get fn call: %w", err)
+	}
+
+	result, err := invoke(ctx, parentJson, parentName, fnName, inputArgs)
+	if err != nil {
+		return err
+	}
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	if err := fnCall.ReturnValue(ctx, dagger.JSON(resultBytes)); err != nil {
+		return fmt.Errorf("store return value: %w", err)
+	}
+	return nil
+}
+func invoke(ctx context.Context, parentJSON []byte, parentName string, fnName string, inputArgs map[string][]byte) (_ any, err error) {
+	_ = inputArgs
 	switch parentName {
 	case "Dockerd":
-		if fnName == "New" {
-			fnName = ""
-		}
 		switch fnName {
-		case "":
-			return &Dockerd{}, nil
 		case "Attach":
 			var parent Dockerd
 			err = json.Unmarshal(parentJSON, &parent)
 			if err != nil {
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
-			var container *core.Container
+			var container *dagger.Container
 			if inputArgs["container"] != nil {
 				err = json.Unmarshal([]byte(inputArgs["container"]), &container)
 				if err != nil {
@@ -114,6 +205,24 @@ func DaggerDispatch(ctx context.Context, parentJSON []byte, parentName string, f
 		default:
 			return nil, fmt.Errorf("unknown function %s", fnName)
 		}
+	case "":
+		return dag.Module().
+			WithDescription("Utility for running dockerd in Dagger\n\nA utility module for configuring a dockerd service in your Dagger pipeline\n").
+			WithObject(
+				dag.TypeDef().WithObject("Dockerd", dagger.TypeDefWithObjectOpts{Description: "Module for running docker in dagger", SourceMap: dag.SourceMap("main.go", 14, 6)}).
+					WithFunction(
+						dag.Function("Attach",
+							dag.TypeDef().WithObject("Container")).
+							WithDescription("Attach a dockerd service to a container").
+							WithSourceMap(dag.SourceMap("main.go", 17, 1)).
+							WithArg("container", dag.TypeDef().WithObject("Container"), dagger.FunctionWithArgOpts{SourceMap: dag.SourceMap("main.go", 19, 2)}).
+							WithArg("dockerVersion", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{SourceMap: dag.SourceMap("main.go", 22, 2), DefaultValue: dagger.JSON("\"24.0\"")})).
+					WithFunction(
+						dag.Function("Service",
+							dag.TypeDef().WithObject("Service")).
+							WithDescription("Get a Service container running dockerd").
+							WithSourceMap(dag.SourceMap("main.go", 39, 1)).
+							WithArg("dockerVersion", dag.TypeDef().WithKind(dagger.TypeDefKindStringKind).WithOptional(true), dagger.FunctionWithArgOpts{SourceMap: dag.SourceMap("main.go", 42, 2), DefaultValue: dagger.JSON("\"24.0\"")}))), nil
 	default:
 		return nil, fmt.Errorf("unknown object %s", parentName)
 	}

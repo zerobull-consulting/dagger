@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"dagger.io/dagger/core"
 	"fmt"
 	"main/internal/dagger"
 )
@@ -43,11 +42,11 @@ func (t *Dockerd) Service(
 	dockerVersion string,
 ) *dagger.Service {
 	port := 2375
-	return core.NewContainer().
+	return dag.Container().
 		From(fmt.Sprintf("docker:%s-dind", dockerVersion)).
 		WithMountedCache(
 			"/var/lib/docker",
-			core.NewCacheVolume(dockerVersion+"-docker-lib"),
+			dag.CacheVolume(dockerVersion+"-docker-lib"),
 			dagger.ContainerWithMountedCacheOpts{
 				Sharing: dagger.CacheSharingModeLocked,
 			}).

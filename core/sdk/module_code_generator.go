@@ -19,9 +19,7 @@ func (sdk *codeGeneratorModule) Codegen(
 	deps *core.SchemaBuilder,
 	source dagql.ObjectResult[*core.ModuleSource],
 ) (_ *core.GeneratedCode, rerr error) {
-	// Encapsulated: the SDK's work is its own, and only a step of it that
-	// failed shows (see dagui's spanWalker.passesOnFailure).
-	ctx, span := core.Tracer(ctx).Start(ctx, "module SDK: run codegen", telemetry.Encapsulate())
+	ctx, span := core.Tracer(ctx).Start(ctx, "module SDK: run codegen")
 	defer telemetry.EndWithCause(span, &rerr)
 
 	sdkInst, err := sdk.mod.instantiate(ctx)
@@ -49,7 +47,7 @@ func (sdk *codeGeneratorModule) Codegen(
 	}
 
 	var inst dagql.Result[*core.GeneratedCode]
-	err = sdkInst.selectSDK(ctx, &inst, dagql.Selector{
+	err = dag.Select(ctx, sdkInst.sdk, &inst, dagql.Selector{
 		Field: "codegen",
 		Args: []dagql.NamedInput{
 			{

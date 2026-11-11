@@ -25,7 +25,6 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
-	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -1128,95 +1127,5 @@ func TestDrainStartsNothingPastItsDeadline(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := h.cache.Exports(); n != 0 || h.cache.InFlight() != 0 {
 		t.Fatalf("%d exports reached the engine after a drain past its deadline", n)
-	}
-}
-
-// A drain asks a paused engine for what is dirty once, then is done: it
-// neither waits out the roots' wait nor asks again, and reports them left
-// for the engine, not as roots it failed to export.
-func TestDrainPausedEngine(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		// before has the engine refuse the root before the drain starts.
-		before bool
-	}{
-		{"paused before the drain", true},
-		{"found paused by the drain", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h, rec := newDrainHarness(t, func(c *ExportConfig) { c.Tracker.PausedWait = 200 * time.Millisecond })
-			h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Refused: exporter.EnginePausedMessage})
-			h.postSpans("session-1", cacheSpan(10))
-			if tc.before {
-				if code, _ := h.debugExport(""); code != http.StatusOK {
-					t.Fatalf("export: %d", code)
-				}
-			}
-			start := time.Now()
-			rep := drainFor(h.svc, time.Minute)
-			if took := time.Since(start); took > 10*time.Second {
-				t.Fatalf("the drain took %s: it waited for a paused engine", took)
-			}
-			if rep.Outcome != metrics.DrainComplete || rep.LeftRoots() != 0 || rep.PausedRoots() != 1 {
-				t.Fatalf("report %+v", rep)
-			}
-			if left := rec.find("drain: left for an engine that gave up its remote-cache work"); len(left) != 1 || left[0]["roots"] != "1" {
-				t.Fatalf("paused roots logged %v", left)
-			}
-			if warned := rec.find("drain: left unexported"); len(warned) != 0 {
-				t.Fatalf("paused roots logged as left unexported: %v", warned)
-			}
-			if tc.before {
-				if started := rec.find("drain: started"); len(started) != 1 || started[0]["paused"] != "1" || started[0]["pending"] != "0" {
-					t.Fatalf("drain start logged %v, want the paused root counted as such", started)
-				}
-			}
-			waitMetric(t, h.svc, "cacheservice_drain_paused_roots_total", nil, 1)
-			if left := metricstest.Read(t, h.svc.registry, "cacheservice_drain_unexported_roots_total", nil); left.Value != 0 {
-				t.Fatalf("%v roots counted left unexported, want the paused root counted apart", left.Value)
-			}
-			// Past the roots' own wait: nothing more is asked of the engine.
-			time.Sleep(600 * time.Millisecond)
-			if asked := metricstest.Read(t, h.svc.registry, "cacheservice_export_roots_total", map[string]string{"result": "paused"}); asked.Value != 1 {
-				t.Fatalf("the paused engine was asked for the root %v times, want once", asked.Value)
-			}
-		})
-	}
-}
-
-// expiringCtx is a context whose deadline passes between two reads of its
-// error: the first read finds none, every later one the deadline's.
-type expiringCtx struct {
-	context.Context
-	reads int
-}
-
-func (c *expiringCtx) Err() error {
-	c.reads++
-	if c.reads == 1 {
-		return nil
-	}
-	return context.DeadlineExceeded
-}
-
-// A drain's deadline that passes while its end is being decided is still
-// its deadline, not a cancellation: the drain polls every 100ms, so with a
-// timeout of whole tenths of a second a pass begins as the deadline passes
-// (seen as outcome=canceled in TestMinIOBinaryLingerStoresNothing).
-func TestDrainEndReadsItsContextOnce(t *testing.T) {
-	now := time.Now()
-	later := now.Add(time.Hour)
-	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background()}, context.Background(), now, later); ok {
-		t.Fatalf("drainEnded: %q for a context that hadn't ended when read", outcome)
-	}
-	if outcome, ok := ctxEnded(&expiringCtx{Context: context.Background()}, now, later); ok {
-		t.Fatalf("ctxEnded: %q for a context that hadn't ended when read", outcome)
-	}
-	// The next pass, or the drain's own clock, then says deadline.
-	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background(), reads: 1}, context.Background(), now, later); !ok || outcome != metrics.DrainDeadline {
-		t.Fatalf("drainEnded: %q, %v after the deadline; want deadline", outcome, ok)
-	}
-	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background()}, context.Background(), later, later); !ok || outcome != metrics.DrainDeadline {
-		t.Fatalf("drainEnded: %q, %v at the deadline on the drain's clock; want deadline", outcome, ok)
 	}
 }

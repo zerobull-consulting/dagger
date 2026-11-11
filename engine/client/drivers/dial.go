@@ -61,10 +61,6 @@ func (d dialConnector) EngineID() string {
 	return ""
 }
 
-func (d dialConnector) ClaimID() string {
-	return ""
-}
-
 func defaultDialer(ctx context.Context, address string) (net.Conn, error) {
 	addrParts := strings.SplitN(address, "://", 2)
 	if len(addrParts) != 2 {

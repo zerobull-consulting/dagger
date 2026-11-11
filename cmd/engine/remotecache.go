@@ -43,7 +43,6 @@ func remoteCacheSettings(cfg config.Config) (remotecache.Config, bool) {
 		Token:         token,
 		EngineVersion: engine.Version,
 		EngineName:    engineName,
-		Lookups:       true,
 	}, true
 }
 

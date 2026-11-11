@@ -1187,15 +1187,6 @@ type Container implements Exportable & Node & Syncer {
     environment variables defined in the container (e.g. "/$VAR/foo").
     """
     expand: Boolean = false
-
-    """
-    Repair symlinks that directory selection would break. Resolve targets across
-    the root filesystem and directory or file mounts. Preserve working relative
-    links and links that already have no target. Cache, volume, tmpfs, secret,
-    and socket mounts cause an error if selection, a resolved link, or mount
-    target resolution needs their contents.
-    """
-    resolveBrokenSymlinks: Boolean = false
   ): Directory!
 
   """
@@ -2985,13 +2976,6 @@ type Directory implements Exportable & Node & Syncer {
     Location of the directory to retrieve. Example: "/src"
     """
     path: String!
-
-    """
-    Repair symlinks that directory selection would break. Copy targets from this
-    directory into the result. Preserve working relative links and links that
-    already have no target.
-    """
-    resolveBrokenSymlinks: Boolean = false
   ): Directory!
 
   """Return a snapshot with a directory added"""
@@ -3160,22 +3144,6 @@ type Directory implements Exportable & Node & Syncer {
     """
     ssh: ID @expectedType(name: "Socket")
   ): Container!
-
-  """
-  Retrieves this directory, declared as made for the given platform.
-
-  Declare a result whose contents are the same whichever platform made them,
-  such as a Go package compiled for a platform by any platform's Go toolchain.
-  An engine of another platform that makes the same directory for the same
-  platform then finds this one, and the other way around.
-
-  The contents are not checked: a declared result that depends on the platform
-  it was made on can be found where it doesn't belong.
-  """
-  withPlatform(
-    """The platform the directory's contents are for (e.g., "linux/arm64")."""
-    platform: Platform!
-  ): Directory!
 
   """
   Retrieves this directory with all file/dir timestamps set to the given time.
@@ -3673,14 +3641,7 @@ type File implements Exportable & Node & Syncer {
   id: ID!
 
   """Force evaluation in the engine."""
-  sync(
-    """
-    Also key the file by its content, so that what consumes it is cached across
-    any two recipes that produce the same file. This hashes the file unless it
-    already has a content key.
-    """
-    keyByContent: Boolean = false
-  ): ID! @expectedType(name: "File")
+  sync: ID! @expectedType(name: "File")
 
   """Retrieves the contents of the file."""
   contents(
@@ -8672,29 +8633,6 @@ type WorkspaceSDK implements Node {
 
   """Generate the modules and clients managed by this SDK."""
   generate: Changeset! @generate
-
-  """
-  The value a setting records in this SDK's scope settings, as a native JSON value.
-
-  Reads [sdks.<name>.scopes."<scope>".settings] from the workspace config, in
-  the scope whose key resolves to path. The setting key is matched without
-  regard to case.
-
-  Null when no scope resolves to path, or the scope records no such setting.
-  Fails when the config is invalid, path escapes the workspace root, key matches
-  several recorded settings, or the value cannot be represented as JSON.
-
-  Fails when this SDK is no longer installed in the workspace config, even if Workspace.sdk returned it earlier.
-  """
-  scopeSetting(
-    """
-    Scope path, relative to the workspace cwd or absolute from the workspace root.
-    """
-    path: String!
-
-    """Setting name, matched without regard to case."""
-    key: String!
-  ): JSONValue
 
   """The user-facing SDK name."""
   name: String!

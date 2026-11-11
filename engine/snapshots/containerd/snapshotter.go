@@ -40,15 +40,11 @@ func (s *nsSnapshotter) Update(ctx context.Context, info snapshots.Info, fieldpa
 	return s.Snapshotter.Update(ctx, info, fieldpaths...)
 }
 
-// usageTally tallies Usage calls on the op they run under: an install asks
-// for usages often enough that an op for each made recording slow the engine.
-var usageTally = wcprof.NewTallyClass(wcprof.OpKindInternal, "snapshot.usage")
-
 func (s *nsSnapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
 	ctx = bksnapshots.WithNamespace(ctx, s.ns)
-	call := wcprof.BeginTally(ctx, usageTally)
+	op := beginSnapshotOp(ctx, "usage", key)
 	usage, err := s.Snapshotter.Usage(ctx, key)
-	call.End(err)
+	op.EndErr(err)
 	return usage, err
 }
 
@@ -68,11 +64,9 @@ func (s *nsSnapshotter) Prepare(ctx context.Context, key, parent string, opts ..
 	return mounts, err
 }
 
-// View's op is named by the snapshot it views: its key is a mount's own,
-// different every time.
 func (s *nsSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	ctx = bksnapshots.WithNamespace(ctx, s.ns)
-	op := beginSnapshotOp(ctx, "view", parent)
+	op := beginSnapshotOp(ctx, "view", key)
 	mounts, err := s.Snapshotter.View(ctx, key, parent, opts...)
 	op.EndErr(err)
 	return mounts, err

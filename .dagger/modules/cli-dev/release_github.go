@@ -19,7 +19,6 @@ import (
 	"github.com/dagger/dagger/util/parallel"
 
 	"dagger/cli-dev/internal/dagger"
-	"dagger/cli-dev/internal/dagger/clients/alpine"
 )
 
 type githubClient struct {
@@ -414,8 +413,8 @@ func (cli *CliDev) uploadGitHubReleaseAsset(
 	uploadURL += "?name=" + url.QueryEscape(asset)
 	// Release archives are binary; keep upload in a container so the mounted
 	// file can be streamed without converting it through File.Contents().
-	ctr := alpine.
-		New(alpine.AlpineOpts{
+	ctr := dag.
+		Alpine(dagger.AlpineOpts{
 			Branch:   "3.22",
 			Packages: []string{"ca-certificates", "curl"},
 		}).

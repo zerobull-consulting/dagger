@@ -84,7 +84,7 @@ func prepareArtifactCommands(ctx context.Context, root *cobra.Command, args, raw
 				return nil, err
 			}
 			if d != nil {
-				d.action, d.discover = action, fn
+				d.root, d.rawArgs, d.action, d.discover = root, rawArgs, action, fn
 				return d, nil
 			}
 		}
@@ -193,7 +193,11 @@ func registerCommandArtifactFilters(ctx context.Context, dag *dagger.Client, cmd
 // engine call takes the open session (see takeOpenSession), with the
 // workspace's modules already loaded.
 type artifactDiscovery struct {
-	cmd      *cobra.Command
+	cmd *cobra.Command
+	// root and rawArgs resolve the command again once discovery has
+	// registered its flags and commands.
+	root     *cobra.Command
+	rawArgs  []string
 	action   string
 	params   client.Params
 	discover runClientCallback
@@ -217,25 +221,28 @@ func (d *artifactDiscovery) execute(ctx context.Context, run func(context.Contex
 		termOut.Write(stdout.Bytes())
 		termErr.Write(stderr.Bytes())
 	}()
-	params, err := engineClientParams(d.params)
-	if err != nil {
-		return err
-	}
-	return withEngine(ctx, params, func(ctx context.Context, ec *client.Client) (rerr error) {
+	parsed := false
+	err := withEngine(ctx, d.params, func(ctx context.Context, ec *client.Client) (rerr error) {
 		discoverCtx, span := Tracer().Start(ctx, d.action, telemetry.Encapsulate())
 		err := d.discover(discoverCtx, ec)
 		telemetry.EndWithCause(span, &err)
 		if err != nil {
 			return err
 		}
-		// Cobra owns parsing after discovery, including parent-local flags.
-		// Keep it inside this frontend even if it rejects the arguments: its
-		// diagnostics are buffered until teardown, and the frontend is single-use.
-		ctx = withOpenSession(ctx, params, ec, rootCmd.OutOrStdout(), rootCmd.ErrOrStderr())
+		if needsArtifactDiscovery(resolveCommand(d.root, d.rawArgs)) {
+			// Cobra will report the command line's error, after the frontend.
+			return nil
+		}
+		parsed = true
+		ctx = withOpenSession(ctx, d.params, ec, rootCmd.OutOrStdout(), rootCmd.ErrOrStderr())
 		rootCmd.SetOut(&stdout)
 		rootCmd.SetErr(&stderr)
 		return run(ctx)
 	})
+	if err != nil || parsed {
+		return err
+	}
+	return run(ctx)
 }
 
 // runsInDiscoverySession reports whether cmd can run in the session that

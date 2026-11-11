@@ -121,12 +121,10 @@ type Metrics struct {
 	drains              *prometheus.HistogramVec
 	drainStoredRoots    prometheus.Counter
 	drainLeftRoots      prometheus.Counter
-	drainPausedRoots    prometheus.Counter
 	drainRefused        *prometheus.CounterVec
 	flushes             *prometheus.CounterVec
 	flushDuration       prometheus.Histogram
 	flushLeftRoots      prometheus.Counter
-	flushPausedRoots    prometheus.Counter
 	otlpRefused         *prometheus.CounterVec
 	otlpRequestBytes    *prometheus.HistogramVec
 	collectors          []prometheus.Collector
@@ -255,7 +253,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		}),
 		exportRoots: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_roots_total",
-			Help: "Roots of export batches, by result: stored, gone, busy, refused, failed or paused (refused by an engine that gave up its remote-cache work until its next session).",
+			Help: "Roots of export batches, by result: stored, gone, busy, refused or failed.",
 		}, []string{"result"}),
 		exportBlobs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "export_blobs_total",
@@ -374,20 +372,12 @@ func New(reg prometheus.Registerer) *Metrics {
 		}, []string{"kind"}),
 		flushes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "flush_total",
-			Help: "Flushes of one engine cache (POST /v1/engines/{cacheID}/flush), by outcome: complete (nothing left), timeout (something left when its timeout passed, or only retries due after it), not_connected (its engine wasn't connected), paused (only roots its engine refuses until its next session were left) or canceled (the request or the export path ended).",
+			Help: "Flushes of one engine cache (POST /v1/engines/{cacheID}/flush), by outcome: complete (nothing left), timeout (something left when its timeout passed, or only retries due after it), not_connected (its engine wasn't connected) or canceled (the request or the export path ended).",
 		}, []string{"outcome"}),
 		flushDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: ns, Name: "flush_duration_seconds",
 			Help:    "Time of each flush of one engine cache, from its start to its report.",
 			Buckets: promotionBuckets,
-		}),
-		drainPausedRoots: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: ns, Name: "drain_paused_roots_total",
-			Help: "Roots a drain left because their engine refuses them: it gave up its remote-cache work until its next session. They aren't in drain_unexported_roots_total, and are lost if the engine stops before a session starts on it.",
-		}),
-		flushPausedRoots: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: ns, Name: "flush_paused_roots_total",
-			Help: "Roots a flush left because their engine refuses them: it gave up its remote-cache work until its next session. They aren't in flush_unexported_roots_total. Each flush adds what it left: a count per flush, not of the roots lost.",
 		}),
 		flushLeftRoots: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: ns, Name: "flush_unexported_roots_total",
@@ -419,7 +409,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.gcRuns, m.gcRunDuration, m.gcEntriesExpired, m.gcStagingRule, m.gcUnexpectedKeys, m.gcRefused,
 		m.exportCollected,
 		m.draining, m.exportEnabled, m.exportWaiting, m.drains, m.drainStoredRoots, m.drainLeftRoots, m.drainRefused,
-		m.flushes, m.flushDuration, m.flushLeftRoots, m.drainPausedRoots, m.flushPausedRoots,
+		m.flushes, m.flushDuration, m.flushLeftRoots,
 		m.otlpRefused, m.otlpRequestBytes,
 	}
 	if reg != nil {
@@ -593,9 +583,6 @@ type ExportBatch struct {
 	// Roots is how many roots the batch asked for.
 	Roots                               int
 	Stored, Gone, Busy, Refused, Failed int
-	// Paused are the roots the engine refused because it has given up its
-	// remote-cache work until its next session.
-	Paused int
 	// Uploaded and Present are blobs stored (uploaded and verified, or
 	// already there), Rejected uploads that failed verification.
 	Uploaded, Present, Rejected int
@@ -616,7 +603,6 @@ func (m *Metrics) ExportBatch(b ExportBatch) {
 	m.exportBatchRoots.Observe(float64(b.Roots))
 	for result, n := range map[string]int{
 		"stored": b.Stored, "gone": b.Gone, "busy": b.Busy, "refused": b.Refused, "failed": b.Failed,
-		"paused": b.Paused,
 	} {
 		if n > 0 {
 			m.exportRoots.WithLabelValues(result).Add(float64(n))
@@ -869,9 +855,6 @@ const (
 	FlushTimeout = "timeout"
 	// FlushNotConnected found its cache's engine not connected.
 	FlushNotConnected = "not_connected"
-	// FlushPaused left only roots its cache's engine refuses because it
-	// has given up its remote-cache work until its next session.
-	FlushPaused = "paused"
 	// FlushCanceled ended because its request was canceled, or the export
 	// path stopped.
 	FlushCanceled = "canceled"
@@ -879,14 +862,13 @@ const (
 
 // FlushEnded records a flush's end: its outcome, how long it took, and how
 // many roots it left unexported.
-func (m *Metrics) FlushEnded(outcome string, d time.Duration, left, paused int) {
+func (m *Metrics) FlushEnded(outcome string, d time.Duration, left int) {
 	if m == nil {
 		return
 	}
 	m.flushes.WithLabelValues(outcome).Inc()
 	m.flushDuration.Observe(d.Seconds())
 	m.flushLeftRoots.Add(float64(left))
-	m.flushPausedRoots.Add(float64(paused))
 }
 
 // Kinds of work refused while draining.
@@ -926,13 +908,12 @@ func (m *Metrics) DrainStarted() {
 
 // DrainEnded records a drain's end: its outcome, how long it took, and how
 // many roots it left unexported. The service is still draining (it stops).
-func (m *Metrics) DrainEnded(outcome string, d time.Duration, left, paused int) {
+func (m *Metrics) DrainEnded(outcome string, d time.Duration, left int) {
 	if m == nil {
 		return
 	}
 	m.drains.WithLabelValues(outcome).Observe(d.Seconds())
 	m.drainLeftRoots.Add(float64(left))
-	m.drainPausedRoots.Add(float64(paused))
 }
 
 // DrainStored records roots stored by an export that ended while draining.

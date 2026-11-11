@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -42,9 +41,7 @@ type RenewalRequest struct {
 	// Layers is an immutable copy with no result or owner runtime IDs.
 	Layers     []snapshots.ExportLayer
 	NeededBlob digest.Digest
-	// Packs maps the layers stored in packs to their packs' IDs.
-	Packs    map[digest.Digest]digest.Digest
-	Deadline time.Time
+	Deadline   time.Time
 	// Done closes on cancellation, timeout, accepted reply, detach or shutdown.
 	Done <-chan struct{}
 }
@@ -75,10 +72,6 @@ type RemoteCacheBridge struct {
 	exchanges map[uint64]*renewalExchange
 	queue     []uint64
 	ready     chan struct{}
-
-	// lookups are the attachment's remote lookups, under their own lock
-	// (cache_remote_lookup.go).
-	lookups remoteLookups
 }
 
 type renewalExchange struct {
@@ -91,7 +84,6 @@ type renewalExchange struct {
 
 func newRemoteCacheBridge(mu *sync.Mutex) (*RemoteCacheBridge, error) {
 	b := &RemoteCacheBridge{mu: mu, exchanges: map[uint64]*renewalExchange{}, ready: make(chan struct{})}
-	b.lookups.init()
 	if _, err := rand.Read(b.epoch[:]); err != nil {
 		return nil, fmt.Errorf("remote cache bridge epoch: %w", err)
 	}
@@ -123,7 +115,6 @@ func (b *RemoteCacheBridge) enqueue(ctx context.Context, request RenewalRequest)
 		return nil, err
 	}
 	request.Layers = layers
-	request.Packs = maps.Clone(request.Packs)
 	exchange := &renewalExchange{requester: ctx, done: make(chan struct{})}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -302,7 +293,6 @@ func (b *RemoteCacheBridge) closeLocked() {
 	}
 	b.queue = nil
 	close(b.ready)
-	b.lookups.close()
 }
 
 func cloneExportLayers(layers []snapshots.ExportLayer) ([]snapshots.ExportLayer, error) {

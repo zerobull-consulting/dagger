@@ -1,6 +1,12 @@
 name = "gh"
-include = []
+engineVersion = "v0.21.9"
 
-[entrypoint]
-  kind = "dang"
-  source = "./internal/dagger/entrypoint"
+[runtime]
+  source = "go"
+
+[[dependencies]]
+  name = "apko"
+  source = "../apko"
+
+[codegen]
+  automaticGitignore = false

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/dagql"
-	"github.com/dagger/dagger/engine/snapshots"
 )
 
 // val is a test value: an engine entry number, the ordinals it depends on,
@@ -423,16 +422,6 @@ func TestValidateBundle(t *testing.T) {
 			b.Outputs = []dagql.TransferredOutput{{Ordinal: 7}}
 		}},
 		{"unsupported version", func(b *dagql.ValueBundle) { b.Version = 2 }},
-		{"the engine's version before v1.0.0-beta.26", func(b *dagql.ValueBundle) { b.Version = 3 }},
-		// What a version 7 bundle may lean on, and a stored one may not.
-		{"held row", func(b *dagql.ValueBundle) { b.Values[0].Held = "sha256:aa" }},
-		{"output with a chain prefix", func(b *dagql.ValueBundle) {
-			b.Outputs = []dagql.TransferredOutput{{Ordinal: 1, Prefix: &dagql.ChainPrefix{Ordinal: 2, Layers: 1}}}
-		}},
-		{"output naming the bundle's layers", func(b *dagql.ValueBundle) {
-			b.Outputs = []dagql.TransferredOutput{{Ordinal: 1, Chain: &dagql.OfferedChain{}, Layers: []int{0}}}
-		}},
-		{"layers listed apart from the chains", func(b *dagql.ValueBundle) { b.Layers = make([]snapshots.ExportLayer, 1) }},
 		{"pending offer owner out of range", func(b *dagql.ValueBundle) {
 			b.Values[0].Record.Envelope.PendingOffers = []dagql.PersistedPartOffer{{Owner: dagql.PersistedOfferOwner{DependencyIDs: []uint64{9}}}}
 		}},

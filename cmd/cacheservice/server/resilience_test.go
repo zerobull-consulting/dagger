@@ -544,10 +544,7 @@ func testImportBundleNearMergeLimit(t *testing.T, blobs blobstore.Store, meta *m
 	if err != nil {
 		t.Fatal(err)
 	}
-	merge, err := importer.MergeSize(capt.Bundle, addr, testScope)
-	if err != nil {
-		t.Fatal(err)
-	}
+	merge := importer.MergeSize(capt.Bundle, len(data), addr, testScope)
 	limit := tc.limit(merge, len(data))
 	t.Logf("the bundle is %d bytes; its merge, with %d byte GETs, is estimated at %d; the limit is %d", len(data), addr, merge, limit)
 

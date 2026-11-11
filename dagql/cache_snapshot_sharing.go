@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/dagger/dagger/engine"
-	"github.com/dagger/dagger/engine/wcprof"
 )
 
 // Early snapshot sharing gives an imported row R its own ownership of a
@@ -281,7 +280,7 @@ func (c *Cache) notifySnapshotShareCompletion(ctx context.Context, row *sharedRe
 	if c.shareAdmissionState() != snapshotShareOn {
 		return
 	}
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	c.queueSnapshotShareRowLocked(ctx, row)
 	duplicates := c.takeShareDuplicateHoldsLocked()
 	c.egraphMu.Unlock()
@@ -382,17 +381,12 @@ func (c *Cache) takeSnapshotShareItemLocked() *snapshotShareItem {
 
 func (c *Cache) runSnapshotShareWorker(ctx context.Context) {
 	for {
-		// Each turn is a profile op, on an engine that records, so a wait
-		// behind the worker's hold on the graph lock names it. A turn that
-		// finds no item ends with no outcome.
-		jobCtx, op := wcprof.BeginOp(ctx, wcprof.OpKindInternal, "snapshot.share", wcprof.OpOpts{})
-		wcprof.WriteLock(jobCtx, &c.egraphMu, egraphLockIdent)
+		c.egraphMu.Lock()
 		item := c.takeSnapshotShareItemLocked()
 		duplicates := c.takeShareDuplicateHoldsLocked()
 		c.egraphMu.Unlock()
-		c.releaseShareDuplicateHolds(jobCtx, duplicates)
+		c.releaseShareDuplicateHolds(ctx, duplicates)
 		if item == nil {
-			op.End(wcprof.OutcomeNone)
 			select {
 			case <-ctx.Done():
 				c.dropSnapshotShareQueue(context.WithoutCancel(ctx))
@@ -405,10 +399,9 @@ func (c *Cache) runSnapshotShareWorker(ctx context.Context) {
 		// extends a separate pending successor with its own holds.
 		c.retireExtraShareOperations(item)
 		if ctx.Err() == nil {
-			c.runSnapshotSharePass(jobCtx, item)
+			c.runSnapshotSharePass(ctx, item)
 		}
-		c.releaseSnapshotShareItem(jobCtx, item)
-		op.End(wcprof.OutcomeOK)
+		c.releaseSnapshotShareItem(ctx, item)
 	}
 }
 
@@ -755,7 +748,7 @@ func (c *Cache) selectShareSlots(ctx context.Context, item *snapshotShareItem) [
 	type sharePair struct{ receiver, donor sharedResultID }
 	eligible := make(map[sharedResultID]bool, len(rows))
 	admits := map[sharePair]bool{}
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	for _, row := range rows {
 		lookup, prepared := lookups[row.id]
 		eligible[row.id] = prepared && c.shareReceiverEligibleLocked(row, now)
@@ -885,7 +878,7 @@ func (c *Cache) preflightShareDecode(ctx context.Context, srv *Server, roots []u
 			continue
 		}
 		seen[id] = true
-		wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+		c.egraphMu.Lock()
 		row := c.resultsByID[sharedResultID(id)]
 		if row != nil {
 			c.incrementIncomingOwnershipLocked(ctx, row)
@@ -1430,7 +1423,7 @@ func (c *Cache) planSharePass(ctx context.Context, item *snapshotShareItem) ([]*
 // has run and a receiver costs at most one pass per part.
 func (c *Cache) releaseSnapshotShareMembers(ctx context.Context, item *snapshotShareItem, successors []*sharedResult) {
 	cleanupCtx := context.WithoutCancel(ctx)
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	for _, row := range successors {
 		c.queueSnapshotShareRowLocked(cleanupCtx, row)
 	}

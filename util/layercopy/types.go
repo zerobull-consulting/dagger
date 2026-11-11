@@ -72,8 +72,4 @@ type Copier struct {
 	dest         *destination
 	sourceCaches map[sourceCacheKey]*sourceCache
 	lowerHides   map[string]bool
-
-	// afterLayerResolve, if set, is called once CopyFileFromLayer has resolved
-	// a file, before it links it. Tests use it to take the file away there.
-	afterLayerResolve func(realPath string)
 }
