@@ -1263,6 +1263,31 @@ cleanup_bounded() {
 }
 check "the cleanup after a signal is bounded: removals that hang are cut off, and the stop exits 143" cleanup_bounded
 check "... and says what it left behind" grep -q "but for container t-service, container t-engine, volume t-engine-state, network t-net" "$tmp/sig.bound.out"
+# A signal before the whole state is read removes nothing, and keeps the
+# state for the next stop: a cleanup from part of it would remove some of
+# what the start created, then the state that names the rest.
+early_signal() {
+	sig_stop_state
+	# shellcheck disable=SC2034
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc" SIDECAR_NAME=t
+		set +e
+		source "$here/sidecar.sh"
+		on_signals stop_signaled
+		# read_state has set some of the state (st_logs among them), but
+		# the stop hasn't marked it read.
+		local name=t state="$tmp/sig/sc/t/state" st_logs="" state_read=false st_service="" st_engine="" st_volume="" st_network=""
+		local st_stop_seconds="" st_settle_seconds="" st_url="" st_role="" st_created=" " st_creating=" " st_old_state=false
+		local leftovers="" cleanup_done=" " code="" flush_result=""
+		read_state "$state"
+		stop_signaled INT 2
+	) >"$tmp/sig.early.out" 2>&1
+	[[ $? == 130 ]]
+}
+check "a signal before the stop has read its whole state exits 130" early_signal
+check "... says it removed nothing" grep -q "before it read its state, and removed nothing" "$tmp/sig.early.out"
+check "... keeps the state for the next stop" [ -f "$tmp/sig/sc/t/state" ]
+check "... and removes nothing" not sig_called "rm -f t-service"
 
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="flush: done" namespace=default cacheID=c1 outcome=complete took=1ms storedRoots=0 leftRoots=0' >"$tmp/no-exports.log"
