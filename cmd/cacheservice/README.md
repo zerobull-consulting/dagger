@@ -392,7 +392,9 @@ the writers and GC both use:
 <prefix>/ns/<ns>/conditional-write-check/<16 hex>         the startup probe, deleted after it
 ```
 
-Incomplete multipart uploads exist only at blob keys (a promotion's copy).
+Incomplete multipart uploads exist only at blob keys (a promotion's copy)
+and at staging keys (the private copy a service-hashed promotion makes of a
+blob over 5 GiB, see [Verification and promotion](#verification-and-promotion)).
 Namespaces live only under `ns/`, with the names
 [the tokens file](#the-tokens-file) takes. Anything else under the prefix
 isn't the service's.
@@ -632,8 +634,9 @@ and reaches the blob's digest key only once the service has checked its
 content ([#23](https://github.com/zerobull-consulting/dagger/issues/23)).
 Usually the store hashes it as it copies it; the exception is a
 service-hashed promotion (a blob over 5 GiB, `CACHESERVICE_S3_HASH_IN_SERVICE`,
-or a store that returns no checksum), which reads the blob once through the
-service, over its network to S3, with a 32 KiB buffer (see
+or a store that returns no checksum), which copies the blob to a private key
+in the store, and reads that copy once through the service, over its network
+to S3, with a 32 KiB buffer (see
 [Verification and promotion](#verification-and-promotion)).
 
 **Keys.** The service uses each namespace's view of the store (`Namespace`),
@@ -714,22 +717,33 @@ and so does AWS S3 for objects up to 5 GB (`TestMinIOStoreHashesCopies`).
   the service.
 - A blob over 5 GiB needs several parts (`UploadPartCopy`'s limit), whose
   checksums are per part and can't be combined into the blob's. The service
-  then reads the staged object and hashes it itself, and copies it in parts
-  of 1 GiB (larger when that would make over S3's 10,000 parts), each
-  conditioned on the ETag it read (`CopySourceIfMatch`), so a staged object
-  overwritten in between is not what gets promoted
-  (`TestMinIOPromoteManyParts`, with the limits lowered to 5 MiB). A store
-  may ignore that condition, as DigitalOcean Spaces does, so the service also
-  takes each part's MD5 as it reads and compares it with the ETag the store
-  returns for that part's copy. A difference is a mismatch, and the upload
-  never completes (`TestPromoteChecksCopiedParts`,
-  `TestMinIOPromoteStagedOverwritten`). This can't apply to a store whose
-  ETags aren't MD5s, such as AWS S3 with SSE-KMS; the staged object's own ETag
-  shows that, and only the condition protects the copy there. Since MD5 isn't
-  collision resistant, someone who holds the presigned PUT, prepares a
-  same-MD5 pair and wins the race could still get past it on a store that
-  ignores the condition
-  ([zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)).
+  then hashes it itself, from a **private copy**: it first copies the staged
+  object to a staging key under a stage of its own
+  (`<prefix>/ns/<ns>/staging/<new stage>/<alg>/<hex>`), new for the
+  promotion and never presigned, so no upload URL reaches it. It reads and
+  hashes that copy, and copies it to the digest key in parts of 1 GiB
+  (larger when that would make over S3's 10,000 parts). What reaches the
+  digest key is what the service hashed, even when someone who holds the
+  still-valid presigned PUT overwrites the staged object meanwhile
+  (`TestPromoteHashesPrivateCopy`, `TestMinIOPromoteStagedOverwritten`,
+  `TestMinIOPromoteManyParts` with the limits lowered to 5 MiB). Nothing
+  rests on a store condition or an ETag: a store that ignores
+  `CopySourceIfMatch` (DigitalOcean Spaces does), a same-MD5 pair, or ETags
+  that aren't MD5s (AWS S3 with SSE-KMS) change nothing
+  (`TestPromoteSameMD5Overwrite`, `TestPromoteNonMD5ETagsIgnoredCondition`;
+  before, the service hashed the staged object and compared each copied
+  part's ETag with its MD5,
+  [zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)).
+  The copy to the private key is one `CopyObject` up to 5 GiB, else a
+  multipart upload of part copies at the private key. It is still
+  conditioned on the staged object's ETag, so a store that honors the
+  condition fails early on an overwrite; one that doesn't makes a copy
+  that doesn't hash to the digest, a mismatch. The private copy is deleted
+  once the promotion is over; one a stopped service leaves is an ordinary
+  staged upload, which the [lifecycle rule](#lifecycle-rule-for-staging) or
+  GC expires, and a multipart copy it leaves is aborted the same way as a
+  promotion's at a blob key. The cost is one more copy in the store per
+  service-hashed blob.
 - So is every blob with `CACHESERVICE_S3_HASH_IN_SERVICE=true`, for a store
   whose copy checksums can't be trusted, and every blob once a store returns
   a part copy without a checksum: the service then hashes from that point
@@ -753,22 +767,25 @@ service-hashed one streams the object through a 32 KiB buffer, so at most
 
 **Time to promotion.** A blob reaches the shared cache after the engine's
 `uploaded` reply (which waits for every upload of the export), plus its own
-promotion. Promotion costs a fixed ~13 ms (6 requests: a HEAD of each key, the
-multipart upload's create, copy and complete, and the staged object's
-delete) plus the copy, which grows with the size. Measured against the local MinIO
-(`TestMinIOPromoteLatency`, 2026-11-02; `CACHESERVICE_TEST_PROMOTE_MB=1024`
-adds the 1 GiB row, which takes about 50s and writes 4 GiB):
+promotion. A store-hashed promotion costs a fixed ~13 ms (6 requests: a HEAD
+of each key, the multipart upload's create, copy and complete, and the staged
+object's delete) plus the copy, which grows with the size. A service-hashed
+one makes 3 more requests (the private copy, its read, and its delete) and
+copies the blob twice. Measured against the local MinIO
+(`TestMinIOPromoteLatency`, 2026-11-11, after the private copy;
+`CACHESERVICE_TEST_PROMOTE_MB=1024` adds the 1 GiB row, which takes about
+40s and writes 5 GiB):
 
 | Blob size | Store-hashed | Service-hashed |
 | --- | --- | --- |
-| 64 KiB | 13 ms | 14 ms |
-| 1 MiB | 20 ms | 21 ms |
-| 16 MiB | 103 ms | 147 ms |
-| 64 MiB | 381 ms | 465 ms |
-| 1 GiB | 5.5 s | 6.9 s |
+| 64 KiB | 13 ms | 17 ms |
+| 1 MiB | 14 ms | 27 ms |
+| 16 MiB | 74 ms | 162 ms |
+| 64 MiB | 251 ms | 710 ms |
+| 1 GiB | 3.6 s | 8.5 s |
 
-So roughly `13 ms + size / 185 MiB/s` when the store hashes, and
-`13 ms + size / 150 MiB/s` when the service does, on one local disk. Store
+So roughly `13 ms + size / 285 MiB/s` when the store hashes, and
+`17 ms + size / 120 MiB/s` when the service does, on one local disk. Store
 copies on AWS S3 run in the store, at its internal copy rate; a
 service-hashed promotion also reads the blob once over the service's network
 to S3. `blob_promotion_duration_seconds` measures it in production (see
@@ -964,7 +981,7 @@ under S3's 255; `CheckSafe` checks every ID again before writing.
 `InvalidArgument`, see `hack/remote-cache/README.md`, "What each store
 does"). `apply` fails, writes nothing, and names that as the likely cause
 of a 400: run it with `-abort-rule=false` there. MinIO drops stale uploads itself after 24 hours (its `api
-stale_uploads_expiry`), and GC aborts stale ones at blob keys. A Spaces key
+stale_uploads_expiry`), and GC aborts stale ones at blob and staging keys. A Spaces key
 that isn't full-access gets 403, which `apply` explains as needing the admin
 key. Tested against MinIO (`TestMinIOLifecycle`: plan, apply, a foreign rule
 kept, a second apply writing nothing, a removed namespace losing its rule
@@ -1058,7 +1075,8 @@ static credentials,
 (false) from `CACHESERVICE_S3_*`. Without static credentials it uses the AWS
 SDK's default chain. The service's credentials need `s3:GetObject` and
 `s3:DeleteObject` on staging keys (a copy reads its source), `s3:PutObject`
-and `s3:AbortMultipartUpload` on digest keys (the multipart copy), besides
+and `s3:AbortMultipartUpload` on digest keys (the multipart copy) and on
+staging keys (a service-hashed promotion's private copy), besides
 what the metadata store needs, and what garbage collection needs (see
 [Retention and garbage collection](#retention-and-garbage-collection)). The
 startup's ownership check needs `s3:ListBucket` on the prefix, and, on an
@@ -1923,13 +1941,26 @@ net/http holds with it, by trickling or stalling the body after a 401
     allocator's size classes, and 16 bytes, so a 32,769-byte one, whose copy
     takes 40,960, is charged 40,977 (`TestOTLPSingularStringCoversSizeClass`,
     [zerobull-consulting/dagger#232](https://github.com/zerobull-consulting/dagger/issues/232));
-    an empty one is charged the 16 bytes. That is the protobuf estimate. Two
-    gaps are left in the JSON one, which charges a string its bytes in the
-    body, not its size class, so a 32,769-byte `stringValue` is charged under
-    the 40,960 its copy takes (`TestOTLPJSONSingularStringSizeClassKnownGap`),
-    and charges 16 bytes for each comma, so an empty element of a repeated
-    string, `"",`, is charged 19 bytes, under what append holds for it
-    (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
+    an empty one is charged the 16 bytes. The JSON estimate charges the same
+    way, from one pass over the body that tracks whether it is in a string,
+    an object or an array, and whether a string is a key or a value, and
+    allocates nothing (`TestOTLPJSONSizeAllocatesNothing`): each object at
+    the largest message's size, 320 bytes; the body's bytes; each string
+    value its length and a quarter more and 16 bytes on top, so a 32,769-byte
+    `stringValue` is charged 40,977 (`TestOTLPJSONSingularStringCoversSizeClass`);
+    each string in an array its length and a quarter more and 64 bytes on
+    top, so 100,000 empty `idKeys`, 300 KB, are charged 6.7 MB, over the
+    3.38 MB append holds at its peak
+    (`TestOTLPJSONEmptyRepeatedStringsCoverDecodePeak`); each number in an
+    array 32 bytes, for the 8-byte scalar append grows
+    (`TestOTLPJSONRepeatedNumbersCoverAppendPeak`); a string holding an
+    escape, which the decoder unescapes by append before copying it, three
+    times its copy (`TestOTLPJSONEscapedStringCoversDecodePeak`); and a value
+    under a key that names a bytes field (a trace or span ID,
+    `bytesValue`), which is base64, also the bytes it decodes to
+    (`TestOTLPJSONBytesFieldCoversBase64Decode`)
+    ([zerobull-consulting/dagger#233](https://github.com/zerobull-consulting/dagger/issues/233)).
+    A key is charged its bytes in the body only. A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded
@@ -2847,8 +2878,15 @@ the bucket's lifecycle rules once per run (`GetBucketLifecycleConfiguration`):
   and removes `gc_staging_rule_missing` (`TestStagingRuleMetricUnknown`).
 
 Stale incomplete multipart uploads (`ListMultipartUploads`) at a
-namespace's blob keys are aborted whatever the rules (`TestStagingAndUploads`,
-`TestMinIOGC`). An upload anywhere else is not the service's: it is never
+namespace's blob keys, and at its staging keys (the private copy of a
+service-hashed promotion over 5 GiB), are aborted whatever the rules
+(`TestStagingAndUploads`, `TestMinIOGC`). An image from before
+[zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)
+takes an upload at a staging key for a violation: during a rolling upgrade,
+or after a rollback, its GC skips a namespace while such an upload is there
+(a large service-hashed promotion in progress, or one a stopped service
+left, until the abort rule or a newer GC aborts it), and deletes nothing in
+it. An upload anywhere else is not the service's: it is never
 aborted, at any age, and stops collection as any unexpected key does
 (`TestUnexpectedUploadNeverAborted`, `TestMinIOGCOwnership`); the bucket's
 own abort rule, if it has one, still applies to it. MinIO lists
@@ -3039,10 +3077,15 @@ There are two ways to get what is pending exported before something stops:
   SIGTERM, every cache, until `-drain-timeout`, taking no new work, and the
   service stops after it. The rest of this section is the drain.
 
-The service runs as a sidecar on an ephemeral CI runner, and the end of the
-job is its only chance to store what the job built
-([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
-SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops.
+On an ephemeral CI runner, the end of the job is a sidecar's only chance to
+store what the job built
+([#63](https://github.com/zerobull-consulting/dagger/issues/63)). The sidecar
+action takes it with the flush, not the drain: it flushes, stops the engine,
+then stops the service, which it runs with `-drain-timeout 0`
+([zerobull-consulting/dagger#137](https://github.com/zerobull-consulting/dagger/issues/137);
+see [Running it as a sidecar](#running-it-as-a-sidecar)). With a drain
+timeout, on the first SIGTERM or interrupt, the service drains
+(`server.Service.Drain`) before it stops.
 A read-only instance (`-export=false`) has nothing to flush: its drain
 logs `drain: nothing to export (read-only: -export=false)`, and returns at
 once, unless an explicit import admitted before it still runs, which it
@@ -3364,8 +3407,9 @@ run over the engine's connection, and the engine uploads the layers itself.
 An engine stopped first takes its pending exports with it. Stop the engine
 once the drain is done (`drain: done` in the service's log), while the
 service lingers, then wait for the service to exit: the engine's stop then
-delivers its `engine.stop` and takes seconds. The sidecar action does this
-(see [Running it as a sidecar](#running-it-as-a-sidecar)).
+delivers its `engine.stop` and takes seconds. (The sidecar action no longer
+drains: it flushes, stops the engine, then the service; see
+[Running it as a sidecar](#running-it-as-a-sidecar).)
 
 **Process managers.** The process manager's stop timeout must be longer than
 `-drain-timeout` plus `-drain-linger` plus 5s, the linger's and the
@@ -3722,9 +3766,9 @@ On GitHub Actions, use the composite action, which does everything below
     s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
     s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
 - run: dagger call build                # any dagger command: start puts a wrapper of the CLI first on PATH
-# No stop step: start stops the sidecar, draining its exports, at the end of the job.
+# No stop step: start stops the sidecar, flushing its exports, at the end of the job.
 # The job's timeout-minutes bounds that stop: set it above the work plus the
-# drain timeout (10m) plus 2 minutes. remote-cache/stop stops earlier.
+# settle timeout (10s) plus 3 minutes. remote-cache/stop stops earlier.
 ```
 
 Pin the action to a commit of `feature/remote-cache`. Its `version` is an
@@ -3772,7 +3816,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
   ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26 \
-  -scope default -drain-timeout 10m -drain-linger 15s -gc-mode=batch
+  -scope default -drain-timeout 0 -gc-mode=batch
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
 
@@ -3787,9 +3831,10 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 - **`-gc-mode=batch`** on writers: the service has no GC schedule, and
   `POST /debug/gc` still runs GC; collecting belongs to a job of its own
   ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
-- **`-drain-timeout 10m`**: the stop's chance to store what the job built
-  (see step 4); **`-drain-linger 15s`** (its default) lets the engine's stop
-  deliver its last event after the drain.
+- **`-drain-timeout 0`**: no drain, and no linger. The stop's chance to
+  store what the job built is the flush before the engine's stop (see step
+  4), so the service, stopped last, has nothing left to do, and stops at
+  once.
 - **The debug API**, when wanted: `-debug-listen :8091` with
   `-p 127.0.0.1:8091:8091`, on the runner's loopback only, and
   `-debug-token-file` with a token generated for the job and mounted
@@ -3863,36 +3908,30 @@ on `PATH` that unsets `TRACEPARENT`, `TRACESTATE`, `OTEL_*`, `DAGGER_*` and
 needs the same.
 
 **4. The stop**, at the end of the job, whatever happened before it
-(`if: always()`): SIGTERM the service, which drains; once its drain is done,
-stop the engine; then wait for the service to exit. The drain's exports run
-over the engine's connection, and the engine uploads the layers itself, so
-an engine stopped before the drain is done takes them with it. After the
-drain, the service [lingers](#the-linger): it still answers the engine's
-events, so the engine's stop delivers its last one (`engine.stop`) and
-takes seconds (about 7s, measured), and the service exits once that event
-arrived.
+(`if: always()`): flush the engine's pending exports, while the service and
+the engine are both fully up; then stop the engine; then SIGTERM the
+service, which runs with no drain
+([zerobull-consulting/dagger#137](https://github.com/zerobull-consulting/dagger/issues/137)).
+The exports run over the engine's connection, and the engine uploads the
+layers itself, so an engine stopped before they are done takes them with
+it: the [flush](#flushing-one-engine-cache) does them first, within a bound
+of its own, and says what it left. The engine is stopped while the service
+still answers its events, so its stop delivers its last one
+(`engine.stop`) and takes seconds (about 7s, measured). Then the service has
+nothing left to do: it stops at once, within its shutdown's 5s.
 
 ```bash
-since="$(($(date +%s) - 1))"
-timeout 30 docker kill -s TERM remote-cache-service
-# Wait for the drain to be done, or the service to have exited, for at most
-# -drain-timeout plus 5s. Every docker call is bounded by what is left of
-# that (at most 10s, at least 1s), and one that fails or times out prints
-# nothing: only docker's "false" means the service has exited, so a failing
-# docker never stops the engine mid-drain.
-end=$((SECONDS + 605))
-left() { t=$((end - SECONDS)); [ "$t" -gt 10 ] && t=10; [ "$t" -lt 1 ] && t=1; echo "$t"; }
-while [ "$SECONDS" -lt "$end" ]; do
-  log="$(timeout "$(left)" docker logs --since "$since" remote-cache-service 2>&1 || true)"
-  grep -q 'msg="drain: done"' <<<"$log" && break
-  [ "$(timeout "$(left)" docker inspect -f '{{.State.Running}}' remote-cache-service 2>/dev/null)" = false ] && break
-  sleep 0.5
-done
+# The flush: what is pending for the engine of this token, for up to 10s.
+# Its report says what it stored and what it left (see "Flushing one engine
+# cache"); a flush that ends at its timeout, or gets no answer, is no reason
+# not to stop.
+curl -sS -X POST -u sidecar-engine: --max-time 15 \
+  "$url/v1/engines/flush?timeout=10s" || echo "the flush got no answer" >&2
 timeout 90 docker stop --time 30 remote-cache-engine
-# It exits once engine.stop arrived, or 15s after its drain. docker wait
-# prints the exit code; nothing means it hadn't exited (or docker failed),
-# which is never a clean stop.
-code="$(timeout 30 docker wait remote-cache-service 2>/dev/null || true)"
+timeout 30 docker kill -s TERM remote-cache-service
+# It exits within 5s. docker wait prints the exit code; nothing means it
+# hadn't exited (or docker failed), which is never a clean stop.
+code="$(timeout 10 docker wait remote-cache-service 2>/dev/null || true)"
 echo "the service's exit code: ${code:-unknown (still running?)}"
 [ "$code" = 0 ]
 ```
@@ -3900,18 +3939,16 @@ echo "the service's exit code: ${code:-unknown (still running?)}"
 Don't shorten the engine's `docker stop --time`: an engine killed before its
 "close dagql cache" phase ended leaves its store unclean, which wipes the
 engine's cache at its next start on a host that keeps the state volume.
-Don't `docker stop` the service again while it lingers either: its SIGTERM
-ends the linger at once, and the engine's last event goes undelivered.
+Don't stop the service before the engine: the engine's stop would retry its
+last event against a closed port for 30s.
 
-- **The bound:** the service's whole stop, from SIGTERM to exit, takes at
-  most `-drain-timeout` plus `-drain-linger` (15s) plus 5s (see
-  [Stopping and draining](#stopping-and-draining)). The waits above, and the
-  CI step's own timeout, must be above that, or the service is cut off
-  mid-drain. With `10m`, the action waits up to 625s for the service in all.
-  The engine's stop (up to 30s, cut off at 90s) comes after the drain's wait,
-  so the step needs `-drain-timeout` plus 2 minutes, 12 for `10m`: the
-  action's stop bounds every wait, and the caller sets the step's
-  `timeout-minutes`.
+- **The bound:** the flush takes at most its `timeout` (and a moment for
+  the answer), the engine's stop up to 30s (cut off at 90s), and the
+  service's, from SIGTERM to exit, at most 5s (see
+  [Stopping and draining](#stopping-and-draining)). The action's stop
+  bounds each, and records their sum, the settle timeout plus 105s, as its
+  own; the step needs the settle timeout plus 3 minutes, 4 for `10s`, and
+  the caller sets the step's `timeout-minutes`.
 - **Exit codes:** 0 for a clean stop; 1 when the bound cut work off, when
   something else left the stop unclean, when a signal arrived during the
   shutdown, or when an HTTP server failed (including one that failed as the
@@ -3924,10 +3961,14 @@ ends the linger at once, and the engine's last event goes undelivered.
   closing (about 2.5s in). Two exits log differently: a signal during the
   shutdown (`signal during the shutdown: exiting at once`) and the outer
   backstop for a step that overran its own bound (`stopped: the shutdown
-  overran its bound`). The action's stop fails the step on anything but 0, and
-  on a service that exited before the stop, with the service's log.
-- The drain logs what it stored (`drain: stored`) and its outcome
-  (`drain: done outcome=complete`). Most exports are stored before it:
+  overran its bound`). An export still in flight at the SIGTERM is
+  canceled, and the stop is still clean
+  (`TestMinIOBinaryNoDrainStopWithExportInFlightExitsZero`). The action's
+  stop fails the step on anything but 0, and on a service that exited
+  before the stop, with the service's log; a flush that doesn't complete
+  is a warning in its output and step summary, not a failure.
+- The flush logs what it did (`flush: done outcome=complete
+  storedRoots=... leftRoots=...`). Most exports are stored before it:
   each entry within about `-export-settle` of its last span, or at its
   session's end.
 
@@ -3936,8 +3977,8 @@ ends the linger at once, and the engine's last event goes undelivered.
 `batch` is refused), and a read-only key (see
 [A read-only key](#a-read-only-key)): `s3:GetObject` and `s3:ListBucket` on
 the prefix. A job that forgets `-export=false` with that key fails at
-startup, exit 1, rather than running as a writer. Its drain has nothing to
-flush, so the stop is quick. The service merges what is stored as the
+startup, exit 1, rather than running as a writer. It has nothing to flush
+(a flush gets 409), so the action's stop skips the flush, and is quick. The service merges what is stored as the
 engine connects, within a second or two, and logs `msg="import sync: first
 done" merged=N` once that first sync ends, even when it merged nothing (see
 [Import path](#import-path)). The action's start waits for that line, in

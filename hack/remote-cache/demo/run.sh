@@ -2,7 +2,7 @@
 # Runs the demo locally, as CI's sidecar job does, against the compose MinIO:
 #
 #   1. writer phase: a writer sidecar (.github/actions/remote-cache/
-#      sidecar.sh), the demo, then the stop, which drains;
+#      sidecar.sh), the demo, then the stop, which flushes;
 #   2. read-only phase: a fresh engine and a read-only sidecar (-export=false,
 #      with MinIO's read-only user), the demo again.
 #
