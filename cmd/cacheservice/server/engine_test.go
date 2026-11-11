@@ -24,7 +24,7 @@ type fakeAdapter struct{}
 
 func (fakeAdapter) CacheIdentity() (string, uint64) { return "cache-1", 3 }
 
-func (fakeAdapter) Export(ctx context.Context, req protocol.Export, consume func(context.Context, remotecache.Export) error) error {
+func (fakeAdapter) Export(ctx context.Context, req protocol.Export, _ *dagql.KnownRows, consume func(context.Context, remotecache.Export) error) error {
 	skipped := make([]protocol.SkippedRoot, 0, len(req.Roots))
 	for _, n := range req.Roots {
 		skipped = append(skipped, protocol.SkippedRoot{Number: n, Reason: protocol.SkipGone})
@@ -32,9 +32,23 @@ func (fakeAdapter) Export(ctx context.Context, req protocol.Export, consume func
 	return consume(ctx, remotecache.Export{Skipped: skipped})
 }
 
-func (fakeAdapter) Merge(context.Context, protocol.Merge) (protocol.Merged, error) {
+func (fakeAdapter) Merge(context.Context, uint64, protocol.Merge, *dagql.KnownRows) (protocol.Merged, error) {
 	return protocol.Merged{}, nil
 }
+
+func (fakeAdapter) StartLookups() {}
+func (fakeAdapter) StopLookups()  {}
+
+func (fakeAdapter) TakeLookupMisses(ctx context.Context, _ int, _ time.Duration) ([]dagql.RemoteMiss, uint64, error) {
+	<-ctx.Done()
+	return nil, 0, ctx.Err()
+}
+
+func (fakeAdapter) SettleState() (remotecache.SettleState, <-chan struct{}) {
+	return remotecache.SettleState{}, nil
+}
+
+func (fakeAdapter) Settled(uint64, []protocol.SettleSession) {}
 
 func (fakeAdapter) OfferParts(_ context.Context, req protocol.Offer) (protocol.Offered, error) {
 	var offered protocol.Offered

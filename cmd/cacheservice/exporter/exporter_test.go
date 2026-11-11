@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -49,6 +53,22 @@ type fakeEngine struct {
 	// onUpload, when set, runs when an upload that asks for blobs arrives,
 	// before the engine answers it.
 	onUpload func()
+	// cutUploads, when set, fails every blob but the first of each upload
+	// with it, unsent, as an upload the engine cut off does.
+	cutUploads string
+	// errOnce answers the next request of a type with an error reply, once;
+	// an upload so answered finds its export dropped. pauseAfter then makes
+	// the engine refuse every root of its later exports as paused.
+	errOnce    map[protocol.Type]string
+	pauseAfter bool
+	paused     bool
+	// requests counts the requests received, by type.
+	requests map[protocol.Type]int
+	// hangUploads leaves every upload that asks for blobs unanswered.
+	hangUploads bool
+	// tooLargeAfter, when set, answers the export request after that many
+	// with TooLargeMessage, once.
+	tooLargeAfter int
 }
 
 func newFakeEngine(cache *fakeengine.Cache) *fakeEngine {
@@ -61,9 +81,44 @@ func (e *fakeEngine) Generation() uint64 { return e.cache.Generation }
 func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.RawMessage) (protocol.Envelope, error) {
 	e.mu.Lock()
 	replyErr, hold := e.replyErr, e.hold
+	if e.requests == nil {
+		e.requests = map[protocol.Type]int{}
+	}
+	e.requests[typ]++
+	once, cutOnce := e.errOnce[typ]
+	if cutOnce {
+		delete(e.errOnce, typ)
+		e.paused = e.pauseAfter
+		if typ == protocol.TypeUpload {
+			e.exports = map[string]fakeengine.Capture{}
+			e.inFlight = 0
+		}
+	}
+	paused := e.paused
+	tooLarge := typ == protocol.TypeExport && e.tooLargeAfter > 0 && e.requests[typ] == e.tooLargeAfter+1
+	if tooLarge {
+		e.tooLargeAfter = 0
+	}
 	e.mu.Unlock()
+	if tooLarge {
+		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: protocol.TooLargeMessage})
+	}
 	if replyErr != "" {
 		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: replyErr})
+	}
+	if cutOnce {
+		return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: once})
+	}
+	if paused && typ == protocol.TypeExport {
+		var req protocol.Export
+		if err := json.Unmarshal(body, &req); err != nil {
+			return protocol.Envelope{}, err
+		}
+		skipped := make([]protocol.SkippedRoot, len(req.Roots))
+		for i, n := range req.Roots {
+			skipped[i] = protocol.SkippedRoot{Number: n, Reason: protocol.SkipRefused, Message: EnginePausedMessage}
+		}
+		return protocol.NewEnvelope(1, 1, protocol.TypeExported, protocol.Exported{Skipped: skipped})
 	}
 	switch typ {
 	case protocol.TypeExport:
@@ -108,16 +163,28 @@ func (e *fakeEngine) Request(ctx context.Context, typ protocol.Type, body json.R
 			e.inFlight--
 		}
 		e.uploads = append(e.uploads, req.URLs)
-		onUpload := e.onUpload
+		onUpload, cut, hang := e.onUpload, e.cutUploads, e.hangUploads
+		if cut != "" && e.pauseAfter {
+			e.paused = true
+		}
 		e.mu.Unlock()
 		if onUpload != nil && len(req.URLs) > 0 {
 			onUpload()
+		}
+		if hang && len(req.URLs) > 0 {
+			<-ctx.Done()
+			return protocol.Envelope{}, ctx.Err()
 		}
 		if !ok {
 			return protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: "no export " + req.ExportID})
 		}
 		reply := protocol.Uploaded{Done: []digest.Digest{}}
-		for d, url := range req.URLs {
+		for i, d := range slices.Sorted(maps.Keys(req.URLs)) {
+			url := req.URLs[d]
+			if cut != "" && i > 0 {
+				reply.Failed = append(reply.Failed, protocol.UploadFailure{Digest: d, Message: cut})
+				continue
+			}
 			e.mu.Lock()
 			skip := e.noPut[d]
 			e.mu.Unlock()
@@ -479,11 +546,11 @@ func (e *testEnv) mergeSize(t *testing.T, roots ...uint64) int {
 		t.Fatal(err)
 	}
 	stripVolatile(capt.Bundle)
-	data, err := json.Marshal(capt.Bundle)
+	size, err := importer.MergeSize(capt.Bundle, e.x.addressSize(context.Background()), "team")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return importer.MergeSize(capt.Bundle, len(data), e.x.addressSize(context.Background()), "team")
+	return size
 }
 
 // manyLayers is a chain of n distinct layers, as a deep image has: its
@@ -907,5 +974,478 @@ func TestExportStaleGenerationAfterEarlyCheck(t *testing.T) {
 	}
 	if after := e.indexBytes(t); !bytes.Equal(after, before) {
 		t.Fatal("index changed by the refused export")
+	}
+}
+
+// Since v1.0.0-beta.26 an engine sends an output whose layers are the first
+// of another output's chain as a prefix of that chain. The stored bundle
+// gives each output its own chain: it is merged whole into other engines,
+// and the blobs it names are read from its chains.
+func TestExportStoresPrefixedOutputsWithTheirChains(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.cache.ChainPrefixes = true
+	e.addBuild()
+	prefixes := 0
+	e.eng.mangle = func(capt *fakeengine.Capture) {
+		for _, o := range capt.Bundle.Outputs {
+			if o.Prefix != nil && o.Chain == nil {
+				prefixes++
+			}
+		}
+	}
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefixes != 1 {
+		t.Fatalf("the engine sent %d prefixed outputs, want the base's", prefixes)
+	}
+	if !slices.Equal(res.Stored, []uint64{11}) || len(res.Bundles) != 1 || len(res.Uploaded) != 2 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	b, err := e.meta.GetBundle(ctx, "team", res.Bundles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := map[int]int{}
+	for _, o := range b.Outputs {
+		if o.Prefix != nil || o.Chain == nil {
+			t.Fatalf("stored output %d: prefix %v, chain %v", o.Ordinal, o.Prefix, o.Chain)
+		}
+		layers[len(o.Chain.Layers)]++
+	}
+	if len(b.Outputs) != 2 || layers[1] != 1 || layers[2] != 1 {
+		t.Fatalf("stored chains by length: %v, want one of the base's layer and one of both", layers)
+	}
+}
+
+// A layer's first export says the export computed its blob, and every later
+// one doesn't: the same values are the same bundle all the same.
+func TestRepeatedExportComputedLayersSameBundle(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.cache.ComputedLayers = true
+	e.addBuild()
+	ctx := context.Background()
+	req := Request{Roots: []uint64{11}, Outputs: fsOutputs(10, 11)}
+	computed := 0
+	e.eng.mangle = func(capt *fakeengine.Capture) {
+		for _, o := range capt.Bundle.Outputs {
+			for _, l := range o.Chain.Layers {
+				if l.Computed {
+					computed++
+				}
+			}
+		}
+	}
+	first, err := e.x.Export(ctx, e.eng, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if computed == 0 {
+		t.Fatal("the first export marked no layer computed: the test proves nothing")
+	}
+	second, err := e.x.Export(ctx, e.eng, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Bundles) != 1 || !slices.Equal(first.Bundles, second.Bundles) {
+		t.Fatalf("bundles: %v then %v", first.Bundles, second.Bundles)
+	}
+}
+
+// Roots an engine refuses because it has given up its remote-cache work
+// are paused, not refused: with its skip, and when it cancels an export in
+// progress with that error.
+func TestExportPausedRoots(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.cache.Add(fakeengine.Entry{Number: 20, Refused: EnginePausedMessage})
+	e.cache.Add(fakeengine.Entry{Number: 21, Refused: "no codec"})
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: []uint64{20, 21}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Paused, []uint64{20}) || len(res.Refused) != 1 || res.Refused[0].Number != 21 || len(res.Failed) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	e.eng.replyErr = "context canceled: " + EnginePausedMessage
+	res, err = e.x.Export(ctx, e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatalf("an export the engine canceled as paused failed: %v", err)
+	}
+	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// An engine that gives up its remote-cache work during an upload answers it,
+// with the blobs it never sent failed by that error: the roots are paused at
+// once, with no further try, and the blob that arrived is stored.
+func TestExportPausedDuringUpload(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.cutUploads = "context canceled: " + EnginePausedMessage
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if len(e.eng.uploads) != 1 || len(e.eng.uploads[0]) < 2 {
+		t.Fatalf("want one upload of several blobs, got %v", e.eng.uploads)
+	}
+	if len(res.Uploaded) != 1 {
+		t.Fatalf("want the blob that arrived stored, got %v", res.Uploaded)
+	}
+
+	// The next export asks only for the blobs still missing.
+	e.eng.cutUploads = ""
+	res, err = e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Present) != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// An engine that gives up its remote-cache work doesn't always say so of the
+// export it cuts off: one waiting for its upload is dropped without a word,
+// so the upload finds no export, and a capture building layers ends with
+// its context's error. The export is asked again, once, and the paused
+// engine refuses its roots: paused, with no failure.
+func TestExportCutByPausedEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		typ     protocol.Type
+		message string
+	}{
+		{"dropped before its upload", protocol.TypeUpload, `no export "export-1"`},
+		{"canceled while capturing", protocol.TypeExport, "context canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			e.addBuild()
+			e.eng.errOnce = map[protocol.Type]string{tc.typ: tc.message}
+			e.eng.pauseAfter = true
+			res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+			if err != nil {
+				t.Fatalf("an export the engine cut off as it paused failed: %v", err)
+			}
+			if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+				t.Fatalf("unexpected result: %+v", res)
+			}
+			if got := e.eng.requests[protocol.TypeExport]; got != 2 {
+				t.Fatalf("%d export requests, want 2", got)
+			}
+		})
+	}
+}
+
+// The blobs a paused engine was sending fail with their context's error,
+// not the pause's: the export is asked again, and its roots are paused.
+func TestExportUploadCanceledByPausedEngine(t *testing.T) {
+	for _, message := range []string{
+		"upload: context canceled",
+		// A PUT cut before it connected ends with the net package's error.
+		"upload: dial tcp 10.0.0.1:443: operation was canceled",
+	} {
+		t.Run(message, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			e.addBuild()
+			e.eng.cutUploads = message
+			e.eng.pauseAfter = true
+			res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+				t.Fatalf("unexpected result: %+v", res)
+			}
+			if got := e.eng.requests[protocol.TypeUpload]; got != 1 {
+				t.Fatalf("%d uploads, want 1: no upload attempt was spent on the cut", got)
+			}
+		})
+	}
+}
+
+// A cut that no pause explains is one more try of the export, which goes
+// on; an engine that keeps cutting it off fails its roots.
+func TestExportCutWithoutPause(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.errOnce = map[protocol.Type]string{protocol.TypeUpload: `no export "export-1"`}
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{10, 11}) || len(res.Paused) != 0 || len(res.Failed) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+
+	e = newTestEnv(t, nil)
+	e.addBuild()
+	e.eng.replyErr = "context canceled"
+	res, err = e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failed) != 2 || !strings.Contains(res.Failed[0].Error, "cut the export off 2 times") || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// EnginePausedMessage is engine/server's errRemoteCacheTimedOut, which that
+// package doesn't export.
+func TestEnginePausedMessageMatchesEngine(t *testing.T) {
+	src, err := os.ReadFile("../../../engine/server/remote_cache.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`errRemoteCacheTimedOut = errors\.New\("([^"]+)"\)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("engine/server/remote_cache.go no longer declares errRemoteCacheTimedOut as errors.New of a literal: " +
+			"find the message of the roots an engine refuses once it has given up its remote-cache work, and update EnginePausedMessage and this test")
+	}
+	if string(m[1]) != EnginePausedMessage {
+		t.Fatalf("the engine refuses roots with %q once it has given up its remote-cache work, and EnginePausedMessage is %q: "+
+			"the service would settle those roots as refused for good", m[1], EnginePausedMessage)
+	}
+}
+
+// The texts replyError takes for an export the engine cut off are the
+// engine's own, which it doesn't export: a reworded one would make a pause
+// that cuts an export count as its roots' failure again, with every other
+// test still passing.
+func TestEngineCutMessagesMatchEngine(t *testing.T) {
+	src, err := os.ReadFile("../../../engine/remotecache/session.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`replyError\(env, fmt\.Errorf\("([^"%]*)%q", req\.ExportID\)\)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("engine/remotecache/session.go's handleUpload no longer answers an upload that names no export with fmt.Errorf of a literal and the export's ID: " +
+			"find its reply, and update engineNoExportPrefix and this test")
+	}
+	if string(m[1]) != engineNoExportPrefix {
+		t.Fatalf("the engine answers an upload that names no export with %q, and engineNoExportPrefix is %q", m[1], engineNoExportPrefix)
+	}
+	// The other text is the standard library's, which the engine's capture
+	// and uploads end with when their context is canceled.
+	if err := replyError(mustError(t, "upload: "+context.Canceled.Error())); !errors.Is(err, errEngineCut) {
+		t.Fatalf("a canceled context's error reply is %v, want errEngineCut", err)
+	}
+	if err := replyError(mustError(t, fmt.Sprintf(engineNoExportPrefix+"%q", "x-1"))); !errors.Is(err, errEngineCut) {
+		t.Fatalf("the engine's no-export reply is %v, want errEngineCut", err)
+	}
+	// And the net package's, for a connection a canceled context cut off
+	// while it was being made, as a blob's PUT is: what a dial with a
+	// canceled context returns.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+	if err == nil || !strings.Contains(err.Error(), netCanceledMessage) {
+		t.Fatalf("a dial with a canceled context returns %v, and netCanceledMessage is %q", err, netCanceledMessage)
+	}
+	if !canceledMessage("upload: "+err.Error()) || canceledMessage("upload: 503 Service Unavailable") {
+		t.Fatal("canceledMessage doesn't tell a canceled dial's error from a store's")
+	}
+}
+
+func mustError(t *testing.T, message string) protocol.Envelope {
+	t.Helper()
+	env, err := protocol.NewEnvelope(1, 1, protocol.TypeError, protocol.Error{Message: message})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// heldFirst makes the engine's first bundle carry a held row, as after a
+// merge of the service's landed on it.
+func heldFirst(e *testEnv, then func()) {
+	first := true
+	e.eng.mangle = func(c *fakeengine.Capture) {
+		if !first {
+			return
+		}
+		first = false
+		c.Bundle.Values[0].Held = digest.FromString("held")
+		if then != nil {
+			then()
+		}
+	}
+}
+
+// A release that fails made the engine forget nothing, so asking again
+// would get the same held rows: the roots fail, and nothing is asked again.
+func TestExportHeldRowsReleaseFails(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	heldFirst(e, func() {
+		e.eng.mu.Lock()
+		e.eng.errOnce = map[protocol.Type]string{protocol.TypeUpload: "boom"}
+		e.eng.mu.Unlock()
+	})
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failed) != 2 || !strings.Contains(res.Failed[0].Error, "release of a bundle with held rows") || len(res.Stored) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if got := e.eng.requests[protocol.TypeExport]; got != 1 {
+		t.Fatalf("%d export requests, want 1: the export was asked again after its release failed", got)
+	}
+}
+
+// An engine that gives up its remote-cache work between a bundle with held
+// rows and its release answers the release as it does any upload then: with
+// the pause's error, or with no export of that ID. Neither is a failure of
+// the roots: they are paused.
+func TestExportHeldRowsReleaseCutByPausedEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name, reply string
+		exports     int
+	}{
+		{"the pause's error", "context canceled: " + EnginePausedMessage, 1},
+		{"no export of that ID", engineNoExportPrefix + `"export-1"`, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			e.addBuild()
+			heldFirst(e, func() {
+				e.eng.mu.Lock()
+				e.eng.errOnce = map[protocol.Type]string{protocol.TypeUpload: tc.reply}
+				e.eng.pauseAfter = true
+				e.eng.mu.Unlock()
+			})
+			res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(res.Paused, []uint64{10, 11}) || len(res.Failed) != 0 || len(res.Stored) != 0 {
+				t.Fatalf("unexpected result: %+v", res)
+			}
+			if got := e.eng.requests[protocol.TypeExport]; got != tc.exports {
+				t.Fatalf("%d export requests, want %d", got, tc.exports)
+			}
+		})
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): an upload
+// the engine never answers holds its export, and with it the cache's export
+// slot, until UploadTimeout (an hour by default). An engine that gives up
+// its remote-cache work at the instant the upload reaches it can drop it so
+// (engine/remotecache's handleUpload hands it to an export that is already
+// ending). Nothing ends the wait sooner: the service can't tell such an
+// upload from a slow one. Closing it needs the engine to answer every
+// upload it takes.
+func TestKnownGapUnansweredUploadHoldsExportUntilUploadTimeout(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	e := newTestEnv(t, func(c *Config) { c.UploadTimeout = timeout })
+	e.addBuild()
+	e.eng.hangUploads = true
+	start := time.Now()
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11}, Outputs: fsOutputs(10, 11)})
+	if took := time.Since(start); took < timeout {
+		t.Fatalf("the export ended after %s, before UploadTimeout: the gap is closed, update the README", took)
+	}
+	if err == nil || len(res.Stored) != 0 {
+		t.Fatalf("an export whose upload got no answer: %+v, %v; want an error", res, err)
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): an export
+// whose first try came back with held rows keeps that try's skipped roots,
+// and when the next try, with the rows in full, is too large, the split
+// asks for the first try's roots again. A root both tries skipped is
+// settled twice: here busy twice, which the tracker's Done counts as two
+// busy answers, so its backoff doubles once more than it should. Nothing is
+// stored wrong. Closing it means splitting only the roots still unsettled.
+func TestKnownGapSplitAfterHeldRowsSettlesRootTwice(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.addBuild()
+	e.cache.Add(fakeengine.Entry{Number: 20, Busy: true})
+	heldFirst(e, func() {
+		e.eng.mu.Lock()
+		// The upload that releases the held bundle is answered; the export
+		// after it is too large.
+		e.eng.errOnce = map[protocol.Type]string{}
+		e.eng.tooLargeAfter = e.eng.requests[protocol.TypeExport]
+		e.eng.mu.Unlock()
+	})
+	res, err := e.x.Export(context.Background(), e.eng, Request{Roots: []uint64{10, 11, 20}, Outputs: fsOutputs(10, 11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res.Stored, []uint64{10, 11}) {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if len(res.Busy) != 2 || res.Busy[0].Number != 20 || res.Busy[1].Number != 20 {
+		t.Fatalf("root 20 is busy %d times in the result, want 2: the gap is closed, update the README", len(res.Busy))
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): the bound
+// on a bundle (MaxMergeBytes) is on its merge as sent, which lists each
+// layer once, but a bundle is stored with every output's chain in full, so
+// that it stands on its own. Outputs that build on each other, as a
+// Dockerfile's steps do, make the stored bundle larger than its merge by
+// about half the chain's depth, and no bound holds it: every engine's
+// import path reads and keeps it. Closing it means storing the bundle with
+// its layers listed once, or bounding the stored size too.
+func TestKnownGapStoredBundleLargerThanItsMerge(t *testing.T) {
+	const depth = 60
+	e := newTestEnv(t, nil)
+	e.cache.ChainPrefixes = true
+	var layers [][]byte
+	var roots []uint64
+	for i := range depth {
+		n := uint64(100 + i)
+		layers = append(layers, layer(fmt.Sprintf("step-%d", i)))
+		entry := fakeengine.Entry{Number: n, Layers: slices.Clone(layers)}
+		if i > 0 {
+			entry.Deps = []uint64{n - 1}
+		}
+		e.cache.Add(entry)
+		roots = append(roots, n)
+	}
+	ctx := context.Background()
+	res, err := e.x.Export(ctx, e.eng, Request{Roots: roots[depth-1:], Outputs: fsOutputs(roots...)})
+	if err != nil || len(res.Bundles) != 1 {
+		t.Fatalf("export: %+v, %v", res, err)
+	}
+	stored, err := e.meta.GetBundle(ctx, "team", res.Bundles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merge, err := importer.MergeSize(stored, e.x.addressSize(ctx), "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := 0
+	for _, o := range stored.Outputs {
+		listed += len(o.Chain.Layers)
+	}
+	t.Logf("%d outputs on a chain %d deep: the stored bundle lists %d layers in %d bytes; its merge is bounded at %d bytes", len(stored.Outputs), depth, listed, len(data), merge)
+	if listed != depth*(depth+1)/2 {
+		t.Fatalf("the stored bundle lists %d layers, want every chain in full (%d)", listed, depth*(depth+1)/2)
+	}
+	if len(data) <= merge {
+		t.Fatalf("the stored bundle is %d bytes, within its merge's %d: the gap is closed, update the README", len(data), merge)
 	}
 }

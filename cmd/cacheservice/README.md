@@ -47,6 +47,9 @@ On the engine WebSocket, the service:
 - answers WebSocket pings (the library does this; `-v` logs each one).
 - answers `renew` with fresh presigned GETs when the import path is on and
   every layer is stored, and with `{"unavailable": true}` otherwise.
+- answers `open`, `claims`, `settle` and `lookup`, which engines send since
+  `v1.0.0-beta.26` (see
+  [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)).
 - answers any other request from the engine with an `error` reply.
 - logs every envelope in both directions: direction, type, `id`, `re`, message
   size, body size, and a short summary for the known body types.
@@ -69,8 +72,8 @@ The list is the manifest [`compat/engines.txt`](compat/engines.txt),
 embedded in the binary:
 
 ```
-base v1.0.0-beta.25
-accept v1.0.0-beta.25 sha256:39abecfe… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
+base v1.0.0-beta.26
+accept v1.0.0-beta.26 sha256:53c0411c… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
 reject v1.0.0-beta.NN zerobull-consulting/dagger#NNN
 ```
 
@@ -153,7 +156,7 @@ the checkout, and says so in the run's output. The default is strict.
 revision, not `internal/version/VERSION` (which tracks upstream main):
 
 ```json
-{"base": "dev", "accept": ["v1.0.0-beta.25", "v1.0.0-beta.24"], "revision": "<commit>"}
+{"base": "dev", "accept": ["v1.0.0-beta.26"], "revision": "<commit>"}
 ```
 
 It is in the welcome (`{"service": {...}}`, alongside `protocol.Welcome`'s
@@ -167,6 +170,150 @@ reports `dev`. A build
 stamped as another release than the manifest's `base` refuses to start.
 The revision is the image's `REVISION`, else the build's VCS revision, else
 `dev`.
+
+## Engines from v1.0.0-beta.26
+
+`v1.0.0-beta.26` changed the engine's side of the remote cache, and a
+service built on `v1.0.0-beta.25` stored nothing from such an engine
+([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)).
+This is what the service does about each change. It serves engines of that
+bundle version only: a `v1.0.0-beta.25` engine is no longer accepted, and
+keeps the service image tagged for it, `dagger-remote-cache:v1.0.0-beta.25`,
+the last build that accepted it (see [Image](#image)).
+
+**Bundles are version 7** (`metastore.BundleVersion`). A version 7 bundle
+can lean on what its recipient holds, or on its own other outputs. A stored
+bundle is merged whole into any engine, so the service stores neither
+(`metastore.ValidateBundle`):
+
+- **Held rows.** Once the service merged a bundle into an engine, the
+  engine sends the rows that merge landed on with no record, as *held
+  rows*, in its later exports over that connection: it expects the service
+  to hold them. Another engine holds no such row, and would refuse the
+  whole merge as stale. So the exporter releases an export with held rows,
+  with an `upload` that doesn't say `merged`, which makes the engine forget
+  that the service holds them, and asks for the same roots again at once:
+  that bundle carries them in full (a release that fails ends the export
+  instead, as a failure of its roots: the engine forgot nothing, and would
+  send the same held rows again; one the engine cut off as it gave up its
+  remote-cache work pauses them, see below). A held row stands for everything below
+  it in an export that selects no parts, so such an export takes one try
+  per level of merged rows under its roots (at most 256); a try is one
+  round trip and uploads nothing. The rows the engine imported still keep
+  their stored entries' numbers (see [Imported entries](#imported-entries)),
+  so nothing is stored twice. The service never says `merged`: it records a
+  bundle only after its blobs are uploaded.
+- **Chain prefixes.** An output whose layers are the first of another
+  output's chain names that chain instead of listing them. The exporter
+  gives each output its own chain (`dagql.ResolveChainPrefixes`) before it
+  stores the bundle.
+- **Computed layers.** Each layer says whether that export computed its
+  blob or found it, which differs between a layer's first export and every
+  later one. It is cleared before the bundle is stored, like the other
+  fields that would make the same values a different bundle (see
+  [Export path](#export-path)).
+
+A merge lists its chains' layers, and each blob's address, once on the wire
+(`protocol.Merge`'s encoding), so the bound on a merge's size
+(`importer.MergeSize`) starts from that form.
+
+**A store written for earlier engines** keeps its version 3 bundles. They
+aren't merged into a `v1.0.0-beta.26` engine: each fails to build a merge
+(`unsupported bundle version 3`), is logged, and is given up on after
+`MergeAttempts` tries per connection. Their entries stay until they expire
+or pass the namespace's max age, and GC then deletes them as any other; a
+value exported again gets a version 7 record. To drop them at once, empty
+the prefix (`cacheservice wipe`) or use a new one.
+
+**The engine's own requests.** Besides `renew`, the engine now sends:
+
+| Engine sends | Service answers | What the service does |
+| --- | --- | --- |
+| `open` | `opened` | A session started on an engine with none live, which begins a new idle period. The roots the engine refused while it had given up (below) are due at once. |
+| `claims` | `claimed` | Nothing: the Dagger Cloud claim of each session, which this service has no use for. |
+| `settle` | `settled`, or the error `stale settle` | No session is live, and the engine asks the service to finish what it wants of it. The service answers once it has nothing left to export for the engine's cache now: no root dirty, in flight, or waiting for another try due within 10s of the settle (`DefaultSettleRetryWait`), and no session whose spans may still come. A root whose try is due later, as after several busy answers, isn't waited for: an engine that hears no `settled` gives up and then refuses that try and every other export, while one that settled takes it once its 20s have passed. Until then the service starts no export of a cache it answered `settled` for (22s from the settle, `DefaultSettleQuiet`; a flush, a drain or the engine's next `open` ends that): the engine's 20s run whether it settled or not, and an export in progress when they pass makes it give up all the same. Nor is a root the engine already refused as paused. A listed session whose engine sent its completion marker, and of which no span reached the service yet, is waited for up to 5s (`DefaultSettleMarkerWait`): spans reach the service through the session's client, so the settle can come first. A settle for a period that is no longer the connection's is stale, and one not settled within 2m (`MaxSettleWait`, far past the engine's own 20s) gets an error. With the export path off, it answers at once. |
+| `lookup` | `lookedUp`, every miss `unknown` | Nothing: the calls the engine's cache missed. This service keeps no index of its values by call, and merges every stored root into every engine anyway (see [Import path](#import-path)), so it looks nothing up and sends no merge for a lookup. |
+
+**An engine that isn't answered gives up.** 20s after its last session
+ended, an engine whose `settle` got no `settled`, or that still has an
+export in progress, gives up its remote-cache work: it cancels its exports
+in progress and refuses every root of a new one, until a session starts
+again. That is why an unanswered `settle` stored nothing. The service
+doesn't settle such roots as refused, which would end their exports for
+good: they are *paused* (`exporter.Result.Paused`), count no failure, and
+are due again when the engine sends `open`, or connects again, or after a
+minute (`exporter.DefaultPausedWait`). **So an export has about 20s after
+the last session's end to finish**; one that takes longer, such as a large
+upload on a slow link, is cut, and goes on in the engine's next session:
+its roots are paused too, and the blobs that arrived stay stored, so the
+next export uploads only the rest. The engine doesn't always say why it
+cut an export off (one waiting for its upload is dropped without a word,
+and a blob being sent ends with `context canceled`, or `operation was
+canceled` before it connected), so the exporter asks once more for an
+export that ended so: a paused
+engine then refuses its roots, and any other goes on.
+
+**What a paused engine holds is left, and may be lost.** Only a new session
+on the engine ends its pause; nothing the service does can. So a flush or a
+drain neither waits for the paused roots nor asks for them again: it
+finishes at once what it can, counts them apart (`paused`, in the flush's
+and the drain's reports, `drain_paused_roots_total` and
+`flush_paused_roots_total`), and ends. A flush of a cache whose engine has
+gone away says `not_connected`, paused roots or not. They aren't a failure of the flush or the drain. Where the engine
+doesn't outlive its job, as with the
+[sidecar](../../.github/actions/remote-cache/README.md), there is no next
+session: **what the engine hadn't finished exporting about 20s after the
+job's last `dagger` call is not stored by that job**, and a later job that
+builds the same values exports them. The store is left whole either way:
+the index names a bundle only once all its blobs are stored, and the blobs
+a cut upload did store are either named by a later export or deleted by GC
+as any unreferenced blob.
+Sessions that overlap keep the engine from asking to settle at all.
+
+**Known limits, accepted.** Each is pinned by a test that fails when the
+behavior changes, so that this list is then updated
+([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)):
+
+- **A stored bundle can be much larger than its merge.** The bound on a
+  bundle (the 64 MiB message limit, by `importer.MergeSize`) is on
+  the merge as sent, which lists each layer once. The bundle is stored with
+  every output's chain in full, so that it stands on its own: outputs that
+  build on each other make it larger by about half the chain's depth (9
+  times for 60 outputs on a chain 60 deep), and every engine's import path
+  reads and keeps it. Earlier engines sent every chain in full, so the
+  message limit bounded the stored bundle too; a closure whose full form
+  is over it was split then, and is stored whole now
+  (`TestKnownGapStoredBundleLargerThanItsMerge`).
+- **An upload the engine never answers holds its cache's exports for
+  `UploadTimeout`** (1h). An engine that gives up its remote-cache work at
+  the instant an upload reaches it can drop it without a reply. Until the
+  timeout, or the engine's connection ends, nothing else of that cache is
+  exported, and a drain waits for it up to its deadline
+  (`TestKnownGapUnansweredUploadHoldsExportUntilUploadTimeout`).
+- **A settle can wait 5s for a session whose spans came long ago.** The
+  engine lists every ended session no `settled` has covered; the service
+  remembers one it is done with for 2m, and not across its own restart
+  (`TestKnownGapUnseenSessionsForgetsLongEndedSessions`).
+- **A root can be settled twice by one export**, when a try with held rows
+  is followed by one too large for a message: the split asks again for
+  the roots the first try had already skipped. A busy root then backs off
+  one step further than it should; nothing is stored wrong
+  (`TestKnownGapSplitAfterHeldRowsSettlesRootTwice`).
+- **Sizing a merge encodes each output's layers**, to find those it lists
+  once (`dagql.ShareChainLayers`), on every try of an export. It is paid
+  per export, not per merge, and hasn't been measured as a cost.
+
+**The engine downloads what it is offered at once.** An offered part's
+blobs are fetched when the merge offers it, ahead of any read, so the blob
+GETs follow each merge within milliseconds, and `renew` is rare: it takes a
+download that failed, and a read after the GET expired.
+
+**A stopping engine waits for its exports.** On SIGTERM the engine lets
+its exports in progress finish, for up to its stop budget (5m by default)
+less 30s, before it closes its connection. Give its container a stop
+timeout that covers that: an engine killed while it waits (docker's default
+is 10s) comes back with a new, empty cache, and the export is lost with
+the old one.
 
 ## Code layout
 
@@ -898,7 +1045,10 @@ records into it. Each scope (a team, a tenant) has:
   is written once (`If-None-Match: *`) and never changes. Storing it again
   writes nothing. Reading it checks its content against the ID. Only bundles
   of the version the engine imports are stored: the service's own
-  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture writes.
+  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture
+  writes, and only bundles that stand on their own, with no held row and a
+  chain for every output (see
+  [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)).
 - **resolutions**, at `<prefix>/ns/<scope>/resolutions/<id>.json`: one per
   export, the service number each of the bundle's values resolved to when
   the export was recorded, which merges of that bundle send (see
@@ -2825,7 +2975,16 @@ the first call's context cancels a drain.
    ended with some of its counted spans missing is waited for (`sessions`)
    until they are in, or `-export-settle` (at most 2s) passed with none of them. Roots
    waiting for another try (busy, failed, interrupted, or waiting for their
-   engine) are due at once too. The drain runs those exports, one at a time
+   engine to connect) are due at once too. Roots an engine refused because
+   it has given up its remote-cache work until its next session
+   (`paused`, see
+   [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)) are neither
+   waited for nor asked for again: one found so during the drain is asked
+   for once. They are reported apart from what the drain left unexported
+   (`pausedRoots` in `drain: done`, a `drain: left for an engine that gave
+   up its remote-cache work` line per cache, and `paused` in
+   `GET /debug/drain`), and a drain that left only those is `complete`. The
+   drain runs those exports, one at a time
    per engine cache as the scheduler does, and waits for them, their uploads,
    verification and index writes included.
 3. **It starts nothing past its deadline.** Each pass checks the deadline,
@@ -2961,7 +3120,10 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
 - **It isn't a drain.** New engines, sessions and spans are taken as usual.
   An engine still running builds can keep a flush busy until its timeout.
 - **When it returns:** once nothing of the cache is dirty, waiting for
-  spans, in flight or due for a retry before the timeout (`complete`); once
+  spans, in flight or due for a retry before the timeout (`complete`, or
+  `paused` when roots are left that the engine refuses because it has given
+  up its remote-cache work until its next session: the flush tries a dirty
+  root once, and neither waits for a paused one nor asks for it again); once
   the timeout passes, or only retries due after it are left (`timeout`; such
   a retry isn't waited for, and is counted `later`); at once, with what is
   left, when the cache's engine isn't connected or disconnects
@@ -2989,14 +3151,16 @@ only for auth, bad requests and refusals. The report:
 }
 ```
 
-- `outcome`: `complete` (nothing left), `timeout`, `not_connected` or
-  `canceled`.
+- `outcome`: `complete` (nothing left), `paused` (only roots of a paused
+  engine left), `timeout`, `not_connected` or `canceled`.
 - `stored`: the roots stored by exports of the cache that ended during the
   flush.
 - `left`, as the drain counts them: `dirty` (worth exporting, not in flight
   or waiting for a retry), `waitingSpans` (sessions still waited
   for), `inFlight`, `retrying` (a retry due before the timeout), `later` (a
-  retry due after it).
+  retry due after it), and `paused` (roots the engine refuses until its next
+  session; left out when 0, and not among the roots `flush: done` and
+  `flush_unexported_roots_total` count as left).
 
 Each flush logs one `flush: done` line, with the outcome and these counts,
 and is counted in `flush_total{outcome}`, `flush_duration_seconds` and
@@ -3211,7 +3375,7 @@ paths record into them through their metadata store. All are prefixed
 | `import_sync_duration_seconds` | | Time per import sync |
 | `export_batches_total` | `scope`, `outcome` | Export batches: `ok`, `error` or `interrupted` |
 | `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
-| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
+| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused`, `failed` or `paused` (refused by an engine that gave up its remote-cache work until its next session) |
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
 | `export_roots_waiting` | `scope` | Roots due for export and waiting, as the scheduler last saw them: for their engine cache's export in flight to end, or for the next batch |
@@ -3237,7 +3401,9 @@ paths record into them through their metadata store. All are prefixed
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
-| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `drain_paused_roots_total` | | Roots a drain left because their engine refuses them until its next session (it gave up its remote-cache work). Not in `drain_unexported_roots_total`; lost if the engine stops before a session starts on it |
+| `flush_paused_roots_total` | | The same, for each flush: a count per flush, not of the roots lost. Not in `flush_unexported_roots_total` |
+| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `paused`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
 | `flush_duration_seconds` | | Time of each flush |
 | `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry. Each flush adds what it left, so overlapping flushes of one cache each count the same roots: a count per flush, not of the roots lost |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
@@ -3311,7 +3477,7 @@ D4 and D6), `linux/amd64` only, from
 The name doesn't depend on this repository, so a later extraction keeps the
 pull paths.
 
-- **`:<engine version>`**, such as `:v1.0.0-beta.25`: a **floating** tag,
+- **`:<engine version>`**, such as `:v1.0.0-beta.26`: a **floating** tag,
   one per `accept` line, on the newest verified build that accepts that
   engine. Pull this tag for the engine you run. A version that a newer
   build no longer accepts keeps its tag on the last build that did.
@@ -3408,7 +3574,7 @@ There is no `HEALTHCHECK`: the image has no shell, and the engine reconnects
 with backoff. To try it, unauthenticated and with no store (export path off):
 
 ```bash
-docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25
+docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26
 ```
 
 The engine that connects to it is a stock Dagger release whose version is
@@ -3437,7 +3603,7 @@ On GitHub Actions, use the composite action, which does everything below
 - uses: zerobull-consulting/dagger/.github/actions/remote-cache/start@<commit SHA>
   with:
     role: writer                    # read-only in pull-request jobs
-    version: v1.0.0-beta.25         # the engine and the CLI; selects the service image too
+    version: v1.0.0-beta.26         # the engine and the CLI; selects the service image too
     s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
     s3-region: ${{ vars.CACHE_S3_REGION }}
     s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -3494,7 +3660,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_ENDPOINT -e CACHESERVICE_S3_REGION -e CACHESERVICE_S3_BUCKET \
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
-  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25 \
+  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26 \
   -scope default -drain-timeout 10m -drain-linger 15s -gc-mode=batch
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
@@ -3536,7 +3702,7 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   -e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
   -e DAGGER_CLOUD_URL="$url" \
   -e DAGGER_CLOUD_TOKEN=sidecar-engine \
-  registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834 --debug
+  registry.dagger.io/engine:v1.0.0-beta.26@sha256:53c0411ca73af93ceb88e97834a992754786d4919505394b699cc34fb76dd3e4 --debug
 ```
 
 - `DAGGER_CLOUD_TOKEN` is a placeholder (any string but `oidc`): without a
@@ -4119,7 +4285,10 @@ This section comes from reading `engine/remotecache`, `cmd/engine` and
   should never show one.
 
 The engine sends nothing else on its own initiative. It does not announce new
-cache entries over the WebSocket.
+cache entries over the WebSocket. Since `v1.0.0-beta.26` it also sends
+`open`, `claims`, `settle` and `lookup` (see
+[Engines from v1.0.0-beta.26](#engines-from-v100-beta26)); this section and
+the live run below are of `v1.0.0-beta.23`.
 
 ### On the WebSocket, what the engine sends only when asked
 

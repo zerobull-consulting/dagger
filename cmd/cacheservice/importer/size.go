@@ -22,25 +22,42 @@ const (
 	// valueGrowthBytes is a value's SenderNumber becoming its service number,
 	// up to 20 digits where the stored one may have 1.
 	valueGrowthBytes = 20
-	// chainOverheadBytes is a chain's `,"addresses":{}` and
-	// `,"renewalKey":""`, without the key itself.
-	chainOverheadBytes = 40
+	// chainOverheadBytes is a chain's `,"renewalKey":`, without the key.
+	chainOverheadBytes = 16
 )
 
 // MergeSize returns an upper bound on the size of the merge request
-// BuildMerge makes from a stored bundle of size storedBytes (its JSON):
-// every root gets an expiry, every value a service number, and each output's
-// chain renewalKey and a download address per layer, whose JSON is at most
-// addressBytes (see AddressBytes).
+// BuildMerge makes from a stored bundle, as it is sent: every root gets an
+// expiry, every value a service number, each output's chain renewalKey, and
+// each layer blob a download address, whose JSON is at most addressBytes
+// (see AddressBytes).
+//
+// A merge lists its chains' layers, and each blob's address, once
+// (protocol.Merge's encoding, dagql.ShareChainLayers), however many of the
+// bundle's outputs build on them, so the bound starts from the bundle in
+// that form, not as stored, where each chain lists every layer from its
+// base up.
 //
 // The importer sends a stored bundle whole, so a bundle whose merge is over
 // the message limit is never imported. The export path checks a bundle with
 // this before storing it, and splits an export whose bundle is over.
-func MergeSize(bundle *dagql.ValueBundle, storedBytes, addressBytes int, renewalKey string) int {
-	n := storedBytes + mergeOverheadBytes +
+func MergeSize(bundle *dagql.ValueBundle, addressBytes int, renewalKey string) (int, error) {
+	// ShareChainLayers encodes each layer of each output's chain to find
+	// those it lists once: accepted as the cost of bounding the merge as it
+	// is sent (see the README, "Known limits, accepted").
+	shared, err := dagql.ShareChainLayers(*bundle)
+	if err != nil {
+		return 0, err
+	}
+	data, err := json.Marshal(shared)
+	if err != nil {
+		return 0, err
+	}
+	n := len(data) + mergeOverheadBytes +
 		len(bundle.Roots)*rootGrowthBytes +
 		len(bundle.Values)*valueGrowthBytes
 	keyBytes := len(strconv.Quote(renewalKey))
+	signed := map[digest.Digest]bool{}
 	for _, o := range bundle.Outputs {
 		if o.Chain == nil {
 			continue
@@ -48,13 +65,17 @@ func MergeSize(bundle *dagql.ValueBundle, storedBytes, addressBytes int, renewal
 		n += chainOverheadBytes + keyBytes
 		for _, l := range o.Chain.Layers {
 			d := l.Descriptor.Digest
+			if signed[d] {
+				continue
+			}
+			signed[d] = true
 			// "<digest>":<address>, where the address names the blob's key,
 			// which holds the digest's hex once: longer for a longer
 			// digest than AddressBytes measured.
 			n += len(d.String()) + 4 + addressBytes + max(0, len(d.Encoded())-canonicalHexBytes)
 		}
 	}
-	return n
+	return n, nil
 }
 
 // canonicalHexBytes is the hex length of a digest of the algorithm

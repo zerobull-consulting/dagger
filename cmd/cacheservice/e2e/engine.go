@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -148,10 +149,21 @@ func (en *Engine) Restart() {
 	en.env.T.Helper()
 	ctx, cancel := en.env.ctx()
 	defer cancel()
-	if _, err := Docker(ctx, "restart", en.Container); err != nil {
+	if _, err := Docker(ctx, restartArgs(en.Container)...); err != nil {
 		en.env.T.Fatalf("restart engine %s: %v", en.Name, err)
 	}
 	en.waitConn(en.Conn)
+}
+
+// engineStopTimeout is the stop timeout of an engine's container on a
+// restart. Since v1.0.0-beta.26 a stopping engine lets its remote cache
+// exports in progress finish, for up to its stop budget (5m) less 30s; one
+// killed while it waits (docker's default is 10s) comes back with a new,
+// empty cache (zerobull-consulting/dagger#227).
+const engineStopTimeout = 2 * time.Minute
+
+func restartArgs(container string) []string {
+	return []string{"restart", "-t", strconv.Itoa(int(engineStopTimeout / time.Second)), container}
 }
 
 // RestartAsync starts restarting the engine's container, and returns a
@@ -161,7 +173,7 @@ func (en *Engine) RestartAsync() (wait func()) {
 	go func() {
 		ctx, cancel := en.env.ctx()
 		defer cancel()
-		_, err := Docker(ctx, "restart", en.Container)
+		_, err := Docker(ctx, restartArgs(en.Container)...)
 		done <- err
 	}()
 	return func() {
