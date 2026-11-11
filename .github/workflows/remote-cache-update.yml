@@ -4,10 +4,11 @@ name: Remote cache update
 # the only one with a write key) runs the Dagger pipelines the checks run, and
 # stores their results under the bucket's prefix (cache-<engine version>).
 #
-# Today that is one pipeline, a build of cmd/cacheservice
-# (hack/remote-cache/speedup/run.sh). Each job moved to Dagger adds its own
-# pipeline here, and reads the cache with a read-only sidecar
-# (pr-checks-readonly) on pull requests.
+# The pipelines are hack/remote-cache/speedup/run.sh's: a build of
+# cmd/cacheservice, and the "service, client and protocol" step of
+# remote-cache-tests.yml's unit job, which runs the same pipeline with a
+# read-only sidecar (pr-checks-readonly). Each job moved to Dagger adds its
+# own pipeline here.
 #
 # Only feature/remote-cache runs it: the job is skipped on any other ref of a
 # manual run. That `if` is in the branch's own copy of this file, so it is not
@@ -17,8 +18,9 @@ name: Remote cache update
 # The engine version is pinned, not read from the manifest's first accept line,
 # so a new accept line doesn't change what fills the cache. It must be an accept
 # line of cmd/cacheservice/compat/engines.txt, or the start fails; when a new
-# one is verified, move VERSION and the environments' CACHE_S3_PREFIX
-# (cache-<version>) together, since one engine's entries are for that engine.
+# one is verified, move VERSION, remote-cache-tests.yml's DAGGER_VERSION and the
+# environments' CACHE_S3_PREFIX (cache-<version>) together, since one
+# engine's entries are for that engine.
 "on":
   push:
     branches:
@@ -48,8 +50,9 @@ jobs:
     environment: pr-checks-readwrite
     # The worst case of the steps below, which this timeout also bounds: the
     # start (30m: two image pulls of 15m, in parallel in practice), the build
-    # (20m) and the stop (12m: the drain's 10m and 2m more), plus slack.
-    timeout-minutes: 65
+    # (20m), the unit tests (30m) and the stop (12m: the drain's 10m and 2m
+    # more), plus slack.
+    timeout-minutes: 95
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -89,7 +92,19 @@ jobs:
         env:
           SERVICE: ${{ steps.writer.outputs.service-container }}
           DAGGER: ${{ steps.writer.outputs.dagger }}
-        run: ./hack/remote-cache/speedup/run.sh update "$RUNNER_TEMP/update" "$SERVICE"
+        run: ./hack/remote-cache/speedup/run.sh build build "$RUNNER_TEMP/update" "$SERVICE"
+      # The layers the unit job's run fetches (see run.sh, unit_pipeline). Only
+      # the layers matter here, not the tests' result: remote-cache-tests.yml
+      # reports that. A failing test stores nothing of the last layer, and the
+      # layers under it are stored all the same.
+      - name: Unit tests (service, client and protocol)
+        id: unit
+        timeout-minutes: 30
+        continue-on-error: true
+        env:
+          SERVICE: ${{ steps.writer.outputs.service-container }}
+          DAGGER: ${{ steps.writer.outputs.dagger }}
+        run: ./hack/remote-cache/speedup/run.sh unit unit "$RUNNER_TEMP/update" "$SERVICE"
       # The drain stores the exports: it must be done before the job ends, and
       # before the check below reads the service's log.
       - name: Stop the writer sidecar
@@ -99,15 +114,22 @@ jobs:
         uses: ./.github/actions/remote-cache/stop
         with:
           name: cache-update
-      # A commit whose entry is already stored (a re-run) builds as a cache hit
+      # A commit whose entries are already stored (a re-run) runs as cache hits
       # and exports nothing: there is nothing to check was stored.
       - name: Check the export was stored
         env:
           LOGS: ${{ steps.stop.outputs.logs }}
         run: |
-          read -r hit executed <"$RUNNER_TEMP/update/update.spans"
+          executed=0
+          for p in build unit; do
+            # A failed run (tests that failed) writes no spans.
+            [[ -f "$RUNNER_TEMP/update/$p.spans" ]] || { echo "$p: no spans (the run failed)" | tee -a "$GITHUB_STEP_SUMMARY"; continue; }
+            read -r h e <"$RUNNER_TEMP/update/$p.spans"
+            echo "$p: $h hit, $e executed" | tee -a "$GITHUB_STEP_SUMMARY"
+            executed=$((executed + e))
+          done
           if ((executed == 0)); then
-            echo "the build was a cache hit ($hit hit, 0 executed): nothing to store"
+            echo "every step was a cache hit: nothing to store"
             exit 0
           fi
           ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/update/stored"
@@ -119,5 +141,5 @@ jobs:
           name: cache-update-logs
           path: |
             ${{ runner.temp }}/remote-cache-sidecar/*/logs
-            ${{ runner.temp }}/update/update.log
+            ${{ runner.temp }}/update/*.log
           if-no-files-found: ignore
