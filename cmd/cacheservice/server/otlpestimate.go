@@ -1,14 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"errors"
 	"reflect"
 	"sync"
 	"unsafe"
 
-	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
-	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
-	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -85,17 +83,6 @@ const (
 	// the largest OTLP message (a Span, 280 bytes) and its slice element,
 	// rounded up.
 	otlpJSONObjectCost = 320
-	// otlpJSONEscapedCopies is how many copies of a JSON string holding an
-	// escape it is charged: the decoder appends the unescaped bytes to a
-	// slice, which append grows to up to about twice the string, then copies
-	// that into the string. At its peak it holds the old array and the new
-	// one, or the new one and the copy: up to about 3.75 times the string's
-	// length, which three of otlpAllocSize cover
-	// (TestOTLPJSONEscapedStringCoversDecodePeak).
-	otlpJSONEscapedCopies = 3
-	// otlpJSONScalarSize is a number decoded (an int64, a uint64 or a
-	// double), which an element of a repeated scalar field appends.
-	otlpJSONScalarSize = 8
 )
 
 // MaxOTLPNesting is otlpMaxDepth: the most levels of messages a protobuf body
@@ -324,170 +311,15 @@ func otlpWireTypeOK(fd protoreflect.FieldDescriptor, typ protowire.Type) bool {
 	return false
 }
 
-// otlpJSONSize estimates what a JSON body decodes to, in one pass that tracks
-// where it is in the document (in a string, an object or an array, and
-// whether a string is a key or a value), without allocating:
-//   - each object at the largest message's cost (otlpJSONObjectCost);
-//   - each string value, which the decoder copies, like a singular string in
-//     the protobuf estimate: otlpAllocSize of its length in the body, for the
-//     allocator's size classes, and a header;
-//   - each string element of an array like an element of a repeated string
-//     field in the protobuf estimate: otlpAllocSize of its length and
-//     otlpElemHeaders headers, for its header in the slice append grows;
-//   - a string holding an escape, which the decoder builds by append before
-//     copying it, otlpJSONEscapedCopies times its copy;
-//   - each number, true, false or null element of an array otlpElemHeaders
-//     of an 8-byte scalar, for the slice append grows; each object or array
-//     element of an array, and each comma between an object's fields, 16
-//     bytes;
-//   - a string value under a key that names a bytes field of an OTLP message
-//     (otlpJSONBytesFields), or under a key holding an escape, also what it
-//     decodes from base64 to, which the decoder holds with the string:
-//     otlpAllocSize of three quarters of its length;
-//   - and the body's bytes, for its numbers and keys, and each string's
-//     length in its copy charged above.
-//
-// A key is charged its bytes in the body only: the decoder looks it up and
-// drops it, and refuses one it doesn't know. Past the depth the scan tracks
-// (otlpMaxJSONDepth, which the body is checked against first), every
-// container is taken for an array, which charges a string more. A body that
-// isn't valid JSON is charged whatever the scan finds; the decode refuses it
-// (zerobull-consulting/dagger#233).
+// otlpJSONSize estimates what a JSON body decodes to: each object at the
+// largest message's cost, each comma an element of a repeated field, and the
+// body's bytes for the strings it holds. It counts braces and commas inside
+// strings too, so it errs high.
 func otlpJSONSize(data []byte) int64 {
-	// arrays has a bit set for each depth whose container is an array.
-	var arrays [otlpMaxJSONDepth/64 + 1]uint64
-	const tracked = 64 * len(arrays)
-	inArray := func(depth int) bool {
-		return depth > 0 && (depth >= tracked || arrays[depth/64]&(1<<(depth%64)) != 0)
-	}
-	size := int64(len(data))
-	depth := 0
-	// expectKey: the next string in this object is a key. elemNext: the next
-	// value in this array starts an element.
-	expectKey, elemNext := false, false
-	// start is the offset of the open string's opening quote, or -1. elem
-	// says it is an element of an array.
-	start := -1
-	var escaped, hasEscape, elem bool
-	// bytesKey: the last key names a bytes field, whose value is base64.
-	bytesKey := false
-	endString := func(end int) {
-		copies := int64(1)
-		if hasEscape {
-			copies = otlpJSONEscapedCopies
-		}
-		// The body's bytes, charged already, count the string's length once.
-		n := int64(end - start - 1)
-		copied := copies*otlpAllocSize(n) - n
-		switch {
-		case elem:
-			size += copied + otlpElemHeaders*otlpFieldCost
-		case expectKey:
-			// Looked up without allocating: the compiler doesn't copy a
-			// []byte converted for a map index.
-			_, named := otlpJSONBytesFields()[string(data[start+1:end])]
-			bytesKey = hasEscape || named
-		default:
-			size += copied + otlpFieldCost
-			if bytesKey {
-				size += otlpAllocSize(3 * n / 4)
-			}
-		}
-		start = -1
-	}
-	for i, c := range data {
-		if start >= 0 {
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped, hasEscape = true, true
-			case c == '"':
-				endString(i)
-			}
-			continue
-		}
-		switch c {
-		case ' ', '\t', '\n', '\r':
-		case '"':
-			start, hasEscape, elem, elemNext = i, false, inArray(depth), false
-		case '{', '[':
-			if inArray(depth) {
-				size += otlpListElemCost
-			}
-			depth++
-			if depth < tracked {
-				arrays[depth/64] &^= 1 << (depth % 64)
-				if c == '[' {
-					arrays[depth/64] |= 1 << (depth % 64)
-				}
-			}
-			if c == '{' {
-				size += otlpJSONObjectCost
-			}
-			expectKey, elemNext = c == '{', c == '['
-		case '}', ']':
-			depth = max(depth-1, 0)
-			expectKey, elemNext = false, false
-		case ':':
-			expectKey = false
-		case ',':
-			if inArray(depth) {
-				elemNext = true
-			} else {
-				size += otlpFieldCost
-				expectKey = true
-			}
-		default:
-			// A number, true, false or null, charged when it starts an
-			// element.
-			if elemNext {
-				size += otlpElemHeaders * otlpJSONScalarSize
-				elemNext = false
-			}
-		}
-	}
-	if start >= 0 {
-		// An unterminated string, which the decode refuses once it has
-		// read it.
-		endString(len(data))
-	}
-	return size
+	objects := int64(bytes.Count(data, []byte("{")))
+	elems := int64(bytes.Count(data, []byte(",")))
+	return objects*otlpJSONObjectCost + elems*otlpListElemCost + int64(len(data))
 }
-
-// otlpJSONBytesFields is the set of names, in JSON and in the .proto, of the
-// bytes fields of every message an OTLP request can hold (trace and span IDs,
-// AnyValue.bytes_value): a JSON value under one of these keys is base64,
-// which the decoder decodes. A key that names one in another message only
-// charges its value more.
-var otlpJSONBytesFields = sync.OnceValue(func() map[string]struct{} {
-	names := map[string]struct{}{}
-	seen := map[protoreflect.FullName]bool{}
-	var walk func(md protoreflect.MessageDescriptor)
-	walk = func(md protoreflect.MessageDescriptor) {
-		if seen[md.FullName()] {
-			return
-		}
-		seen[md.FullName()] = true
-		fields := md.Fields()
-		for i := range fields.Len() {
-			fd := fields.Get(i)
-			if fd.Kind() == protoreflect.BytesKind {
-				names[fd.JSONName()] = struct{}{}
-				names[string(fd.Name())] = struct{}{}
-			}
-			if fd.Message() != nil {
-				walk(fd.Message())
-			}
-		}
-	}
-	for _, m := range []proto.Message{
-		&coltracepb.ExportTraceServiceRequest{}, &collogspb.ExportLogsServiceRequest{}, &colmetricspb.ExportMetricsServiceRequest{},
-	} {
-		walk(m.ProtoReflect().Descriptor())
-	}
-	return names
-})
 
 // otlpMessageCosts caches each message type's cost by its full name.
 var otlpMessageCosts sync.Map

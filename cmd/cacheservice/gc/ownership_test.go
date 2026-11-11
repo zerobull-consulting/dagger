@@ -292,9 +292,7 @@ func TestUnexpectedUploadNeverAborted(t *testing.T) {
 		key  string
 		root bool
 	}{
-		// A staging key holds an upload of the service's (a large
-		// service-hashed promotion's private copy), but nothing below it.
-		{key: nsPrefix("team") + layout.StagingRel(string(stage), d) + "/x"},
+		{key: nsPrefix("team") + layout.StagingRel(string(stage), d)},
 		{key: nsPrefix("team") + layout.IndexName},
 		{key: nsPrefix("team") + "backups/db.tar"},
 		{key: "cache/backups/db.tar", root: true},

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Tests of release-check.sh, offline: local git repositories stand in for
-# upstream dagger/dagger (its tags) and for this fork (its branch), and fake
-# gh, docker and go stand in for the GitHub API, the registry and the
-# bundle test. Run it from anywhere:
+# upstream dagger/dagger (its tags) and for this fork (its branches), and
+# fake gh and docker stand in for the GitHub API and the registry. Run it
+# from anywhere:
 #
 #   hack/remote-cache/release-check_test.sh
 set -uo pipefail
@@ -36,9 +36,13 @@ git config --global advice.detachedHead false
 
 d1="sha256:$(printf '1%.0s' {1..64})"
 d2="sha256:$(printf '2%.0s' {1..64})"
+d3="sha256:$(printf '3%.0s' {1..64})"
 bot_secret="bot-secret-token-do-not-print"
 gh_secret="gh-secret-token-do-not-print"
 manifest=cmd/cacheservice/compat/engines.txt
+v26=v1.0.0-beta.26
+sync26=release-check/sync/$v26
+title26="Remote cache tests: candidate $v26 $d2"
 
 # --- fakes ---
 mkdir -p "$tmp/bin"
@@ -53,13 +57,10 @@ line="$(awk -v t="$tag" '$1 == t' "$FAKE/images" 2>/dev/null)"
 [[ -n "$line" ]] || { echo "ERROR: registry.dagger.io/engine:$tag: not found" >&2; exit 1; }
 echo "${line#* }"
 EOF
-# go: the bundle test passes unless FAKE_GO_FAIL is set.
+# go: never called; upstream's code doesn't run here.
 cat >"$tmp/bin/go" <<'EOF'
 #!/usr/bin/env bash
 echo "go $*" >>"$FAKE/go-calls"
-# The tree it runs in: the merge's first parent, the branch it built on.
-echo "built on $(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)" >>"$FAKE/go-calls"
-[[ -z "${FAKE_GO_FAIL:-}" ]]
 EOF
 # gh: the API calls the script makes, against JSON state in $FAKE. Every
 # call is logged as "<who> <method> <path>", who being bot or gh by the
@@ -88,18 +89,27 @@ case "$method $path" in
 "GET repos/o/r/pulls?state=open"*) jq '[.[] | select(.state == "open")]' "$FAKE/pulls.json" ;;
 "POST repos/o/r/pulls")
 	num=$(n pr)
-	jq --argjson n "$num" --argjson in "$input" '. + [{number: $n, state: "open", title: $in.title, body: $in.body,
-		head: {ref: $in.head, sha: "0123456789012345678901234567890123456789", repo: {full_name: "o/r"}}, base: {ref: $in.base}, auto_merge: null, node_id: "PR_\($n)"}]' "$FAKE/pulls.json" >"$FAKE/p.tmp"
+	jq --argjson n "$num" --argjson in "$input" '. + [{number: $n, state: "open", title: $in.title, body: $in.body, draft: $in.draft,
+		head: {ref: $in.head, sha: "0123456789012345678901234567890123456789", repo: {full_name: "o/r"}}, base: {ref: $in.base}, node_id: "PR_\($n)"}]' "$FAKE/pulls.json" >"$FAKE/p.tmp"
 	mv "$FAKE/p.tmp" "$FAKE/pulls.json"
 	echo "{\"number\": $num}" ;;
-"GET repos/o/r/pulls/"*/files*)
-	num="${path#repos/o/r/pulls/}"; num="${num%%/*}"
-	if [[ -f "$FAKE/files-$num.json" ]]; then cat "$FAKE/files-$num.json"; else
-		echo '[{"filename": "cmd/cacheservice/compat/engines.txt", "status": "modified", "additions": 1, "deletions": 0}]'; fi ;;
 "GET repos/o/r/pulls/"*) jq --argjson n "${path##*/}" '.[] | select(.number == $n)' "$FAKE/pulls.json" ;;
+"PATCH repos/o/r/pulls/"*)
+	jq --argjson n "${path##*/}" --argjson in "$input" 'map(if .number == $n then .body = $in.body else . end)' "$FAKE/pulls.json" >"$FAKE/p.tmp"
+	mv "$FAKE/p.tmp" "$FAKE/pulls.json"
+	echo '{}' ;;
 "GET repos/o/r/git/matching-refs/heads/release-check/")
 	git -C "$FAKE/origin.git" for-each-ref --format='%(refname)' refs/heads/release-check/ | jq -R . | jq -s 'map({ref: .})' ;;
 "GET repos/o/r/issues?labels=compat-break"*) jq '[.[] | select(.state == "open")]' "$FAKE/issues.json" ;;
+"GET repos/o/r/issues/"*/comments*)
+	num="${path#repos/o/r/issues/}"; num="${num%%/*}"
+	jq --argjson n "$num" '[.[] | select(.on == $n)]' "$FAKE/comments.json" ;;
+"POST repos/o/r/issues/"*/comments)
+	num="${path#repos/o/r/issues/}"; num="${num%%/*}"
+	jq --argjson n "$num" --argjson in "$input" '. + [{on: $n, body: $in.body}]' "$FAKE/comments.json" >"$FAKE/c.tmp"
+	mv "$FAKE/c.tmp" "$FAKE/comments.json"
+	echo '{}' ;;
+"GET repos/o/r/issues/"*) jq --argjson n "${path##*/}" '.[] | select(.number == $n)' "$FAKE/issues.json" ;;
 "GET repos/o/r/labels/compat-break") [[ -f "$FAKE/label" ]] || { echo '{"message":"Not Found"}'; exit 1; } ;;
 "POST repos/o/r/labels") touch "$FAKE/label"; echo '{}' ;;
 "POST repos/o/r/issues")
@@ -111,68 +121,41 @@ case "$method $path" in
 "POST repos/o/r/actions/workflows/"*/dispatches)
 	wf="${path#repos/o/r/actions/workflows/}"; wf="${wf%/dispatches}"
 	echo "$input" >"$FAKE/dispatch-$wf-$(n dispatch-$wf)"
-	# Whether the advisory diff was written before this dispatch.
-	# How many tags had been fetched by now.
-		git tag -l | wc -l >>"$FAKE/tags-at-dispatch"
-		if [[ -f "$FAKE/notes/advisory.md" ]]; then echo "$wf" >>"$FAKE/advisory-before-dispatch"; else echo "$wf" >>"$FAKE/dispatch-saw-no-advisory"; fi
 	[[ -n "${FAKE_NO_RUN_ID:-}" ]] && exit 0
 	id=$((5000 + $(n run)))
-	c="$(head -n1 "$FAKE/conclusions" 2>/dev/null || echo success)"
-	sed -i 1d "$FAKE/conclusions" 2>/dev/null || true
-	echo "$c" >"$FAKE/run-$id"
 	echo "{\"workflow_run_id\": $id, \"run_url\": \"x\", \"html_url\": \"x\"}" ;;
+"GET repos/o/r/actions/workflows/remote-cache-tests.yml/runs?"*)
+	# $FAKE/runs.json: [{id, head_sha, display_title, status, conclusion}].
+	sha="${path#*head_sha=}"; sha="${sha%%&*}"
+	# FAKE_RUNS_TOTAL: the listing's total_count (none by default).
+	jq --arg s "$sha" --arg t "${FAKE_RUNS_TOTAL:-}" '{workflow_runs: [.[] | select(.head_sha == $s)]} + (if $t == "" then {} else {total_count: ($t | tonumber)} end)' "$FAKE/runs.json" ;;
 "GET repos/o/r/actions/runs/"*/jobs*)
 	[[ -n "${FAKE_JOBS_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
-	# FAKE_JOBS_FAIL_AFTER=1: the first read works, every later one fails.
-	# FAKE_JOBS_FAIL_FIRST=1: the first read fails, the later ones work.
-	if [[ -n "${FAKE_JOBS_FAIL_FIRST:-}" ]] && (($(n jobs-try) <= FAKE_JOBS_FAIL_FIRST)); then echo "HTTP 502" >&2; exit 1; fi
-	if [[ -n "${FAKE_JOBS_FAIL_AFTER:-}" ]] && (($(n jobs-read) > FAKE_JOBS_FAIL_AFTER)); then echo "HTTP 502" >&2; exit 1; fi
 	# FAKE_JOBS: the jobs array as it is; otherwise the four jobs of a
-	# candidate run, all green in a green run and with the e2e red in a red
-	# one (at FAKE_FAILED_STEP).
-	# FAKE_JOBS_TOTAL: the listing's total_count (none by default).
-	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{${FAKE_JOBS_TOTAL:+\"total_count\": $FAKE_JOBS_TOTAL, }\"jobs\": $FAKE_JOBS}"; exit 0; fi
-	failed_step="${FAKE_FAILED_STEP:-Real engines}"
+	# candidate run, the e2e red in a red run.
+	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{\"jobs\": $FAKE_JOBS}"; exit 0; fi
 	rid="${path#repos/o/r/actions/runs/}"; rid="${rid%%/*}"
-	e2e=success; [[ "$(cat "$FAKE/run-$rid")" == failure ]] && e2e=failure
+	c="$(jq -r --argjson i "$rid" '.[] | select(.id == $i) | .conclusion' "$FAKE/runs.json")"
+	e2e=success; [[ "$c" == failure ]] && e2e=failure
 	echo '{"jobs": [{"name": "unit tests", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/4"},
 		{"name": "S3 tests against MinIO", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/5"},
-		{"name": "real engines (e2e)", "conclusion": "'"$e2e"'", "html_url": "https://github.com/o/r/actions/runs/1/job/2",
-		"steps": [{"name": "Checkout", "conclusion": "success"}, {"name": "'"$failed_step"'", "conclusion": "'"$e2e"'"}]},
+		{"name": "real engines (e2e)", "conclusion": "'"$e2e"'", "html_url": "https://github.com/o/r/actions/runs/1/job/2"},
 		{"name": "sidecar demo", "conclusion": "success", "html_url": "https://github.com/o/r/actions/runs/1/job/3"}]}' ;;
-"GET repos/o/r/actions/runs/"*)
-	# FAKE_RUN_READ_FAIL: no run can be read (as gh does, the error's body
-	# on stdout).
-	[[ -n "${FAKE_RUN_READ_FAIL:-}" ]] && { echo '{"message": "Server Error"}'; echo "HTTP 502" >&2; exit 1; }
-	# A run whose conclusion is "running" hasn't completed (yet).
-	c="$(cat "$FAKE/run-${path##*/}")"
-	if [[ "$c" == running ]]; then echo '{"status": "in_progress", "conclusion": null}'; else
-		echo "{\"status\": \"completed\", \"conclusion\": \"$c\"}"; fi ;;
 "GET repos/o/r/branches/feature/remote-cache")
 	sha="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
 	echo "{\"commit\": {\"sha\": \"$sha\", \"commit\": {\"committer\": {\"date\": \"${FAKE_HEAD_DATE:-2020-01-01T00:00:00Z}\"}}}}" ;;
 "GET repos/o/r/actions/workflows/cacheservice-publish.yml/runs?head_sha="*)
 	# FAKE_PUBLISH_RUNS: space-separated "<event>:<status>:<conclusion>".
 	jq -n --arg r "${FAKE_PUBLISH_RUNS:-}" '{workflow_runs: [$r | split(" ")[] | select(. != "") | split(":") | {event: .[0], status: .[1], conclusion: (.[2] // null)}]}' ;;
-"POST graphql")
-	[[ -n "${FAKE_CLEAN:-}" ]] && { echo "gh: Pull request Pull request is in clean status (enablePullRequestAutoMerge)" >&2; exit 1; }
-	printf '%s\n' "${fields[@]}" >"$FAKE/graphql" ; echo '{}' ;;
-"POST repos/o/r/actions/runs/"*/cancel)
-	# As the API does: a run that has completed can't be cancelled.
-	# FAKE_CANCEL_FAIL: no cancel works.
-	[[ -n "${FAKE_CANCEL_FAIL:-}" ]] && { echo "HTTP 502" >&2; exit 1; }
-	rid="${path#repos/o/r/actions/runs/}"; rid="${rid%%/*}"
-	[[ "$(cat "$FAKE/run-$rid")" == running ]] || { echo "Cannot cancel a workflow run that is completed. (HTTP 409)" >&2; exit 1; }
-	echo cancelled >"$FAKE/run-$rid"
-	echo "{}" ;;
-"PUT repos/o/r/pulls/"*/merge) echo "$input" >"$FAKE/merged"; echo '{"merged": true}' ;;
+"POST graphql") printf '%s\n' "${fields[@]}" >"$FAKE/graphql"; echo '{}' ;;
 *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
 esac
 EOF
 chmod +x "$tmp/bin/"*
 
-# --- upstream: tags beta.24 to beta.27 on main, plus tags the check must
-# skip. Each release changes a file the fork doesn't touch. ---
+# --- upstream: tags beta.24 to beta.28 on main, plus tags the check must
+# skip. Each release changes a file the fork doesn't touch; beta.28 changes
+# the bundle version. ---
 up="$tmp/upstream"
 mkdir -p "$up/dagql" "$up/engine/remotecache/protocol"
 git -C "$up" init -q
@@ -193,6 +176,10 @@ git -C "$up" tag -a -m beta.26 v1.0.0-beta.26
 echo 27 >"$up/release"
 git -C "$up" add -A && git -C "$up" commit -q -m beta.27
 git -C "$up" tag v1.0.0-beta.27
+echo 28 >"$up/release"
+echo 'const valueBundleVersion = 7' >"$up/dagql/cache_transfer_types.go"
+git -C "$up" add -A && git -C "$up" commit -q -m beta.28
+git -C "$up" tag v1.0.0-beta.28
 
 # --- the fork: feature/remote-cache, upstream beta.25 plus the service ---
 fork_manifest() {
@@ -206,14 +193,15 @@ setup() {
 	mkdir -p "$FAKE"
 	echo '[]' >"$FAKE/pulls.json"
 	echo '[]' >"$FAKE/issues.json"
+	echo '[]' >"$FAKE/comments.json"
+	echo '[]' >"$FAKE/runs.json"
 	: >"$FAKE/calls"
-	printf 'v1.0.0-beta.26 application/vnd.oci.image.index.v1+json %s\n' "$d2" >"$FAKE/images"
+	printf '%s application/vnd.oci.image.index.v1+json %s\n' "$v26" "$d2" >"$FAKE/images"
 	git clone -q --bare "$up" "$FAKE/origin.git"
 	git -C "$FAKE/origin.git" tag -l | xargs -r git -C "$FAKE/origin.git" tag -d >/dev/null
 	work="$tmp/work"
 	git clone -q "$FAKE/origin.git" "$work"
-	git -C "$work" checkout -q -b feature/remote-cache v1.0.0-beta.25 2>/dev/null ||
-		git -C "$work" checkout -q -b feature/remote-cache "$(git -C "$up" rev-parse v1.0.0-beta.25)"
+	git -C "$work" checkout -q -b feature/remote-cache "$(git -C "$up" rev-parse v1.0.0-beta.25)"
 	mkdir -p "$work/cmd/cacheservice/compat"
 	fork_manifest >"$work/$manifest"
 	git -C "$work" add -A && git -C "$work" commit -q -m "the service"
@@ -223,12 +211,12 @@ setup() {
 # rc <args...>: runs the script in the checkout, as the workflow does;
 # output in $tmp/out (stdout and stderr), status in $status.
 rc() {
+	rm -f "$FAKE/output"
 	(
 		cd "$work" &&
 			PATH="$tmp/bin:$PATH" BOT_SECRET="$bot_secret" GH_SECRET="$gh_secret" GH_TOKEN="$gh_secret" \
 				ENGINES_FILE="$work/$manifest" RELEASE_CHECK_REPO=o/r RELEASE_CHECK_REMOTE="$FAKE/origin.git" \
-				RELEASE_CHECK_UPSTREAM="$up" RELEASE_CHECK_DIR="$FAKE/notes" RELEASE_CHECK_POLL_SECONDS=0 \
-				GITHUB_SERVER_URL=https://github.com GITHUB_OUTPUT="$FAKE/output" RELEASE_CHECK_BUNDLE="${BUNDLE-pass}" \
+				RELEASE_CHECK_UPSTREAM="$up" GITHUB_SERVER_URL=https://github.com GITHUB_OUTPUT="$FAKE/output" \
 				"$@" "$script" "${ARGS[@]}"
 	) >"$tmp/out" 2>&1
 	status=$?
@@ -237,21 +225,39 @@ run() { ARGS=("$@"); rc env; }
 run_bot() { ARGS=("$@"); rc env BOT_TOKEN="$bot_secret"; }
 writes() { grep -cE ' (POST|PATCH|PUT|DELETE) ' "$FAKE/calls" || true; }
 branch_file() { git -C "$FAKE/origin.git" show "refs/heads/$1:$manifest"; }
+branch_sha() { git -C "$FAKE/origin.git" rev-parse "refs/heads/$1"; }
 no_secret() { not grep -qE "$bot_secret|$gh_secret" "$tmp/out"; }
+output() { awk -F= -v k="$1" '$1 == k { v = substr($0, length(k) + 2) } END { print v }' "$FAKE/output"; }
+# add_run <id> <head sha> <title> <status> [<conclusion>]: a verifying run.
+add_run() {
+	jq --argjson i "$1" --arg s "$2" --arg t "$3" --arg st "$4" --arg c "${5:-}" \
+		'. + [{id: $i, head_sha: $s, display_title: $t, status: $st, conclusion: (if $c == "" then null else $c end)}]' \
+		"$FAKE/runs.json" >"$FAKE/r.tmp" && mv "$FAKE/r.tmp" "$FAKE/runs.json"
+}
+# started: setup, then beta.26's sync started (its PR is #1).
+started() {
+	setup
+	run_bot start "$v26" "$d2"
+	[[ "$status" == 0 ]] || { cat "$tmp/out"; echo "start failed"; exit 1; }
+	: >"$FAKE/calls"
+	rm -f "$FAKE"/dispatch-* "$FAKE"/next-dispatch-*
+}
+job() { printf '{"name": "%s", "conclusion": "%s", "html_url": "https://github.com/o/r/actions/runs/1/job/9"}' "$1" "$2"; }
+jobs_of() { local IFS=,; echo "[$*]"; }
 
-echo "--- plan"
+echo "--- plan, nothing open"
 setup
 run plan
-check "plan: the oldest new release with an image is verified" has "$tmp/out" "action=verify"
-check "plan: it is beta.26, not beta.24 (older than the manifest's lines) or beta.27" has "$tmp/out" "version=v1.0.0-beta.26"
+check "plan: the oldest new release with an image starts a sync" has "$tmp/out" "action=start"
+check "plan: it is beta.26, not beta.24 (older than the manifest's lines) or beta.27" has "$tmp/out" "version=$v26"
 check "plan: with its index digest" has "$tmp/out" "digest=$d2"
 check "plan: sdk/*, v0.* and malformed tags are skipped" not hasx "$tmp/out" "sdk/|v0\.19|beta_x"
 check "plan: writes nothing" test "$(writes)" = 0
-check "plan: outputs reach GITHUB_OUTPUT" has "$FAKE/output" "action=verify"
+check "plan: outputs reach GITHUB_OUTPUT" has "$FAKE/output" "action=start"
 
 : >"$FAKE/images"
 run plan
-check "plan: a release with no image yet is skipped this hour" has "$tmp/out" "no registry.dagger.io/engine:v1.0.0-beta.26 image yet"
+check "plan: a release with no image yet is skipped this hour" has "$tmp/out" "no registry.dagger.io/engine:$v26 image yet"
 check "plan: and nothing is done" has "$tmp/out" "action=none"
 
 printf 'v1.0.0-beta.27 application/vnd.oci.image.index.v1+json %s\n' "$d2" >"$FAKE/images"
@@ -263,11 +269,11 @@ ARGS=(plan); rc env RELEASE_CHECK_UPSTREAM="$tmp/no-such-repo"
 check "plan: an upstream that can't be listed fails the run" test "$status" -ne 0
 check "plan: rather than reading as nothing new" not has "$tmp/out" "action=none"
 
-printf 'v1.0.0-beta.26 application/vnd.oci.image.manifest.v1+json %s\n' "$d2" >"$FAKE/images"
+printf '%s application/vnd.oci.image.manifest.v1+json %s\n' "$v26" "$d2" >"$FAKE/images"
 run plan
 check "plan: a single-platform image fails the run" test "$status" -ne 0
 
-printf 'v1.0.0-beta.26 application/vnd.oci.image.index.v1+json sha256:abc\n' >"$FAKE/images"
+printf '%s application/vnd.oci.image.index.v1+json sha256:abc\n' "$v26" >"$FAKE/images"
 run plan
 check "plan: a malformed digest from the registry fails the run" test "$status" -ne 0
 
@@ -277,215 +283,259 @@ check "plan: a registry error fails the run, rather than skipping" test "$status
 run plan v1.0.0-beta.24
 check "plan: a chosen version is for dry runs only" test "$status" -ne 0
 setup
-run --dry-run plan v1.0.0-beta.26
-check "plan: a dry run may choose a version" has "$tmp/out" "version=v1.0.0-beta.26"
+printf 'v1.0.0-beta.27 application/vnd.oci.image.index.v1+json %s\n' "$d3" >>"$FAKE/images"
+run --dry-run plan v1.0.0-beta.27
+check "plan: a dry run may choose a version" has "$tmp/out" "version=v1.0.0-beta.27"
+
+setup
+git -C "$work" push -q origin "feature/remote-cache:refs/heads/release-check/reject/$v26"
+run plan
+check "plan: a leftover branch of the earlier flow fails the run" test "$status" -ne 0
+check "plan: naming it" has "$tmp/out" "release-check/reject/$v26"
+
+echo "--- start"
+setup
+run_bot start "$v26" "$d2"
+check "start: succeeds" test "$status" = 0
+check "start: pushes the sync branch" branch_sha "$sync26"
+check "start: with the tag merged" git -C "$FAKE/origin.git" merge-base --is-ancestor "$(git -C "$up" rev-parse "$v26^{commit}")" "refs/heads/$sync26"
+check "start: by a merge commit, on feature/remote-cache" test "$(git -C "$FAKE/origin.git" rev-parse "refs/heads/$sync26~1^1")" = "$(branch_sha feature/remote-cache)"
+check "start: and the base moved" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/$sync26:$manifest' | grep -qx 'base $v26'"
+check "start: the accept lines unchanged" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/$sync26:$manifest' | grep -c '^accept' | grep -qx 1"
+check "start: says it merged" has "$tmp/out" "merge=merged"
+check "start: opens the PR as the bot" has "$FAKE/calls" "bot POST repos/o/r/pulls"
+check "start: a draft" jq -e '.[0].draft == true and .[0].head.ref == "'"$sync26"'" and .[0].base.ref == "feature/remote-cache"' "$FAKE/pulls.json"
+check "start: titled for the sync" jq -e '.[0].title == "remote cache: sync upstream '"$v26"' (release check)"' "$FAKE/pulls.json"
+check "start: its description says to merge with a merge commit" jq -e '.[0].body | test("gh pr merge --merge")' "$FAKE/pulls.json"
+check "start: with the advisory diff" jq -e '.[0].body | test("dagql/cache_live.go")' "$FAKE/pulls.json"
+check "start: prints the PR" has "$tmp/out" "pr=1"
+check "start: dispatches the first verification on the sync branch" \
+	jq -e --arg d "$d2" '.ref == "'"$sync26"'" and .inputs == {"candidate-version": "'"$v26"'", "candidate-digest": $d}' "$FAKE/dispatch-remote-cache-tests.yml-1"
+check "start: with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/actions/workflows/remote-cache-tests.yml/dispatches"
+check "start: and prints its run" has "$tmp/out" "run=https://github.com/o/r/actions/runs/5001"
+check "start: never runs upstream's code" not test -f "$FAKE/go-calls"
+check "start: never prints a token" no_secret
+
+setup
+run start "$v26" "$d2"
+check "start: without the bot's token, fails" test "$status" -ne 0
+check "start: saying so" has "$tmp/out" "BOT_TOKEN is not set"
+check "start: pushing nothing" test -z "$(git -C "$FAKE/origin.git" for-each-ref refs/heads/release-check/)"
+
+setup
+echo fork >"$work/release"
+git -C "$work" commit -qam "the fork changes upstream's file"
+git -C "$work" push -q origin feature/remote-cache
+run_bot start "$v26" "$d2"
+check "start: a conflicting tag still starts the sync" test "$status" = 0
+check "start: says it conflicts" has "$tmp/out" "merge=conflict"
+check "start: the branch is feature/remote-cache with the base moved" test "$(git -C "$FAKE/origin.git" rev-parse "refs/heads/$sync26~1")" = "$(branch_sha feature/remote-cache)"
+check "start: without the tag" not git -C "$FAKE/origin.git" merge-base --is-ancestor "$(git -C "$up" rev-parse "$v26^{commit}")" "refs/heads/$sync26"
+check "start: the PR says how to merge it by hand" jq -e '.[0].body | test("Merging `'"$v26"'` conflicts")' "$FAKE/pulls.json"
+check "start: and nothing is verified yet" not test -f "$FAKE/dispatch-remote-cache-tests.yml-1"
+
+echo "--- plan, a sync open"
+started
+sha="$(branch_sha "$sync26")"
+run plan
+check "plan: an open sync is followed" has "$tmp/out" "action=sync"
+check "plan: its version, PR and head" bash -c "grep -qx 'version=$v26' '$tmp/out' && grep -qx 'pr=1' '$tmp/out' && grep -qx 'sha=$sha' '$tmp/out'"
+check "plan: with no run of its head, verify" has "$tmp/out" "state=verify"
+check "plan: writes nothing" test "$(writes)" = 0
+
+printf 'v1.0.0-beta.27 application/vnd.oci.image.index.v1+json %s\n' "$d3" >>"$FAKE/images"
+run plan
+check "plan: a newer release waits for the open sync" not has "$tmp/out" "action=start"
+
+add_run 7001 "$sha" "$title26" in_progress
+run plan
+check "plan: a run in progress is waited on" has "$tmp/out" "state=running"
+check "plan: and named" has "$tmp/out" "run=https://github.com/o/r/actions/runs/7001"
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7002 "$sha" "$title26" completed failure
+run plan
+check "plan: a red run is red" has "$tmp/out" "state=red"
+check "plan: naming it" has "$tmp/out" "run=https://github.com/o/r/actions/runs/7002"
+
+add_run 7003 "$sha" "$title26" completed success
+run plan
+check "plan: the latest run decides: green" has "$tmp/out" "state=green"
+check "plan: naming it" has "$tmp/out" "run=https://github.com/o/r/actions/runs/7003"
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7004 "0000000000000000000000000000000000000000" "$title26" completed success
+add_run 7005 "$sha" "Remote cache tests: candidate $v26 $d3" completed success
+run plan
+check "plan: runs of another head, or another digest, don't count" has "$tmp/out" "state=verify"
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7006 "$sha" "$title26" completed success
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'real engines (e2e)' skipped)" "$(job 'sidecar demo' success)")"
+check "plan: a green run whose engine job was skipped decides nothing" has "$tmp/out" "state=verify"
+add_run 7007 "$sha" "$title26" completed cancelled
+run plan
+check "plan: two undecided runs of one head stop the dispatches" has "$tmp/out" "state=bounded"
+check "plan: saying so" has "$tmp/out" "Re-run it by hand"
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7011 "$sha" "$title26" completed failure
+add_run 7012 "$sha" "$title26" completed cancelled
+run plan
+check "plan: a red run doesn't count toward the bound" has "$tmp/out" "state=verify"
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7013 "$sha" "$title26" completed failure
+early='{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "x", "steps": [{"name": "Checkout", "conclusion": "failure"}]}'
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
+check "plan: a run that failed before testing isn't red" has "$tmp/out" "state=verify"
+check "plan: saying why" has "$tmp/out" "jobs failed before testing: real engines (e2e)"
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'real engines (e2e)' success)" "$(job 'sidecar demo' success)")"
+check "plan: a red unit test job is red (it runs the sync's code)" has "$tmp/out" "state=red"
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'sidecar demo' success)")"
+check "plan: a failed run missing an engine job decides nothing" has "$tmp/out" "state=verify"
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'real engines (e2e)' cancelled)" "$(job 'sidecar demo' success)")"
+check "plan: nor does a failed run in which no job failed" has "$tmp/out" "no job in it failed"
+add_run 7014 "$sha" "$title26" completed failure
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
+check "plan: two runs that failed before testing stop the dispatches" has "$tmp/out" "state=bounded"
+timedout='{"name": "sidecar demo", "conclusion": "timed_out", "html_url": "x", "steps": [{"name": "The engine pin, from the manifest", "conclusion": "timed_out"}]}'
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'real engines (e2e)' success)" "$timedout")"
+check "plan: a pin step that timed out is a failure before testing too" has "$tmp/out" "jobs failed before testing: sidecar demo"
+ARGS=(plan); rc env FAKE_RUNS_TOTAL=150
+check "plan: more verifying runs than were listed fails the plan" test "$status" -ne 0
+ARGS=(plan); rc env FAKE_JOBS_FAIL=1
+check "plan: a red run whose jobs can't be read fails the plan" test "$status" -ne 0
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7008 "$sha" "$title26" completed success
+ARGS=(plan); rc env FAKE_JOBS_FAIL=1
+check "plan: a green run whose jobs can't be read fails the plan" test "$status" -ne 0
+
+jq '. + [.[0] | .number = 2]' "$FAKE/pulls.json" >"$FAKE/p.tmp" && mv "$FAKE/p.tmp" "$FAKE/pulls.json"
+run plan
+check "plan: two open syncs fail the run" test "$status" -ne 0
+
+setup
+echo fork >"$work/release"
+git -C "$work" commit -qam "the fork changes upstream's file"
+git -C "$work" push -q origin feature/remote-cache
+run_bot start "$v26" "$d2"
+run plan
+check "plan: a sync without the tag waits for a human merge" has "$tmp/out" "state=needs-merge"
+git -C "$work" fetch -q origin "$sync26" && git -C "$work" checkout -q -b s FETCH_HEAD
+git -C "$work" fetch -q "$up" "refs/tags/$v26:refs/tags/$v26"
+git -C "$work" merge -q "$v26" >/dev/null 2>&1; echo fork >"$work/release"; git -C "$work" commit -qam "merge $v26" && git -C "$work" push -q origin "s:$sync26"
+git -C "$work" checkout -q feature/remote-cache
+run plan
+check "plan: once a human merged it, it is verified" has "$tmp/out" "state=verify"
 
 echo "--- verify"
-setup
-echo success >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "verify: a green run passes" has "$tmp/out" "result=pass"
-check "verify: cites the run" has "$tmp/out" "run=https://github.com/o/r/actions/runs/5001"
-check "verify: dispatches remote-cache-tests.yml on the branch with the candidate" \
-	jq -e --arg d "$d2" '.ref == "feature/remote-cache" and .inputs == {"candidate-version": "v1.0.0-beta.26", "candidate-digest": $d}' "$FAKE/dispatch-remote-cache-tests.yml-1"
-check "verify: dispatches with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/actions/workflows/remote-cache-tests.yml/dispatches"
-check "verify: never runs upstream's code (the bundle job does)" not test -f "$FAKE/go-calls"
-check "verify: writes the advisory diff" has "$FAKE/notes/advisory.md" "dagql/cache_live.go"
+started
+run verify "$v26" "$d2"
+check "verify: dispatches on the sync branch" jq -e '.ref == "'"$sync26"'"' "$FAKE/dispatch-remote-cache-tests.yml-1"
+check "verify: and returns" has "$tmp/out" "run=https://github.com/o/r/actions/runs/500"
 
-setup
-echo failure >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "verify: a red run fails" has "$tmp/out" "result=fail"
-check "verify: and lists its failing jobs" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
+echo "--- report"
+started
+sha="$(branch_sha "$sync26")"
+add_run 7002 "$sha" "$title26" completed failure
+run report "$v26" https://github.com/o/r/actions/runs/7002 1
+check "report: files the compat-break issue" jq -e '.[0].title == "compat-break: engine '"$v26"' fails against the cache service" and .[0].labels == ["compat-break"]' "$FAKE/issues.json"
+check "report: with the failing run" jq -e '.[0].body | test("actions/runs/7002")' "$FAKE/issues.json"
+check "report: its failing jobs" jq -e '.[0].body | test("real engines \\(e2e\\)")' "$FAKE/issues.json"
+check "report: and the sync PR" jq -e '.[0].body | test("o/r#1")' "$FAKE/issues.json"
+check "report: with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/issues"
+check "report: the PR closes it" jq -e '.[0].body | test("Closes #101.")' "$FAKE/pulls.json"
+check "report: prints it" has "$tmp/out" "issue=101"
+run report "$v26" https://github.com/o/r/actions/runs/7002 1
+check "report: the same run again is said once" has "$tmp/out" "names https://github.com/o/r/actions/runs/7002 already"
+check "report: no second issue, no comment" bash -c "jq -e 'length == 1' '$FAKE/issues.json' && jq -e 'length == 0' '$FAKE/comments.json'"
+add_run 7010 "$sha" "$title26" completed failure
+run report "$v26" https://github.com/o/r/actions/runs/7010 1
+check "report: a new red run is a comment" jq -e '.[0].on == 101 and (.[0].body | test("actions/runs/7010"))' "$FAKE/comments.json"
+run report "$v26" https://github.com/o/r/actions/runs/7010 1
+check "report: once" jq -e 'length == 1' "$FAKE/comments.json"
+check "report: the PR names the issue once" test "$(jq -r '.[0].body' "$FAKE/pulls.json" | grep -c 'Closes #101.')" = 1
 
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
-check "verify: a red run whose jobs can't be read is an error, not a failure" test "$status" -ne 0
-check "verify: so no result is given" not has "$tmp/out" "result="
+started
+echo '[{"number": 90, "state": "open", "title": "compat-break: engine '"$v26"' fails against the cache service", "body": "x"}]' >"$FAKE/issues.json"
+run report "$v26" https://github.com/o/r/actions/runs/7002 1
+check "report: an issue already open is reused" jq -e 'length == 1' "$FAKE/issues.json"
+check "report: and linked from the PR" jq -e '.[0].body | test("Closes #90.")' "$FAKE/pulls.json"
 
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_FIRST=1
-check "verify: a jobs read that fails once is tried again" has "$tmp/out" "result=pass"
-setup
-ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:failure"
-check "publish: lists the runs of the branch only" has "$FAKE/calls" "&branch=feature/remote-cache"
-check "engine jobs: the names are the workflow's own" bash -c "grep -qxF '    name: real engines (e2e)' '$here/../../.github/workflows/remote-cache-tests.yml' && grep -qxF '    name: sidecar demo' '$here/../../.github/workflows/remote-cache-tests.yml'"
-
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL_AFTER=1
-check "verify: a red run's jobs are read once, so a failing second read can't stand in for them" has "$FAKE/notes/a-jobs.md" "real engines (e2e)"
-check "verify: and no placeholder list is written" not has "$FAKE/notes/a-jobs.md" "couldn't list"
-
-# Only the engine jobs decide (zerobull-consulting/dagger#166).
-job() { printf '{"name": "%s", "conclusion": "%s", "html_url": "https://github.com/o/r/actions/runs/1/job/9", "steps": []}' "$1" "$2"; }
-jobs_of() { local IFS=,; echo "[$*]"; }
-e2e="real engines (e2e)"
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'S3 tests against MinIO' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
-check "verify: a red unit test job is an error, not a failure" test "$status" -ne 0
-check "verify: naming the job" has "$tmp/out" "unit tests: failure"
-check "verify: so no result is given" not has "$tmp/out" "result="
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'S3 tests against MinIO' timed_out)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
-check "verify: nor is a timed-out MinIO job a failure of the engine" test "$status" -ne 0
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' failure)" "$(job 'S3 tests against MinIO' success)" "$(job "$e2e" failure)" "$(job 'sidecar demo' success)")"
-check "verify: a red engine job with a red unit job is still an error" test "$status" -ne 0
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'S3 tests against MinIO' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' failure)")"
-check "verify: a red sidecar demo is the failure verdict" has "$tmp/out" "result=fail"
-check "verify: and the list names only it" has "$FAKE/notes/a-jobs.md" "sidecar demo"
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job 'S3 tests against MinIO' success)" "$(job 'sidecar demo' success)")"
-check "verify: a green run without its e2e job is an error" test "$status" -ne 0
-check "verify: not a pass" not has "$tmp/out" "result="
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)")"
-check "verify: a red run without its sidecar job is an error, not a failure" test "$status" -ne 0
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)" "$(job 'sidecar demo' skipped)")"
-check "verify: a red engine job beside a skipped one is an error, not a failure" test "$status" -ne 0
-check "verify: so no result is given" not has "$tmp/out" "result="
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" failure)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
-check "verify: a duplicated engine job is an error" test "$status" -ne 0
-check "verify: not a failure verdict" not has "$tmp/out" "result="
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job "$e2e" success)" "$(job 'sidecar demo' skipped)")"
-check "verify: a skipped engine job in a green run is an error" test "$status" -ne 0
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
-check "verify: a green run whose jobs can't be read is an error" test "$status" -ne 0
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
-check "verify: a red run whose every job is green is an error" test "$status" -ne 0
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_TOTAL=101 FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
-check "verify: a run with more jobs than were listed is an error" test "$status" -ne 0
-check "verify: ... and says so" has "$tmp/out" "more jobs than were listed"
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_TOTAL=3 FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
-check "verify: ... while one whose jobs were all listed passes" has "$tmp/out" "result=pass"
-
-echo "--- the bundle test"
-setup
-ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
-check "bundle: runs the bundle test with the tag merged" has "$FAKE/go-calls" "TestBundleVersionMatchesEngineCapture"
-check "bundle: passes" has "$tmp/out" "bundle=pass"
-check "bundle: notes the tag merges" has "$tmp/out" "merge=merged"
-check "bundle: writes nothing" test "$(writes)" = 0
-setup
-ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN FAKE_GO_FAIL=1
-check "bundle: a failing bundle test fails" has "$tmp/out" "bundle=fail"
-for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN; do
-	setup
-	ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN "$var=x"
-	check "bundle: refuses to run upstream's code with $var set" test "$status" -ne 0
-	check "bundle: before compiling anything ($var)" not test -f "$FAKE/go-calls"
-done
-
-setup
-echo failure >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_FAILED_STEP="The engine pin, from the manifest"
-check "verify: a run that failed at its pin step is an error, not a failure" test "$status" -ne 0
-check "verify: saying it failed before testing" has "$tmp/out" "failed before testing"
-
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF=remote-cache/some-branch
-check "verify: a dry run's verification runs on its own ref" jq -e '.ref == "remote-cache/some-branch"' "$FAKE/dispatch-remote-cache-tests.yml-1"
-
-setup
-echo cancelled >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "verify: a cancelled run is an error, not a failure" test "$status" -ne 0
-check "verify: so no result is given" not has "$tmp/out" "result="
-
-setup
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_NO_RUN_ID=1
-check "verify: a dispatch whose run isn't named is an error" test "$status" -ne 0
-
-setup
-run verify 'v1.0.0-beta.26;true' "$d2"
-check "verify: a malformed version is refused" test "$status" -ne 0
-run verify v1.0.0-beta.26 sha256:abc
-check "verify: a malformed digest is refused" test "$status" -ne 0
-check "verify: before anything is dispatched" test "$(writes)" = 0
-
-echo "--- outcome A"
-setup
-echo success >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-run_bot accept v1.0.0-beta.26 "$d2" https://github.com/o/r/actions/runs/5001
-check "accept: opens a PR" has "$tmp/out" "pr=1"
-check "accept: as the bot" has "$FAKE/calls" "bot POST repos/o/r/pulls"
-check "accept: from release-check/accept/<version>" jq -e '.[0].head.ref == "release-check/accept/v1.0.0-beta.26" and .[0].base.ref == "feature/remote-cache"' "$FAKE/pulls.json"
-diff_lines="$(git -C "$FAKE/origin.git" diff feature/remote-cache release-check/accept/v1.0.0-beta.26 | grep -E '^[-+][^-+]')"
-check "accept: the branch adds only the accept line" test "$diff_lines" = "+accept v1.0.0-beta.26 $d2 verified: https://github.com/o/r/actions/runs/5001"
-check "accept: the PR cites the verifying run" jq -e '.[0].body | contains("actions/runs/5001")' "$FAKE/pulls.json"
-check "accept: and says auto-merge is off" jq -e '.[0].body | contains("Auto-merge is off")' "$FAKE/pulls.json"
-check "accept: no token in the output" no_secret
-
-before="$(writes)"
-printf 'v1.0.0-beta.26 application/vnd.oci.image.index.v1+json %s\n' "$d2" >"$FAKE/images"
+echo "--- accept"
+started
+sha="$(branch_sha "$sync26")"
+echo '[{"number": 101, "state": "open", "title": "compat-break: engine '"$v26"' fails against the cache service", "body": "x"}]' >"$FAKE/issues.json"
+run_bot accept "$v26" "$d2" https://github.com/o/r/actions/runs/7003 "$sha" 1
+check "accept: succeeds" test "$status" = 0
+check "accept: pushes the accept line, first, to the sync branch" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/$sync26:$manifest' | grep '^accept' | head -n1 | grep -qx 'accept $v26 $d2 verified: https://github.com/o/r/actions/runs/7003'"
+check "accept: on top of the verified head" test "$(git -C "$FAKE/origin.git" rev-parse "refs/heads/$sync26~1")" = "$sha"
+check "accept: keeps the other lines (same bundle version)" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/$sync26:$manifest' | grep -q '^accept v1.0.0-beta.25 '"
+check "accept: marks the PR ready, with GITHUB_TOKEN" bash -c "grep -q 'gh POST graphql' '$FAKE/calls' && grep -q 'markPullRequestReadyForReview' '$FAKE/graphql' && grep -qx 'id=PR_1' '$FAKE/graphql'"
+check "accept: says so on the PR" jq -e 'any(.[]; .on == 1 and (.body | test("merge commit")))' "$FAKE/comments.json"
+check "accept: and on the issue" jq -e 'any(.[]; .on == 101 and (.body | test("actions/runs/7003")))' "$FAKE/comments.json"
+check "accept: never prints a token" no_secret
 run plan
-check "A again: the next hour finds the open PR" has "$tmp/out" "action=pending"
-check "A again: names it" has "$tmp/out" "pr=1"
-check "A again: and opens nothing" test "$(writes)" = "$before"
-
-run auto-merge 1
-check "auto-merge: off without RELEASE_CHECK_AUTO_MERGE" has "$tmp/out" "auto_merge=off"
-check "auto-merge: and enables nothing" not test -f "$FAKE/graphql"
-ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true
-check "auto-merge: on with it" has "$tmp/out" "auto_merge=on"
-check "auto-merge: squash, with GITHUB_TOKEN" has "$FAKE/calls" "gh POST graphql"
-check "auto-merge: titled with the full PR reference" has "$FAKE/graphql" "(zerobull-consulting/dagger#1)"
+check "plan: a sync with its accept line waits for a human" has "$tmp/out" "state=ready"
+ARGS=(plan); rc env FAKE_REGISTRY_ERROR="unexpected status 503"
+check "plan: a sync waiting on a human doesn't need the registry" has "$tmp/out" "state=ready"
+check "plan: and says the PR is still a draft (the fake doesn't change it)" has "$tmp/out" "draft=true"
 rm -f "$FAKE/graphql"
-ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true FAKE_CLEAN=1
-check "auto-merge: a PR whose checks passed already is squash-merged" has "$tmp/out" "auto_merge=merged"
-check "auto-merge: with GITHUB_TOKEN, pinned to the checked head" jq -e '.merge_method == "squash" and .sha == "0123456789012345678901234567890123456789" and (.commit_title | endswith("(zerobull-consulting/dagger#1)"))' "$FAKE/merged"
-check "auto-merge: by GITHUB_TOKEN" has "$FAKE/calls" "gh PUT repos/o/r/pulls/1/merge"
-echo '[{"filename": "cmd/cacheservice/compat/engines.txt", "status": "modified", "additions": 2, "deletions": 0}]' >"$FAKE/files-1.json"
-ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true
-check "auto-merge: refused for a PR adding two lines" test "$status" -ne 0
-check "auto-merge: which isn't enabled" not test -f "$FAKE/graphql"
-echo '[{"filename": ".github/workflows/x.yml", "status": "modified", "additions": 1, "deletions": 0}]' >"$FAKE/files-1.json"
-ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true
-check "auto-merge: refused for a PR changing another file" test "$status" -ne 0
-rm -f "$FAKE/files-1.json"
-jq '.[0].head.repo.full_name = "someone/fork"' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE/pulls.json"
-ARGS=(auto-merge 1); rc env RELEASE_CHECK_AUTO_MERGE=true
-check "auto-merge: refused for a fork's PR of the same name" test "$status" -ne 0
-check "auto-merge: which isn't enabled either" not test -f "$FAKE/graphql"
-run plan
-check "plan: a fork's PR of the same name isn't the release's PR" not has "$tmp/out" "action=pending"
-jq '.[0].head.repo.full_name = "o/r"' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE/pulls.json"
+echo '[]' >"$FAKE/comments.json"
+run ready "$v26" 1
+check "ready: marks a draft ready" bash -c "grep -q 'markPullRequestReadyForReview' '$FAKE/graphql' && grep -qx 'id=PR_1' '$FAKE/graphql'"
+check "ready: says so on the PR" jq -e 'any(.[]; .on == 1 and (.body | test("merge commit")))' "$FAKE/comments.json"
+check "ready: and on the issue" jq -e 'any(.[]; .on == 101 and (.body | test("ready to merge")))' "$FAKE/comments.json"
+jq 'map(.draft = false)' "$FAKE/pulls.json" >"$FAKE/p.tmp" && mv "$FAKE/p.tmp" "$FAKE/pulls.json"
+rm -f "$FAKE/graphql"
+run ready "$v26" 1
+check "ready: a PR marked ready meanwhile is left alone" bash -c "test '$status' = 0 && test ! -f '$FAKE/graphql'"
 
-# The PR merged: the line is on the branch, and the tag is done.
-git -C "$work" fetch -q origin
-git -C "$work" merge -q --ff-only origin/release-check/accept/v1.0.0-beta.26 2>/dev/null ||
-	git -C "$work" merge -q origin/release-check/accept/v1.0.0-beta.26
-jq 'map(.state = "closed")' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE/pulls.json"
-git -C "$FAKE/origin.git" update-ref -d refs/heads/release-check/accept/v1.0.0-beta.26
-run plan
-check "A merged: the release isn't new any more" not has "$tmp/out" "v1.0.0-beta.26:"
-check "A merged: and the next one without an image waits" has "$tmp/out" "action=none"
+started
+sha="$(branch_sha "$sync26")"
+run_bot accept "$v26" "$d2" https://github.com/o/r/actions/runs/7003 0123456789012345678901234567890123456789 1
+check "accept: a head that moved since the run is refused" test "$status" -ne 0
+check "accept: pushing nothing" test "$(branch_sha "$sync26")" = "$sha"
+
+setup
+printf 'v1.0.0-beta.28 application/vnd.oci.image.index.v1+json %s\n' "$d3" >"$FAKE/images"
+run_bot start v1.0.0-beta.28 "$d3"
+sha="$(branch_sha release-check/sync/v1.0.0-beta.28)"
+run_bot accept v1.0.0-beta.28 "$d3" https://github.com/o/r/actions/runs/7020 "$sha" 1
+check "accept: a changed bundle version resets the accept list to the release" bash -c "test \"\$(git -C '$FAKE/origin.git' show 'refs/heads/release-check/sync/v1.0.0-beta.28:$manifest' | grep '^accept')\" = 'accept v1.0.0-beta.28 $d3 verified: https://github.com/o/r/actions/runs/7020'"
+
+setup
+git -C "$up" checkout -q -b odd v1.0.0-beta.25
+echo 'const valueBundleVersion uint = 3 // typed now' >"$up/dagql/cache_transfer_types.go"
+git -C "$up" commit -qam odd && git -C "$up" tag -f -a -m odd "$v26" >/dev/null
+run_bot start "$v26" "$d2"
+check "advisory: a bundle version it can't read fails the run" test "$status" -ne 0
+check "advisory: saying so" has "$tmp/out" "couldn't read dagql's valueBundleVersion"
+git -C "$up" checkout -q main
+git -C "$up" tag -f -a -m beta.26 "$v26" "$(git -C "$up" rev-parse main~2)" >/dev/null
+git -C "$up" branch -q -D odd
+
+echo "--- dry run"
+setup
+run --dry-run start "$v26" "$d2"
+check "dry run: start succeeds without a token" test "$status" = 0
+check "dry run: start prints the push" has "$tmp/out" "dry run: would push $sync26"
+check "dry run: and the draft PR" has "$tmp/out" "dry run: would open a draft PR from $sync26"
+check "dry run: and the dispatch" has "$tmp/out" "dry run: would dispatch remote-cache-tests.yml on $sync26"
+check "dry run: pushes nothing" test -z "$(git -C "$FAKE/origin.git" for-each-ref refs/heads/release-check/)"
+started
+sha="$(branch_sha "$sync26")"
+run --dry-run report "$v26" https://github.com/o/r/actions/runs/7002 1
+check "dry run: report prints the issue" has "$tmp/out" "dry run: would label compat-break and file"
+run --dry-run accept "$v26" "$d2" https://github.com/o/r/actions/runs/7003 "$sha" 1
+check "dry run: accept prints the push" has "$tmp/out" "dry run: would push $sync26"
+check "dry run: and marking the PR ready" has "$tmp/out" "dry run: would mark #1 ready"
+run --dry-run verify "$v26" "$d2"
+check "dry run: verify prints the dispatch" has "$tmp/out" "dry run: would dispatch remote-cache-tests.yml"
+check "dry run: none of them writes" test "$(writes)" = 0
+check "dry run: the branch is as it was" test "$(branch_sha "$sync26")" = "$sha"
 
 echo "--- publish"
 setup
@@ -533,286 +583,11 @@ setup
 ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:success workflow_dispatch:completed:failure workflow_dispatch:completed:failure"
 check "publish: a success outranks the bound" has "$tmp/out" "publish=none"
 
-echo "--- outcome B"
-setup
-printf 'failure\nsuccess\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "B: A fails first" has "$tmp/out" "result=fail"
-run_bot rebuild v1.0.0-beta.26 "$d2"
-check "B: the rebuild passes" has "$tmp/out" "result=pass"
-check "B: and opens a PR" has "$tmp/out" "pr=1"
-check "B: as the bot" has "$FAKE/calls" "bot POST repos/o/r/pulls"
-check "B: verified on its own branch" jq -e '.ref == "release-check/rebuild/v1.0.0-beta.26"' "$FAKE/dispatch-remote-cache-tests.yml-2"
-check "B: the branch has the tag as a parent" git -C "$FAKE/origin.git" merge-base --is-ancestor "$(git -C "$up" rev-parse 'v1.0.0-beta.26^{commit}')" release-check/rebuild/v1.0.0-beta.26
-check "B: moves the base" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/release-check/rebuild/v1.0.0-beta.26:$manifest' | grep -qx 'base v1.0.0-beta.26'"
-check "B: adds the accept line, citing its own run, first" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/release-check/rebuild/v1.0.0-beta.26:$manifest' | grep '^accept' | head -n1 | grep -qx 'accept v1.0.0-beta.26 $d2 verified: https://github.com/o/r/actions/runs/5002'"
-check "B: keeps the other lines (no version change)" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/release-check/rebuild/v1.0.0-beta.26:$manifest' | grep -q '^accept v1.0.0-beta.25 '"
-check "B: says to merge with a merge commit" jq -e '.[0].body | contains("with a merge commit")' "$FAKE/pulls.json"
-check "B: no auto-merge" not test -f "$FAKE/graphql"
-check "B: no token in the output" no_secret
-before="$(writes)"
-run plan
-check "B again: the open PR is found" has "$tmp/out" "kind=rebuild"
-check "B again: nothing new" test "$(writes)" = "$before"
-
-# The bundle version changes in beta.26: the list resets to it.
-setup
-git -C "$up" checkout -q -b bump v1.0.0-beta.25
-echo 'const valueBundleVersion = 4' >"$up/dagql/cache_transfer_types.go"
-git -C "$up" commit -qam bump && git -C "$up" tag -f -a -m bumped v1.0.0-beta.26 >/dev/null
-printf 'failure\nsuccess\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "B reset: the advisory names the bundle version change" has "$FAKE/notes/advisory.md" "3 in v1.0.0-beta.25, 4 in v1.0.0-beta.26"
-run_bot rebuild v1.0.0-beta.26 "$d2"
-check "B reset: the accept list is the new version alone" test "$(branch_file release-check/rebuild/v1.0.0-beta.26 | grep -c '^accept')" = 1
-check "B reset: the PR says so" jq -e '.[0].body | contains("resets to")' "$FAKE/pulls.json"
-git -C "$up" checkout -q main
-git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
-
-# The tag is merged already (the sync got there first): no rebuild.
-setup
-git -C "$work" merge -q --no-edit "$(git -C "$up" rev-parse 'v1.0.0-beta.26^{commit}')" 2>/dev/null ||
-	{ git -C "$work" fetch -q "$up" v1.0.0-beta.26 && git -C "$work" merge -q --no-edit FETCH_HEAD; }
-git -C "$work" push -q origin feature/remote-cache
-run_bot rebuild v1.0.0-beta.26 "$d2"
-check "B ancestor: skipped, it would be the code A ran" has "$tmp/out" "result=skipped"
-check "B ancestor: nothing pushed or opened" test "$(writes)" = 0
-
-setup
-printf 'failure\nsuccess\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-before="$(writes)"
-ARGS=(rebuild v1.0.0-beta.26 "$d2"); BUNDLE=fail rc env BOT_TOKEN="$bot_secret"
-check "B bundle: no rebuild when the bundle test of that merge failed" has "$tmp/out" "result=skipped"
-check "B bundle: nothing pushed, dispatched or opened" test "$(writes)" = "$before"
-check "B bundle: no rebuild branch" test -z "$(git -C "$FAKE/origin.git" for-each-ref refs/heads/release-check/)"
-check "B bundle: never runs upstream's code itself" not test -f "$FAKE/go-calls"
-run_bot reject v1.0.0-beta.26
-check "B bundle: C's issue says why it wasn't rebuilt" jq -e '.[0].body | contains("the bundle test with")' "$FAKE/issues.json"
-
-setup
-printf 'failure\nfailure\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-run_bot rebuild v1.0.0-beta.26 "$d2"
-check "B red: the rebuild fails" has "$tmp/out" "result=fail"
-check "B red: no PR" test "$(jq length "$FAKE/pulls.json")" = 0
-
-echo "--- outcome C"
-run_bot reject v1.0.0-beta.26
-check "C: files the issue" has "$tmp/out" "issue=101"
-check "C: with GITHUB_TOKEN" has "$FAKE/calls" "gh POST repos/o/r/issues"
-check "C: labeled compat-break, creating the label" bash -c "grep -q 'gh POST repos/o/r/labels' '$FAKE/calls' && jq -e '.[0].labels == [\"compat-break\"]' '$FAKE/issues.json' >/dev/null"
-check "C: with both runs' failing jobs and the diff" jq -e '.[0].body | (contains("actions/runs/5001") and contains("actions/runs/5002") and contains("real engines (e2e)") and contains("dagql/cache_live.go"))' "$FAKE/issues.json"
-check "C: opens the reject PR as the bot" has "$FAKE/calls" "bot POST repos/o/r/pulls"
-check "C: whose line names the issue" bash -c "git -C '$FAKE/origin.git' show 'refs/heads/release-check/reject/v1.0.0-beta.26:$manifest' | grep -qx 'reject v1.0.0-beta.26 o/r#101'"
-check "C: no token in the output" no_secret
-before="$(writes)"
-run plan
-check "C again: the open reject PR is found" has "$tmp/out" "kind=reject"
-check "C again: nothing new" test "$(writes)" = "$before"
-
-# A run that stopped after the issue: the reject PR is opened, once.
-setup
-jq '. + [{number: 101, state: "open", title: "compat-break: engine v1.0.0-beta.26 fails against the cache service"}]' "$FAKE/issues.json" >"$FAKE/i" && mv "$FAKE/i" "$FAKE/issues.json"
-run plan
-check "C resume: an open issue without its reject branch resumes" has "$tmp/out" "action=resume-reject"
-check "C resume: naming the issue" has "$tmp/out" "issue=101"
-run_bot reject v1.0.0-beta.26 101
-check "C resume: files no second issue" not has "$FAKE/calls" "POST repos/o/r/issues"
-check "C resume: opens the reject PR" has "$tmp/out" "pr=1"
-
-# A PR closed by hand leaves its branch: the check stops and says so.
-jq 'map(.state = "closed")' "$FAKE/pulls.json" >"$FAKE/p" && mv "$FAKE/p" "$FAKE/pulls.json"
-run plan
-check "stuck: a branch with no open PR fails the run" test "$status" -ne 0
-check "stuck: naming the branch" has "$tmp/out" "release-check/reject/v1.0.0-beta.26"
-
-echo "--- the dry run's ref, and the order"
-# zerobull-consulting/dagger#162: a dry run's bundle test builds on the dry
-# run's ref, as its e2e does; a real run's on the branch.
-setup
-git -C "$work" checkout -q -b other
-echo "# other" >>"$work/$manifest"
-git -C "$work" commit -qam other && git -C "$work" push -q origin other
-other="$(git -C "$work" rev-parse HEAD)"
-git -C "$work" checkout -q feature/remote-cache
-main="$(git -C "$FAKE/origin.git" rev-parse refs/heads/feature/remote-cache)"
-ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN RELEASE_CHECK_TEST_REF=other
-check "bundle on the dry run's ref (zerobull-consulting/dagger#162): it builds on that ref" has "$FAKE/go-calls" "built on $other"
-check "bundle on the dry run's ref (zerobull-consulting/dagger#162): not on the branch" not has "$FAKE/go-calls" "built on $main"
-rm -f "$FAKE/go-calls"
-ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
-check "bundle on the branch (zerobull-consulting/dagger#162): a real run builds on the branch" has "$FAKE/go-calls" "built on $main"
-check "bundle on the branch (zerobull-consulting/dagger#162): not on another ref" not has "$FAKE/go-calls" "built on $other"
-
-# zerobull-consulting/dagger#163: verify dispatches before it fetches the
-# tags and writes the advisory diff.
-setup
-echo success >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "dispatch first (zerobull-consulting/dagger#163): no advisory diff existed at the dispatch" has "$FAKE/dispatch-saw-no-advisory" "remote-cache-tests.yml"
-check "dispatch first (zerobull-consulting/dagger#163): and none was written before it" not test -s "$FAKE/advisory-before-dispatch"
-check "dispatch first (zerobull-consulting/dagger#163): no tag was fetched at the dispatch" test "$(head -n1 "$FAKE/tags-at-dispatch" | tr -d ' ')" = 0
-check "dispatch first (zerobull-consulting/dagger#163): both the tag and the base are fetched after" test "$(git -C "$work" tag -l | wc -l)" -eq 2
-check "dispatch first (zerobull-consulting/dagger#163): and it is written after" test -s "$FAKE/notes/advisory.md"
-check "dispatch first (zerobull-consulting/dagger#163): the verdict is the same" has "$tmp/out" "result=pass"
-# A fetch that fails after the dispatch is an error, never a verdict.
-setup
-echo running >"$FAKE/conclusions"
-run verify v1.0.0-beta.99 "$d2"
-check "dispatch first: a tag that can't be fetched is an error" test "$status" -ne 0
-check "dispatch first: after the dispatch" test -f "$FAKE/dispatch-remote-cache-tests.yml-1"
-check "dispatch first: so no result is given" not has "$tmp/out" "result="
-check "dispatch first: saying the run isn't awaited" has "$tmp/out" "is not awaited"
-check "dispatch first: and cancelling it" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "dispatch first: and saying the cancel was asked for" has "$tmp/out" "no result is given: asked GitHub to cancel it"
-# zerobull-consulting/dagger#187: a wait that times out, or a verdict that
-# can't be read, cancels the run too.
-setup
-echo running >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0
-check "a wait that times out (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
-check "a wait that times out (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
-check "a wait that times out (zerobull-consulting/dagger#187): the run is cancelled" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "a wait that times out (zerobull-consulting/dagger#187): and the cancel said to be asked for" has "$tmp/out" "is not awaited and no result is given: asked GitHub to cancel it"
-# A cancel that fails on a run still going: said so, not cancelled.
-setup
-echo running >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0 FAKE_CANCEL_FAIL=1
-check "a cancel that fails (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a cancel that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "a cancel that fails (zerobull-consulting/dagger#187): then the run is read" bash -c "grep -A1 -F 'gh POST repos/o/r/actions/runs/5001/cancel' '$FAKE/calls' | tail -n1 | grep -qxF 'gh GET repos/o/r/actions/runs/5001'"
-check "a cancel that fails (zerobull-consulting/dagger#187): is said to have failed" has "$tmp/out" "cancelling it failed: it will finish unread"
-check "a cancel that fails (zerobull-consulting/dagger#187): not to have cancelled" not has "$tmp/out" "asked GitHub to cancel it"
-# Neither the cancel nor the run's read works: its state is unknown.
-setup
-echo running >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_WAIT_MINUTES=0 FAKE_CANCEL_FAIL=1 FAKE_RUN_READ_FAIL=1
-check "a cancel and a read that fail (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a cancel and a read that fail (zerobull-consulting/dagger#187): the state is said to be unknown" has "$tmp/out" "cancelling it and reading its state failed: it may finish unread"
-check "a cancel and a read that fail (zerobull-consulting/dagger#187): not that it will finish unread" not has "$tmp/out" "it will finish unread"
-# The run ends while the jobs read keeps failing: the cancel is tried and
-# refused, and the message says the run ended rather than that it was
-# cancelled.
-setup
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_FAIL=1
-check "a jobs read that fails (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a jobs read that fails (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
-check "a jobs read that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "a jobs read that fails (zerobull-consulting/dagger#187): the run is said to have ended" has "$tmp/out" "ended 'success' and no result is given: nothing to cancel"
-check "a jobs read that fails (zerobull-consulting/dagger#187): not to be cancelled" not has "$tmp/out" "asked GitHub to cancel it"
-check "a jobs read that fails (zerobull-consulting/dagger#187): nor that the cancel failed" not has "$tmp/out" "cancelling it failed"
-# A run that ended cancelled: neither green nor red, and not cancelled again.
-setup
-echo cancelled >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "a run that ended cancelled (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a run that ended cancelled (zerobull-consulting/dagger#187): so no result is given" not has "$tmp/out" "result="
-check "a run that ended cancelled (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5001/cancel"
-check "a run that ended cancelled (zerobull-consulting/dagger#187): is said to have ended" has "$tmp/out" "ended 'cancelled' and no result is given: nothing to cancel"
-check "a run that ended cancelled (zerobull-consulting/dagger#187): not to be cancelled by the check" not has "$tmp/out" "asked GitHub to cancel it"
-# A verdict that is read: nothing is cancelled.
-setup
-echo failure >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "a verdict that is read (zerobull-consulting/dagger#187): is given" has "$tmp/out" "result=fail"
-check "a verdict that is read (zerobull-consulting/dagger#187): nothing is cancelled" not has "$FAKE/calls" "/cancel"
-# The rebuild's run too: a wait that times out, or a jobs read that fails.
-setup
-printf 'failure\nrunning\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" RELEASE_CHECK_WAIT_MINUTES=0
-check "a rebuild wait that times out (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a rebuild wait that times out (zerobull-consulting/dagger#187): saying so" has "$tmp/out" "didn't complete within 0 minutes"
-check "a rebuild wait that times out (zerobull-consulting/dagger#187): the run is cancelled" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5002/cancel"
-check "a rebuild wait that times out (zerobull-consulting/dagger#187): and the cancel said to be asked for" has "$tmp/out" "is not awaited and no result is given: asked GitHub to cancel it"
-check "a rebuild wait that times out (zerobull-consulting/dagger#187): no PR" test "$(jq length "$FAKE/pulls.json")" = 0
-setup
-printf 'failure\nsuccess\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-ARGS=(rebuild v1.0.0-beta.26 "$d2"); rc env BOT_TOKEN="$bot_secret" FAKE_JOBS_FAIL=1
-check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): is an error" test "$status" -ne 0
-check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): the cancel is tried" has "$FAKE/calls" "gh POST repos/o/r/actions/runs/5002/cancel"
-check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): the run is said to have ended" has "$tmp/out" "ended 'success' and no result is given: nothing to cancel"
-check "a rebuild jobs read that fails (zerobull-consulting/dagger#187): no PR" test "$(jq length "$FAKE/pulls.json")" = 0
-# A rebuild whose verdict is read: nothing is cancelled.
-setup
-printf 'failure\nfailure\n' >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-run_bot rebuild v1.0.0-beta.26 "$d2"
-check "a rebuild verdict that is read (zerobull-consulting/dagger#187): is given" has "$tmp/out" "result=fail"
-check "a rebuild verdict that is read (zerobull-consulting/dagger#187): nothing is cancelled" not has "$FAKE/calls" "/cancel"
-setup
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='x:y'
-check "a test ref that isn't a branch name is refused" test "$status" -ne 0
-check "a test ref that isn't a branch name: before any dispatch" test "$(writes)" = 0
-setup
-git -C "$work" push -q origin HEAD:refs/heads/fix/a+b@c
-echo success >"$FAKE/conclusions"
-ARGS=(verify v1.0.0-beta.26 "$d2"); rc env RELEASE_CHECK_TEST_REF='fix/a+b@c'
-check "a valid branch name with odd characters is accepted" has "$tmp/out" "result=pass"
-
-echo "--- a tag that conflicts"
-setup
-git -C "$up" checkout -q -b conflicting v1.0.0-beta.25
-mkdir -p "$up/cmd/cacheservice/compat"
-echo "upstream's own" >"$up/cmd/cacheservice/compat/engines.txt"
-git -C "$up" add -A && git -C "$up" commit -qm conflicting && git -C "$up" tag -f -a -m conflicting v1.0.0-beta.26 >/dev/null
-ARGS=(bundle v1.0.0-beta.26); rc env -u GH_TOKEN
-check "conflict: the bundle test isn't run, which is no pass" has "$tmp/out" "bundle=conflict"
-check "conflict: nothing compiled" not test -f "$FAKE/go-calls"
-git -C "$up" checkout -q main
-git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
-
-echo "--- the bundle version"
-setup
-git -C "$up" checkout -q -b odd v1.0.0-beta.25
-echo 'const valueBundleVersion uint = 3 // typed now' >"$up/dagql/cache_transfer_types.go"
-git -C "$up" commit -qam odd && git -C "$up" tag -f -a -m odd v1.0.0-beta.26 >/dev/null
-echo success >"$FAKE/conclusions"
-run verify v1.0.0-beta.26 "$d2"
-check "advisory: a bundle version it can't read fails the run" test "$status" -ne 0
-check "advisory: saying so" has "$tmp/out" "couldn't read dagql's valueBundleVersion"
-git -C "$up" checkout -q main
-git -C "$up" tag -f -a -m beta.26 v1.0.0-beta.26 "$(git -C "$up" rev-parse main~1)" >/dev/null
-
-echo "--- dry run of a listed version"
-setup
-run --dry-run accept v1.0.0-beta.25 "$d1" https://github.com/o/r/actions/runs/7
-check "dry run listed: accept still shows its PR" has "$tmp/out" "dry run: would open a PR from release-check/accept/v1.0.0-beta.25"
-check "dry run listed: and says the edit would be refused" has "$tmp/out" "is listed already"
-run --dry-run reject v1.0.0-beta.25
-check "dry run listed: reject still shows its PR" has "$tmp/out" "dry run: would open a PR from release-check/reject/v1.0.0-beta.25"
-check "dry run listed: nothing written" test "$(writes)" = 0
-
-echo "--- dry run"
-setup
-echo success >"$FAKE/conclusions"
-run --dry-run verify v1.0.0-beta.26 "$d2"
-check "dry run: verify still verifies" has "$tmp/out" "result=pass"
-run --dry-run accept v1.0.0-beta.26 "$d2" https://github.com/o/r/actions/runs/5001
-check "dry run: accept prints the push" has "$tmp/out" "dry run: would push release-check/accept/v1.0.0-beta.26"
-check "dry run: and the PR" has "$tmp/out" "dry run: would open a PR from release-check/accept/v1.0.0-beta.26"
-run --dry-run rebuild v1.0.0-beta.26 "$d2"
-check "dry run: rebuild merges locally and prints the push" has "$tmp/out" "dry run: would push release-check/rebuild/v1.0.0-beta.26"
-run --dry-run reject v1.0.0-beta.26
-check "dry run: reject prints the issue" has "$tmp/out" "dry run: would label compat-break and file"
-check "dry run: and the reject PR" has "$tmp/out" "dry run: would open a PR from release-check/reject/v1.0.0-beta.26"
-ARGS=(--dry-run auto-merge 1); echo '[{"number":1,"state":"open","title":"t","head":{"ref":"release-check/accept/v1.0.0-beta.26","repo":{"full_name":"o/r"}},"base":{"ref":"feature/remote-cache"},"auto_merge":null,"node_id":"x"}]' >"$FAKE/pulls.json"
-rc env RELEASE_CHECK_AUTO_MERGE=true
-check "dry run: auto-merge prints it" has "$tmp/out" "dry run: would enable squash auto-merge on #1"
-run --dry-run publish
-check "dry run: publish prints the dispatch" has "$tmp/out" "dry run: would dispatch cacheservice-publish.yml"
-check "dry run: the only write is verify's dispatch" test "$(writes)" = 1
-check "dry run: no branch pushed" test -z "$(git -C "$FAKE/origin.git" for-each-ref refs/heads/release-check/)"
-run accept v1.0.0-beta.26 "$d2" https://github.com/o/r/actions/runs/5001
-check "no bot token: accept fails" test "$status" -ne 0
-check "no bot token: and says the token is missing" has "$tmp/out" "BOT_TOKEN is not set"
+check "early failure: the step names are the workflow's own" bash -c "test \"\$(grep -cxF '      - name: The engine pin, from the manifest' '$here/../../.github/workflows/remote-cache-tests.yml')\" = 2 && grep -qxF '      - name: Checkout' '$here/../../.github/workflows/remote-cache-tests.yml'"
+check "engine jobs: the names are the workflow's own" bash -c "grep -qxF '    name: real engines (e2e)' '$here/../../.github/workflows/remote-cache-tests.yml' && grep -qxF '    name: sidecar demo' '$here/../../.github/workflows/remote-cache-tests.yml'"
 
 echo "--- remote-cache-tests.yml's checkouts (zerobull-consulting/dagger#165, lead 2)"
-# B's verifying run executes remote-cache-tests.yml as the rebuild branch has
+# The verifying run executes remote-cache-tests.yml as the sync branch has
 # it, after upstream's tag was merged in: no checkout there may leave the
 # job's token in .git/config.
 tests_yml="$here/../../.github/workflows/remote-cache-tests.yml"

@@ -165,11 +165,6 @@ uploads ([#23](https://github.com/zerobull-consulting/dagger/issues/23); see
 - `TestMinIOPromoteManyParts`: a blob over the part-copy limit (lowered to
   5 MiB) is hashed by the service and copied in parts; a mismatch is caught
   the same way.
-- `TestMinIOPromoteStagedOverwritten`: a staged object overwritten during a
-  service-hashed promotion never reaches the digest key: before the
-  service's private copy, the copy fails its condition (or, on a store that
-  ignores it, doesn't hash to the digest); after the hash, the content
-  promoted is the private copy's, which was hashed.
 - `TestMinIOPromoteStoreWithoutChecksums`: a store that doesn't hash on
   copy has its blobs hashed by the service.
 - `TestMinIOPromoteLatency`: logs the time to promotion of blobs of 64 KiB
@@ -325,8 +320,8 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `PutObject` | Honored, quoted or not | **Honored only unquoted**; a quoted current ETag gets 412. A stale one gets 412 either way. 8 racing writers lost no update in 80. | Sends it unquoted, on every store. |
 | Store-side checksum on a one-part `UploadPartCopy` | Full SHA-256 | **None returned** | Detects it on the first copy and hashes in the service from then on, so blob bytes pass through the service. |
 | `If-None-Match: *` on `CompleteMultipartUpload` | Honored (412) | **Ignored**: overwrites | Accepts it: only verified copies complete, so racing exports write the same bytes. |
-| `CopySourceIfMatch` on copies | Honored (412) | **Ignored** | Relies on neither: a service-hashed promotion hashes a private copy of the staged object, which no upload URL reaches, and promotes that copy ([zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)). |
-| `If-Match` on `GetObject` | Honored | Honored | No longer used while hashing: the service reads its private copy, which nothing else writes. |
+| `CopySourceIfMatch` on copies | Honored (412) | **Ignored** | Compares each copied part's ETag with the MD5 it took while hashing. |
+| `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
 | Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. A `Read/Write/Delete` limited key can't *read* them either (`GetBucketLifecycleConfiguration` 403 `AccessDenied`, observed 2026-11-07) | Set only by `cacheservice lifecycle apply`, with a full-access key, after `lifecycle claim` (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |
@@ -464,8 +459,8 @@ git diff --stat <tag> HEAD -- engine/remotecache cmd/engine/remotecache.go \
 The same client shows only `dagql/cache_transfer_types.go`, with that
 constant.
 
-**Verifying a new version.** The release check does this every hour for
-each new upstream release ([Release check](#release-check)). By hand: run
+**Verifying a new version.** The release check does this for each new
+upstream release, on its sync branch ([Release check](#release-check)). By hand: run
 the workflow with
 `candidate-version` and `candidate-digest` (the image index digest:
 `docker buildx imagetools inspect --format '{{.Manifest.Digest}}'
@@ -806,15 +801,15 @@ sync is still to be built. Each token is an environment secret:
 
 | Token | Permissions | Environment | Secret | Used by |
 |---|---|---|---|---|
-| `dagger-cache-bot-pr` | Contents: write, Pull requests: write | `cache-bot-pr` | `CACHE_BOT_PR_TOKEN` | the release check's `accept` and `reject` PRs |
-| `dagger-cache-bot-sync` | Contents: write, Pull requests: write, Workflows: write | `cache-bot-sync` | `CACHE_BOT_SYNC_TOKEN` | the nightly sync, and the release check's rebuild on a new upstream tag |
+| `dagger-cache-bot-pr` | Contents: write, Pull requests: write | `cache-bot-pr` | `CACHE_BOT_PR_TOKEN` | nothing now (it was the release check's accept and reject PRs): delete the token, the secret and the environment |
+| `dagger-cache-bot-sync` | Contents: write, Pull requests: write, Workflows: write | `cache-bot-sync` | `CACHE_BOT_SYNC_TOKEN` | the release check's sync branch (its merge of the tag, its accept line, its PR), and the nightly sync |
 
 - **Scope.** Both tokens are owned by `zerobull-consulting` and reach this
   repository only.
 - **Why two.** Merges from upstream regularly change `.github/workflows/`,
-  and GitHub refuses that push without Workflows permission. The
-  accept-line PR changes only `cmd/cacheservice/compat/engines.txt`, so its
-  token can't touch CI.
+  and GitHub refuses that push without Workflows permission, so the sync
+  token has it. The PR token, without it, was for the accept-line PRs the
+  release check no longer opens: nothing uses it now.
 - **Expiry.** Each token expires 90 days after it's created; the token's
   settings page shows the date. Rotate both together before the earlier
   expiry: regenerate each one with the same permissions, then update its
@@ -831,29 +826,18 @@ sync is still to be built. Each token is an environment secret:
   `schedule` and `workflow_dispatch` jobs.
 
 **Neither token merges anything:**
-- The release check's `auto-merge` job enables squash auto-merge on the
-  accept-line PR with `GITHUB_TOKEN`, and only while the repository
-  variable `RELEASE_CHECK_AUTO_MERGE` is `true`. GitHub then merges it once
-  the required checks pass.
-- The `auto-merge: adds compatible engine only` check fails any `release-check/accept/*` PR that
-  changes more than one added accept line, and turns its auto-merge off.
-  Set `RELEASE_CHECK_AUTO_MERGE` only once that check is in the ruleset's
-  required checks: the five required before it don't stop a PR changing
-  more than the manifest.
-- That merge starts no workflows, so the release check's next run
-  dispatches `cacheservice-publish.yml` on `feature/remote-cache` itself,
-  with `GITHUB_TOKEN` and `actions: write` (`workflow_dispatch` is the
-  exception that does start a run). That moves the floating
-  `:<engineVersion>` tags.
+- A human merges the release check's sync PR, with a merge commit.
+- Its push starts `cacheservice-publish.yml`, which moves the floating
+  `:<engineVersion>` tags; if that run fails, the release check's next run
+  dispatches it again, with `GITHUB_TOKEN` and `actions: write`.
 - The tokens act as their owner, who can bypass the ruleset. A merge made
   with one might not wait for the checks, so they are only used to push and
   to open PRs. Removing that risk is
   [zerobull-consulting/dagger#152](https://github.com/zerobull-consulting/dagger/issues/152).
 
 **Merges from upstream use a merge commit, never a squash.** That's the
-nightly sync PR, and the release check's rebuild PR (outcome B), which
-always merges the tag: the check doesn't rebuild on a tag the branch
-already contains.
+nightly sync PR, and the release check's sync PR, which merges the tag.
+Fixes squash-merged *into* a sync branch are ordinary PRs.
 Either has to keep the upstream commit as a parent, or the next sync
 conflicts again and the `fork paths` base stays old (see "The fork's
 paths"). For this, the repository allows merge commits and the ruleset
@@ -886,204 +870,153 @@ role on the repository, not the token's permissions.
 
 ## Release check
 
-`.github/workflows/remote-cache-release-check.yml` verifies each new
-upstream Dagger release against the cache service, once per release
+`.github/workflows/remote-cache-release-check.yml` brings each new upstream
+Dagger release into `feature/remote-cache` through **one sync branch at a
+time**, `release-check/sync/<version>`
 ([zerobull-consulting/dagger#117](https://github.com/zerobull-consulting/dagger/issues/117),
 D5). `release-check.sh` does the work and documents each step; the workflow
 only decides when it runs and with which token.
+
+```
+new release ──▶ sync branch: tag merged, base moved, draft PR
+                     │
+                     ▼  hourly: remote-cache-tests.yml on its head
+              ┌──── red ─────┐                 green
+              │ compat-break │                   │
+              │ issue + run  │                   ▼
+              │              │        accept line pushed, PR ready
+              │ fix PRs into │                   │
+              │ the sync     │                   ▼
+              │ branch,      │        a human merges it (merge commit)
+              │ squashed ────┘                   │
+              ▼                                  ▼
+          new head, verified again       the next release, if any
+```
 
 **Each hour** (minute 17, and by hand):
 
 1. **Publish what nothing published.** If `feature/remote-cache`'s head has
    no successful `cacheservice-publish.yml` run, and none queued or in
    progress, it dispatches one, which moves the floating
-   `dagger-remote-cache:<version>` tags. A head with no run at all (an
-   auto-merge by `GITHUB_TOKEN` starts none) must be older than 10 minutes
-   first. A publish that failed or was cancelled is dispatched again on a
-   later hour, but at most twice per head: past that the step's summary says
-   so (`publish=bounded`) and nothing more is dispatched, so re-run the
-   publish by hand (the count includes a hand-run dispatch, and a cancelled
-   run is retried like a failed one; a run stuck queued holds the retry
-   back until GitHub ends it)
+   `dagger-remote-cache:<version>` tags. A head with no run at all must be
+   older than 10 minutes first. A publish that failed or was cancelled is
+   dispatched again on a later hour, but at most twice per head: past that
+   the step's summary says so (`publish=bounded`) and nothing more is
+   dispatched, so re-run the publish by hand
    ([zerobull-consulting/dagger#166](https://github.com/zerobull-consulting/dagger/issues/166)).
-2. **Poll.** `git ls-remote --tags https://github.com/dagger/dagger` for
-   `v1.*`; a tag must match `^v1\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$` and be
-   a version `engines.sh` takes. A release is **new** when it is newer than
-   every version the manifest names (`base`, `accept` and `reject` lines):
-   older releases (`v1.0.0-beta.2` to `beta.23`) are never tried. The oldest
-   new release is handled first, and only one at a time:
-   - if a release-check PR for it is open, the run waits for it (and turns
-     auto-merge on for an accept PR once the gate is on);
-   - if its image isn't on `registry.dagger.io` yet, the run waits for it
-     and tries nothing newer: a newer release accepted first would make it
-     old, and it would never be checked. Only a multi-platform index digest
-     counts; a registry error, or an upstream that can't be listed, fails
-     the run rather than reading as "nothing new".
-3. **Verify (A).** It dispatches `remote-cache-tests.yml` on
-   `feature/remote-cache` (a dry run: on its own branch) with `candidate-version` and `candidate-digest`,
-   and waits for it (at most 150 minutes from the dispatch, the fetches below included): the e2e and the sidecar demo of
-   the service as it is, against that stock engine. Meanwhile, a job of its
-   own (`bundle test`) merges the tag into a scratch copy of the branch and
-   runs `TestBundleVersionMatchesEngineCapture`; both must pass. If the tag
-   conflicts with the branch, the bundle test can't run, and that counts as
-   not passing. The bundle test compiles and runs upstream's code, so that
-   job holds no credential: no environment, no token in any step, a
-   read-only `GITHUB_TOKEN`, and `release-check.sh bundle` refuses to run
-   with a token in its environment. It is the only place upstream's code
-   runs in this workflow.
-   Once the run is dispatched (the dispatch comes first, so the fetches
-   don't eat into the step's timeout), it fetches the tags and writes the
-   advisory diff of the engine's side of the remote cache from the manifest's
-   `base` to the release, and whether the bundle or protocol version
-   changed. If that fails, or the wait for the run times out, or its
-   verdict can't be read, the step errors and the dispatched run is
-   cancelled (best effort), since nothing would read it; a run that had
-   already ended is said to have ended, not to be cancelled
-   (zerobull-consulting/dagger#187). In a dry run the bundle test builds on the dry run's own branch,
-   as the e2e does. **The run is the gate**; the diff only informs.
-   Only the run's `real engines (e2e)` and `sidecar demo` jobs decide, read
-   from the run's jobs by name (a jobs read that fails is tried three times). The run's other jobs (`unit tests`,
-   `S3 tests against MinIO`) don't depend on the engine: if one of them
-   fails, or an engine job is missing or skipped, that is an error too, and
-   the next hour verifies the release again.
-   A run that is cancelled, that failed before testing (its checkout or its
-   pin step), or that the check can't read, is an error: it never leads to
-   a reject line.
-4. **The outcome:**
-   - **A, both green:** a PR from `release-check/accept/<version>`, as
-     `CACHE_BOT_PR_TOKEN`, adding only
-     `accept <version> <digest> verified: <run>` as the first accept line,
-     so the PR's own CI runs that engine too. With the gate on, it
-     auto-merges (squash).
-   - **B, otherwise:** `release-check/rebuild/<version>`, as
-     `CACHE_BOT_SYNC_TOKEN`: the tag merged with a merge commit, the `base`
-     line moved. That branch is verified the same way: a dispatch on it, and
-     the bundle test's verdict, which is for this same merge (a wait that
-     times out, or a verdict that can't be read, cancels its run too). If green, it
-     gets the accept line, citing that run, and a PR. If the bundle or
-     protocol version changed, the accept list resets to that one version.
-     **A human merges it, with a merge commit.** No rebuild is tried if the
-     merge conflicts, if the bundle test didn't pass, or if the branch
-     already contains the tag: that rebuild would be the code A ran.
-   - **C, the rebuild red or not tried:** an issue titled
-     `compat-break: engine <version> fails against the cache service`,
-     labeled `compat-break` (with `GITHUB_TOKEN`), with both runs' failing
-     jobs and the advisory diff; then `release-check/reject/<version>`, as
-     `CACHE_BOT_PR_TOKEN`, adding `reject <version> <repo>#<issue>`. A human
-     merges it.
+2. **A sync open?** If a PR from `release-check/sync/<version>` into
+   `feature/remote-cache` is open, that sync is all the run looks at
+   (more than one open fails the run). Its head is:
+   - **without the tag** (the merge conflicted when it started): waited
+     on, until a human merges the tag into the branch and pushes;
+   - **with the release's accept line**: ready, waited on until a human
+     merges the PR (marked ready first, if the run that pushed the line
+     stopped before it could);
+   - otherwise **verified**: `remote-cache-tests.yml` dispatched on the sync
+     branch with `candidate-version` and `candidate-digest` (the release's
+     stock engine as the first accept line). The run is not waited on: a
+     later hour reads its verdict, matching the run to the head by its
+     commit and its title (`Remote cache tests: candidate <version>
+     <digest>`). The latest run of the head decides:
+     - **in progress:** waited on;
+     - **red** (failed or timed out, with a complete jobs listing, both
+       engine jobs in it, and a job that failed past its checkout and engine
+       pin steps; the unit and MinIO jobs count): the `compat-break` issue
+       (`compat-break: engine <version> fails against the cache service`,
+       with `GITHUB_TOKEN`) is filed with the failing jobs, the advisory diff
+       and the PR, and the PR's description gets `Closes #<issue>`; each
+       later red run is a comment on it, once per run. An issue of that
+       title already open (from the earlier flow, say) is reused, and
+       linked from the PR too;
+     - **green**, with both engine jobs run and passed (a run whose engine
+       jobs were skipped still ends green, and decides nothing,
+       [zerobull-consulting/dagger#223](https://github.com/zerobull-consulting/dagger/issues/223)):
+       the release's accept line, citing that run, is pushed to the sync
+       branch as `CACHE_BOT_SYNC_TOKEN`, only if the branch's head is still
+       the commit the run verified; the PR is marked ready and the issue
+       told. If the bundle or protocol version changed between the
+       manifest's `base` and the release, the accept list resets to that
+       one version;
+     - **undecided** (cancelled; failed in its checkout or engine pin step,
+       with an engine job missing, or with no job failed; or green with an
+       engine job skipped): verified again, at most twice
+       per head (red runs don't count); then the summary says to re-run it
+       by hand.
 
-**Once per release.** A release with an open release-check PR is waited
-on; nothing newer is tried meanwhile. A release whose `compat-break` issue
-is open but whose reject branch doesn't exist (a run that stopped between
-them) gets its reject PR, without a second issue. Once a line for it is
-merged, it's no longer new. A release whose image never appears holds
-up everything newer: add a `reject` line for it by hand. A `release-check/*/<version>` branch with no
-open PR (a PR closed by hand, or a run that died) **fails the run** with
-the branch named: delete it to try that release again, or add its line by
-hand. To verify a rejected release again, remove its `reject` line.
+   Every job of the run counts, not only the engine's: the unit tests
+   (`TestBundleVersionMatchesEngineCapture` among them), the MinIO tests,
+   the e2e and the sidecar demo all run the sync branch's code.
+3. **No sync open: a new release?** `git ls-remote --tags
+   https://github.com/dagger/dagger` for `v1.*`; a tag must match
+   `^v1\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$` and be a version `engines.sh`
+   takes. A release is **new** when it is newer than every version the
+   manifest names (`base`, `accept` and `reject` lines). The oldest new
+   release is the one: if its image isn't on `registry.dagger.io` yet, the
+   run waits for it and tries nothing newer (only a multi-platform index
+   digest counts; a registry error, or an upstream that can't be listed,
+   fails the run rather than reading as "nothing new"). Otherwise the sync
+   **starts**, as `CACHE_BOT_SYNC_TOKEN`: the tag merged into
+   `feature/remote-cache` with a merge commit, the manifest's `base` moved
+   to it, pushed as `release-check/sync/<version>`, a draft PR
+   (`remote cache: sync upstream <version> (release check)`) with the
+   advisory diff, and its first verification dispatched. If the merge
+   conflicts, the branch is `feature/remote-cache` with only the base
+   moved, and the PR says how to merge the tag by hand; nothing is verified
+   until that's pushed.
 
-**Reading its PRs and issues.**
-- **Accept** (`remote cache: accept engine <v> (release check)`): one line,
-  the verifying run, the bundle test, the advisory diff. Squash it, titled
-  as the description says.
-- **Rebuild** (`remote cache: build on engine <v> (release check)`): the
-  merge, the base move, the line, the run of the service as it is that
-  failed and the run of the rebuild that passed. Merge it with
-  `gh pr merge --merge`, never a squash: upstream's tag must stay a parent,
-  or `fork paths` keeps the old base.
-- **Reject** (`remote cache: reject engine <v> (release check)`) and its
-  `compat-break` issue: the failing jobs of both runs, and the diff.
+**Fixing a red sync.** Open PRs **into `release-check/sync/<version>`**
+and squash-merge them: they get the same CI as any PR. The next hour
+verifies the new head (or run the workflow by hand, with `dry-run` off, to
+read it sooner). Only a human pushes to the sync branch otherwise: the tag's
+merge after a conflict, which must stay a merge commit.
 
-**The auto-merge gate.** `RELEASE_CHECK_AUTO_MERGE` (a repository
-variable) stays unset until `auto-merge: adds compatible engine only` is a required check. Then:
-1. `auto-merge: adds compatible engine only` has reported on a PR (it runs on every PR; any PR
-   that isn't from `release-check/accept/*` passes it);
-2. add it to the ruleset's required checks;
-3. set `RELEASE_CHECK_AUTO_MERGE` to `true`.
+**One at a time.** While a sync is open, newer releases wait. Once it
+merges, the next release is synced against `feature/remote-cache` with
+those fixes in: a fix made for one release is often all the next one needs.
+To skip a release instead (one upstream fixed in the next, say), close its
+sync PR, delete its branch, and add a `reject <version> <issue>` line to the
+manifest by hand: a listed version is no longer new.
 
-The check, `.github/workflows/remote-cache-auto-merge-add-compatible-engine.yml`, runs on
-`pull_request_target`, so its workflow and the scripts it runs
-(`accept-line-only.sh`, the `engine-jobs.sh` it sources, `engines.sh`) are always the default branch's
-(`feature/remote-cache`): a PR that edits any of them is still measured by
-the versions it would replace. It runs none of the PR's code, only diffs its
-commits and parses its manifest, and requests no environment. It has no
-`pull_request` trigger, so no skipped job of its name reports (a skipped
-required check counts as passed). **A gap:** a required status check is
-matched by name, so a PR from a branch of this repository (its author has
-write access) can add a `pull_request` workflow with its own job named
-`auto-merge: adds compatible engine only`. Requiring this workflow through the ruleset's "Require
-workflows to pass", rather than as a status check, closes that
-([zerobull-consulting/dagger#164](https://github.com/zerobull-consulting/dagger/issues/164)). It fails an
-accept PR unless, from
-its merge base, it changes only `cmd/cacheservice/compat/engines.txt`, by
-one added line (no mode change, no rename), that line is
-`accept <the branch's version> <digest> verified: <run URL>`, it is the
-first accept line, and `engines.sh` takes the result. It also reads the run
-the line cites (with `GITHUB_TOKEN`, `actions: read`) and requires it to be
-a completed, successful `workflow_dispatch` run of `remote-cache-tests.yml`
-of this repository (its code too, not a fork's), titled
-`Remote cache tests: candidate <version> <digest>` for the line's own version and
-digest, whose `real engines (e2e)` and `sidecar demo` jobs each completed
-successfully: a run whose engine jobs were skipped still ends green, so it
-reads the run's jobs too (one page of 100, of the attempt the run read
-reports as its `run_attempt`, so a re-run started between the two reads
-can't swap in another attempt's jobs; each read is tried three times),
-and fails if that read fails, if `run_attempt` isn't a number (or differs
-from the URL's `/attempts/N`), if the run has more jobs than were listed, or
-if either job is missing, listed twice, or anything but `completed`/`success`
-([zerobull-consulting/dagger#223](https://github.com/zerobull-consulting/dagger/issues/223)).
-The job names, and the checks on the listing, are `engine-jobs.sh`'s, which
-`release-check.sh` shares. A run some of whose jobs were re-run ("Re-run
-failed jobs") hasn't been tried: if its attempt lists only the re-run jobs,
-the check refuses it (an engine job is missing), so it fails closed. The runs API doesn't return a dispatch's inputs, so
-`remote-cache-tests.yml`'s `run-name` puts them in the title. **Known
-limits:** the title is the workflow file's, so a writer who edits `run-name`
-on a branch can make a run look like this (the same writer can push the
-accept branch anyway, [zerobull-consulting/dagger#152](https://github.com/zerobull-consulting/dagger/issues/152));
-and the run's branch isn't checked, since the release check dispatches on
-`RELEASE_CHECK_BRANCH`, on `RELEASE_CHECK_TEST_REF` in a dry run, and on
-`release-check/rebuild/<version>` for B, and a hand-added line may cite any.
-The run must come from a ref whose `remote-cache-tests.yml` has that
-`run-name`, or its title is GitHub's default and the check fails (closed,
-with the title it saw in the message). The forgery above needs write access.
-For an accept PR the check fetches `refs/pull/<N>/head` explicitly (it
-checks nothing out; it only reads commits) and requires the PR's head to be
-that ref's tip or in its history, so a fork PR's commit, which is on no
-branch of this repository, is found the same way (a real fork PR hasn't been tried
-([zerobull-consulting/dagger#165](https://github.com/zerobull-consulting/dagger/issues/165))).
-On failure it turns the PR's auto-merge off. The release check's
-`auto-merge` job checks only the PR's files before enabling it, and only on
-PRs from this repository's own branches. If the PR's required checks have all passed before the gate is
-on, GitHub refuses to enable auto-merge on it ("clean status"), so the job
-squash-merges it instead, with `GITHUB_TOKEN`, at the head it checked;
-`GITHUB_TOKEN` can't bypass the ruleset, so that merge still needs every
-required check.
+**Merging it.** The bot marks the PR ready once the verifying run is
+green and the accept line is pushed; that push starts the PR's own CI. When
+that CI is green, merge it **with a merge commit**, `gh pr merge --merge`, never a
+squash: upstream's tag must stay a parent, or `fork paths` keeps the old
+base and the next sync conflicts again. Its push's
+`cacheservice-publish.yml` run moves `dagger-remote-cache:<version>`, and
+the release matrix verifies every accept line again. Fixes pushed after the
+accept line is added are verified by the PR's own CI, whose first accept
+line is now the release.
+
+**Branches.** A `release-check/*/<version>` branch with no open sync PR (a
+PR closed by hand, a run that died, or a `release-check/accept/`,
+`rebuild/` or `reject/` branch of the earlier flow) **fails the run** when
+that release would start, naming the branch: delete it to sync that
+release, or add its line to the manifest by hand.
 
 **Running it by hand.** Actions, "Remote cache release check", Run
-workflow. Off `feature/remote-cache` it is always a dry run, which can't
-reach the bots' environments: it polls, prints the plan, and prints each
-push, PR and issue the outcome would make, after a real, local merge. On
-`feature/remote-cache`, `dry-run` (default on) does the same. In a dry run:
-- `verify` also runs the real verification, on the dry run's own branch, so
-  a branch's dry run tests that branch's service in the e2e and the bundle
-  test; it changes no file in the repository;
-- `version` checks a chosen release, listed or not. For an accepted one,
-  `engines.sh candidate` moves its own line first, with its digest, so the
-  run runs it.
+workflow. With `dry-run` off, on `feature/remote-cache`, it is the hourly
+run, now: the way to read a fix to a sync branch without waiting. Off
+`feature/remote-cache` it is always a dry run, which can't reach the bot's
+environment; on it, `dry-run` (default on) is one too. A dry run polls,
+prints the plan, and prints each push, PR, dispatch, issue and comment the
+plan would lead to, after a real, local merge. `version` plans starting a
+chosen release's sync, listed or not.
 
 Locally, with `gh` logged in and Docker:
 
 ```sh
 hack/remote-cache/release-check.sh --dry-run plan
-hack/remote-cache/release-check_test.sh      # offline, fake gh, docker and go
-hack/remote-cache/accept-line-only_test.sh   # offline
+hack/remote-cache/release-check_test.sh      # offline, fake gh and docker
 ```
 
-Both run in `remote-cache-tests.yml`'s `unit tests` job.
+It runs in `remote-cache-tests.yml`'s `unit tests` job.
 
 **What it never does.** It never merges, never pushes to
-`feature/remote-cache`, and never gives a bot token to anything but a push
-and the PR it opens (through git's environment, never its arguments).
+`feature/remote-cache`, never force-pushes (a sync branch that moved under
+it refuses the push), never runs upstream's code (the verifying runs do,
+in `remote-cache-tests.yml`), and never gives the bot's token to anything
+but a push and the PR it opens (through git's environment, never its
+arguments).
 Tags and digests from upstream and the registry are checked against strict
 patterns before they reach a branch name, a file or a command, and every
 call is bounded. The manifest is edited only through `engines.sh`
