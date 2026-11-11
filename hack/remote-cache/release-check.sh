@@ -476,9 +476,10 @@ verdict() {
 	# The latest run of this head ended undecided (cancelled, say): try
 	# again, a bounded number of times. Every completed run that ended
 	# undecided counts; a red one doesn't, but a failed one that decides
-	# nothing (undecided_failure) does.
+	# nothing (undecided_failure) does. The latest, undecided as read above,
+	# counts without a second read.
 	local rid rconclusion early
-	undecided=0
+	undecided=1
 	while read -r rid rconclusion; do
 		case "$rconclusion" in
 		failure | timed_out)
@@ -487,7 +488,7 @@ verdict() {
 			;;
 		*) undecided=$((undecided + 1)) ;;
 		esac
-	done < <(jq -r '.[] | select(.status == "completed") | "\(.id) \(.conclusion // "")"' <<<"$runs")
+	done < <(jq -r '.[:-1][] | select(.status == "completed") | "\(.id) \(.conclusion // "")"' <<<"$runs")
 	if ((undecided >= max_verify_dispatches)); then
 		echo "bounded $url"
 	else
