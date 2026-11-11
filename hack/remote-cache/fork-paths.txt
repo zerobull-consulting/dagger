@@ -42,5 +42,6 @@ any       .github/workflows/remote-cache-release-check.yml  the hourly release c
 deleted   .github/workflows/changelog.yml                gated on a needs/changelog label this repository doesn't have, so it only ever showed as a skipped check (zerobull-consulting/dagger#122)
 add-lines dagger.toml                                    registers the cacheservice module and its SDK scope
 go-mod    go.mod                                         the service's own dependencies (the S3 SDK, prometheus/client_model) share the root module; moves out with the service's own module (zerobull-consulting/dagger#117, D7 spike)
+add-lines dagger.lock                                    pins the cacheservice module's MinIO image by digest (the CLI records it)
 add-lines go.sum                                         the checksums of those dependencies
 add-lines .gitignore                                     ignores dotenvx's .env.keys, the private key for cmd/cacheservice/.env's encrypted values; a nested .gitignore wouldn't cover a key file written at the root

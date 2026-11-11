@@ -79,4 +79,99 @@ type Cacheservice {
     }
     ctr.publish(address, forcedCompression: ImageLayerCompression.GZIP)
   }
+
+  """
+  The tree the service's Go tests build from: the image's build context, with
+  the tests.
+  """
+  testSource: Directory! @defaultPath(path: "/") @ignorePatterns(patterns: [
+    "*",
+    "!go.mod",
+    "!go.sum",
+    "!cmd/cacheservice",
+    "!dagql",
+    "!engine",
+    "!internal",
+    "!sdk/go",
+    "!util",
+  ])
+
+  """
+  MinIO, the S3-compatible store the tests run against, as
+  hack/remote-cache/compose.yaml runs it. Its root credentials are the dev
+  ones committed there.
+  """
+  let minioImage = "pgsty/silo:RELEASE.2026-10-26T00-00-00Z"
+
+  let minio: Service! {
+    container.from(minioImage)
+      .withEnvVariable("MINIO_ROOT_USER", "dagger-dev")
+      .withEnvVariable("MINIO_ROOT_PASSWORD", "dagger-dev-secret")
+      # Presigned URLs carry a region in their signature: the one the tests
+      # configure.
+      .withEnvVariable("MINIO_REGION", "us-east-1")
+      .withExposedPort(9000)
+      .asService(args: ["server", "/data"], useEntrypoint: true)
+  }
+
+  """
+  The tests in cmd/cacheservice that need a real S3-compatible store
+  (TestMinIO...), against MinIO: what hack/remote-cache/dev.sh test runs. The
+  bucket is this run's own, so tests may replace its lifecycle configuration.
+  """
+  pub testMinio: Void @check {
+    minioTests.sync
+
+    null
+  }
+
+  """
+  The container testMinio runs, executed: its stdout is the go test output.
+  """
+  pub minioTests: Container! {
+    # The Go toolchain the Dockerfile builds with. Its build stage's copy of the
+    # source has no tests (Dockerfile.dockerignore), so the tests' source is
+    # mounted over it.
+    let goImage = testSource.dockerBuild(
+      dockerfile: "cmd/cacheservice/Dockerfile",
+      target: "build",
+    )
+    goImage
+      .withMountedDirectory("/src", testSource)
+      .withFile("/usr/local/bin/mc", container.from(minioImage).file("/usr/bin/mc"))
+      .withMountedCache("/go/pkg/mod", cacheVolume("cacheservice-go-mod"))
+      .withMountedCache("/root/.cache/go-build", cacheVolume("cacheservice-go-build"))
+      .withServiceBinding("minio", minio)
+      .withEnvVariable("CACHESERVICE_S3_ENDPOINT", "http://minio:9000")
+      .withEnvVariable("CACHESERVICE_S3_REGION", "us-east-1")
+      .withEnvVariable("CACHESERVICE_S3_BUCKET", "dagger-cache")
+      .withEnvVariable("CACHESERVICE_S3_ACCESS_KEY_ID", "dagger-dev")
+      .withEnvVariable("CACHESERVICE_S3_SECRET_ACCESS_KEY", "dagger-dev-secret")
+      .withEnvVariable("CACHESERVICE_S3_PATH_STYLE", "true")
+      .withEnvVariable("CACHESERVICE_S3_PREFIX", "test")
+      .withEnvVariable("CACHESERVICE_TEST_DISPOSABLE_BUCKET", "1")
+      .withEnvVariable("CACHESERVICE_TEST_READONLY_ACCESS_KEY_ID", "dagger-readonly")
+      .withEnvVariable("CACHESERVICE_TEST_READONLY_SECRET_ACCESS_KEY", "dagger-readonly-secret")
+      .withNewFile("/usr/local/bin/run-minio-tests", """
+        #!/bin/bash
+        set -euo pipefail
+        mc alias set local http://minio:9000 dagger-dev dagger-dev-secret
+        mc mb --ignore-existing local/dagger-cache
+        # A user that can only read under the prefix, for the tests of a
+        # read-only instance (-export=false).
+        cat >/tmp/readonly.json <<'POLICY'
+        {"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::dagger-cache/test/*"]},
+        {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::dagger-cache"],"Condition":{"StringLike":{"s3:prefix":["test/*"]}}}]}
+        POLICY
+        mc admin policy create local cacheservice-readonly /tmp/readonly.json
+        mc admin user add local dagger-readonly dagger-readonly-secret
+        mc admin policy attach local cacheservice-readonly --user dagger-readonly
+        go test -count=1 -run TestMinIO -v ./cmd/cacheservice/... | tee /tmp/test.log
+        # Without a store, every one of these tests skips and the run still
+        # passes: a run in which none passed is not a pass.
+        grep -q -e '--- PASS' /tmp/test.log || { echo "no MinIO test passed" >&2; exit 1; }
+        """, permissions: 493)
+      .withExec(["/usr/local/bin/run-minio-tests"])
+  }
 }
