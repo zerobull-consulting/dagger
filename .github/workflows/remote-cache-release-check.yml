@@ -68,6 +68,7 @@ jobs:
       pr: ${{ steps.plan.outputs.pr }}
       sha: ${{ steps.plan.outputs.sha }}
       state: ${{ steps.plan.outputs.state }}
+      draft: ${{ steps.plan.outputs.draft }}
       run: ${{ steps.plan.outputs.run }}
     steps:
       # Full history, without blobs: the plan fetches the sync branch and
@@ -156,14 +157,16 @@ jobs:
         run: ./hack/remote-cache/release-check.sh start "$VERSION" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The open sync's head: verify it (a dispatch, not waited on: a later hour
-  # reads its verdict), or report it red. GITHUB_TOKEN only. In a dry run,
-  # printed.
+  # reads its verdict), report it red, or mark a sync PR with its accept
+  # line ready if accept stopped before it could. GITHUB_TOKEN only. In a
+  # dry run, printed.
   follow:
     name: verify or report the sync
     needs: check
     if: >-
       needs.check.outputs.action == 'sync' &&
-      (needs.check.outputs.state == 'verify' || needs.check.outputs.state == 'red')
+      (needs.check.outputs.state == 'verify' || needs.check.outputs.state == 'red' ||
+       (needs.check.outputs.state == 'ready' && needs.check.outputs.draft == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -197,6 +200,14 @@ jobs:
           RUN: ${{ needs.check.outputs.run }}
           PR: ${{ needs.check.outputs.pr }}
         run: ./hack/remote-cache/release-check.sh report "$VERSION" "$RUN" "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Mark the PR ready
+        if: needs.check.outputs.state == 'ready'
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: ${{ needs.check.outputs.dry }}
+          PR: ${{ needs.check.outputs.pr }}
+        run: ./hack/remote-cache/release-check.sh ready "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The sync's head is green: its accept line, pushed as the sync bot; then
   # the PR marked ready and the issue told (GITHUB_TOKEN). A human merges.

@@ -2,10 +2,10 @@
 # The engine jobs of remote-cache-tests.yml, for release-check.sh, which
 # sources this file (it runs nothing on its own).
 #
-# A run's verdict on an engine is these jobs' alone
-# (zerobull-consulting/dagger#166): any other job (unit tests, the MinIO
-# tests) doesn't depend on the engine, and a run whose engine jobs were
-# skipped still ends green (zerobull-consulting/dagger#223).
+# A sync branch's verifying run counts every job (each runs the branch's
+# code), but a run whose engine jobs were skipped still ends green
+# (zerobull-consulting/dagger#223): the release check calls a run green
+# only if these jobs are each there once, and passed.
 engine_jobs=("real engines (e2e)" "sidecar demo")
 
 engine_json="$(printf '%s\n' "${engine_jobs[@]}" | jq -R . | jq -s -c .)"

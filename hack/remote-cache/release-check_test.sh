@@ -378,6 +378,21 @@ check "plan: two undecided runs of one head stop the dispatches" has "$tmp/out" 
 check "plan: saying so" has "$tmp/out" "Re-run it by hand"
 
 echo '[]' >"$FAKE/runs.json"
+add_run 7011 "$sha" "$title26" completed failure
+add_run 7012 "$sha" "$title26" completed cancelled
+run plan
+check "plan: a red run doesn't count toward the bound" has "$tmp/out" "state=verify"
+
+echo '[]' >"$FAKE/runs.json"
+add_run 7013 "$sha" "$title26" completed failure
+early='{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "x", "steps": [{"name": "Checkout", "conclusion": "failure"}]}'
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
+check "plan: a run that failed before testing isn't red" has "$tmp/out" "state=verify"
+check "plan: saying why" has "$tmp/out" "failed before testing (real engines (e2e))"
+ARGS=(plan); rc env FAKE_JOBS_FAIL=1
+check "plan: a red run whose jobs can't be read fails the plan" test "$status" -ne 0
+
+echo '[]' >"$FAKE/runs.json"
 add_run 7008 "$sha" "$title26" completed success
 ARGS=(plan); rc env FAKE_JOBS_FAIL=1
 check "plan: a green run whose jobs can't be read fails the plan" test "$status" -ne 0
@@ -426,6 +441,13 @@ run report "$v26" https://github.com/o/r/actions/runs/7010 1
 check "report: a new red run is a comment" jq -e '.[0].on == 101 and (.[0].body | test("actions/runs/7010"))' "$FAKE/comments.json"
 run report "$v26" https://github.com/o/r/actions/runs/7010 1
 check "report: once" jq -e 'length == 1' "$FAKE/comments.json"
+check "report: the PR names the issue once" test "$(jq -r '.[0].body' "$FAKE/pulls.json" | grep -c 'Closes #101.')" = 1
+
+started
+echo '[{"number": 90, "state": "open", "title": "compat-break: engine '"$v26"' fails against the cache service", "body": "x"}]' >"$FAKE/issues.json"
+run report "$v26" https://github.com/o/r/actions/runs/7002 1
+check "report: an issue already open is reused" jq -e 'length == 1' "$FAKE/issues.json"
+check "report: and linked from the PR" jq -e '.[0].body | test("Closes #90.")' "$FAKE/pulls.json"
 
 echo "--- accept"
 started
@@ -442,6 +464,9 @@ check "accept: and on the issue" jq -e 'any(.[]; .on == 101 and (.body | test("a
 check "accept: never prints a token" no_secret
 run plan
 check "plan: a sync with its accept line waits for a human" has "$tmp/out" "state=ready"
+check "plan: and says the PR is still a draft (the fake doesn't change it)" has "$tmp/out" "draft=true"
+run ready 1
+check "ready: marks it ready" bash -c "grep -q 'markPullRequestReadyForReview' '$FAKE/graphql' && grep -qx 'id=PR_1' '$FAKE/graphql'"
 
 started
 sha="$(branch_sha "$sync26")"

@@ -51,6 +51,10 @@
 #       Step 3, with GITHUB_TOKEN: files the compat-break issue with the
 #       run's failing jobs and the advisory diff and links it from the PR,
 #       or comments on the open issue with the run, once per run.
+#   release-check.sh [--dry-run] ready <PR>
+#       Marks the sync PR ready (GITHUB_TOKEN), if it is still a draft
+#       once its accept line is pushed: accept does this itself, and this
+#       retries it if accept stopped after its push.
 #   release-check.sh [--dry-run] accept <version> <digest> <run URL> <sha> <PR>
 #       Step 4: pushes the accept line to the sync branch as the bot (only
 #       if its head is still <sha>, the commit the run verified), then
@@ -70,7 +74,8 @@
 #             red          run=: its verifying run failed: report it
 #             green        run=: its verifying run passed: accept
 #             ready        the branch has the release's accept line: a
-#                          human merges the PR
+#                          human merges the PR (draft=true: mark it ready
+#                          first, with the ready subcommand)
 #             bounded      two verifying runs of this head ended neither
 #                          green nor red (cancelled, say): re-run by hand
 # and fails if a release-check branch for the release it would start
@@ -313,11 +318,11 @@ sync_branch() { echo "$sync_prefix/$1"; }
 
 # sync_prs: the open sync PRs into the branch, from this repository's own
 # branches (a fork's PR may use the same name), as
-# "<number> <version> <head sha>" lines.
+# "<number> <version> <head sha> <draft>" lines.
 sync_prs() {
 	api "repos/$repo/pulls?state=open&base=$branch&per_page=100" |
 		jq -r --arg r "$repo" --arg p "$sync_prefix/" '.[] | select(.head.repo.full_name == $r) | select(.head.ref | startswith($p)) |
-			"\(.number) \(.head.ref | ltrimstr($p)) \(.head.sha)"'
+			"\(.number) \(.head.ref | ltrimstr($p)) \(.head.sha) \(.draft // false)"'
 }
 # release_branches <version>: the release-check branches for the version,
 # of any kind (the earlier flow's accept/rebuild/reject too).
@@ -413,8 +418,16 @@ verdict() {
 	fi
 	case "$conclusion" in
 	failure | timed_out)
-		echo "red $url"
-		return
+		# A job that failed before testing anything (its checkout, or the
+		# pin step refusing the candidate) says nothing about the code.
+		jobs="$(run_jobs "$id")" || die "couldn't read the verifying run $url's jobs: not deciding on it"
+		why="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
+			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
+		if [[ -z "$why" ]]; then
+			echo "red $url"
+			return
+		fi
+		say "the verifying run $url failed before testing ($why): it decides nothing"
 		;;
 	success)
 		if jobs="$(run_jobs "$id")"; then
@@ -430,9 +443,11 @@ verdict() {
 		;;
 	*) say "the verifying run $url ended '$conclusion': it decides nothing" ;;
 	esac
-	# Every run of this head ended undecided (cancelled, say): try again,
-	# a bounded number of times.
-	undecided="$(jq length <<<"$runs")"
+	# The latest run of this head ended undecided (cancelled, say): try
+	# again, a bounded number of times. Only runs that may have ended
+	# undecided count: not red ones (one that failed before testing does).
+	undecided="$(jq '[.[] | select(.conclusion != "failure" and .conclusion != "timed_out")] | length' <<<"$runs")"
+	if [[ "$conclusion" == failure || "$conclusion" == timed_out ]]; then undecided=$((undecided + 1)); fi
 	if ((undecided >= max_verify_dispatches)); then
 		echo "bounded $url"
 	else
@@ -558,9 +573,9 @@ cmd_publish() {
 	fi
 }
 
-# plan_sync <PR> <version> <PR head sha>: the open sync's state.
+# plan_sync <PR> <version> <draft>: the open sync's state.
 plan_sync() {
-	local pr="$1" v="$2" sha d rc=0 ref state url accepted vout
+	local pr="$1" v="$2" draft="$3" sha d rc=0 ref state url accepted vout
 	need_number "$pr"
 	need_tag "$v"
 	ref="$(sync_branch "$v")"
@@ -588,6 +603,9 @@ plan_sync() {
 	if ENGINES_FILE="$accepted" "$engines" pin "$v" >/dev/null 2>&1; then
 		say "$ref (PR #$pr) has $v's accept line: waiting for a human to merge it, with a merge commit"
 		out state ready
+		# Still a draft: the accept that pushed the line didn't get to mark
+		# it ready.
+		out draft "$draft"
 		return
 	fi
 	# Apart from the read, so a verdict that fails fails the plan.
@@ -621,8 +639,9 @@ cmd_plan() {
 		n="$(grep -c . <<<"$prs" || true)"
 		((n <= 1)) || die "more than one sync PR is open: $(awk '{ print "#" $1 }' <<<"$prs" | paste -sd' '). Close all but one"
 		if ((n == 1)); then
-			read -r pr v sha <<<"$prs"
-			plan_sync "$pr" "$v" "$sha"
+			local draft
+			read -r pr v sha draft <<<"$prs"
+			plan_sync "$pr" "$v" "$draft"
 			return
 		fi
 	fi
@@ -682,9 +701,10 @@ cmd_start() {
 		manifest_edit set-base "$v"
 		git -C "$tree" add "$manifest_path"
 		commit -m "remote cache: build on upstream $v" -m "Moves the manifest's base from $old (release check)."
-	elif [[ "$merge" == ancestor ]]; then
-		# Nothing to change, but a PR needs a commit.
-		commit --allow-empty -m "remote cache: sync upstream $v" -m "$branch contains $v already, and its base is $v (release check)."
+	elif [[ "$merge" != merged ]]; then
+		# Nothing to change (the tag merged already, or its merge left to a
+		# human), but a PR needs a commit.
+		commit --allow-empty -m "remote cache: sync upstream $v" -m "The manifest's base is $v already (release check)."
 	fi
 	push "$ref"
 	body="$scratch/pr.md"
@@ -734,8 +754,22 @@ cmd_verify() {
 	if [[ -n "$run" ]]; then out run "$run"; fi
 }
 
+# link_issue <PR> <issue>: the PR closes the issue when it merges: its
+# description gets "Closes #<issue>." unless it has it already.
+link_issue() {
+	local pr="$1" issue="$2" pbody
+	pbody="$(api "repos/$repo/pulls/$pr" | jq -r '.body // ""')" || die "couldn't read #$pr"
+	if grep -qF "Closes #$issue." <<<"$pbody"; then return; fi
+	if is_dry; then
+		would "add 'Closes #$issue.' to #$pr's description"
+		return
+	fi
+	jq -n --arg b "$pbody"$'\n\n'"Closes #$issue." '{body: $b}' | api -X PATCH "repos/$repo/pulls/$pr" --input - >/dev/null ||
+		die "linking #$issue from #$pr failed"
+}
+
 cmd_report() {
-	local v="$1" run="$2" pr="$3" id issue title body seen pbody
+	local v="$1" run="$2" pr="$3" id issue title body seen
 	need_tag "$v"
 	need_run "$run"
 	need_number "$pr"
@@ -772,15 +806,15 @@ cmd_report() {
 			api -X POST "repos/$repo/issues" --input - | jq -r .number)" || die "filing the compat-break issue failed"
 		need_number "$issue"
 		say "filed $server/$repo/issues/$issue"
-		# The PR closes the issue when it merges.
-		pbody="$(api "repos/$repo/pulls/$pr" | jq -r '.body // ""')" || die "couldn't read #$pr"
-		jq -n --arg b "$pbody"$'\n\n'"Closes #$issue." '{body: $b}' | api -X PATCH "repos/$repo/pulls/$pr" --input - >/dev/null ||
-			die "linking #$issue from #$pr failed"
+		link_issue "$pr" "$issue"
 		out issue "$issue"
 		return
 	fi
 	need_number "$issue"
 	out issue "$issue"
+	# An issue filed by a run that stopped before linking it, or by the
+	# earlier flow, is linked now.
+	link_issue "$pr" "$issue"
 	# Once per run: the issue's body or a comment names it already.
 	seen="$( (
 		api "repos/$repo/issues/$issue" | jq -r '.body // ""'
@@ -799,8 +833,27 @@ cmd_report() {
 	say "commented on #$issue with $run"
 }
 
+# mark_ready <PR>: marks the PR ready for review, with GITHUB_TOKEN.
+mark_ready() {
+	local node
+	if is_dry; then
+		would "mark #$1 ready for review"
+		return
+	fi
+	node="$(api "repos/$repo/pulls/$1" | jq -r .node_id)" || die "couldn't read #$1"
+	# shellcheck disable=SC2016 # GraphQL variables, not shell
+	api graphql -f query='mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }' \
+		-f id="$node" >/dev/null || die "marking #$1 ready failed (the next hour tries again)"
+	say "marked #$1 ready for review"
+}
+
+cmd_ready() {
+	need_number "$1"
+	mark_ready "$1"
+}
+
 cmd_accept() {
-	local v="$1" d="$2" run="$3" sha="$4" pr="$5" ref head issue body node
+	local v="$1" d="$2" run="$3" sha="$4" pr="$5" ref head issue body
 	need_tag "$v"
 	need_digest "$d"
 	need_run "$run"
@@ -834,14 +887,7 @@ cmd_accept() {
 		echo
 		echo "Ready to merge **with a merge commit** (\`gh pr merge --merge\`), never a squash, once its checks pass."
 	} >"$body"
-	if is_dry; then
-		would "mark #$pr ready for review"
-	else
-		node="$(api "repos/$repo/pulls/$pr" | jq -r .node_id)" || die "couldn't read #$pr"
-		# shellcheck disable=SC2016 # GraphQL variables, not shell
-		api graphql -f query='mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }' \
-			-f id="$node" >/dev/null || die "marking #$pr ready failed (the accept line is pushed: mark it by hand)"
-	fi
+	mark_ready "$pr"
 	comment "$pr" "$body"
 	issue="$(open_issue "$v")"
 	if [[ -n "$issue" ]]; then
@@ -863,6 +909,7 @@ plan) [[ $# -le 2 ]] || die "usage: release-check.sh plan [<version>]"; cmd_plan
 start) [[ $# -eq 3 ]] || die "usage: release-check.sh start <version> <digest>"; cmd_start "$2" "$3" ;;
 verify) [[ $# -eq 3 ]] || die "usage: release-check.sh verify <version> <digest>"; cmd_verify "$2" "$3" ;;
 report) [[ $# -eq 4 ]] || die "usage: release-check.sh report <version> <run URL> <PR>"; cmd_report "$2" "$3" "$4" ;;
+ready) [[ $# -eq 2 ]] || die "usage: release-check.sh ready <PR>"; cmd_ready "$2" ;;
 accept) [[ $# -eq 6 ]] || die "usage: release-check.sh accept <version> <digest> <run URL> <sha> <PR>"; cmd_accept "$2" "$3" "$4" "$5" "$6" ;;
-*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | start <version> <digest> | verify <version> <digest> | report <version> <run URL> <PR> | accept <version> <digest> <run URL> <sha> <PR>" ;;
+*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | start <version> <digest> | verify <version> <digest> | report <version> <run URL> <PR> | ready <PR> | accept <version> <digest> <run URL> <sha> <PR>" ;;
 esac

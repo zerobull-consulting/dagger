@@ -910,7 +910,8 @@ new release ──▶ sync branch: tag merged, base moved, draft PR
    - **without the tag** (the merge conflicted when it started): waited
      on, until a human merges the tag into the branch and pushes;
    - **with the release's accept line**: ready, waited on until a human
-     merges the PR;
+     merges the PR (marked ready first, if the run that pushed the line
+     stopped before it could);
    - otherwise **verified**: `remote-cache-tests.yml` dispatched on the sync
      branch with `candidate-version` and `candidate-digest` (the release's
      stock engine as the first accept line). The run is not waited on: a
@@ -918,12 +919,14 @@ new release ──▶ sync branch: tag merged, base moved, draft PR
      commit and its title (`Remote cache tests: candidate <version>
      <digest>`). The latest run of the head decides:
      - **in progress:** waited on;
-     - **red** (failed or timed out): the `compat-break` issue
+     - **red** (failed or timed out, past its checkout and engine pin
+       steps): the `compat-break` issue
        (`compat-break: engine <version> fails against the cache service`,
        with `GITHUB_TOKEN`) is filed with the failing jobs, the advisory diff
        and the PR, and the PR's description gets `Closes #<issue>`; each
        later red run is a comment on it, once per run. An issue of that
-       title already open (from the earlier flow, say) is reused;
+       title already open (from the earlier flow, say) is reused, and
+       linked from the PR too;
      - **green**, with both engine jobs run and passed (a run whose engine
        jobs were skipped still ends green, and decides nothing,
        [zerobull-consulting/dagger#223](https://github.com/zerobull-consulting/dagger/issues/223)):
@@ -933,9 +936,10 @@ new release ──▶ sync branch: tag merged, base moved, draft PR
        told. If the bundle or protocol version changed between the
        manifest's `base` and the release, the accept list resets to that
        one version;
-     - **undecided** (cancelled, or green with an engine job skipped):
-       verified again, at most twice per head; then the summary says to
-       re-run it by hand.
+     - **undecided** (cancelled, failed in its checkout or engine pin step,
+       or green with an engine job skipped): verified again, at most twice
+       per head (red runs don't count); then the summary says to re-run it
+       by hand.
 
    Every job of the run counts, not only the engine's: the unit tests
    (`TestBundleVersionMatchesEngineCapture` among them), the MinIO tests,
