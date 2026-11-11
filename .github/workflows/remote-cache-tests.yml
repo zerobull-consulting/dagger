@@ -42,9 +42,11 @@ name: Remote cache tests
 permissions:
   contents: read
 # A candidate's run is titled with what it verifies, because the runs API
-# doesn't return a dispatch's inputs: the accept-line check
-# (hack/remote-cache/accept-line-only.sh, verify_run) reads this title to
-# tell that the run an accept line cites verified that version and digest
+# doesn't return a dispatch's inputs: the release check
+# (hack/remote-cache/release-check.sh, verdict) reads this title to match a
+# sync branch's verifying runs to the release, and the accept-line check
+# (hack/remote-cache/accept-line-only.sh, verify_run) to tell that the run
+# an accept line cites verified that version and digest
 # (zerobull-consulting/dagger#165). Any other run keeps GitHub's default
 # title (an empty run-name falls back to it).
 run-name: "${{ inputs.candidate-version && format('Remote cache tests: candidate {0} {1}', inputs.candidate-version, inputs.candidate-digest) || '' }}"
@@ -111,8 +113,8 @@ jobs:
         run: ./hack/remote-cache/release-tags_test.sh
       # The hourly release check (remote-cache-release-check.yml) and the
       # "auto-merge: adds compatible engine only" check
-      # (remote-cache-auto-merge-add-compatible-engine.yml), against fake gh,
-      # registry and go, and scratch repositories.
+      # (remote-cache-auto-merge-add-compatible-engine.yml), against fake gh
+      # and registry, and scratch repositories.
       - name: Release check
         timeout-minutes: 5
         run: |
