@@ -517,9 +517,10 @@ func TestDeletePrefixReportsUploadsLeft(t *testing.T) {
 // right, and the others must never need them: only the Spaces jobs use an
 // external bucket, and each gives it to the step that runs the tests.
 func TestWorkflowOnlySpacesJobsAreExternal(t *testing.T) {
-	// Pull requests run remote-cache-tests.yml, none of whose jobs may reach
+	// Pull requests run remote-cache-tests.yml, none of whose tests may reach
 	// Spaces; the Spaces jobs are in remote-cache-spaces.yml, off pull
-	// requests.
+	// requests. (The unit job's sidecar reads the PR checks' remote cache
+	// bucket, with its own CACHE_S3_* settings: no test uses it.)
 	core := workflowJobs(t, "remote-cache-tests.yml")
 	for _, job := range []string{"unit", "minio", "e2e"} {
 		if _, ok := core[job]; !ok {
