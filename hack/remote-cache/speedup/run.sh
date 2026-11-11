@@ -54,6 +54,9 @@ start=$SECONDS
 size="$(cd "$root" && "$dagger" --progress=plain --no-load-module -c "$pipeline" 2>"$dir/$label.log")" ||
 	{ echo "run.sh: the pipeline failed: see $dir/$label.log" >&2; tail -n 30 "$dir/$label.log" >&2; exit 1; }
 seconds=$((SECONDS - start))
+# The dagger CLI prints an Int result of 1e6 or more in exponent notation
+# (6.3700575e+07): normalize it to a plain integer before checking it.
+if [[ "$size" =~ ^[0-9]+(\.[0-9]+)?[eE]\+?[0-9]+$ ]]; then size="$(LC_ALL=C printf '%.0f' "$size")"; fi
 [[ "$size" =~ ^[0-9]+$ && "$size" -gt 1000000 ]] || { echo "run.sh: not a binary's size: '$size'" >&2; exit 1; }
 echo "$label: built cmd/cacheservice ($size bytes) in ${seconds}s"
 
