@@ -7,9 +7,9 @@
 #   sidecar.sh version print the engine version SIDECAR_VERSION selects (the
 #                      manifest's first accept line for none), or fail: the
 #                      check the start action runs before it installs the CLI
-#   sidecar.sh stop    stop the service (it drains), then, once its drain
-#                      is done, the engine, then wait for the service to
-#                      exit; keep their logs; remove the containers, the
+#   sidecar.sh stop    flush the engine's pending exports (bounded), stop
+#                      the engine while the service is up, then the
+#                      service; keep their logs; remove the containers, the
 #                      engine's state and the network
 #
 # The actions start/ and stop/ run it (start through a small JavaScript
@@ -44,7 +44,9 @@
 #                           PATH_STYLE (optional); passed to the service by
 #                           name, never on a command line
 #   SIDECAR_NAMESPACE       the service's -scope (default: default)
-#   SIDECAR_DRAIN_TIMEOUT   the service's -drain-timeout (default: 10m)
+#   SIDECAR_SETTLE_TIMEOUT  how long the stop's flush may take, as a Go
+#                           duration such as 10s or 2m (default: 10s; at
+#                           most 10m; 0: no flush)
 #   SIDECAR_NAME            prefix of the containers, volume and network
 #                           (default: remote-cache)
 #   SIDECAR_DEBUG_PORT      publish the debug API on 127.0.0.1:<port>
@@ -193,11 +195,17 @@ duration_seconds() {
 	echo $((10#$h * 3600 + 10#$m * 60 + 10#$s))
 }
 
-# The service's -drain-linger, which start passes: how long, after its
-# drain, it keeps answering the engine's events at most, so that the engine's
-# stop delivers its last one (engine.stop) and ends in seconds. It ends
-# sooner, once that event arrived. 15s is the service's default too.
-linger_seconds=15
+# The stop's bounds after its flush (zerobull-consulting/dagger#137): the
+# engine's docker stop is cut off at engine_stop_seconds, and the service,
+# which start runs with -drain-timeout 0, exits within its shutdown's 5s of
+# its SIGTERM; the stop waits service_stop_seconds for that.
+engine_stop_seconds=90
+service_stop_seconds=10
+# The flush's answer may come a little after its timeout: the request is
+# bounded at the timeout plus this.
+flush_slack_seconds=5
+# The most a flush may ask for (the service's MaxFlushTimeout).
+max_settle_seconds=600
 
 # The version a dagger CLI says it is, such as v1.0.0-beta.25, from the line
 # of `dagger version` that reads "version:     v1.0.0-beta.25" (the CLI's
@@ -277,7 +285,10 @@ read_state() {
 		volume) st_volume="$value" ;;
 		network) st_network="$value" ;;
 		stop_seconds) st_stop_seconds="$value" ;;
-		linger_seconds) st_linger_seconds="$value" ;;
+		# Written by every start since zerobull-consulting/dagger#137; a
+		# state without it is an older start's.
+		settle_seconds) st_settle_seconds="$value" ;;
+		url) st_url="$value" ;;
 		logs) st_logs="$value" ;;
 		role) st_role="$value" ;;
 		# What this sidecar's start created, one line each as it did: the
@@ -286,8 +297,14 @@ read_state() {
 		esac
 	done <"$file"
 	valid_name "$st_service" && valid_name "$st_engine" && valid_name "$st_volume" &&
-		valid_name "$st_network" && [[ "$st_stop_seconds" =~ ^[0-9]+$ && "$st_linger_seconds" =~ ^[0-9]+$ ]] ||
+		valid_name "$st_network" && [[ -z "$st_url" || "$st_url" =~ ^http://[0-9.]+:[0-9]+$ ]] ||
 		die "the state file $file isn't one start wrote"
+	if [[ -z "$st_settle_seconds" ]]; then
+		st_old_state=true
+	else
+		[[ "$st_settle_seconds" =~ ^[0-9]+$ && "$st_stop_seconds" =~ ^[0-9]+$ ]] ||
+			die "the state file $file isn't one start wrote"
+	fi
 }
 
 # A container's exit code, or "unknown" when docker fails or doesn't answer
@@ -343,21 +360,6 @@ step_bound() {
 # Whether this sidecar's start created a resource (service, engine, volume,
 # network), from the state it read.
 created() { [[ "$st_created" == *" $1 "* ]]; }
-
-# Waits until the service's log since a Unix time says its drain is done, or
-# docker says the service has stopped, for at most a number of seconds;
-# returns 1 when that bound passed first. A docker that fails meanwhile ends
-# nothing: the engine must not be stopped before the drain is done.
-wait_drained() {
-	local container="$1" since="$2" end=$((SECONDS + $3)) log
-	while ((SECONDS < end)); do
-		exited "$container" "$(step_bound "$end")" && return 0
-		log="$(timeout "$(step_bound "$end")" docker logs --since "$since" "$container" 2>&1 || true)"
-		grep -q 'msg="drain: done"' <<<"$log" && return 0
-		sleep 0.5
-	done
-	return 1
-}
 
 # Waits until docker says a container has stopped, for at most a number of
 # seconds (at least 1); returns 1 when that bound passed first, a docker that
@@ -421,7 +423,7 @@ start() {
 	local role="${SIDECAR_ROLE:-}"
 	local name="${SIDECAR_NAME:-remote-cache}"
 	local namespace="${SIDECAR_NAMESPACE:-default}"
-	local drain="${SIDECAR_DRAIN_TIMEOUT:-10m}"
+	local settle="${SIDECAR_SETTLE_TIMEOUT:-10s}"
 	local debug_port="${SIDECAR_DEBUG_PORT:-}"
 	local wait="${SIDECAR_START_TIMEOUT:-120}" grace="${SIDECAR_WELCOME_GRACE:-10}"
 	local sync_wait="${SIDECAR_FIRST_SYNC_TIMEOUT:-30}"
@@ -436,8 +438,13 @@ start() {
 	select_images
 	valid_image "$service_image" || die "service-image '$service_image' isn't an image reference"
 	valid_image "$engine_image" || die "engine-image '$engine_image' isn't an image reference"
-	local drain_seconds
-	drain_seconds="$(duration_seconds "$drain")" || die "drain-timeout '$drain' isn't a duration such as 10m, 90s or 1h30m"
+	local settle_seconds
+	settle_seconds="$(duration_seconds "$settle")" || die "settle-timeout '$settle' isn't a duration such as 10s, 2m or 1m30s (or 0)"
+	((settle_seconds <= max_settle_seconds)) || die "settle-timeout '$settle' is more than 10m, the longest flush the service takes"
+	# Gone, with no alias (zerobull-consulting/dagger#137): the service runs
+	# with no drain now, and the stop flushes instead.
+	[[ -z "${SIDECAR_DRAIN_TIMEOUT:-}" ]] ||
+		warn "SIDECAR_DRAIN_TIMEOUT (drain-timeout) is no longer read, and is ignored: the stop flushes the engine's exports for up to SIDECAR_SETTLE_TIMEOUT (settle-timeout) instead, then stops the service with no drain"
 	[[ -z "$debug_port" || ("$debug_port" =~ ^[0-9]{1,5}$ && "$debug_port" -ge 1 && "$debug_port" -le 65535) ]] ||
 		die "debug-port '$debug_port' isn't a port number"
 	[[ "$wait" =~ ^[0-9]{1,4}$ ]] || die "SIDECAR_START_TIMEOUT '$wait' isn't a number of seconds"
@@ -480,10 +487,10 @@ start() {
 	fi
 	mkdir -p "$logs" "$bin"
 	local service="$name-service" engine="$name-engine" volume="$name-engine-state" network="$name-net"
-	# The stop's own bound: the service's whole stop takes at most the drain
-	# plus its linger plus 5s (README, "Stopping and draining"); the stop
-	# allows 5s more.
-	local stop_seconds=$((drain_seconds + linger_seconds + 10))
+	# The stop's own bound, from its flush to the service's exit: the flush
+	# (the settle timeout, and a few seconds for its answer), the engine's
+	# stop (cut off at 90s), then the service's (5s, and 5s more).
+	local stop_seconds=$((settle_seconds + flush_slack_seconds + engine_stop_seconds + service_stop_seconds))
 	# Every name must be free before anything is written or created: the
 	# stop removes what the start created, and must never take a container,
 	# volume or network that was already there (such as a crashed job's on
@@ -496,7 +503,7 @@ start() {
 	[[ -z "$taken" ]] ||
 		die "already there, and not this sidecar's:$taken. Remove them (docker rm -f, docker volume rm, docker network rm), or give this sidecar another name"
 	printf '%s\n' "service=$service" "engine=$engine" "volume=$volume" "network=$network" \
-		"stop_seconds=$stop_seconds" "linger_seconds=$linger_seconds" "logs=$logs" "role=$role" >"$state"
+		"stop_seconds=$stop_seconds" "settle_seconds=$settle_seconds" "logs=$logs" "role=$role" >"$state"
 
 	# Pulled only when not here already: a job may have built them, and the
 	# engine is pinned by digest. The version's floating service tag is
@@ -519,7 +526,10 @@ start() {
 	gateway="$(timeout 30 docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$network")"
 	[[ "$gateway" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "the network $network has no IPv4 gateway ('$gateway')"
 
-	local flags=(-scope "$namespace" -drain-timeout "$drain" -drain-linger "${linger_seconds}s")
+	# No drain, and so no linger: the stop flushes the engine's exports
+	# while the service is fully up, stops the engine, and only then the
+	# service, which has nothing left to do (zerobull-consulting/dagger#137).
+	local flags=(-scope "$namespace" -drain-timeout 0)
 	if [[ "$role" == writer ]]; then
 		# Scheduled GC belongs to its own job (zerobull-consulting/dagger#61):
 		# the service has no schedule, and POST /debug/gc still runs GC.
@@ -575,6 +585,8 @@ start() {
 	hostport="$(timeout 30 docker port "$service" 8090/tcp | head -n1)"
 	[[ "$hostport" =~ ^[0-9.]+:[0-9]+$ ]] || { show_log "$service"; die "the service's port isn't published ('$hostport')"; }
 	local url="http://$hostport"
+	# For the stop's flush.
+	echo "url=$url" >>"$state"
 
 	# Up once it listens: it checked the bucket's ownership before that, and
 	# exits 1 or 2 on a refusal or a bad flag.
@@ -777,78 +789,139 @@ EOF
 
 # --- stop ---
 
+# The first value of a key in the flush's JSON report (indented, one key per
+# line), with quotes dropped; nothing when it has none.
+json_value() {
+	{ grep -oE "\"$2\": *(\"[^\"]*\"|[0-9]+)" "$1" 2>/dev/null || true; } | head -n 1 | sed -E 's/^[^:]*: *//; s/"//g'
+}
+
+# flush_engine URL SECONDS REPORT: asks the service, still fully up, to
+# export what is pending for the engine's cache now, for at most SECONDS
+# (POST /v1/engines/flush, the form keyed by the engine's token, which needs
+# no cache ID; zerobull-consulting/dagger#136), and keeps its report in
+# REPORT. It sets flush_result, a line for the output and the step summary.
+# It never fails the stop: a flush that times out, is refused, or gets no
+# answer is said so, and the stop goes on.
+flush_engine() {
+	local url="$1" settle="$2" report="$3" code rc=0 err outcome
+	rm -f "$report"
+	if ! command -v curl >/dev/null 2>&1; then
+		flush_result="not run: there is no curl on this host"
+		warn "the flush wasn't run: there is no curl on this host; what the engine hadn't exported yet is lost with it"
+		return 0
+	fi
+	echo "remote-cache-sidecar: flushing the engine's pending exports, for up to ${settle}s"
+	# Bounded twice: curl's own --max-time, and timeout, for a curl that
+	# doesn't end at it.
+	code="$(timeout $((settle + flush_slack_seconds + 5)) curl -sS -X POST -u sidecar-engine: \
+		--max-time $((settle + flush_slack_seconds)) -o "$report" -w '%{http_code}' \
+		"$url/v1/engines/flush?timeout=${settle}s" 2>"$report.err")" || rc=$?
+	err="$(head -c 300 "$report.err" 2>/dev/null | tr '\n' ' ' || true)"
+	rm -f "$report.err"
+	outcome="$(json_value "$report" outcome)"
+	if ((rc != 0)); then
+		flush_result="failed: the service didn't answer in time, or at all (curl exit $rc${err:+: $err})"
+	elif [[ "$code" != 200 || -z "$outcome" ]]; then
+		flush_result="refused: HTTP ${code:-none}: $(head -c 300 "$report" 2>/dev/null | tr '\n' ' ' || true)"
+	else
+		local paused
+		paused="$(json_value "$report" paused)"
+		flush_result="$outcome, in $(json_value "$report" took): stored $(json_value "$report" stored) root(s); left $(json_value "$report" dirty) dirty, $(json_value "$report" inFlight) in flight, $(json_value "$report" retrying) retrying, $(json_value "$report" later) later, ${paused:-0} paused, $(json_value "$report" waitingSpans) session(s) waiting for spans"
+		if [[ "$outcome" == complete ]]; then
+			echo "remote-cache-sidecar: the flush: $flush_result"
+			return 0
+		fi
+	fi
+	warn "the flush: $flush_result. The stop goes on: what the engine hadn't exported is lost with it"
+}
+
 stop() {
 	local name="${SIDECAR_NAME:-remote-cache}"
 	valid_name "$name" || die "name '$name' isn't valid"
 	local state
 	state="$(sidecar_dir)/$name/state"
-	# A state without linger_seconds is a start's from before the linger,
-	# whose stop_seconds has no room for one.
-	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_linger_seconds=0 st_logs="" st_role="" st_created=" "
+	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_settle_seconds="" st_url=""
+	local st_logs="" st_role="" st_created=" " st_old_state=false
 	if ! read_state "$state"; then
 		echo "remote-cache-sidecar: nothing to stop: no state at $state (did the start step run?)"
 		return 0
 	fi
-	local failed=""
+	local failed="" old_state=""
+	if [[ "$st_old_state" == true ]]; then
+		# A start from before zerobull-consulting/dagger#137 ran its service
+		# with a drain, which this stop doesn't wait for; nor does it flush,
+		# since it can't tell how that service was started. It still keeps
+		# the logs and removes what that start created, and fails the step.
+		old_state="the state at $state was written by an older start of the action (it has no settle_seconds): this run's pending exports weren't flushed. Run remote-cache/start and remote-cache/stop from the same commit"
+		echo "remote-cache-sidecar: $old_state; removing the sidecar without a flush" >&2
+	fi
 
-	# The service first: the drain's exports run over the engine's
-	# connection, and the engine uploads the layers itself. Then, once the
-	# drain is done, the engine, while the service still answers its events:
-	# the engine's stop sends its last one (engine.stop) to the service, and
-	# ends in seconds rather than retry against a closed port for 30s. Then
-	# the service, which exits once that event arrived (or at its linger's
-	# bound). Every wait is bounded, and the cleanup below runs whatever
-	# they found.
-	local was_running=false code="" still_running=false overran=false engine_code=""
-	# The stop's bound counts from the SIGTERM, set below: the probe before
-	# it doesn't eat into the service's time.
-	local deadline=$((SECONDS + st_stop_seconds))
-	# A docker that fails here says nothing about the service: it is taken
-	# for running, so the engine still waits for the drain. The probe is
-	# bounded at about 10s in all, so a daemon that hangs here keeps the
-	# step inside its documented bound (zerobull-consulting/dagger#125).
-	local service_state=""
-	created service && service_state="$(container_state "$st_service" 10)"
-	[[ "$service_state" == unknown ]] && echo "remote-cache-sidecar: docker didn't say whether the service is running; stopping it as if it is" >&2
-	if [[ "$service_state" == running || "$service_state" == unknown ]]; then
-		was_running=true
-		local since
-		since="$(($(date +%s) - 1))"
-		echo "remote-cache-sidecar: stopping the service; it drains for up to $((st_stop_seconds - st_linger_seconds - 10))s, then answers the engine's last event for up to ${st_linger_seconds}s; the stop waits ${st_stop_seconds}s for it"
-		deadline=$((SECONDS + st_stop_seconds))
-		timeout 30 docker kill -s TERM "$st_service" >/dev/null 2>&1 || true
-		if ! wait_drained "$st_service" "$since" $((st_stop_seconds - st_linger_seconds - 5)); then
-			echo "remote-cache-sidecar: the service didn't report its drain done in time; stopping the engine anyway" >&2
+	# The engine's pending exports first, with the service fully up: the
+	# flush (bounded by the settle timeout). Then the engine, while the
+	# service still answers its events, so its stop delivers its last one
+	# (engine.stop) and ends in seconds. Then the service, which start ran
+	# with no drain: it stops at once, within its shutdown's 5s
+	# (zerobull-consulting/dagger#137). Every wait is bounded, and the
+	# cleanup below runs whatever they found.
+	local was_running=false code="" still_running=false overran=false engine_code="" flush_result=""
+	if [[ "$st_old_state" != true ]]; then
+		# A docker that fails here says nothing about the service: it is
+		# taken for running, so it is still flushed and stopped. The probe
+		# is bounded at about 10s in all, so a daemon that hangs here keeps
+		# the step inside its documented bound (zerobull-consulting/dagger#125).
+		local service_state=""
+		created service && service_state="$(container_state "$st_service" 10)"
+		[[ "$service_state" == unknown ]] && echo "remote-cache-sidecar: docker didn't say whether the service is running; stopping it as if it is" >&2
+		[[ "$service_state" == running || "$service_state" == unknown ]] && was_running=true
+		if [[ "$was_running" == true ]]; then
+			if ((st_settle_seconds == 0)); then
+				flush_result="skipped (settle-timeout 0)"
+			elif [[ "$st_role" == read-only ]]; then
+				flush_result="skipped (read-only: the service exports nothing)"
+			elif [[ -z "$st_url" ]]; then
+				flush_result="skipped (the start didn't record the service's URL)"
+			else
+				flush_engine "$st_url" "$st_settle_seconds" "$st_logs/flush.json"
+			fi
+			[[ "$flush_result" == skipped* ]] && echo "remote-cache-sidecar: the flush: $flush_result"
+		fi
+		if created engine && timeout 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
+			# The engine's own bound: a kill before it closed its cache would
+			# leave its store unclean.
+			timeout "$engine_stop_seconds" docker stop --time 30 "$st_engine" >/dev/null 2>&1 || true
+			if running "$st_engine"; then
+				echo "remote-cache-sidecar: the engine was still running after docker stop" >&2
+			else
+				# 0 for a clean stop; 137 when docker stop killed it.
+				engine_code="$(exit_code "$st_engine")"
+				echo "remote-cache-sidecar: the engine stopped (exit ${engine_code:-unknown})"
+			fi
+		fi
+		if [[ "$was_running" == true ]]; then
+			echo "remote-cache-sidecar: stopping the service; with no drain, it exits within 5s"
+			timeout 30 docker kill -s TERM "$st_service" >/dev/null 2>&1 || true
+			if ! wait_exited "$st_service" "$service_stop_seconds"; then
+				# Past the service's own bound: stop it. docker stop's
+				# SIGTERM ends its shutdown at once, with exit 1.
+				overran=true
+				timeout 60 docker stop --time 5 "$st_service" >/dev/null 2>&1 || true
+				# A docker stop that gave up (or was cut off) leaves the
+				# service running, with the exit code of a container that
+				# hasn't exited: never take that for a clean stop.
+				if running "$st_service"; then
+					still_running=true
+				fi
+			fi
 		fi
 	fi
 	if created engine && timeout 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
-		# The engine's own bound: a kill before it closed its cache would
-		# leave its store unclean.
-		timeout 90 docker stop --time 30 "$st_engine" >/dev/null 2>&1 || true
-		if running "$st_engine"; then
-			echo "remote-cache-sidecar: the engine was still running after docker stop" >&2
-		else
-			# 0 for a clean stop; 137 when docker stop killed it.
-			engine_code="$(exit_code "$st_engine")"
-			echo "remote-cache-sidecar: the engine stopped (exit ${engine_code:-unknown})"
-		fi
 		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
 	fi
-	if [[ "$was_running" == true ]] && ! wait_exited "$st_service" $((deadline - SECONDS)); then
-		# Past the service's own bound: stop it. docker stop's SIGTERM
-		# ends its linger at once, or its shutdown with exit 1.
-		overran=true
-		timeout 60 docker stop --time 5 "$st_service" >/dev/null 2>&1 || true
-		# A docker stop that gave up (or was cut off) leaves the service
-		# running, with the exit code of a container that hasn't exited:
-		# never take that for a clean stop.
-		if running "$st_service"; then
-			still_running=true
-		fi
-	fi
 	if created service && timeout 30 docker container inspect "$st_service" >/dev/null 2>&1; then
-		code="$(exit_code "$st_service")"
-		[[ "$code" != unknown ]] || code=""
+		if [[ "$st_old_state" != true ]]; then
+			code="$(exit_code "$st_service")"
+			[[ "$code" != unknown ]] || code=""
+		fi
 		timeout 60 docker logs "$st_service" 2>&1 | redact >"$st_logs/service.log" || true
 	fi
 	# Only what this sidecar's start created.
@@ -871,11 +944,13 @@ stop() {
 	[[ -n "${GITHUB_OUTPUT:-}" ]] && echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
 
 	if [[ -f "$st_logs/service.log" ]]; then
-		echo "remote-cache-sidecar: the drain, from the service's log:"
-		grep -E 'msg="?(stopping|drain|linger|stopped|export stored)' "$st_logs/service.log" | tail -n 20 || true
+		echo "remote-cache-sidecar: the flush and the stop, from the service's log:"
+		grep -E 'msg="?(stopping|flush|stopped|export stored)' "$st_logs/service.log" | tail -n 20 || true
 	fi
-	if [[ "$still_running" == true ]]; then
-		failed="the service was still running after docker stop gave up: it was killed, and what it was exporting is lost"
+	if [[ -n "$old_state" ]]; then
+		failed="$old_state"
+	elif [[ "$still_running" == true ]]; then
+		failed="the service was still running after docker stop gave up: it was killed"
 	elif [[ -z "$code" ]] && ! created service; then
 		# The start failed before it ran the service; its step said why.
 		echo "remote-cache-sidecar: the start didn't get as far as the service; cleaned up what it left"
@@ -888,9 +963,9 @@ stop() {
 	elif [[ "$was_running" != true ]]; then
 		failed="the service exited during the job, with code $code, before the stop"
 	elif [[ "$overran" == true ]]; then
-		failed="the service was still stopping after ${st_stop_seconds}s, past its own bound, and was stopped (exit $code): what it was exporting is lost"
+		failed="the service was still stopping ${service_stop_seconds}s after its SIGTERM, past its own 5s bound, and was stopped (exit $code)"
 	elif [[ "$code" == 137 ]]; then
-		failed="the service was killed (137) before its stop ended, not by this stop (such as out of memory): what it was exporting is lost"
+		failed="the service was killed (137) before its stop ended, not by this stop (such as out of memory)"
 	elif [[ "$code" != 0 ]]; then
 		failed="the service's stop wasn't clean (exit $code): the shutdown's bound cut work off, or a server failed; see its log"
 	fi
@@ -898,6 +973,7 @@ stop() {
 		{
 			echo "### remote-cache-sidecar: $st_role stopped"
 			echo
+			[[ -n "$flush_result" ]] && echo "- flush: $flush_result"
 			echo "- service exit code: ${code:-unknown}"
 			echo "- engine exit code: ${engine_code:-unknown}"
 			echo "- logs: \`$st_logs\`"

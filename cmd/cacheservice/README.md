@@ -3039,10 +3039,15 @@ There are two ways to get what is pending exported before something stops:
   SIGTERM, every cache, until `-drain-timeout`, taking no new work, and the
   service stops after it. The rest of this section is the drain.
 
-The service runs as a sidecar on an ephemeral CI runner, and the end of the
-job is its only chance to store what the job built
-([#63](https://github.com/zerobull-consulting/dagger/issues/63)). On the first
-SIGTERM or interrupt, it drains (`server.Service.Drain`) before it stops.
+On an ephemeral CI runner, the end of the job is a sidecar's only chance to
+store what the job built
+([#63](https://github.com/zerobull-consulting/dagger/issues/63)). The sidecar
+action takes it with the flush, not the drain: it flushes, stops the engine,
+then stops the service, which it runs with `-drain-timeout 0`
+([zerobull-consulting/dagger#137](https://github.com/zerobull-consulting/dagger/issues/137);
+see [Running it as a sidecar](#running-it-as-a-sidecar)). With a drain
+timeout, on the first SIGTERM or interrupt, the service drains
+(`server.Service.Drain`) before it stops.
 A read-only instance (`-export=false`) has nothing to flush: its drain
 logs `drain: nothing to export (read-only: -export=false)`, and returns at
 once, unless an explicit import admitted before it still runs, which it
@@ -3364,8 +3369,9 @@ run over the engine's connection, and the engine uploads the layers itself.
 An engine stopped first takes its pending exports with it. Stop the engine
 once the drain is done (`drain: done` in the service's log), while the
 service lingers, then wait for the service to exit: the engine's stop then
-delivers its `engine.stop` and takes seconds. The sidecar action does this
-(see [Running it as a sidecar](#running-it-as-a-sidecar)).
+delivers its `engine.stop` and takes seconds. (The sidecar action no longer
+drains: it flushes, stops the engine, then the service; see
+[Running it as a sidecar](#running-it-as-a-sidecar).)
 
 **Process managers.** The process manager's stop timeout must be longer than
 `-drain-timeout` plus `-drain-linger` plus 5s, the linger's and the
@@ -3722,9 +3728,9 @@ On GitHub Actions, use the composite action, which does everything below
     s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
     s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
 - run: dagger call build                # any dagger command: start puts a wrapper of the CLI first on PATH
-# No stop step: start stops the sidecar, draining its exports, at the end of the job.
+# No stop step: start stops the sidecar, flushing its exports, at the end of the job.
 # The job's timeout-minutes bounds that stop: set it above the work plus the
-# drain timeout (10m) plus 2 minutes. remote-cache/stop stops earlier.
+# settle timeout (10s) plus 3 minutes. remote-cache/stop stops earlier.
 ```
 
 Pin the action to a commit of `feature/remote-cache`. Its `version` is an
@@ -3772,7 +3778,7 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
   ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26 \
-  -scope default -drain-timeout 10m -drain-linger 15s -gc-mode=batch
+  -scope default -drain-timeout 0 -gc-mode=batch
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
 
@@ -3787,9 +3793,10 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 - **`-gc-mode=batch`** on writers: the service has no GC schedule, and
   `POST /debug/gc` still runs GC; collecting belongs to a job of its own
   ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
-- **`-drain-timeout 10m`**: the stop's chance to store what the job built
-  (see step 4); **`-drain-linger 15s`** (its default) lets the engine's stop
-  deliver its last event after the drain.
+- **`-drain-timeout 0`**: no drain, and no linger. The stop's chance to
+  store what the job built is the flush before the engine's stop (see step
+  4), so the service, stopped last, has nothing left to do, and stops at
+  once.
 - **The debug API**, when wanted: `-debug-listen :8091` with
   `-p 127.0.0.1:8091:8091`, on the runner's loopback only, and
   `-debug-token-file` with a token generated for the job and mounted
@@ -3863,36 +3870,30 @@ on `PATH` that unsets `TRACEPARENT`, `TRACESTATE`, `OTEL_*`, `DAGGER_*` and
 needs the same.
 
 **4. The stop**, at the end of the job, whatever happened before it
-(`if: always()`): SIGTERM the service, which drains; once its drain is done,
-stop the engine; then wait for the service to exit. The drain's exports run
-over the engine's connection, and the engine uploads the layers itself, so
-an engine stopped before the drain is done takes them with it. After the
-drain, the service [lingers](#the-linger): it still answers the engine's
-events, so the engine's stop delivers its last one (`engine.stop`) and
-takes seconds (about 7s, measured), and the service exits once that event
-arrived.
+(`if: always()`): flush the engine's pending exports, while the service and
+the engine are both fully up; then stop the engine; then SIGTERM the
+service, which runs with no drain
+([zerobull-consulting/dagger#137](https://github.com/zerobull-consulting/dagger/issues/137)).
+The exports run over the engine's connection, and the engine uploads the
+layers itself, so an engine stopped before they are done takes them with
+it: the [flush](#flushing-one-engine-cache) does them first, within a bound
+of its own, and says what it left. The engine is stopped while the service
+still answers its events, so its stop delivers its last one
+(`engine.stop`) and takes seconds (about 7s, measured). Then the service has
+nothing left to do: it stops at once, within its shutdown's 5s.
 
 ```bash
-since="$(($(date +%s) - 1))"
-timeout 30 docker kill -s TERM remote-cache-service
-# Wait for the drain to be done, or the service to have exited, for at most
-# -drain-timeout plus 5s. Every docker call is bounded by what is left of
-# that (at most 10s, at least 1s), and one that fails or times out prints
-# nothing: only docker's "false" means the service has exited, so a failing
-# docker never stops the engine mid-drain.
-end=$((SECONDS + 605))
-left() { t=$((end - SECONDS)); [ "$t" -gt 10 ] && t=10; [ "$t" -lt 1 ] && t=1; echo "$t"; }
-while [ "$SECONDS" -lt "$end" ]; do
-  log="$(timeout "$(left)" docker logs --since "$since" remote-cache-service 2>&1 || true)"
-  grep -q 'msg="drain: done"' <<<"$log" && break
-  [ "$(timeout "$(left)" docker inspect -f '{{.State.Running}}' remote-cache-service 2>/dev/null)" = false ] && break
-  sleep 0.5
-done
+# The flush: what is pending for the engine of this token, for up to 10s.
+# Its report says what it stored and what it left (see "Flushing one engine
+# cache"); a flush that ends at its timeout, or gets no answer, is no reason
+# not to stop.
+curl -sS -X POST -u sidecar-engine: --max-time 15 \
+  "$url/v1/engines/flush?timeout=10s" || echo "the flush got no answer" >&2
 timeout 90 docker stop --time 30 remote-cache-engine
-# It exits once engine.stop arrived, or 15s after its drain. docker wait
-# prints the exit code; nothing means it hadn't exited (or docker failed),
-# which is never a clean stop.
-code="$(timeout 30 docker wait remote-cache-service 2>/dev/null || true)"
+timeout 30 docker kill -s TERM remote-cache-service
+# It exits within 5s. docker wait prints the exit code; nothing means it
+# hadn't exited (or docker failed), which is never a clean stop.
+code="$(timeout 10 docker wait remote-cache-service 2>/dev/null || true)"
 echo "the service's exit code: ${code:-unknown (still running?)}"
 [ "$code" = 0 ]
 ```
@@ -3900,18 +3901,16 @@ echo "the service's exit code: ${code:-unknown (still running?)}"
 Don't shorten the engine's `docker stop --time`: an engine killed before its
 "close dagql cache" phase ended leaves its store unclean, which wipes the
 engine's cache at its next start on a host that keeps the state volume.
-Don't `docker stop` the service again while it lingers either: its SIGTERM
-ends the linger at once, and the engine's last event goes undelivered.
+Don't stop the service before the engine: the engine's stop would retry its
+last event against a closed port for 30s.
 
-- **The bound:** the service's whole stop, from SIGTERM to exit, takes at
-  most `-drain-timeout` plus `-drain-linger` (15s) plus 5s (see
-  [Stopping and draining](#stopping-and-draining)). The waits above, and the
-  CI step's own timeout, must be above that, or the service is cut off
-  mid-drain. With `10m`, the action waits up to 625s for the service in all.
-  The engine's stop (up to 30s, cut off at 90s) comes after the drain's wait,
-  so the step needs `-drain-timeout` plus 2 minutes, 12 for `10m`: the
-  action's stop bounds every wait, and the caller sets the step's
-  `timeout-minutes`.
+- **The bound:** the flush takes at most its `timeout` (and a moment for
+  the answer), the engine's stop up to 30s (cut off at 90s), and the
+  service's, from SIGTERM to exit, at most 5s (see
+  [Stopping and draining](#stopping-and-draining)). The action's stop
+  bounds each, and records their sum, the settle timeout plus 105s, as its
+  own; the step needs the settle timeout plus 3 minutes, 4 for `10s`, and
+  the caller sets the step's `timeout-minutes`.
 - **Exit codes:** 0 for a clean stop; 1 when the bound cut work off, when
   something else left the stop unclean, when a signal arrived during the
   shutdown, or when an HTTP server failed (including one that failed as the
@@ -3924,10 +3923,14 @@ ends the linger at once, and the engine's last event goes undelivered.
   closing (about 2.5s in). Two exits log differently: a signal during the
   shutdown (`signal during the shutdown: exiting at once`) and the outer
   backstop for a step that overran its own bound (`stopped: the shutdown
-  overran its bound`). The action's stop fails the step on anything but 0, and
-  on a service that exited before the stop, with the service's log.
-- The drain logs what it stored (`drain: stored`) and its outcome
-  (`drain: done outcome=complete`). Most exports are stored before it:
+  overran its bound`). An export still in flight at the SIGTERM is
+  canceled, and the stop is still clean
+  (`TestMinIOBinaryNoDrainStopWithExportInFlightExitsZero`). The action's
+  stop fails the step on anything but 0, and on a service that exited
+  before the stop, with the service's log; a flush that doesn't complete
+  is a warning in its output and step summary, not a failure.
+- The flush logs what it did (`flush: done outcome=complete
+  storedRoots=... leftRoots=...`). Most exports are stored before it:
   each entry within about `-export-settle` of its last span, or at its
   session's end.
 
@@ -3936,8 +3939,8 @@ ends the linger at once, and the engine's last event goes undelivered.
 `batch` is refused), and a read-only key (see
 [A read-only key](#a-read-only-key)): `s3:GetObject` and `s3:ListBucket` on
 the prefix. A job that forgets `-export=false` with that key fails at
-startup, exit 1, rather than running as a writer. Its drain has nothing to
-flush, so the stop is quick. The service merges what is stored as the
+startup, exit 1, rather than running as a writer. It has nothing to flush
+(a flush gets 409), so the action's stop skips the flush, and is quick. The service merges what is stored as the
 engine connects, within a second or two, and logs `msg="import sync: first
 done" merged=N` once that first sync ends, even when it merged nothing (see
 [Import path](#import-path)). The action's start waits for that line, in

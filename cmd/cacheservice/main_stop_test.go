@@ -102,6 +102,39 @@ func TestMinIOBinaryStopBoundedExitsOne(t *testing.T) {
 	b.logHas(t, `msg="drain: done" outcome=deadline`, "stopped uncleanly: the shutdown's bound passed with work still running", "held=1")
 }
 
+// The sidecar's stop (zerobull-consulting/dagger#137) runs the service with
+// -drain-timeout 0, and signals it last, after its flush and the engine's
+// stop. A SIGTERM that still finds an export in flight (the engine holds its
+// chain) ends in a clean stop all the same: no drain waits for the export,
+// the shutdown cancels it, and the process exits 0 within shutdownGrace.
+func TestMinIOBinaryNoDrainStopWithExportInFlightExitsZero(t *testing.T) {
+	b := startBinary(t, "-drain-timeout", "0")
+	b.build()
+	release := b.cache.Hold()
+	defer release()
+	b.postSpans("session-1", true)
+	b.waitFor(10*time.Second, "the export to be in flight", func() bool { return b.cache.InFlight() == 1 })
+	b.signal()
+	code, took := b.waitExitCode(2 * shutdownGrace)
+	if code != 0 {
+		t.Fatalf("exit %d after a SIGTERM with an export in flight and -drain-timeout 0, want 0", code)
+	}
+	if took > shutdownGrace {
+		t.Fatalf("the stop took %s, past the shutdown's bound %s", took, shutdownGrace)
+	}
+	release()
+	if b.stored() {
+		t.Fatal("the export in flight was stored: the stop drained")
+	}
+	b.logHas(t, "msg=stopping signal=terminated drainTimeout=0s", "msg=stopped took=")
+	if strings.Contains(b.logs.String(), "drain:") {
+		t.Error("the stop with -drain-timeout 0 logged a drain")
+	}
+	if strings.Contains(b.logs.String(), "level=ERROR") {
+		t.Error("the stop with an export in flight logged an error")
+	}
+}
+
 // A clean stop exits 0, within the bound, and logs that it stopped.
 func TestMinIOBinaryCleanStopExitsZero(t *testing.T) {
 	b := startBinary(t, "-drain-timeout", "0")
