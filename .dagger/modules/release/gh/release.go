@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"dagger.io/dagger/core"
 	"dagger/gh/internal/dagger"
 	"fmt"
 	"path"
@@ -187,7 +186,7 @@ func (m *Release) Create(
 
 	{
 		// TODO: use WithFiles
-		dir := core.NewDirectory()
+		dir := dag.Directory()
 
 		for _, file := range files {
 			dir = dir.WithFile("", file)
@@ -271,7 +270,7 @@ func (m *Release) update(
 	ctr = ctr.WithExec(args)
 
 	if len(files) > 0 {
-		dir := core.NewDirectory()
+		dir := dag.Directory()
 		for _, file := range files {
 			dir = dir.WithFile("", file)
 		}

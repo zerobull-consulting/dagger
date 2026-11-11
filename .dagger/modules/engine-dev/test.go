@@ -9,16 +9,13 @@ import (
 	"time"
 
 	"dagger/engine-dev/internal/dagger"
-	clidev "dagger/engine-dev/internal/dagger/clients/cli-dev"
-	gomod "dagger/engine-dev/internal/dagger/clients/go"
 
-	"dagger.io/dagger/core"
 	"github.com/dagger/dagger/engine/distconsts"
 )
 
 // List all core engine tests
 func (dev *EngineDev) Tests(ctx context.Context) (string, error) {
-	return gomod.New(gomod.GoOpts{Source: dev.Source, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).Tests(ctx)
+	return dag.Go(dagger.GoOpts{Source: dev.Source, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).Tests(ctx)
 }
 
 // Run core engine tests
@@ -505,7 +502,7 @@ func (dev *EngineDev) testContainer(ctx context.Context, ebpfProgs []string, wcp
 		return nil, nil, err
 	}
 
-	devBinary := clidev.New(clidev.CliDevOpts{Source: dev.cliDevSource(), VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).Binary()
+	devBinary := dag.DaggerCli(dagger.DaggerCliOpts{VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws}).Binary()
 	// This creates an engine.tar container file that can be used by the integration tests.
 	// In particular, it is used by core/integration/remotecache_test.go to create a
 	// dev engine that can be used to test remote caching.
@@ -513,7 +510,7 @@ func (dev *EngineDev) testContainer(ctx context.Context, ebpfProgs []string, wcp
 	// run dagger queries.
 
 	// These are used by core/integration/remotecache_test.go
-	testEngineUtils := core.NewDirectory().
+	testEngineUtils := dag.Directory().
 		WithFile("engine.tar", devEngine.AsTarball()).
 		WithFile("dagger", devBinary, dagger.DirectoryWithFileOpts{
 			Permissions: 0o755,
@@ -531,14 +528,14 @@ func (dev *EngineDev) testContainer(ctx context.Context, ebpfProgs []string, wcp
 		engineArgs = append(engineArgs, "--wcprof")
 	}
 
-	engineRunVol := core.NewCacheVolume("dagger-dev-engine-test-varrun" + rand.Text())
+	engineRunVol := dag.CacheVolume("dagger-dev-engine-test-varrun" + rand.Text())
 	registrySvc := registry()
 	devEngineSvc := devEngine.
 		WithServiceBinding("registry", registrySvc).
 		WithServiceBinding("privateregistry", privateRegistry()).
 		WithExposedPort(1234, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
 		WithExposedPort(6060, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
-		WithMountedCache(distconsts.EngineDefaultStateDir, core.NewCacheVolume("dagger-dev-engine-test-state"+rand.Text())).
+		WithMountedCache(distconsts.EngineDefaultStateDir, dag.CacheVolume("dagger-dev-engine-test-state"+rand.Text())).
 		WithMountedCache("/run", engineRunVol).
 		AsService(dagger.ContainerAsServiceOpts{
 			Args:                     engineArgs,
@@ -554,7 +551,7 @@ func (dev *EngineDev) testContainer(ctx context.Context, ebpfProgs []string, wcp
 	}
 
 	utilDirPath := "/dagger-dev"
-	goToolchain := gomod.New(gomod.GoOpts{Source: dev.Source, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws,
+	goToolchain := dag.Go(dagger.GoOpts{Source: dev.Source, VcsCommit: dev.VCSCommit, VcsDirty: dev.VCSDirty, Ws: dev.Ws,
 		// Exercise real client-managed agents and encrypted key loading.
 		ExtraPackages: []string{"openssh-client", "curl"},
 	})
@@ -587,7 +584,7 @@ func testLdflags(values []string) string {
 }
 
 func registry() *dagger.Service {
-	return core.NewContainer().
+	return dag.Container().
 		From("registry:2").
 		WithExposedPort(5000, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
 		AsService(dagger.ContainerAsServiceOpts{UseEntrypoint: true})
@@ -595,7 +592,7 @@ func registry() *dagger.Service {
 
 func privateRegistry() *dagger.Service {
 	const htpasswd = "john:$2y$05$/iP8ud0Fs8o3NLlElyfVVOp6LesJl3oRLYoc3neArZKWX10OhynSC" //nolint:gosec
-	return core.NewContainer().
+	return dag.Container().
 		From("registry:2").
 		WithNewFile("/auth/htpasswd", htpasswd).
 		WithEnvVariable("REGISTRY_AUTH", "htpasswd").

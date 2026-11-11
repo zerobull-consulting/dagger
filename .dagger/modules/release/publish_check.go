@@ -12,10 +12,7 @@ import (
 	"time"
 
 	"dagger/release/internal/dagger"
-	enginedev "dagger/release/internal/dagger/clients/engine-dev"
-	"dagger/release/internal/dagger/clients/wolfi"
 
-	"dagger.io/dagger/core"
 	"golang.org/x/mod/semver"
 	"sigs.k8s.io/yaml"
 )
@@ -26,10 +23,6 @@ const (
 	publishCheckRegistryAddress = "registry:5000"
 	publishCheckRegistryImage   = publishCheckRegistryAddress + "/dagger/engine"
 	publishCheckEngineStateDir  = "/var/lib/dagger"
-
-	// publishCheckEngineCLIPath is where an engine image keeps the dagger CLI
-	// of its own version.
-	publishCheckEngineCLIPath = "/usr/local/bin/dagger"
 )
 
 type publishCheckEnv struct {
@@ -40,9 +33,6 @@ type publishCheckEnv struct {
 	releaseVersion string
 	commit         string
 	moduleRef      string
-
-	// releaseEngineImage is the engine image release runs on.
-	releaseEngineImage string
 
 	awsBucket                 string
 	awsCloudfrontDistribution string
@@ -79,11 +69,6 @@ func (r *Release) PublishWithMockEndpoints(
 	// +defaultPath="/"
 	source *dagger.Directory,
 ) (rerr error) {
-	// A failure below reports the release report first; check that it does.
-	if err := checkReportFirst(); err != nil {
-		return err
-	}
-
 	env, err := newPublishCheckEnv(ctx, source.WithoutDirectory(".git"), r.Workspace)
 	if err != nil {
 		return err
@@ -137,12 +122,6 @@ func (r *Release) PublishWithMockEndpoints(
 		return err
 	}
 	if err := requireContains(initialOut, "- [x] 🚗 CLI", "initial main publish should publish the CLI"); err != nil {
-		return err
-	}
-	if err := requireContains(initialOut, "- [x] 🐹 Go SDK", "initial main publish should publish the Go SDK"); err != nil {
-		return err
-	}
-	if err := requireContains(initialOut, "- [x] 🐘 PHP SDK", "initial main publish should publish the PHP SDK"); err != nil {
 		return err
 	}
 	if err := env.assertPublishOrder(ctx, "main", initialStart); err != nil {
@@ -306,10 +285,6 @@ func newPublishCheckEnv(ctx context.Context, source *dagger.Directory, ws *dagge
 	if err != nil {
 		return nil, err
 	}
-	releaseEngineImage, err := publishWorkflowEngineImage(ctx, source)
-	if err != nil {
-		return nil, err
-	}
 
 	// A stable release reads release notes from a changelog file per published
 	// component: the root .changes/<tag>.md for the engine and CLI (cli-dev's
@@ -349,17 +324,16 @@ func newPublishCheckEnv(ctx context.Context, source *dagger.Directory, ws *dagge
 	}
 
 	env := &publishCheckEnv{
-		source:             source,
-		workspace:          ws,
-		releaseTag:         releaseTag,
-		releaseVersion:     releaseVersion,
-		releaseEngineImage: releaseEngineImage,
-		awsBucket:          "dagger-release-test-" + strings.ToLower(randomID()),
-		platform:           platform,
-		platformArchive:    platformArchive,
+		source:          source,
+		workspace:       ws,
+		releaseTag:      releaseTag,
+		releaseVersion:  releaseVersion,
+		awsBucket:       "dagger-release-test-" + strings.ToLower(randomID()),
+		platform:        platform,
+		platformArchive: platformArchive,
 	}
 
-	gitSetup := core.NewContainer().
+	gitSetup := dag.Container().
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "git"}).
 		WithDirectory("/root/repo", source).
@@ -416,8 +390,8 @@ git rev-parse HEAD
 
 	// The registry's storage lives on a cache volume so assertPublishOrder can
 	// read when each engine tag was pushed.
-	env.registryStorage = core.NewCacheVolume("release-registry-storage-" + randomID())
-	env.registrySvc = core.NewContainer().
+	env.registryStorage = dag.CacheVolume("release-registry-storage-" + randomID())
+	env.registrySvc = dag.Container().
 		From("registry:3").
 		WithMountedCache("/var/lib/registry", env.registryStorage).
 		WithNewFile("/auth/htpasswd", publishCheckRegistryUser+":$2y$05$/iP8ud0Fs8o3NLlElyfVVOp6LesJl3oRLYoc3neArZKWX10OhynSC").
@@ -427,12 +401,12 @@ git rev-parse HEAD
 		WithExposedPort(5000, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
 		AsService()
 
-	env.motoSvc = core.NewContainer().
+	env.motoSvc = dag.Container().
 		From("motoserver/moto:latest").
 		WithExposedPort(5000, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
 		AsService(dagger.ContainerAsServiceOpts{UseEntrypoint: true})
 
-	env.verdaccio = core.NewContainer().
+	env.verdaccio = dag.Container().
 		From("verdaccio/verdaccio:5").
 		WithNewFile("/verdaccio/conf/config.yaml", verdaccioConfig).
 		WithExposedPort(4873, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
@@ -440,8 +414,8 @@ git rev-parse HEAD
 
 	env.certs = newReleaseCheckCerts("ca")
 	githubCert, githubKey := env.certs.newServerCerts("github.test")
-	env.mockRecords = core.NewCacheVolume("release-mock-records-" + randomID())
-	env.mockSvc = core.NewContainer().
+	env.mockRecords = dag.CacheVolume("release-mock-records-" + randomID())
+	env.mockSvc = dag.Container().
 		From("python:3.12-alpine").
 		WithMountedFile("/certs/github.test.crt", githubCert).
 		WithMountedFile("/certs/github.test.key", githubKey).
@@ -483,7 +457,7 @@ func publishCheckRelease(ctx context.Context, source *dagger.Directory) (tag, ve
 }
 
 func (env *publishCheckEnv) releaseEngine(ctx context.Context) (*dagger.Service, error) {
-	dev := enginedev.New(env.workspace, enginedev.EngineDevOpts{
+	dev := dag.EngineDev(env.workspace, dagger.EngineDevOpts{
 		SubnetNumber: 90,
 	}).IncrementSubnet()
 	networkCIDR, err := dev.NetworkCidr(ctx)
@@ -491,12 +465,9 @@ func (env *publishCheckEnv) releaseEngine(ctx context.Context) (*dagger.Service,
 		return nil, err
 	}
 
-	// Release runs on the engine the Publish workflow publishes with, not on
-	// one built from the tree: that is the engine a real publish runs on.
-	// This replaces the image's default engine.json, so keep a docker.io
+	// This replaces engine-dev's default engine.json, so keep its docker.io
 	// mirror: without it the release engine pulls straight from Docker Hub.
-	engineCtr := core.NewContainer().
-		From(env.releaseEngineImage).
+	engineCtr := dev.Container().
 		WithNewFile("/etc/dagger/engine.json", `{
   "registries": {
     "docker.io": {
@@ -514,7 +485,7 @@ func (env *publishCheckEnv) releaseEngine(ctx context.Context) (*dagger.Service,
 		WithServiceBinding("mock", env.mockSvc).
 		WithServiceBinding("github.test", env.mockSvc).
 		WithExposedPort(1234, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
-		WithMountedCache(publishCheckEngineStateDir, core.NewCacheVolume("release-publish-nested-engine-state-"+randomID()), dagger.ContainerWithMountedCacheOpts{
+		WithMountedCache(publishCheckEngineStateDir, dag.CacheVolume("release-publish-nested-engine-state-"+randomID()), dagger.ContainerWithMountedCacheOpts{
 			Sharing: dagger.CacheSharingModeLocked,
 		})
 
@@ -529,16 +500,10 @@ func (env *publishCheckEnv) releaseEngine(ctx context.Context) (*dagger.Service,
 	}), nil
 }
 
-// client is a container with the CLI of the release engine's version, bound
-// to engine.
-func (env *publishCheckEnv) client(ctx context.Context, engine *dagger.Service) (*dagger.Container, error) {
-	endpoint, err := engine.Endpoint(ctx, dagger.ServiceEndpointOpts{Port: 1234, Scheme: "tcp"})
-	if err != nil {
-		return nil, err
-	}
-	cli := core.NewContainer().From(env.releaseEngineImage).File(publishCheckEngineCLIPath)
-	return wolfi.New().
-		Container(wolfi.WolfiContainerOpts{
+func (env *publishCheckEnv) client(engine *dagger.Service) *dagger.Container {
+	dev := dag.EngineDev(env.workspace)
+	client := dag.Wolfi().
+		Container(dagger.WolfiContainerOpts{
 			Packages: []string{"apk-tools", "ca-certificates", "curl", "git"},
 		}).
 		WithEnvVariable("HOME", "/root").
@@ -550,35 +515,12 @@ func (env *publishCheckEnv) client(ctx context.Context, engine *dagger.Service) 
 		WithServiceBinding("verdaccio", env.verdaccio).
 		WithServiceBinding("mock", env.mockSvc).
 		WithServiceBinding("github.test", env.mockSvc).
-		WithMountedFile("/github-ca.pem", env.certs.caRootCert).
-		WithServiceBinding("dagger-engine", engine).
-		WithEnvVariable("_EXPERIMENTAL_DAGGER_RUNNER_HOST", endpoint).
-		WithMountedFile("/.dagger-cli", cli).
-		WithEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", "/.dagger-cli").
-		WithSymlink("/.dagger-cli", "/usr/local/bin/dagger"), nil
-}
+		WithMountedFile("/github-ca.pem", env.certs.caRootCert)
 
-// publishWorkflowEngineImage is the engine image the Publish workflow runs
-// release on: the dagger version .github/actions/call runs by default.
-func publishWorkflowEngineImage(ctx context.Context, source *dagger.Directory) (string, error) {
-	const path = ".github/actions/call/action.yml"
-	contents, err := source.File(path).Contents(ctx)
-	if err != nil {
-		return "", err
-	}
-	var action struct {
-		Inputs map[string]struct {
-			Default string `json:"default"`
-		} `json:"inputs"`
-	}
-	if err := yaml.Unmarshal([]byte(contents), &action); err != nil {
-		return "", fmt.Errorf("parse %s: %w", path, err)
-	}
-	version := action.Inputs["version"].Default
-	if !semver.IsValid(version) {
-		return "", fmt.Errorf("%s: the version input's default %q is not a version", path, version)
-	}
-	return "registry.dagger.io/engine:" + version, nil
+	return dev.InstallClient(dagger.EngineDevInstallClientOpts{
+		Client:  client,
+		Service: engine,
+	})
 }
 
 // runReleasePublish runs release publish for tag in the nested engine.
@@ -589,7 +531,7 @@ func publishWorkflowEngineImage(ctx context.Context, source *dagger.Directory) (
 // the local registry with it.
 func (env *publishCheckEnv) runReleasePublish(ctx context.Context, engine *dagger.Service, tag, registryPassword, tokenSuffix string) (string, error) {
 	script := `set +e
-	env -u DAGGER_SESSION_PORT -u DAGGER_SESSION_TOKEN dagger --progress=plain -W "$MODULE_REF" call release publish \
+	dagger --progress=plain -W "$MODULE_REF" call release publish \
   --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" \
   --registry-image "` + publishCheckRegistryImage + `" \
   --registry-username "` + publishCheckRegistryUser + `" \
@@ -624,20 +566,16 @@ cat /tmp/publish.log
 exit "$status"
 `
 
-	client, err := env.client(ctx, engine)
-	if err != nil {
-		return "", err
-	}
-	out, err := client.
-		WithSecretVariable("REGISTRY_PASSWORD", core.SetSecret("release-registry-password-"+randomID(), registryPassword)).
-		WithSecretVariable("FAKE_GITHUB_TOKEN", core.SetSecret("fake-github-token-"+randomID(), publishCheckRegistryPass)).
-		WithSecretVariable("FAKE_NETLIFY_TOKEN", core.SetSecret("fake-netlify-token-"+randomID(), "fake-netlify-token"+tokenSuffix)).
-		WithSecretVariable("FAKE_PYPI_TOKEN", core.SetSecret("fake-pypi-token-"+randomID(), "fake-pypi-token"+tokenSuffix)).
-		WithSecretVariable("FAKE_NPM_TOKEN", core.SetSecret("fake-npm-token-"+randomID(), "fake-npm-token"+tokenSuffix)).
-		WithSecretVariable("FAKE_HEX_API_KEY", core.SetSecret("fake-hex-api-key-"+randomID(), "fake-hex-api-key"+tokenSuffix)).
-		WithSecretVariable("FAKE_CARGO_REGISTRY_TOKEN", core.SetSecret("fake-cargo-token-"+randomID(), "fake-cargo-token"+tokenSuffix)).
-		WithSecretVariable("AWS_ACCESS_KEY_ID", core.SetSecret("fake-aws-access-key-"+randomID(), "test"+tokenSuffix)).
-		WithSecretVariable("AWS_SECRET_ACCESS_KEY", core.SetSecret("fake-aws-secret-key-"+randomID(), "test"+tokenSuffix)).
+	out, err := env.client(engine).
+		WithSecretVariable("REGISTRY_PASSWORD", dag.SetSecret("release-registry-password-"+randomID(), registryPassword)).
+		WithSecretVariable("FAKE_GITHUB_TOKEN", dag.SetSecret("fake-github-token-"+randomID(), publishCheckRegistryPass)).
+		WithSecretVariable("FAKE_NETLIFY_TOKEN", dag.SetSecret("fake-netlify-token-"+randomID(), "fake-netlify-token"+tokenSuffix)).
+		WithSecretVariable("FAKE_PYPI_TOKEN", dag.SetSecret("fake-pypi-token-"+randomID(), "fake-pypi-token"+tokenSuffix)).
+		WithSecretVariable("FAKE_NPM_TOKEN", dag.SetSecret("fake-npm-token-"+randomID(), "fake-npm-token"+tokenSuffix)).
+		WithSecretVariable("FAKE_HEX_API_KEY", dag.SetSecret("fake-hex-api-key-"+randomID(), "fake-hex-api-key"+tokenSuffix)).
+		WithSecretVariable("FAKE_CARGO_REGISTRY_TOKEN", dag.SetSecret("fake-cargo-token-"+randomID(), "fake-cargo-token"+tokenSuffix)).
+		WithSecretVariable("AWS_ACCESS_KEY_ID", dag.SetSecret("fake-aws-access-key-"+randomID(), "test"+tokenSuffix)).
+		WithSecretVariable("AWS_SECRET_ACCESS_KEY", dag.SetSecret("fake-aws-secret-key-"+randomID(), "test"+tokenSuffix)).
 		WithEnvVariable("MODULE_REF", env.moduleRef).
 		WithEnvVariable("RELEASE_TAG", tag).
 		WithEnvVariable("RELEASE_COMMIT", env.commit).
@@ -655,7 +593,7 @@ exit "$status"
 }
 
 func (env *publishCheckEnv) gitStdout(ctx context.Context, script string) (string, error) {
-	out, err := core.NewContainer().
+	out, err := dag.Container().
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "git"}).
 		With(gitUserConfig).
@@ -676,7 +614,7 @@ func (env *publishCheckEnv) gitStdout(ctx context.Context, script string) (strin
 }
 
 func (env *publishCheckEnv) gitWorktreeStdout(ctx context.Context, script string) (string, error) {
-	out, err := core.NewContainer().
+	out, err := dag.Container().
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "git"}).
 		With(gitUserConfig).
@@ -700,7 +638,7 @@ func (env *publishCheckEnv) awsCLI(opts ...dagger.ContainerOpts) *dagger.Contain
 	if len(opts) > 0 {
 		containerOpts = opts[0]
 	}
-	return core.NewContainer(containerOpts).
+	return dag.Container(containerOpts).
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "aws-cli", "curl"}).
 		WithServiceBinding("moto", env.motoSvc).
@@ -1392,7 +1330,7 @@ PY
 }
 
 func (env *publishCheckEnv) assertComponentGitHubReleases(ctx context.Context) error {
-	_, err := core.NewContainer().
+	_, err := dag.Container().
 		From("python:3.12-alpine").
 		WithMountedCache("/records", env.mockRecords).
 		WithEnvVariable("RELEASE_TAG", env.releaseTag).
@@ -1706,7 +1644,7 @@ func (env *publishCheckEnv) assertPackageRegistryRequests(
 	if isPrerelease {
 		prerelease = "1"
 	}
-	_, err := core.NewContainer().
+	_, err := dag.Container().
 		From("python:3.12-alpine").
 		WithMountedCache("/records", env.mockRecords).
 		WithEnvVariable("RELEASE_VERSION", env.releaseVersion).
@@ -1817,7 +1755,7 @@ need(any(e.get("kind") == "cargo_config" for e in events), "Cargo should fetch r
 }
 
 func (env *publishCheckEnv) mockEvents(ctx context.Context) (string, error) {
-	events, err := core.NewContainer().
+	events, err := dag.Container().
 		From("alpine:latest").
 		WithMountedCache("/records", env.mockRecords).
 		WithEnvVariable("MOCK_EVENTS_CACHE_BUSTER", randomID()).
@@ -1834,12 +1772,12 @@ func (env *publishCheckEnv) assertRegistryTags(ctx context.Context) error {
 	if semver.Prerelease(env.releaseTag) != "" {
 		isPrerelease = "1"
 	}
-	tags, err := core.NewContainer().
+	tags, err := dag.Container().
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "curl"}).
 		WithServiceBinding("registry", env.registrySvc).
 		WithEnvVariable("REGISTRY_USERNAME", publishCheckRegistryUser).
-		WithSecretVariable("REGISTRY_PASSWORD", core.SetSecret("registry-list-password-"+randomID(), publishCheckRegistryPass)).
+		WithSecretVariable("REGISTRY_PASSWORD", dag.SetSecret("registry-list-password-"+randomID(), publishCheckRegistryPass)).
 		WithExec([]string{"sh", "-ec", `curl -fsS -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" http://registry:5000/v2/dagger/engine/tags/list`}).
 		Stdout(ctx)
 	if err != nil {
@@ -1861,11 +1799,11 @@ func (env *publishCheckEnv) assertRegistryTags(ctx context.Context) error {
 			return err
 		}
 	}
-	craneCtr := core.NewContainer(dagger.ContainerOpts{Platform: env.platform}).
+	craneCtr := dag.Container(dagger.ContainerOpts{Platform: env.platform}).
 		From("gcr.io/go-containerregistry/crane:debug").
 		WithServiceBinding("registry", env.registrySvc).
 		WithEnvVariable("REGISTRY_USERNAME", publishCheckRegistryUser).
-		WithSecretVariable("REGISTRY_PASSWORD", core.SetSecret("registry-manifest-password-"+randomID(), publishCheckRegistryPass)).
+		WithSecretVariable("REGISTRY_PASSWORD", dag.SetSecret("registry-manifest-password-"+randomID(), publishCheckRegistryPass)).
 		WithEnvVariable("RELEASE_TAG", env.releaseTag).
 		WithEnvVariable("IS_PRERELEASE", isPrerelease)
 
@@ -1935,7 +1873,7 @@ set -eu
 	crane export --insecure --platform linux/amd64 "registry:5000/dagger/engine:$RELEASE_TAG-gpu" - | tar -xOf - usr/local/bin/dagger-engine > /tmp/engine-binaries/gpu-linux-amd64
 	`}).
 		Directory("/tmp/engine-binaries")
-	_, err = core.NewContainer().
+	_, err = dag.Container().
 		From("python:3.12-alpine").
 		WithDirectory("/engine-binaries", engineBinaries).
 		WithExec([]string{"python", "-c", `
@@ -1974,11 +1912,11 @@ check_elf("gpu-linux-amd64", 62)
 }
 
 func (env *publishCheckEnv) assertEngineVersion(ctx context.Context) error {
-	version, err := core.NewContainer(dagger.ContainerOpts{Platform: env.platform}).
+	version, err := dag.Container(dagger.ContainerOpts{Platform: env.platform}).
 		From("gcr.io/go-containerregistry/crane:debug").
 		WithServiceBinding("registry", env.registrySvc).
 		WithEnvVariable("REGISTRY_USERNAME", publishCheckRegistryUser).
-		WithSecretVariable("REGISTRY_PASSWORD", core.SetSecret("registry-crane-password-"+randomID(), publishCheckRegistryPass)).
+		WithSecretVariable("REGISTRY_PASSWORD", dag.SetSecret("registry-crane-password-"+randomID(), publishCheckRegistryPass)).
 		WithExec([]string{"sh", "-ec", "crane auth login registry:5000 --insecure --username \"$REGISTRY_USERNAME\" --password \"$REGISTRY_PASSWORD\" && crane export --insecure --platform " + string(env.platform) + " registry:5000/dagger/engine:" + env.releaseTag + " - | tar -xOf - usr/local/bin/dagger-engine > /tmp/dagger-engine && chmod +x /tmp/dagger-engine && /tmp/dagger-engine --version"}).
 		Stdout(ctx)
 	if err != nil {
@@ -2022,7 +1960,7 @@ func (env *publishCheckEnv) assertNpmVersion(
 		distTag = strings.SplitN(env.releaseVersion, "-", 2)[1]
 		distTag = strings.SplitN(distTag, ".", 2)[0]
 	}
-	_, err := core.NewContainer().
+	_, err := dag.Container().
 		From("node:20-alpine").
 		WithServiceBinding("verdaccio", env.verdaccio).
 		WithEnvVariable("RELEASE_VERSION", env.releaseVersion).
@@ -2084,12 +2022,12 @@ JS
 }
 
 func (env *publishCheckEnv) assertHelmTags(ctx context.Context) error {
-	tags, err := core.NewContainer().
+	tags, err := dag.Container().
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "curl"}).
 		WithServiceBinding("registry", env.registrySvc).
 		WithEnvVariable("REGISTRY_USERNAME", publishCheckRegistryUser).
-		WithSecretVariable("REGISTRY_PASSWORD", core.SetSecret("registry-helm-list-password-"+randomID(), publishCheckRegistryPass)).
+		WithSecretVariable("REGISTRY_PASSWORD", dag.SetSecret("registry-helm-list-password-"+randomID(), publishCheckRegistryPass)).
 		WithExec([]string{"sh", "-ec", `curl -fsS -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" http://registry:5000/v2/dagger/dagger-helm/tags/list`}).
 		Stdout(ctx)
 	if err != nil {
@@ -2099,12 +2037,12 @@ func (env *publishCheckEnv) assertHelmTags(ctx context.Context) error {
 		return err
 	}
 
-	_, err = core.NewContainer(dagger.ContainerOpts{Platform: env.platform}).
+	_, err = dag.Container(dagger.ContainerOpts{Platform: env.platform}).
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "curl", "python3"}).
 		WithServiceBinding("registry", env.registrySvc).
 		WithEnvVariable("REGISTRY_USERNAME", publishCheckRegistryUser).
-		WithSecretVariable("REGISTRY_PASSWORD", core.SetSecret("registry-helm-password-"+randomID(), publishCheckRegistryPass)).
+		WithSecretVariable("REGISTRY_PASSWORD", dag.SetSecret("registry-helm-password-"+randomID(), publishCheckRegistryPass)).
 		WithEnvVariable("RELEASE_VERSION", env.releaseVersion).
 		WithExec([]string{"sh", "-ec", `
 	set -eu
@@ -2216,7 +2154,7 @@ server {
 		RepoURL:    "http://" + hostname + "/repo",
 	})
 
-	svc := core.NewContainer().
+	svc := dag.Container().
 		From("nginx").
 		WithExec([]string{"sh", "-lc", `
 set -eux
@@ -2251,7 +2189,7 @@ type releaseCheckCerts struct {
 
 func newReleaseCheckCerts(caHostname string) *releaseCheckCerts {
 	const password = "hunter4"
-	ctr := core.NewContainer().
+	ctr := dag.Container().
 		From("alpine:latest").
 		WithExec([]string{"apk", "add", "openssl"}).
 		WithExec([]string{"openssl", "genrsa", "-des3", "-out", "/ca.key", "-passout", "pass:" + password, "2048"}).
@@ -2292,7 +2230,7 @@ DNS.1 = %s
 }
 
 func publishCheckPlatform(ctx context.Context) (dagger.Platform, string, error) {
-	defaultPlatform, err := core.DefaultPlatform(ctx)
+	defaultPlatform, err := dag.DefaultPlatform(ctx)
 	if err != nil {
 		return "", "", err
 	}
@@ -2333,88 +2271,14 @@ func serviceHost(rawURL string) (string, error) {
 
 func requireContains(haystack, needle, msg string) error {
 	if !strings.Contains(haystack, needle) {
-		return fmt.Errorf("%s: missing %q\n%s", msg, needle, withReportFirst(haystack))
+		return fmt.Errorf("%s: missing %q in:\n%s", msg, needle, haystack)
 	}
 	return nil
 }
 
 func requireNotContains(haystack, needle, msg string) error {
 	if strings.Contains(haystack, needle) {
-		return fmt.Errorf("%s: found %q\n%s", msg, needle, withReportFirst(haystack))
-	}
-	return nil
-}
-
-// reportLimit caps the report lines withReportFirst puts first.
-const reportLimit = 8 << 10
-
-// withReportFirst is a publish's output with the release report's own lines
-// first: its checklist ("- [x] …", "- [ ] …") and its error blocks ("> …"),
-// which say which artifact failed and why. The output before the report, a
-// publish's progress, is long, and a view of the error shows only its start.
-// An error block quotes its message in a fence, "> ```", of which
-// report.md.tmpl prefixes only the first line: every line inside the fence is
-// the message's.
-func withReportFirst(output string) string {
-	var report []string
-	inFence := false
-	for _, line := range strings.Split(output, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "> ```" {
-			inFence = !inFence
-			report = append(report, trimmed)
-			continue
-		}
-		if inFence || strings.HasPrefix(trimmed, "- [") || strings.HasPrefix(trimmed, ">") {
-			report = append(report, trimmed)
-		}
-	}
-	lines := strings.Join(report, "\n")
-	if lines == "" {
-		lines = "(none)"
-	}
-	if len(lines) > reportLimit {
-		lines = lines[:reportLimit] + "\n…"
-	}
-	return "release report:\n" + lines + "\nin:\n" + output
-}
-
-// checkReportFirst checks that withReportFirst puts a report's checklist and
-// a multi-line error's every line before the progress that comes ahead of
-// them, so a failing publish check names its cause where it's seen.
-func checkReportFirst() error {
-	output := strings.Join([]string{
-		"1   : connect",
-		"2   : progress of the publish",
-		"Published:",
-		"- [x] 🚙 Engine",
-		"- [ ] 🐍 Python SDK",
-		"> [!CAUTION]",
-		"> Error while publishing 🐍 Python SDK:",
-		">",
-		"> ```",
-		"> first line of the error",
-		"second line of the error",
-		"> ```",
-		"after the report",
-	}, "\n")
-	got := withReportFirst(output)
-	report, _, ok := strings.Cut(got, "\nin:\n")
-	if !ok {
-		return fmt.Errorf("withReportFirst: no full output after the report:\n%s", got)
-	}
-	for _, want := range []string{"- [ ] 🐍 Python SDK", "> Error while publishing 🐍 Python SDK:", "> first line of the error", "second line of the error"} {
-		if !strings.Contains(report, want) {
-			return fmt.Errorf("withReportFirst: the report lacks %q:\n%s", want, report)
-		}
-	}
-	for _, unwanted := range []string{"progress of the publish", "after the report"} {
-		if strings.Contains(report, unwanted) {
-			return fmt.Errorf("withReportFirst: the report holds %q:\n%s", unwanted, report)
-		}
-	}
-	if !strings.HasSuffix(got, output) {
-		return fmt.Errorf("withReportFirst: the full output doesn't follow the report:\n%s", got)
+		return fmt.Errorf("%s: found %q in:\n%s", msg, needle, haystack)
 	}
 	return nil
 }

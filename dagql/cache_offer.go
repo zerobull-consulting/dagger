@@ -5,8 +5,6 @@ import (
 	"errors"
 	"reflect"
 	"slices"
-
-	"github.com/dagger/dagger/engine/wcprof"
 )
 
 type OfferOutcome uint8
@@ -25,11 +23,6 @@ type OfferDisposition struct {
 	Replaced bool
 	OfferRev uint64
 	Err      error
-	// Target is the row the offer's address resolved to, the receiver or a
-	// descendant, and TargetAddress the address re-rooted at it. Target is 0
-	// for an offer refused before its address resolved.
-	Target        uint64
-	TargetAddress PersistedPartAddress
 	// Replacements and Deps are the receiver's replacement count and direct
 	// dependencies, read under the lock that decided Outcome: the value state
 	// the outcome describes.
@@ -87,7 +80,7 @@ func (c *Cache) OfferParts(ctx context.Context, receiver AnyResult, offers []Clo
 		return unavailableOffers(offers, err), err
 	}
 	root := receiver.cacheSharedResult()
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	if c.resultsByID[root.id] != root || root.attachmentState() != resultAttachmentClean {
 		c.egraphMu.Unlock()
 		err := errors.New("offer: receiver is unavailable")
@@ -174,7 +167,7 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 		if capture := captures[id]; capture != nil {
 			return capture.record, true
 		}
-		wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+		c.egraphMu.Lock()
 		row := c.resultsByID[sharedResultID(id)]
 		if row == nil || row.attachmentState() != resultAttachmentClean {
 			c.egraphMu.Unlock()
@@ -216,7 +209,6 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 		return out
 	}
 	offer.Address = address
-	out.Target, out.TargetAddress = id, clonePartAddress(address)
 	capture := captures[id]
 	row := capture.row
 	probes, err := describePartRecord(capture.record)
@@ -257,7 +249,7 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 	}
 	key, _ := partAddressKey(address)
 	// A preparation hold protects references across the two E sections.
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	var owner *offerOwner
 	old := row.partOfferLocked(key)
 	if old != nil && sameOfferMeaning(old.record, offer) {
@@ -278,7 +270,7 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 			return
 		}
 		cleanupCtx := context.WithoutCancel(ctx)
-		wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+		c.egraphMu.Lock()
 		queue, err := c.releaseOfferOwnerLocked(cleanupCtx, owner)
 		callbacks, collectErr := c.collectUnownedResultsLocked(cleanupCtx, queue)
 		c.egraphMu.Unlock()
@@ -297,7 +289,7 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 	if c.testOfferBeforeDecision != nil {
 		c.testOfferBeforeDecision(root)
 	}
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	gate := row.partGate.loadOrCreate()
 	gate.mu.Lock()
 	out.Outcome = offerGateOutcomeLocked(gate, address)
@@ -322,16 +314,6 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 		row.noteCloudCopyLocked(item.CloudNumber, item.CloudStored, item.CloudExpiresAtUnix)
 	}
 	var queue collectionQueue
-	// accepted is the offer this call attached, for prefetching.
-	var accepted *partOffer
-	if out.Outcome == OfferAccepted {
-		if _, image := row.imageHoldingLocked(); image != nil {
-			// The engine image ships the row and offers its parts from the
-			// engine's own disk: the Cloud's offer is left out, and the row
-			// takes no Cloud holding from it.
-			out.Outcome = OfferUnavailable
-		}
-	}
 	if out.Outcome == OfferAccepted {
 		current := row.partOfferLocked(key)
 		if current != old {
@@ -350,9 +332,6 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 				}
 				transferred = row.partOfferLocked(key) == next
 				out.Replaced = transferred && current != nil
-				if transferred {
-					accepted = next
-				}
 				if !transferred {
 					out.Outcome = OfferInvalid
 				}
@@ -370,9 +349,6 @@ func (c *Cache) offerPart(ctx context.Context, root *sharedResult, item CloudPar
 	callbacks, collectErr := c.collectUnownedResultsLocked(context.WithoutCancel(ctx), queue)
 	c.egraphMu.Unlock()
 	out.Err = errors.Join(out.Err, collectErr, runOnReleaseFuncs(context.WithoutCancel(ctx), callbacks))
-	if accepted != nil && out.Outcome == OfferAccepted {
-		c.partOfferAccepted(ctx, row, key, accepted)
-	}
 	return out
 }
 

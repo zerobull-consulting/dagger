@@ -47,14 +47,7 @@ import (
 type Directory struct {
 	filesystemOutput
 	transferPending *persistedDirectoryPayload
-	// transferShell is set when the directory decoded from another engine's
-	// record without its recipe, and never changes after.
-	transferShell bool
-	// completedElsewhere is set when the directory decoded from another
-	// engine's record of an operation that completed there, and never
-	// changes after.
-	completedElsewhere bool
-	Platform           Platform
+	Platform        Platform
 	// Services necessary to provision the directory.
 	Services ServiceBindings
 
@@ -342,11 +335,6 @@ func (dir *Directory) persistedPayloadLocked(ctx context.Context, enc *dagql.Per
 	}
 	if dir.Lazy != nil {
 		payload.Form = persistedDirectoryFormLazy
-		if dir.completedElsewhere {
-			// Its operation completed on the engine it came from, though not
-			// here: a record of it says so, as the one it came in did.
-			payload.OperationState = "evaluated"
-		}
 		payload.LazyKind, payload.LazyJSON, err = encodePersistedDirectoryLazy(ctx, enc, dir.Lazy)
 		if err != nil {
 			return persistedDirectoryPayload{}, nil, err
@@ -384,15 +372,6 @@ func decodePersistedDirectoryWithSnapshotRole(ctx context.Context, dec *dagql.Pe
 		dir.OutputRev++ // private decoded output, before publication
 		dir.outputMu.Unlock()
 	}()
-	dir.completedElsewhere = persisted.OperationState == "evaluated"
-	// A record from another engine that holds no download address decodes
-	// as local persistence decodes a pending directory: its recipe armed.
-	if persisted.Form == transferPending && persisted.LazyKind != "" && dec.ArmRecipe() {
-		if err := foreignFamilyCodec("Directory").ValidateForeign(dagql.PersistedPayloadVisit{Payload: payload, Call: dec.Call()}); err != nil {
-			return nil, err
-		}
-		persisted.Form = persistedDirectoryFormLazy
-	}
 	if persisted.Dir != "" && persisted.Form != transferPending {
 		dir.SetPath(persisted.Dir)
 	}
@@ -402,7 +381,6 @@ func decodePersistedDirectoryWithSnapshotRole(ctx context.Context, dec *dagql.Pe
 			return nil, err
 		}
 		dir.transferPending = &persisted
-		dir.transferShell = true
 		if persisted.ValueKnown {
 			dir.SetPath(persisted.Dir)
 		}
@@ -437,15 +415,6 @@ func decodePersistedDirectoryWithSnapshotRole(ctx context.Context, dec *dagql.Pe
 func (*Directory) DecodePersistedObject(ctx context.Context, dec *dagql.PersistDecodeContext, payload json.RawMessage) (dagql.Typed, error) {
 	return decodePersistedDirectoryWithSnapshotRole(ctx, dec, payload, "snapshot")
 }
-
-// PartTransferShell reports whether the directory decoded from another
-// engine's record without its recipe, so that its content comes only through
-// part acquisition.
-func (dir *Directory) PartTransferShell() bool { return dir.transferShell }
-
-// OperationCompletedElsewhere reports whether the directory decoded from
-// another engine's record of an operation that completed there.
-func (dir *Directory) OperationCompletedElsewhere() bool { return dir.completedElsewhere }
 
 func loadCanonicalScratchDirectory(ctx context.Context) (string, bkcache.ImmutableRef, error) {
 	query, err := CurrentQuery(ctx)
@@ -568,7 +537,6 @@ type DirectoryWithNewDirectoryLazy struct {
 }
 
 type DirectorySubdirectoryLazy struct {
-	ResolveBrokenSymlinks bool
 	LazyState
 	Parent dagql.ObjectResult[*Directory]
 	Subdir string
@@ -675,9 +643,8 @@ type persistedDirectoryWithNewDirectoryLazy struct {
 }
 
 type persistedDirectorySubdirectoryLazy struct {
-	ResolveBrokenSymlinks bool   `json:"resolveBrokenSymlinks,omitempty"`
-	ParentResultID        uint64 `json:"parentResultID"`
-	Subdir                string `json:"subdir"`
+	ParentResultID uint64 `json:"parentResultID"`
+	Subdir         string `json:"subdir"`
 }
 
 type persistedDirectoryDiffLazy struct {
@@ -867,7 +834,7 @@ func decodePersistedDirectoryLazy(ctx context.Context, dec *dagql.PersistDecodeC
 		if err != nil {
 			return nil, err
 		}
-		return &ContainerDirectoryLazy{LazyState: NewLazyState(), Parent: parent, Path: persisted.Path, ResolveBrokenSymlinks: persisted.ResolveBrokenSymlinks}, nil
+		return &ContainerDirectoryLazy{LazyState: NewLazyState(), Parent: parent, Path: persisted.Path}, nil
 	case persistedDirectoryLazyKindWithDirectory:
 		var persisted persistedDirectoryWithDirectoryLazy
 		if err := json.Unmarshal(payload, &persisted); err != nil {
@@ -1005,7 +972,7 @@ func decodePersistedDirectoryLazy(ctx context.Context, dec *dagql.PersistDecodeC
 		if err != nil {
 			return nil, err
 		}
-		return &DirectorySubdirectoryLazy{LazyState: NewLazyState(), Parent: parent, Subdir: persisted.Subdir, ResolveBrokenSymlinks: persisted.ResolveBrokenSymlinks}, nil
+		return &DirectorySubdirectoryLazy{LazyState: NewLazyState(), Parent: parent, Subdir: persisted.Subdir}, nil
 	case persistedDirectoryLazyKindDiff:
 		var persisted persistedDirectoryDiffLazy
 		if err := json.Unmarshal(payload, &persisted); err != nil {
@@ -1413,14 +1380,6 @@ func (lazy *DirectorySubdirectoryLazy) Evaluate(ctx context.Context, dir *Direct
 			return fmt.Errorf("failed to get parent directory path: %w", err)
 		}
 
-		if lazy.ResolveBrokenSymlinks {
-			ref, err := lazy.Parent.Self().Snapshot.GetOrEval(ctx, lazy.Parent.Result)
-			if err != nil {
-				return err
-			}
-			return dir.materializeSubdirectory(ctx, ref, parentDir, lazy.Subdir)
-		}
-
 		finalDir := parentDir
 		if cleanDotsAndSlashes(lazy.Subdir) != "" {
 			finalDir = path.Join(parentDir, lazy.Subdir)
@@ -1488,7 +1447,7 @@ func (lazy *DirectorySubdirectoryLazy) EncodePersisted(ctx context.Context, enc 
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(persistedDirectorySubdirectoryLazy{ParentResultID: parentID, Subdir: lazy.Subdir, ResolveBrokenSymlinks: lazy.ResolveBrokenSymlinks})
+	return json.Marshal(persistedDirectorySubdirectoryLazy{ParentResultID: parentID, Subdir: lazy.Subdir})
 }
 
 func (lazy *DirectoryDiffLazy) Evaluate(ctx context.Context, dir *Directory) error {
@@ -1629,16 +1588,6 @@ func (lazy *DirectoryChownLazy) EncodePersisted(ctx context.Context, enc *dagql.
 }
 
 func (dir *Directory) Digest(ctx context.Context, self dagql.ObjectResult[*Directory]) (string, error) {
-	return dir.digest(ctx, self, bkcontenthash.ChecksumOpts{})
-}
-
-// DigestExcluding is Digest without the entries matching excludes, which are
-// patterns relative to the directory.
-func (dir *Directory) DigestExcluding(ctx context.Context, self dagql.ObjectResult[*Directory], excludes []string) (string, error) {
-	return dir.digest(ctx, self, bkcontenthash.ChecksumOpts{ExcludePatterns: excludes})
-}
-
-func (dir *Directory) digest(ctx context.Context, self dagql.ObjectResult[*Directory], opts bkcontenthash.ChecksumOpts) (string, error) {
 	snapshot, err := dir.Snapshot.GetOrEval(ctx, self.Result)
 	if err != nil {
 		return "", fmt.Errorf("failed to evaluate directory: %w", err)
@@ -1655,7 +1604,7 @@ func (dir *Directory) digest(ctx context.Context, self dagql.ObjectResult[*Direc
 		ctx,
 		snapshot,
 		dirPath,
-		opts,
+		bkcontenthash.ChecksumOpts{},
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to compute digest: %w", err)
@@ -2406,100 +2355,15 @@ func cleanDotsAndSlashes(path string) string {
 	return filepath.Join(cleaned...)
 }
 
-// materializeSubdirectory resolves links while the parent is still available.
-// Its new snapshot contains only the selection and the copied link targets.
-func (dir *Directory) materializeSubdirectory(ctx context.Context, source bkcache.ImmutableRef, parentPath, subdir string) error {
-	if source == nil {
-		if cleanDotsAndSlashes(subdir) != "" {
-			return fmt.Errorf("directory %q does not exist", subdir)
-		}
-		root, ref, err := loadCanonicalScratchDirectory(ctx)
-		if err != nil {
-			return err
-		}
-		dir.SetPath(root)
-		dir.SetSnapshot(ref)
-		return nil
-	}
-	return dir.materializeSelection(ctx, func(copier *layercopy.Copier) error {
-		return MountRef(ctx, source, func(root string, _ *mount.Mount) error {
-			// The parent's logical root is the boundary, even when its backing
-			// snapshot still contains siblings from an earlier selection.
-			parentRoot, err := containerdfs.RootPath(root, parentPath)
-			if err != nil {
-				return err
-			}
-			parentRel, err := filepath.Rel(root, parentRoot)
-			if err != nil {
-				return err
-			}
-			parentFile, err := os.OpenInRoot(root, parentRel)
-			if err != nil {
-				return err
-			}
-			defer parentFile.Close()
-			// Pin the boundary before the copy opens it. A replaced parent
-			// pathname must not redirect the copy to another filesystem.
-			parentRoot = fmt.Sprintf("/proc/self/fd/%d", parentFile.Fd())
-			// CopySelection resolves and checks the pinned selection itself.
-			// A separate path check can clean .. before expanding symlinks.
-			err = copier.CopySelection(ctx, parentRoot, subdir)
-			if errors.Is(err, syscall.ENOTDIR) {
-				return notADirectoryError{err}
-			}
-			return TrimErrPathPrefix(err, parentRoot)
-		}, mountRefAsReadOnly)
-	})
-}
-
-func (dir *Directory) materializeSelection(ctx context.Context, copySelection func(*layercopy.Copier) error) error {
-	query, err := CurrentQuery(ctx)
-	if err != nil {
-		return err
-	}
-	ref, err := query.SnapshotManager().New(ctx, nil,
-		bkcache.WithRecordType(bkclient.UsageRecordTypeRegular),
-		bkcache.WithDescription("Directory.directory resolveBrokenSymlinks"))
-	if err != nil {
-		return err
-	}
-	defer ref.Release(context.WithoutCancel(ctx))
-
-	var usage snapshots.Usage
-	err = MountRef(ctx, ref, func(destRoot string, destMount *mount.Mount) error {
-		copier, err := layercopy.NewCopier(layercopy.Mount{Root: destRoot, Mount: destMount})
-		if err != nil {
-			return err
-		}
-		defer copier.Close()
-		if err := copySelection(copier); err != nil {
-			return err
-		}
-		usage, err = copier.Usage()
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	result, err := ref.CommitWithUsage(ctx, usage)
-	if err != nil {
-		return err
-	}
-	dir.SetPath("/")
-	dir.SetSnapshot(result)
-	return nil
-}
-
-func (dir *Directory) Subdirectory(ctx context.Context, parent dagql.ObjectResult[*Directory], subdir string, resolveBrokenSymlinks bool) (*Directory, error) {
+func (dir *Directory) Subdirectory(ctx context.Context, parent dagql.ObjectResult[*Directory], subdir string) (*Directory, error) {
 	_ = ctx
 	return &Directory{
 		Platform: parent.Self().Platform,
 		Services: slices.Clone(parent.Self().Services),
 		Lazy: &DirectorySubdirectoryLazy{
-			ResolveBrokenSymlinks: resolveBrokenSymlinks,
-			LazyState:             NewLazyState(),
-			Parent:                parent,
-			Subdir:                subdir,
+			LazyState: NewLazyState(),
+			Parent:    parent,
+			Subdir:    subdir,
 		},
 		Dir:      new(LazyAccessor[string, *Directory]),
 		Snapshot: new(LazyAccessor[bkcache.ImmutableRef, *Directory]),
@@ -3367,12 +3231,12 @@ func (dir *Directory) WithTimestamps(ctx context.Context, parent dagql.ObjectRes
 		if err != nil {
 			return err
 		}
-		modTime := time.Unix(int64(unix), 0)
 		return filepath.WalkDir(resolvedDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
-			return setTimestampsNoFollow(path, modTime)
+			modTime := time.Unix(int64(unix), 0)
+			return os.Chtimes(path, modTime, modTime)
 		})
 	})
 	if err != nil {

@@ -75,12 +75,8 @@ func (fe *frontendPretty) renderCheckNode(ctx tuist.Context, out TermOutput, r *
 	switch {
 	case node.Failed() && !node.HasFailedChild():
 		if fe.checkDefersToTests(node.Span) {
-			// The tests beneath the check get per-test rendering with rolled-up logs
-			// (richer than the check's raw command output). They may not explain
-			// this check, though: a test run shared by several checks sits under
-			// whichever one started it. So its own error comes first, even when its
-			// origin has a row: the report leaves the rows out.
-			fe.renderSpanErrorMessage(out, r, &dagui.TraceRow{Span: node.Span, Expanded: true, Depth: depth + 1}, strings.Repeat("  ", depth+1))
+			// The check's failures are test cases: render them per-test with
+			// rolled-up logs (richer than the check's raw command output).
 			for _, line := range fe.renderCheckTests(ctx, node.Span, depth) {
 				fmt.Fprintln(out, line)
 			}

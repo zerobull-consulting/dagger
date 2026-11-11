@@ -1,3 +1,6 @@
+// Send notifications
+//
+// Supports Discord & Slack.
 package main
 
 import (
@@ -12,13 +15,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Send notifications
-//
-// Supports Discord & Slack.
 type Notify struct{}
 
 // Message a Discord webhook: `dagger call discord --webhook-url=env://DISCORD_WEBHOOK --message="👋 from Dagger notify module"`
-// +cache="session"
 func (n *Notify) Discord(
 	ctx context.Context,
 	webhookURL *dagger.Secret,
@@ -48,7 +47,6 @@ func (n *Notify) Discord(
 }
 
 // Message a specific Slack channel: `dagger call slack --token=env://SLACK_TOKEN --channel-id=C07PBDE3U57 --color="#FC0" --message="👋 from Dagger notify module"`
-// +cache="session"
 func (n *Notify) Slack(
 	ctx context.Context,
 	// The slack token to authenticate with the slack organization
@@ -115,7 +113,6 @@ func (n *Notify) Slack(
 
 // helper to return a dagger cloud trace link from the OTEL data in ctx.
 // useful as input to "message" to link your slack or discord notification back up to dagger cloud.
-// +cache="session"
 func (n *Notify) DaggerCloudTraceURL(
 	ctx context.Context,
 ) (string, error) {

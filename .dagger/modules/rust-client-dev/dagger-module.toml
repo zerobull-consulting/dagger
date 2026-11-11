@@ -1,6 +1,12 @@
 name = "rust-client-dev"
-include = []
+engineVersion = "v0.21.9"
 
-[entrypoint]
-  kind = "dang"
-  source = "./internal/dagger/entrypoint"
+[runtime]
+  source = "go"
+
+[[dependencies]]
+  name = "dagger-engine"
+  source = "../engine-dev"
+
+[codegen]
+  automaticGitignore = false

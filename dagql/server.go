@@ -360,7 +360,6 @@ func NewDefaultHandler(es graphql.ExecutableSchema) *handler.Server {
 	srv.Use(extension.AutomaticPersistedQuery{
 		Cache: lru.New[string](100),
 	})
-	srv.AroundResponses(stampResponse)
 
 	srv.SetValidationRulesFn(func() *rules.Rules {
 		validationRules := rules.NewDefaultRules()
@@ -375,10 +374,7 @@ func NewDefaultHandler(es graphql.ExecutableSchema) *handler.Server {
 
 		// HACK: this rule is disabled because PHP modules <=v0.15.2 query
 		// inputArgs incorrectly.
-		//
-		// It is replaced with a no-op rather than removed: gqlgen adds
-		// ScalarLeafs back after this function whenever no rule has its name.
-		validationRules.ReplaceRule(rules.ScalarLeafsRule.Name, func(*validatorcore.Events, validatorcore.AddErrFunc) {})
+		validationRules.RemoveRule(rules.ScalarLeafsRule.Name)
 
 		// Replace PossibleFragmentSpreads with a version that handles
 		// interface-implements-interface per the GraphQL spec.  The
@@ -1828,7 +1824,7 @@ func (s *Server) lazyRefArgNames(id *call.ID) map[string]bool {
 		return nil
 	}
 	var lazyRefs map[string]bool
-	for _, argSpec := range fieldSpec.Args.inputs(id.View()) {
+	for _, argSpec := range fieldSpec.Args.Inputs(id.View()) {
 		if argSpec.LazyRef {
 			if lazyRefs == nil {
 				lazyRefs = make(map[string]bool)
@@ -2059,7 +2055,7 @@ func selectorFromLoadedCall(ctx context.Context, frame *ResultCall, baseObj AnyO
 		}
 	}
 	args := make([]NamedInput, 0, len(frame.Args))
-	for _, argSpec := range fieldSpec.Args.inputs(view) {
+	for _, argSpec := range fieldSpec.Args.Inputs(view) {
 		if lazyRefs[argSpec.Name] {
 			lit, ok := recipeArgLiterals[argSpec.Name]
 			if !ok {

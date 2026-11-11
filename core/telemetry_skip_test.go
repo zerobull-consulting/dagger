@@ -44,9 +44,7 @@ func TestProfileSkipClassifier(t *testing.T) {
 		// callChainInfo).
 		{"Query", "__schema"}, {"Query", "sourceMap"}, {"Query", "currentTypeDefs"},
 		{"Query", "function"}, {"Query", "typeDef"}, {"Query", "__objectTypeDef"},
-		{"Query", "currentFunctionCall"},
-		// Internal roots: emitted, but the root call itself stays unprofiled.
-		{"Query", "currentModule"},
+		{"Query", "currentFunctionCall"}, {"Query", "currentModule"},
 		// A receiver-less synthetic root frame still classifies by the root set.
 		{"", "__schema"}, {"", "currentTypeDefs"},
 	}
@@ -94,11 +92,9 @@ func TestProfileSkipIsDebugIndependentPureFunction(t *testing.T) {
 // callChainInfo classifies as roots, so the UI and profiler never diverge.
 func TestIntrospectionRootFieldsMatchProfileSkip(t *testing.T) {
 	t.Parallel()
-	for _, roots := range []map[string]struct{}{introspectionRootFields, internalRootFields} {
-		for field := range roots {
-			require.Truef(t, profileSkip("Query", field), "root %q must be profile-skipped on Query", field)
-			require.Truef(t, profileSkip("", field), "root %q must be profile-skipped on a receiver-less root", field)
-		}
+	for field := range introspectionRootFields {
+		require.Truef(t, profileSkip("Query", field), "root %q must be profile-skipped on Query", field)
+		require.Truef(t, profileSkip("", field), "root %q must be profile-skipped on a receiver-less root", field)
 	}
 }
 

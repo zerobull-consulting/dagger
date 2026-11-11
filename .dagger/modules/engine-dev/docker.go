@@ -9,7 +9,6 @@ import (
 
 	"dagger/engine-dev/internal/dagger"
 
-	"dagger.io/dagger/core"
 	"github.com/dagger/dagger/engine/distconsts"
 )
 
@@ -40,7 +39,7 @@ func (dev *EngineDev) LoadToDocker(
 		ForcedCompression: dagger.ImageLayerCompressionGzip,
 	})
 
-	loader := core.NewContainer().
+	loader := dag.Container().
 		From("docker:cli").
 		WithUnixSocket("/var/run/docker.sock", docker).
 		WithMountedFile("/image.tar.gz", tar).

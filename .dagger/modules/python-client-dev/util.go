@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"dagger.io/dagger/core"
-
 	"dagger/python-client-dev/internal/dagger"
 )
 
@@ -29,7 +27,7 @@ func toolsCache(args ...string) dagger.WithContainerFunc {
 			ctr = ctr.
 				WithMountedCache(
 					fmt.Sprintf("/root/.cache/%s", tool),
-					core.NewCacheVolume(fmt.Sprintf("modpythondev-%s", tool))).
+					dag.CacheVolume(fmt.Sprintf("modpythondev-%s", tool))).
 				WithEnvVariable(
 					fmt.Sprintf("%s_CACHE_DIR", strings.ToUpper(tool)),
 					fmt.Sprintf("/root/.cache/%s", tool))

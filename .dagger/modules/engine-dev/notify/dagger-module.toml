@@ -1,6 +1,9 @@
 name = "notify"
-include = []
+engineVersion = "v0.21.9"
+disableDefaultFunctionCaching = true
 
-[entrypoint]
-  kind = "dang"
-  source = "./internal/dagger/entrypoint"
+[runtime]
+  source = "go"
+
+[codegen]
+  automaticGitignore = false

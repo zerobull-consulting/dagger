@@ -148,7 +148,7 @@ func hostFileReader(ctx context.Context, src *ModuleSource) (workspace.TreeFileR
 	if err != nil {
 		return nil, err
 	}
-	hostMetadata, err := LocalSourceHostClientMetadata(ctx, query, src)
+	hostMetadata, err := query.ModuleParentHostClientMetadata(ctx)
 	if errors.Is(err, ErrNoCurrentModule) {
 		// A call's cache key is computed in its caller's client, which, with
 		// no module above it, is itself the host the module was loaded from.

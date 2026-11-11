@@ -346,7 +346,6 @@ type ContainerWithRootFSLazy struct {
 }
 
 type ContainerDirectoryLazy struct {
-	ResolveBrokenSymlinks bool
 	LazyState
 	Parent dagql.ObjectResult[*Container]
 	Path   string
@@ -615,11 +614,6 @@ type persistedContainerMetadataValue struct {
 	SystemEnvNames     []string                            `json:"systemEnvNames,omitempty"`
 	VolatileEnv        []string                            `json:"volatileEnv,omitempty"`
 	DefaultArgs        bool                                `json:"defaultArgs,omitempty"`
-
-	// FromContentDigestSafe keeps Container.fromContentDigestSafe: a scratch
-	// container read back from the cache is still one From may give a
-	// content digest.
-	FromContentDigestSafe bool `json:"fromContentDigestSafe,omitempty"`
 }
 
 type persistedContainerWithEntrypointLazy struct {
@@ -800,9 +794,8 @@ type persistedContainerWithDirectoryLazy struct {
 }
 
 type persistedContainerDirectoryLazy struct {
-	ResolveBrokenSymlinks bool   `json:"resolveBrokenSymlinks,omitempty"`
-	ParentResultID        uint64 `json:"parentResultID"`
-	Path                  string `json:"path"`
+	ParentResultID uint64 `json:"parentResultID"`
+	Path           string `json:"path"`
 }
 
 type persistedContainerWithFileLazy struct {
@@ -1673,8 +1666,6 @@ func (container *Container) encodeContainerMetadata(enc *dagql.PersistEncodeCont
 		SystemEnvNames:     slices.Clone(container.SystemEnvNames),
 		VolatileEnv:        slices.Clone(container.VolatileEnv),
 		DefaultArgs:        container.DefaultArgs,
-
-		FromContentDigestSafe: container.fromContentDigestSafe,
 	}
 
 	for _, mnt := range container.Mounts {
@@ -1816,65 +1807,10 @@ func decodePersistedContainerResources(ctx context.Context, dec *dagql.PersistDe
 	return mounts, secrets, sockets, nil
 }
 
-// containerHoldsAcquiredPart reports whether a transferred container's
-// record holds a part this engine acquired: transfer leaves every part it
-// carries pending or absent.
-func containerHoldsAcquiredPart(parts map[dagql.PartKey]persistedContainerPart) bool {
-	for _, part := range parts {
-		if part.Kind != containerPartPending && part.Kind != containerPartAbsent {
-			return true
-		}
-	}
-	return false
-}
-
-// armTransferredContainer reports whether a container record from another
-// engine decodes with its recipe armed, and if so validates its operation and
-// clears its transfer state. A record that holds no download address for any
-// part decodes as local persistence decodes a pending container: its recipe
-// armed, its parts pending. One that already acquired a part stays a shell: a
-// group's parts complete together locally, so a recipe can't keep one of them
-// and compute the rest.
-func armTransferredContainer(dec *dagql.PersistDecodeContext, envelope *persistedContainerPayload) (bool, error) {
-	if envelope.OperationState == "" || len(envelope.LazyJSON) == 0 || !dec.ArmRecipe() || containerHoldsAcquiredPart(envelope.Parts) {
-		return false, nil
-	}
-	kind := ""
-	if dec.Call() != nil {
-		kind = dec.Call().Field
-	}
-	if err := validateTransferOperation(envelope.OperationState, kind, envelope.LazyJSON); err != nil {
-		return false, err
-	}
-	envelope.OperationState = ""
-	return true, nil
-}
-
-// armedContainerParts gives the metadata state and parts a container decodes
-// with. An armed whole operation computes every part in one run: local
-// persistence saves it, before that run, with none of them.
-func armedContainerParts(armed bool, recipe Lazy[*Container], envelope persistedContainerPayload) (bool, map[dagql.PartKey]persistedContainerPart) {
-	if _, refined := recipe.(LazyContainerParts); armed && recipe != nil && !refined {
-		return false, nil
-	}
-	return envelope.Metadata.Consumed, envelope.Parts
-}
-
-// PartTransferShell reports whether the container decoded from another
-// engine's record without its recipe, so that its parts come only through
-// part acquisition.
-func (container *Container) PartTransferShell() bool {
-	return container.acquiredOutput.Load() != nil
-}
-
 func (*Container) DecodePersistedObject(ctx context.Context, dec *dagql.PersistDecodeContext, payload json.RawMessage) (dagql.Typed, error) {
 	var envelope persistedContainerPayload
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return nil, fmt.Errorf("decode persisted container payload: %w", err)
-	}
-	armed, err := armTransferredContainer(dec, &envelope)
-	if err != nil {
-		return nil, err
 	}
 	persisted := envelope.Metadata.Value
 	fs := new(LazyAccessor[*Directory, *Container])
@@ -1911,8 +1847,6 @@ func (*Container) DecodePersistedObject(ctx context.Context, dec *dagql.PersistD
 		SystemEnvNames:     slices.Clone(persisted.SystemEnvNames),
 		VolatileEnv:        slices.Clone(persisted.VolatileEnv),
 		DefaultArgs:        persisted.DefaultArgs,
-
-		fromContentDigestSafe: persisted.FromContentDigestSafe,
 	}
 	// Local persistence may contain an unchanged pending part without a recipe.
 	// Admit only the same closed, recorded-parent mapping used after transfer.
@@ -1965,8 +1899,7 @@ func (*Container) DecodePersistedObject(ctx context.Context, dec *dagql.PersistD
 			return nil, err
 		}
 	}
-	metadataConsumed, parts := armedContainerParts(armed, recipe, envelope)
-	if err := container.installContainerParts(ctx, dec, metadataConsumed, parts, links, recipe); err != nil {
+	if err := container.installContainerParts(ctx, dec, envelope.Metadata.Consumed, envelope.Parts, links, recipe); err != nil {
 		return nil, fmt.Errorf("decode persisted container: %w", err)
 	}
 	return container, nil
@@ -3599,10 +3532,6 @@ func (lazy *ContainerDirectoryLazy) Evaluate(ctx context.Context, dir *Directory
 			return fmt.Errorf("container directory lazy: nil parent container")
 		}
 
-		if lazy.ResolveBrokenSymlinks {
-			return lazy.materializeSelection(ctx, dir)
-		}
-
 		srv, err := CurrentDagqlServer(ctx)
 		if err != nil {
 			return err
@@ -3626,10 +3555,11 @@ func (lazy *ContainerDirectoryLazy) Evaluate(ctx context.Context, dir *Directory
 			if subpath == "" || subpath == "." || subpath == "/" {
 				resolved = rootfs
 			} else {
-				args := []dagql.NamedInput{{Name: "path", Value: dagql.String(subpath)}}
 				if err := srv.Select(ctx, rootfs, &resolved, dagql.Selector{
 					Field: "directory",
-					Args:  args,
+					Args: []dagql.NamedInput{
+						{Name: "path", Value: dagql.String(subpath)},
+					},
 				}); err != nil {
 					return err
 				}
@@ -3743,9 +3673,8 @@ func (lazy *ContainerDirectoryLazy) EncodePersisted(ctx context.Context, enc *da
 		return nil, err
 	}
 	return json.Marshal(persistedContainerDirectoryLazy{
-		ResolveBrokenSymlinks: lazy.ResolveBrokenSymlinks,
-		ParentResultID:        parentID,
-		Path:                  lazy.Path,
+		ParentResultID: parentID,
+		Path:           lazy.Path,
 	})
 }
 
@@ -6928,11 +6857,9 @@ func locatePath(
 
 	// NB(vito): iterate in reverse order so we'll find deeper mounts first
 	for i := len(container.Mounts) - 1; i >= 0; i-- {
-		// Look at each mount in place: only the match is copied, so a
-		// container with many mounts costs no allocation per mount passed.
-		mnt := &container.Mounts[i]
+		mnt := container.Mounts[i]
 
-		if rest, ok := strings.CutPrefix(containerPath, mnt.Target); ok && (rest == "" || rest[0] == '/') {
+		if containerPath == mnt.Target || strings.HasPrefix(containerPath, mnt.Target+"/") {
 			if mnt.TmpfsSource != nil {
 				return nil, "", fmt.Errorf("%s: cannot retrieve path from tmpfs", containerPath)
 			}
@@ -6949,8 +6876,7 @@ func locatePath(
 			if err != nil {
 				return nil, "", err
 			}
-			found := *mnt
-			return &found, relPath, nil
+			return &mnt, relPath, nil
 		}
 	}
 

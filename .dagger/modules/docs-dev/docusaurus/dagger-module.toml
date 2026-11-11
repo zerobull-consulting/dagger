@@ -1,6 +1,9 @@
 name = "docusaurus"
-include = []
+engineVersion = "v0.21.9"
+source = "dagger"
 
-[entrypoint]
-  kind = "dang"
-  source = "./internal/dagger/entrypoint"
+[runtime]
+  source = "go"
+
+[codegen]
+  automaticGitignore = false

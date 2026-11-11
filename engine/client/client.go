@@ -86,10 +86,6 @@ const (
 	cacheExportsConfigEnvName = "_EXPERIMENTAL_DAGGER_CACHE_EXPORT_CONFIG"
 	// allow enabling scale-out of checks to support cloud
 	enableChecksScaleOutEnvName = "_EXPERIMENTAL_DAGGER_CHECKS_SCALE_OUT"
-	// cloudClaimIDEnvName carries the Dagger Cloud claim identifier to a
-	// client connected straight to an assigned engine; a Cloud connector
-	// carries its own.
-	cloudClaimIDEnvName = "DAGGER_CLOUD_CLAIM_ID"
 	// shutdown timeout, default is 10s
 	shutdownTimeoutEnvName = "_EXPERIMENTAL_DAGGER_SHUTDOWN_TIMEOUT"
 )
@@ -252,18 +248,6 @@ type Client struct {
 	isCloudScaleOutClient bool
 }
 
-// nestedSessionPortEnv names the port of the session that an exec, or a
-// parent CLI (`dagger run`), serves to the processes it starts.
-const nestedSessionPortEnv = "DAGGER_SESSION_PORT"
-
-// NestedSession reports whether Connect joins the session of the exec or CLI
-// that started this process, as a nested client of it. The engine delivers a
-// nested client's telemetry to its ancestors as well as to the client itself.
-func NestedSession() bool {
-	_, ok := os.LookupEnv(nestedSessionPortEnv)
-	return ok
-}
-
 func Connect(ctx context.Context, params Params) (_ *Client, rerr error) {
 	loadWorkspaceModules, err := normalizeWorkspaceModuleLoading(
 		params.LoadWorkspaceModules,
@@ -337,7 +321,7 @@ func Connect(ctx context.Context, params Params) (_ *Client, rerr error) {
 	defer telemetry.EndWithCause(span, &rerr)
 	slog := slog.SpanLogger(connectCtx, InstrumentationLibrary)
 
-	nestedSessionPortVal, isNestedSession := os.LookupEnv(nestedSessionPortEnv)
+	nestedSessionPortVal, isNestedSession := os.LookupEnv("DAGGER_SESSION_PORT")
 	if isNestedSession {
 		nestedSessionPort, err := strconv.Atoi(nestedSessionPortVal)
 		if err != nil {
@@ -625,11 +609,7 @@ func (c *Client) telemetryContext(ctx context.Context) (context.Context, context
 	return ctx, cancel
 }
 
-func (c *Client) subscribeTelemetry(ctx context.Context) error {
-	return c.subscribeTelemetryWith(ctx, c.newTelemetryHTTPClient())
-}
-
-func (c *Client) subscribeTelemetryWith(ctx context.Context, hc *httpClient) (rerr error) {
+func (c *Client) subscribeTelemetry(ctx context.Context) (rerr error) {
 	// Keep telemetry alive across the caller's cancellation and the server's
 	// shutdown drain, but tie it to the client-owned internal lifetime so a
 	// failed initialization or rejected /shutdown cannot strand telemetry streams.
@@ -649,37 +629,21 @@ func (c *Client) subscribeTelemetryWith(ctx context.Context, hc *httpClient) (re
 	slog.Debug("subscribing to telemetry", "remote", c.RunnerHost)
 
 	c.telemetry = new(errgroup.Group)
-	// The three subscriptions don't depend on each other, so they're made at
-	// once: with a remote engine, each one waits a round trip for its answer.
-	// The first to fail cancels the others, so connecting reports its error
-	// instead of waiting on an answer that may never come.
-	var subscriptions errgroup.Group
-	subscribe := func(name string, export func(context.Context, *httpClient) error) {
-		subscriptions.Go(func() error {
-			if err := export(ctx, hc); err != nil {
-				err = fmt.Errorf("export %s: %w", name, err)
-				cancel(err)
-				return err
-			}
-			return nil
-		})
-	}
+	httpClient := c.newTelemetryHTTPClient()
 	if c.EngineTrace != nil {
-		subscribe("traces", c.exportTraces)
+		if err := c.exportTraces(ctx, httpClient); err != nil {
+			return fmt.Errorf("export traces: %w", err)
+		}
 	}
 	if c.EngineLogs != nil {
-		subscribe("logs", c.exportLogs)
+		if err := c.exportLogs(ctx, httpClient); err != nil {
+			return fmt.Errorf("export logs: %w", err)
+		}
 	}
 	if c.EngineMetrics != nil {
-		subscribe("metrics", c.exportMetrics)
-	}
-	if err := subscriptions.Wait(); err != nil {
-		// A subscription cancelled by the first failure may return before
-		// it; report the failure that cancelled them.
-		if cause := context.Cause(ctx); cause != nil {
-			return cause
+		if err := c.exportMetrics(ctx, httpClient); err != nil {
+			return fmt.Errorf("export metrics: %w", err)
 		}
-		return err
 	}
 	return nil
 }
@@ -2053,12 +2017,8 @@ func (c *Client) clientMetadata() engine.ClientMetadata {
 	}
 
 	var remoteEngineID string
-	cloudClaimID := os.Getenv(cloudClaimIDEnvName)
 	if c.connector != nil {
 		remoteEngineID = c.connector.EngineID()
-		if claimID := c.connector.ClaimID(); claimID != "" {
-			cloudClaimID = claimID
-		}
 	}
 
 	md := engine.ClientMetadata{
@@ -2084,7 +2044,6 @@ func (c *Client) clientMetadata() engine.ClientMetadata {
 		CloudAuth:                      c.CloudAuth,
 		EnableCloudScaleOut:            c.EnableCloudScaleOut,
 		CloudScaleOutEngineID:          remoteEngineID,
-		CloudClaimID:                   cloudClaimID,
 		Profile:                        c.Profile,
 		ProfileEBPF:                    c.ProfileEBPF,
 	}

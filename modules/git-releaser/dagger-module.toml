@@ -1,6 +1,13 @@
 name = "git-releaser"
-include = []
+engineVersion = "v0.21.9"
 
-[entrypoint]
-  kind = "dang"
-  source = "./internal/dagger/entrypoint"
+[runtime]
+  source = "go"
+
+[[dependencies]]
+  name = "alpine"
+  source = "https://github.com/dagger/alpine@main"
+  pin = "ff6a5f4c28364912d92c00e682dd0bf19f524ef9"
+
+[codegen]
+  automaticGitignore = false

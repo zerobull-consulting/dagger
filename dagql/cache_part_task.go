@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/dagger/dagger/engine/wcprof"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -121,20 +120,13 @@ type lazyTaskContinuation struct {
 	synced, cleaned, settled bool
 }
 
-// finish is the bookkeeping after the task's body. When profiled, each of its
-// steps that has work is a step of its own (lazyBody.*), and a wait for the
-// owner sync to be ready is a lazy wait: one op or wait per step a body runs,
-// none per part.
 func (t *lazyTaskContinuation) finish(ctx context.Context, c *Cache, row *sharedResult) error {
-	if installed := t.token.installed.Load(); installed != nil && len(installed.beforeSync) > 0 {
-		stepCtx, step := BeginStep(ctx, "lazyBody.cleanup")
+	if installed := t.token.installed.Load(); installed != nil {
 		for _, cleanup := range installed.beforeSync {
-			if err := cleanup.release(stepCtx); err != nil {
-				step.End(err)
+			if err := cleanup.release(ctx); err != nil {
 				return err
 			}
 		}
-		step.End(nil)
 	}
 	if t.spec.OwnerSyncReady != nil {
 		select {
@@ -142,75 +134,44 @@ func (t *lazyTaskContinuation) finish(ctx context.Context, c *Cache, row *shared
 		case <-t.token.ownerSync:
 		case <-ctx.Done():
 			return context.Cause(ctx)
-		default:
-			wait := wcprof.BeginWaitIdent(ctx, "dagql.lazyBody.ownerSyncReady", wcprof.WaitReasonLazy)
-			select {
-			case <-t.spec.OwnerSyncReady:
-			case <-t.token.ownerSync:
-			case <-ctx.Done():
-				wait.End()
-				return context.Cause(ctx)
-			}
-			wait.End()
 		}
 	}
 	if !t.synced {
 		c.recordPartFixture(row, PersistedPartAddress{}, "owner-sync")
-		stepCtx, step := BeginStep(ctx, "lazyBody.ownerSync")
-		err := c.syncTaskPartLeases(stepCtx, row, t.token)
-		step.End(err)
-		if err != nil {
+		if err := c.syncTaskPartLeases(ctx, row, t.token); err != nil {
 			return err
 		}
 		t.synced = true
 	}
 	if !t.cleaned {
-		if installed := t.token.installed.Load(); installed != nil && len(installed.protections) > 0 {
-			stepCtx, step := BeginStep(ctx, "lazyBody.releaseProtections")
+		if installed := t.token.installed.Load(); installed != nil {
 			for _, protection := range installed.protections {
-				if err := protection.release(stepCtx); err != nil {
-					step.End(err)
+				if err := protection.release(ctx); err != nil {
 					return err
 				}
 			}
-			step.End(nil)
 		}
 		if t.spec.AfterOwnerSync != nil {
-			stepCtx, step := BeginStep(ctx, "lazyBody.afterOwnerSync")
-			err := t.spec.AfterOwnerSync(stepCtx)
-			step.End(err)
-			if err != nil {
+			if err := t.spec.AfterOwnerSync(ctx); err != nil {
 				return err
 			}
 		}
 		t.cleaned = true
 	}
 	if !t.settled {
-		installed := t.token.installed.Load()
-		if (installed != nil && len(installed.outputs) > 0) || t.spec.Settled != nil {
-			stepCtx, step := BeginStep(ctx, "lazyBody.settle")
-			err := t.settle(stepCtx, c, row, installed)
-			step.End(err)
-			if err != nil {
+		if installed := t.token.installed.Load(); installed != nil {
+			for _, output := range installed.outputs {
+				if err := c.settlePart(ctx, row, output.address, t.token, output.installation); err != nil {
+					return err
+				}
+			}
+		}
+		if t.spec.Settled != nil {
+			if err := t.spec.Settled(ctx); err != nil {
 				return err
 			}
 		}
 		t.settled = true
-	}
-	return nil
-}
-
-// settle settles the parts the task installed, then runs its Settled.
-func (t *lazyTaskContinuation) settle(ctx context.Context, c *Cache, row *sharedResult, installed *InstalledOutputs) error {
-	if installed != nil {
-		for _, output := range installed.outputs {
-			if err := c.settlePart(ctx, row, output.address, t.token, output.installation); err != nil {
-				return err
-			}
-		}
-	}
-	if t.spec.Settled != nil {
-		return t.spec.Settled(ctx)
 	}
 	return nil
 }
@@ -231,7 +192,7 @@ func (c *Cache) RunLazyTask(ctx context.Context, receiver AnyResult, key LazyGro
 	if key == LazyGroupWhole {
 		return fmt.Errorf("lazy task: synthetic task requires a named key")
 	}
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	if c.resultsByID[row.id] != row {
 		c.egraphMu.Unlock()
 		return fmt.Errorf("lazy task: unregistered receiver")
@@ -243,7 +204,7 @@ func (c *Cache) RunLazyTask(ctx context.Context, receiver AnyResult, key LazyGro
 		return err
 	}
 	if op.sessionID != "" {
-		wcprof.ReadLock(ctx, &c.egraphMu, egraphLockIdent)
+		c.egraphMu.RLock()
 		allowed := c.sessionSatisfiesResourceRequirementsLocked(op.sessionID, row)
 		c.egraphMu.RUnlock()
 		if !allowed {
@@ -254,7 +215,7 @@ func (c *Cache) RunLazyTask(ctx context.Context, receiver AnyResult, key LazyGro
 }
 
 func (c *Cache) releasePartRow(ctx context.Context, row *sharedResult) error {
-	wcprof.WriteLock(ctx, &c.egraphMu, egraphLockIdent)
+	c.egraphMu.Lock()
 	queue, err := c.decrementIncomingOwnershipLocked(ctx, row, nil)
 	callbacks, collectErr := c.collectUnownedResultsLocked(ctx, queue)
 	c.egraphMu.Unlock()
@@ -263,14 +224,6 @@ func (c *Cache) releasePartRow(ctx context.Context, row *sharedResult) error {
 
 func isPartTaskKey(key LazyGroupKey) bool {
 	return strings.HasPrefix(string(key), "obtain:") || strings.HasPrefix(string(key), "acquire:") || strings.HasPrefix(string(key), "lazy:")
-}
-
-// isPartDeliveryTaskKey reports whether a part task only delivers a part:
-// acquiring it opens a local copy or obtains one, and obtaining installs it
-// from a source. Neither computes the value; an acquire that must compute
-// starts a lazy evaluation task, which is a group of its own.
-func isPartDeliveryTaskKey(key LazyGroupKey) bool {
-	return strings.HasPrefix(string(key), "obtain:") || strings.HasPrefix(string(key), "acquire:")
 }
 
 func (t *PartTaskToken) openOwnerSync() {

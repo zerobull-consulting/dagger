@@ -3,11 +3,9 @@ package main
 import (
 	"fmt"
 
-	"dagger.io/dagger/core"
 	"golang.org/x/mod/semver"
 
 	"dagger/cli-dev/internal/dagger"
-	"dagger/cli-dev/internal/dagger/clients/alpine"
 )
 
 type cliReleaseMode string
@@ -73,7 +71,7 @@ func (cli *CliDev) releaseBinary(target cliReleaseTarget) *dagger.File {
 }
 
 func (cli *CliDev) releaseBinaries() *dagger.Directory {
-	dir := core.NewDirectory()
+	dir := dag.Directory()
 	for _, target := range cliReleaseTargets {
 		dir = dir.WithFile(
 			target.ID+"/"+target.Binary,
@@ -88,7 +86,7 @@ func (cli *CliDev) releaseDist(tag, commit string) (*dagger.Directory, error) {
 		return nil, fmt.Errorf("commit must be set")
 	}
 
-	dist := core.NewDirectory()
+	dist := dag.Directory()
 	for _, label := range cliReleaseLabels(tag, commit) {
 		for _, target := range cliReleaseTargets {
 			name := cliReleaseArchiveName(label, target)
@@ -101,7 +99,7 @@ func (cli *CliDev) releaseDist(tag, commit string) (*dagger.Directory, error) {
 
 func (cli *CliDev) releaseArchive(label string, target cliReleaseTarget) *dagger.File {
 	name := cliReleaseArchiveName(label, target)
-	input := core.NewDirectory().
+	input := dag.Directory().
 		WithFile("LICENSE", cli.Go.Source().File("LICENSE"), dagger.DirectoryWithFileOpts{
 			Permissions: 0o644,
 		}).
@@ -126,8 +124,8 @@ func (cli *CliDev) releaseArchive(label string, target cliReleaseTarget) *dagger
 }
 
 func (cli *CliDev) releaseChecksums(dist *dagger.Directory) *dagger.File {
-	return alpine.
-		New(alpine.AlpineOpts{
+	return dag.
+		Alpine(dagger.AlpineOpts{
 			Branch: "3.22",
 		}).
 		Container().
@@ -141,8 +139,8 @@ done > /out/checksums.txt`}).
 }
 
 func releaseArchiveBase() *dagger.Container {
-	return alpine.
-		New(alpine.AlpineOpts{
+	return dag.
+		Alpine(dagger.AlpineOpts{
 			Branch:   "3.22",
 			Packages: []string{"tar", "gzip", "zip"},
 		}).

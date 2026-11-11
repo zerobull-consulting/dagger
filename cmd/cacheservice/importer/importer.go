@@ -712,12 +712,6 @@ func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *
 	if err := env.Decode(&reply); err != nil {
 		return MergedBundle{}, nil, err
 	}
-	if len(reply.Stale) > 0 {
-		// The engine committed nothing: it didn't hold a held row. A stored
-		// bundle has none (metastore.ValidateBundle), so this merge sent
-		// none.
-		return MergedBundle{}, nil, fmt.Errorf("merge: the engine refused %d held rows as stale, and the bundle has none", len(reply.Stale))
-	}
 	return im.applyMerged(ctx, eng, st, c, mb, reply)
 }
 

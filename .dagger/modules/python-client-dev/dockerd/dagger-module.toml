@@ -1,6 +1,8 @@
 name = "dockerd"
-include = []
+engineVersion = "v0.21.9"
 
-[entrypoint]
-  kind = "dang"
-  source = "./internal/dagger/entrypoint"
+[runtime]
+  source = "go"
+
+[codegen]
+  automaticGitignore = false

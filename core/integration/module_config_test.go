@@ -273,7 +273,7 @@ func (ModuleConfigSuite) TestSDKConfig(ctx context.Context, t *testctx.T) {
 		}
 	}
 }`,
-				expectedError: `parsing value for arg "goprivate": cannot create String from float64`,
+				expectedError: "'GoPrivate' expected type 'string', got unconvertible type 'float64', value: '1234'",
 			},
 			{
 				name: "unknown sdk config keys returns error",

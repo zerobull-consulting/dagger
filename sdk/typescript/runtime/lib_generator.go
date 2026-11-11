@@ -20,11 +20,11 @@ type LibGenerator struct {
 }
 
 type LibGeneratorOpts struct {
-	moduleName         string
-	modulePath         string
-	moduleDependencies string
-	genClient          bool
-	coexistWithModule  bool
+	moduleName        string
+	modulePath        string
+	moduleSourceID    string
+	genClient         bool
+	coexistWithModule bool
 }
 
 func NewLibGenerator(sdkSourceDir *dagger.Directory, opts *LibGeneratorOpts) *LibGenerator {
@@ -81,8 +81,8 @@ func (l *LibGenerator) GenerateBindings(
 		ctr = ctr.WithWorkdir(l.Opts.modulePath)
 	}
 
-	if l.Opts.moduleDependencies != "" {
-		codegenArgs = append(codegenArgs, "--module-dependencies", l.Opts.moduleDependencies)
+	if l.Opts.moduleSourceID != "" {
+		codegenArgs = append(codegenArgs, "--module-source-id", l.Opts.moduleSourceID)
 	}
 
 	if libOrigin == Bundle && !l.Opts.genClient {
@@ -93,7 +93,9 @@ func (l *LibGenerator) GenerateBindings(
 		// Mount the introspection file.
 		WithMountedFile(schemaPath, introspectionJSON).
 		// Execute the code generator using the given introspection file.
-		WithExec(codegenArgs)
+		WithExec(codegenArgs, dagger.ContainerWithExecOpts{
+			ExperimentalPrivilegedNesting: true,
+		})
 
 	if l.Opts.modulePath != "" {
 		return ctr.

@@ -30,29 +30,11 @@ const EntrypointSourcesMember = "sources"
 // type does not count. A file that does not parse declares nothing, so its
 // error surfaces when the entrypoint runs. dangVersion is the Dang version the
 // files are written in (ModuleSource.DangVersion).
-func DeclaresEntrypointSources(ctx context.Context, dir string, dangVersion string) (bool, error) {
-	ctx, err := contextWithEntrypointVersion(ctx, dangVersion)
+func DeclaresEntrypointSources(dir string, dangVersion string) (bool, error) {
+	version, err := parseEntrypointDangVersion(dangVersion)
 	if err != nil {
 		return false, err
 	}
-	runDir, err := copyEntrypointDir(dir)
-	if err != nil {
-		return false, err
-	}
-	defer os.RemoveAll(runDir)
-	return declaresEntrypointMember(ctx, runDir, EntrypointSourcesMember)
-}
-
-// declaresEntrypointMember reports whether a type that implements
-// ModuleEntrypoint in the top-level Dang files of dir, a copy from
-// copyEntrypointDir, declares the public member name, as
-// DeclaresEntrypointSources does for sources. Every module source load and
-// every entrypoint run asks, so it parses the files where the entrypoint runs
-// from, through the engine's Dang syntax cache: they parse as the run parses
-// them, and an entrypoint is parsed once for all of them. ctx carries the
-// entrypoint's Dang version (contextWithEntrypointVersion), so the files
-// parse at the version the run parses them at.
-func declaresEntrypointMember(ctx context.Context, dir, name string) (bool, error) {
 	files, err := entrypointFiles(dir)
 	if err != nil {
 		return false, err
@@ -62,14 +44,14 @@ func declaresEntrypointMember(ctx context.Context, dir, name string) (bool, erro
 		if err != nil {
 			return false, fmt.Errorf("read module entrypoint file %q: %w", filepath.Base(path), err)
 		}
-		if !bytes.Contains(data, []byte(name)) {
+		if !bytes.Contains(data, []byte(EntrypointSourcesMember)) {
 			continue
 		}
-		file, err := parseDangSource(ctx, path)
+		root, err := dang.Parse(path, data, dang.WithVersion(version))
 		if err != nil {
 			return false, nil //nolint:nilerr
 		}
-		if declaresMember(file, name) {
+		if file, ok := root.(*dang.FileBlock); ok && declaresSources(file) {
 			return true, nil
 		}
 	}
@@ -91,7 +73,7 @@ func entrypointFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
-func declaresMember(file *dang.FileBlock, name string) bool {
+func declaresSources(file *dang.FileBlock) bool {
 	for _, form := range file.Forms {
 		decl, ok := form.(*dang.ObjectDecl)
 		if !ok || decl.Value == nil || !implementsModuleEntrypoint(decl) {
@@ -99,7 +81,7 @@ func declaresMember(file *dang.FileBlock, name string) bool {
 		}
 		for _, member := range decl.Value.Forms {
 			field, ok := member.(*dang.FieldDecl)
-			if ok && field.Name != nil && field.Name.Name == name && field.Visibility >= dang.PublicVisibility {
+			if ok && field.Name != nil && field.Name.Name == EntrypointSourcesMember && field.Visibility >= dang.PublicVisibility {
 				return true
 			}
 		}

@@ -102,10 +102,10 @@ func TestCommitReadyPartChangedRefusals(t *testing.T) {
 		row     func(receiver, donor *sharedResult) *sharedResult
 	}{
 		{"receiver moved", func(_ *Cache, _ *PreparedReadyPart, receiver, _ *sharedResult) {
-			testMovePayload(receiver)
+			receiver.storeSnapshotOwnerLinks(receiver.loadSnapshotOwnerLinks())
 		}, "commit: receiver version", true, func(receiver, _ *sharedResult) *sharedResult { return receiver }},
 		{"donor moved", func(_ *Cache, _ *PreparedReadyPart, _, donor *sharedResult) {
-			testMovePayload(donor)
+			donor.storeSnapshotOwnerLinks(donor.loadSnapshotOwnerLinks())
 		}, "commit: donor version", true, func(_, donor *sharedResult) *sharedResult { return donor }},
 		{"donor offers moved", func(c *Cache, _ *PreparedReadyPart, _, donor *sharedResult) {
 			c.egraphMu.Lock()
@@ -236,7 +236,7 @@ func TestPublishEvaluatedPartsSurvivesContention(t *testing.T) {
 	var commits int
 	c.testBeforePartCommit = func(p *PreparedReadyPart) {
 		if commits++; commits <= rounds {
-			testMovePayload(p.receiver)
+			p.receiver.storeSnapshotOwnerLinks(p.receiver.loadSnapshotOwnerLinks())
 		}
 	}
 	demand := &PartDemandState{}
@@ -341,8 +341,8 @@ func TestInstallChainPartRecordsOnce(t *testing.T) {
 			if commits++; commits > 1 {
 				return
 			}
-			testMovePayload(receiver)
-			testMovePayload(donor)
+			receiver.storeSnapshotOwnerLinks(receiver.loadSnapshotOwnerLinks())
+			donor.storeSnapshotOwnerLinks(donor.loadSnapshotOwnerLinks())
 			c.egraphMu.Lock()
 			donor.transferRevision++
 			donor.dependencyOwnershipRevision++

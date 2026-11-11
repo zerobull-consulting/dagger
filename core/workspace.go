@@ -202,8 +202,7 @@ type WorkspaceSourceGitRef struct {
 	// Sparse holds the part of the tree module loading reads, so that reading
 	// it doesn't make the full checkout. It only serves reads faster: it's not
 	// part of the workspace's identity, and a workspace without one reads
-	// everything from its tree. It's persisted with the workspace, since an
-	// engine can use a workspace's record in place of the one it loaded.
+	// everything from its tree.
 	Sparse *GitSparseTree
 }
 
@@ -718,7 +717,6 @@ type persistedWorkspaceSource struct {
 	Kind           string                    `json:"kind"`
 	RootResultID   uint64                    `json:"rootResultID,omitempty"`
 	GitRefResultID uint64                    `json:"gitRefResultID,omitempty"`
-	SparseResultID uint64                    `json:"sparseResultID,omitempty"`
 	ChangesID      uint64                    `json:"changesID,omitempty"`
 	TouchedPaths   []string                  `json:"touchedPaths,omitempty"`
 	SeededPaths    []string                  `json:"seededPaths,omitempty"`
@@ -758,18 +756,10 @@ func encodePersistedWorkspaceSource(enc *dagql.PersistEncodeContext, src Workspa
 		if err != nil {
 			return nil, err
 		}
-		payload := &persistedWorkspaceSource{
+		return &persistedWorkspaceSource{
 			Kind:           persistedWorkspaceSourceGitRef,
 			GitRefResultID: refID,
-		}
-		if src.Sparse != nil && src.Sparse.Root.Self() != nil {
-			sparseID, err := encodePersistedObjectRef(enc, src.Sparse.Root, "workspace sparse tree")
-			if err != nil {
-				return nil, err
-			}
-			payload.SparseResultID = sparseID
-		}
-		return payload, nil
+		}, nil
 	case *WorkspaceSourceOverlay:
 		payload := &persistedWorkspaceSource{Kind: persistedWorkspaceSourceOverlay}
 		if src.Base != nil {
@@ -831,15 +821,7 @@ func decodePersistedWorkspaceSource(
 		if err != nil {
 			return nil, err
 		}
-		source := &WorkspaceSourceGitRef{Ref: ref.Result}
-		if persisted.SparseResultID != 0 {
-			root, err := loadPersistedObjectResultByResultID[*Directory](ctx, dec, persisted.SparseResultID, "workspace sparse tree")
-			if err != nil {
-				return nil, err
-			}
-			source.Sparse = &GitSparseTree{Root: root}
-		}
-		return source, nil
+		return NewWorkspaceSourceGitRef(ref.Result), nil
 	case persistedWorkspaceSourceOverlay:
 		base, err := decodePersistedWorkspaceSource(ctx, dec, persisted.Base, rootfs, hostPath)
 		if err != nil {

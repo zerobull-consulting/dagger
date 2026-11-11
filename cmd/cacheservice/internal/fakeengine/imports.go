@@ -88,11 +88,6 @@ func (c *Cache) byRecipeLocked(recipe string) *Entry {
 func (c *Cache) Merge(b dagql.ValueBundle) (protocol.Merged, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// As the engine does: a merge lists its chains' layers once
-	// (protocol.Merge's encoding), and each output gets its chain back.
-	if err := dagql.ResolveChainPrefixes(&b); err != nil {
-		return protocol.Merged{}, err
-	}
 	if len(b.Roots) == 0 {
 		return protocol.Merged{}, errors.New("bundle has no roots")
 	}

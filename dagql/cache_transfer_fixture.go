@@ -113,12 +113,6 @@ type TransferFixtureRow struct {
 	OutputClasses []uint64                   `json:"outputClasses"`
 	TermIDs       []uint64                   `json:"termIDs"`
 	SnapshotLinks []PersistedSnapshotRefLink `json:"snapshotLinks,omitempty"`
-
-	// ImageHeld reports that the engine's image holds the row. Its offers
-	// are then the image's: attached (AttachedOffers) but never persisted,
-	// so Offers lists none.
-	ImageHeld      bool                 `json:"imageHeld,omitempty"`
-	AttachedOffers []PersistedPartOffer `json:"attachedOffers,omitempty"`
 }
 type TransferFixtureReport struct {
 	Parts  []TransferFixturePartEvent `json:"parts,omitempty"`
@@ -165,11 +159,6 @@ func (c *Cache) TransferFixtureSnapshot(ctx context.Context, sessionID string, i
 			return report, err
 		}
 		entry := TransferFixtureRow{ResultID: uint64(id), Call: frame.clone(), Imported: row.imported, Offers: offers}
-		_, image := row.imageHoldingLocked()
-		entry.ImageHeld = image != nil
-		if entry.AttachedOffers, err = row.attachedOffersLocked(); err != nil {
-			return report, err
-		}
 		entry.SnapshotLinks = cloneSnapshotRefLinks(row.loadPayloadState().snapshotOwnerLinks)
 		_, entry.Persisted = c.persistedEdgesByResult[id]
 		for dep := range row.deps {

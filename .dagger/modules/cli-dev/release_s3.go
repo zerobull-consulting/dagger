@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"dagger/cli-dev/internal/dagger"
-	"dagger/cli-dev/internal/dagger/clients/alpine"
 )
 
 type cliS3UploadSet struct {
@@ -55,8 +54,8 @@ func (cli *CliDev) publishReleaseArtifactsToS3(
 		}
 	}
 
-	ctr := alpine.
-		New(alpine.AlpineOpts{
+	ctr := dag.
+		Alpine(dagger.AlpineOpts{
 			Branch:   "3.22",
 			Packages: []string{"aws-cli"},
 		}).

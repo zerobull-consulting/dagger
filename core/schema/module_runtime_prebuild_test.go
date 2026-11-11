@@ -3,10 +3,7 @@ package schema
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"os"
-	"os/exec"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -177,29 +174,12 @@ func TestModuleRuntimePrebuildNotAwaited(t *testing.T) {
 	require.True(t, buildStopped.Load(), "the build was stopped")
 }
 
-var prebuildBound = flag.Int("prebuild-bound", 0, "run TestModuleRuntimePrebuildsBounded's checks in this process, expecting this bound")
-
-// The engine prebuilds one runtime at once per CPU it runs on, and at least
-// 4: here more modules than that wait on a dependency that loads only once
-// the test lets it, so every one of them wants to prebuild at the same time.
-// The checks run in child test processes with GOMAXPROCS set, since the bound
-// is set once per process: with 2 the bound is 4, and with 8 it is 8.
+// The engine prebuilds at most maxRuntimePrebuilds runtimes at once: here
+// more modules than that wait on a dependency that loads only once the test
+// lets it, so every one of them wants to prebuild at the same time. Not
+// parallel: the bound is engine-wide, and the other prebuild tests would take
+// its slots.
 func TestModuleRuntimePrebuildsBounded(t *testing.T) {
-	if *prebuildBound == 0 {
-		t.Parallel()
-		for procs, bound := range map[int]int{2: 4, 8: 8} {
-			t.Run(fmt.Sprintf("GOMAXPROCS=%d", procs), func(t *testing.T) {
-				t.Parallel()
-				cmd := exec.Command(os.Args[0], "-test.run=^TestModuleRuntimePrebuildsBounded$", fmt.Sprintf("-prebuild-bound=%d", bound))
-				cmd.Env = append(os.Environ(), fmt.Sprintf("GOMAXPROCS=%d", procs))
-				if out, err := cmd.CombinedOutput(); err != nil {
-					t.Fatalf("child test process: %v\n%s", err, out)
-				}
-			})
-		}
-		return
-	}
-	bound := *prebuildBound
 	ctx, cache, srv, _ := prebuildTestEnv(t, "bounded")
 	depLoads := make(chan struct{})
 	dep := prebuildTestSource(t, ctx, cache, srv, "bounded", "dep", &prebuildTestSDK{runtime: func(ctx context.Context) error {
@@ -212,8 +192,8 @@ func TestModuleRuntimePrebuildsBounded(t *testing.T) {
 	}})
 
 	var inFlight, most atomic.Int32
-	entered := make(chan struct{}, 2*bound)
-	modules := 2 * bound
+	entered := make(chan struct{}, 2*maxRuntimePrebuilds)
+	modules := 2 * maxRuntimePrebuilds
 	srcs := make([]dagql.ObjectResult[*core.ModuleSource], modules)
 	for i := range srcs {
 		srcs[i] = prebuildTestSource(t, ctx, cache, srv, "bounded", fmt.Sprintf("mod%d", i), &prebuildTestSDK{prebuild: func(ctx context.Context) error {
@@ -238,7 +218,7 @@ func TestModuleRuntimePrebuildsBounded(t *testing.T) {
 			loaded <- err
 		}()
 	}
-	for range bound {
+	for range maxRuntimePrebuilds {
 		select {
 		case <-entered:
 		case <-time.After(30 * time.Second):
@@ -248,14 +228,14 @@ func TestModuleRuntimePrebuildsBounded(t *testing.T) {
 	// Give any prebuild past the bound time to start.
 	select {
 	case <-entered:
-		t.Fatalf("%d runtimes prebuilt at once, more than %d", most.Load(), bound)
+		t.Fatalf("%d runtimes prebuilt at once, more than %d", most.Load(), maxRuntimePrebuilds)
 	case <-time.After(2 * time.Second):
 	}
 	close(depLoads)
 	for range modules {
 		require.NoError(t, <-loaded)
 	}
-	require.EqualValues(t, bound, most.Load())
+	require.EqualValues(t, maxRuntimePrebuilds, most.Load())
 }
 
 // A dependency that fails to load fails the module with the dependency's
