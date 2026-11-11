@@ -28,7 +28,7 @@ Dagger offers caching as part of its paid platform, together with compute and sc
 | **Is** | A reference architecture for an engine cache on object storage: how the protocol's exports, imports, lookups, garbage collection and bucket ownership map onto S3 conditional writes. A working, tested example of the protocol's other half. |
 | **Is not** | A hosted service, a scheduler, a compute layer, or a managed multi-tenant cache. It has none of the integration a platform offers. |
 
-It was built by one person, with AI assistance, in a few weeks, and is used in production CI by one consumer. The platform's investment is of a different order; this proposal does not claim parity with it.
+It was built by one person, with AI assistance, in a few weeks, and is used in CI by one private consumer. The platform's investment is of a different order; this proposal does not claim parity with it.
 
 ## Limits
 
@@ -37,7 +37,7 @@ It was built by one person, with AI assistance, in a few weeks, and is used in p
 | **Object storage only** | S3-compatible stores: MinIO is tested in CI; DigitalOcean Spaces by hand. |
 | **A sidecar** | The service starts beside the engine in a job and stops with it. It does not run as a shared, always-on service in anything we have tested. |
 | **Concurrent writers** | Safe by design, best avoided. Index updates are conditional writes with retry (`UpdateIndex`, up to 50 attempts), racing exports are resolved by `If-None-Match` (`TestVerifyRacingExports`, `TestWritersRaceOnEmptyPrefix`). Throughput under contention is not measured. The fork's workflows run one writer per prefix. |
-| **Break-even** | Observed startup and drain time for the service is about 30 seconds. That makes it a good fit for caching work like dependency installation from a package manager lockfile, or toolchain builds that can be separated from application code, and a poor fit for small, quick items that a runner-local cache already serves repeatedly. The action reports the start time and `hack/remote-cache/speedup/run.sh` counts cache hits against executed steps. *[add: the consumer's measured savings per job]* |
+| **Break-even** | Observed startup and drain time for the service is about 30 seconds. That makes it a good fit for caching work like dependency installation from a package manager lockfile, or toolchain builds that can be separated from application code, and a poor fit for small, quick items that a runner-local cache already serves repeatedly. The action reports the start time and `hack/remote-cache/speedup/run.sh` counts cache hits against executed steps. A private consumer, a small (~60k lines) Next.js web application, uses it to cache an Alpine customization and an npm install. This saves about 1.5 minutes on each CI run, and is a key part of its solo developer's velocity. |
 | **One engine version** | The service accepts the engine version it was built with. The protocol's handshake carries `EngineVersion`; how a tree-built service would enforce it is to be settled. |
 
 ## Options for the tree
