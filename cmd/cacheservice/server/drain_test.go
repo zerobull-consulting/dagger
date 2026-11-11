@@ -346,7 +346,7 @@ func TestDrainRetriesRootOnBackoff(t *testing.T) {
 			digests := h.build()
 			// The export's 3 tries upload a corrupt exec layer, which fails
 			// verification: its roots count as failed, and wait a backoff.
-			h.cache.CorruptUploads(digests[1], 3)
+			corruptPuts(t, digests[1], 3)
 			failed := func() bool {
 				for _, e := range h.ns().tracker.Entries(h.cache.ID) {
 					if e.Failures > 0 && e.RetryAt != "" {
@@ -918,7 +918,7 @@ func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
 	// after the drain's deadline (DrainState.Later).
 	retryLater := func(t *testing.T, h *exportHarness) {
 		digests := h.build()
-		h.cache.CorruptUploads(digests[1], 3)
+		corruptPuts(t, digests[1], 3)
 		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
 		waitUntil(t, 10*time.Second, "the export to fail", func() bool {
 			left := h.svc.drainLeft(time.Now(), time.Now().Add(time.Second))
