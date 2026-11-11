@@ -25,6 +25,11 @@ name: Remote cache smoke test on Spaces
     branches:
       - feature/remote-cache
   workflow_dispatch: {}
+# A manual run is for feature/remote-cache only: the jobs below are skipped on
+# any other ref, since the pr-checks-* environments hold the bucket's keys.
+# That `if` is in the branch's own copy of this file, so it is not the guard:
+# restrict both environments' deployment branches to feature/remote-cache
+# (Settings > Environments) too.
 permissions:
   contents: read
 concurrency:
@@ -38,6 +43,7 @@ env:
 jobs:
   writer:
     name: writer
+    if: github.ref == 'refs/heads/feature/remote-cache'
     runs-on: ubuntu-24.04
     environment: pr-checks-readwrite
     # The work, the drain (10m) and the stop's 2 minutes.
@@ -101,6 +107,7 @@ jobs:
 
   reader:
     name: reader
+    if: github.ref == 'refs/heads/feature/remote-cache'
     needs: writer
     runs-on: ubuntu-24.04
     environment: pr-checks-readonly
