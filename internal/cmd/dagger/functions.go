@@ -1734,6 +1734,11 @@ func printPlainResult(w io.Writer, r any) error {
 		return nil
 	case string:
 		fmt.Fprint(w, t)
+	case float64:
+		// JSON numbers decode to float64, and %v prints one of 1e6 or more
+		// in exponent notation: print it as a plain number instead, so an
+		// Int result like a file's size reads 63700575, not 6.3700575e+07.
+		fmt.Fprint(w, strconv.FormatFloat(t, 'f', -1, 64))
 	default:
 		fmt.Fprintf(w, "%+v", t)
 	}
