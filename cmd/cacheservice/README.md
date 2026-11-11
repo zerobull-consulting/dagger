@@ -97,10 +97,11 @@ sidecar action is checked against the `accept` lines
 **New versions are verified by the release check**
 ([Release check](../../hack/remote-cache/README.md#release-check)): every
 hour it looks for an upstream `v1` release newer than every line here,
-waits for its image, and runs the e2e and the sidecar demo of this service
-against it. A green run becomes an `accept` line through a PR; a red one is
-tried again on a rebuild of the service on that release, and failing that
-becomes a `reject` line and a `compat-break` issue. To verify a version by
+waits for its image, and merges it into a sync branch,
+`release-check/sync/<version>`, whose service it tests against that
+engine (the e2e, the sidecar demo and the unit tests). A red sync gets a
+`compat-break` issue and is fixed in place; a green one gets the version's
+`accept` line and a PR for a human to merge. To verify a version by
 hand, see [Engine](../../hack/remote-cache/README.md#engine).
 
 **The match** is an exact string match of the hello's `engineVersion`

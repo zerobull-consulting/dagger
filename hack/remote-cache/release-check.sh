@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
-# The release check (zerobull-consulting/dagger#117, D5): verifies each new
-# upstream Dagger release against the cache service, and ends it as one of
+# The release check (zerobull-consulting/dagger#117, D5): brings each new
+# upstream Dagger release into feature/remote-cache through one sync branch
+# at a time, release-check/sync/<version>:
 #
-#   A  passes as-is: a PR adding its accept line, which auto-merges once
-#      the "auto-merge: adds compatible engine only" check is required
-#      (RELEASE_CHECK_AUTO_MERGE);
-#   B  passes after rebuilding on the new tag: a PR merging the tag, moving
-#      the base line and adding the accept line, for a human to merge with
-#      a merge commit;
-#   C  fails: an issue labeled compat-break, and a PR adding a reject line
-#      that names it.
+#   1. A new release starts the sync: the tag merged into the branch (with a
+#      merge commit), the manifest's base moved to it, pushed as
+#      release-check/sync/<version>, and a draft PR from it.
+#   2. Each hour the sync branch's head is verified: remote-cache-tests.yml
+#      dispatched on it with the release as the candidate engine (every job:
+#      the unit tests, TestBundleVersionMatchesEngineCapture among them, the
+#      MinIO tests, the e2e and the sidecar demo).
+#   3. Red: a compat-break issue pointing at the failing run (filed once;
+#      each later red head is a comment on it). The branch is expected to
+#      stay red until it's compatible: fixes are PRs into the sync branch,
+#      squash-merged, and each new head is verified again.
+#   4. Green: the release's accept line (citing the green run) is pushed to
+#      the sync branch and the PR is marked ready. A human merges it, with a
+#      merge commit.
+#
+# Only one sync is open at a time: newer releases wait until it is merged,
+# and are then verified against the branch with its fixes in (a fix made
+# for beta.26 may be all beta.27 needs).
 #
 # .github/workflows/remote-cache-release-check.yml runs it hourly and by
 # hand, and only decides when and with which token; everything else is
@@ -17,86 +28,80 @@
 #
 #   release-check.sh [--dry-run] publish
 #       If the branch's head has no successful publish run and none
-#       queued or in progress (an auto-merge by GITHUB_TOKEN starts no
-#       workflows; a publish may fail), dispatches cacheservice-publish.yml
-#       on it, which moves the floating :<engine version> tags. At most two
-#       dispatches per head (counting its workflow_dispatch runs, a hand
-#       re-run too): past that it prints publish=bounded and a warning and
-#       dispatches nothing. Skips a head with no run at all younger than 10
-#       minutes, whose push run may not be listed yet.
+#       queued or in progress (a publish may fail), dispatches
+#       cacheservice-publish.yml on it, which moves the floating
+#       :<engine version> tags. At most two dispatches per head (counting
+#       its workflow_dispatch runs, a hand re-run too): past that it prints
+#       publish=bounded and a warning and dispatches nothing. Skips a head
+#       with no run at all younger than 10 minutes, whose push run may not
+#       be listed yet.
 #   release-check.sh [--dry-run] plan [<version>]
-#       Finds the oldest upstream v1 release newer than every version the
-#       manifest names, and prints what to do with it (below). With a
-#       version (dry run only), that release, listed or not.
+#       Reads the state and prints what to do (below). Reads only. With a
+#       version (dry run only), plans starting that release's sync, listed
+#       or not.
+#   release-check.sh [--dry-run] start <version> <digest>
+#       Step 1, as the sync bot (BOT_TOKEN): merges the tag (a conflict
+#       leaves the merge to a human, and the branch on feature/remote-cache
+#       with the base moved), pushes release-check/sync/<version>, opens its
+#       draft PR, and dispatches its first verification (GITHUB_TOKEN).
 #   release-check.sh [--dry-run] verify <version> <digest>
-#       Runs the current service against that stock engine: dispatches
-#       remote-cache-tests.yml on the branch (RELEASE_CHECK_TEST_REF: a dry
-#       run's own ref) with the candidate inputs, writes the advisory diff
-#       while it runs, and waits for it. Prints result=pass or
-#       result=fail: the verdict of the "real engines (e2e)" and "sidecar demo"
-#       jobs alone, read by name from the run's jobs. A run that doesn't end
-#       in success or failure (cancelled, timed out waiting), that failed
-#       before testing (its checkout or pin step), in which any other job
-#       (unit tests, MinIO) failed, or in which an engine job is missing or
-#       skipped, is an error, never a failure: it must not lead to a reject
-#       line.
-#   release-check.sh bundle <version>
-#       TestBundleVersionMatchesEngineCapture with the tag merged into the
-#       branch (RELEASE_CHECK_TEST_REF: a dry run's own ref, as verify's).
-#       It runs upstream's code, so the workflow runs it in a job of its own
-#       with no credential, and it refuses to run if a token is in its
-#       environment. Prints bundle=pass, fail or conflict (not run: the tag
-#       conflicts with the branch), and merge=. A needs verify's pass and
-#       this pass; the outcome commands read this verdict from
-#       RELEASE_CHECK_BUNDLE.
-#   release-check.sh [--dry-run] accept <version> <digest> <run URL>
-#       Outcome A: pushes release-check/accept/<version> with the accept
-#       line, and opens its PR.
-#   release-check.sh [--dry-run] auto-merge <PR number>
-#       Enables squash auto-merge on an accept PR, with GITHUB_TOKEN, only
-#       if RELEASE_CHECK_AUTO_MERGE is true and the PR changes nothing but
-#       one added accept line.
-#   release-check.sh [--dry-run] rebuild <version> <digest>
-#       Outcome B, tried after A fails: pushes release-check/rebuild/
-#       <version> (the tag merged, the base moved), verifies it as verify
-#       does, and if it passes adds the accept line (or resets the list to
-#       it, if the bundle or protocol version changed) and opens its PR.
-#       Prints result=pass, fail or skipped (the tag is already merged, so
-#       a rebuild is the code A ran; the merge conflicts; or the bundle
-#       test of that same merge didn't pass).
-#   release-check.sh [--dry-run] reject <version> [<issue number>]
-#       Outcome C: files (or finds) the compat-break issue with the failing
-#       jobs and the advisory diff, then pushes release-check/reject/
-#       <version> with the reject line and opens its PR.
+#       Step 2: dispatches remote-cache-tests.yml on the sync branch with
+#       the candidate inputs, and returns: a later hour reads its verdict.
+#   release-check.sh [--dry-run] report <version> <run URL> <PR>
+#       Step 3, with GITHUB_TOKEN: files the compat-break issue with the
+#       run's failing jobs and the advisory diff and links it from the PR,
+#       or comments on the open issue with the run, once per run.
+#   release-check.sh [--dry-run] ready <version> <PR>
+#       Marks the sync PR ready and says so on it and on the issue
+#       (GITHUB_TOKEN), if it is still a draft once its accept line is
+#       pushed: accept does this itself, and this retries it if accept
+#       stopped after its push.
+#   release-check.sh [--dry-run] accept <version> <digest> <run URL> <sha> <PR>
+#       Step 4: pushes the accept line to the sync branch as the bot (only
+#       if its head is still <sha>, the commit the run verified), then
+#       says so on the PR and the issue and, last, marks the PR ready
+#       (GITHUB_TOKEN): a run that stops in between leaves a draft, which
+#       ready finishes. If the bundle or protocol version changed since the
+#       manifest's base, the accept list resets to this one version.
 #
 # plan prints action=, one of:
-#   none            nothing new, or the oldest new release has no image
-#                   yet (nothing newer is tried before it has)
-#   verify          version= and digest=: a new release to verify
-#   pending         kind= (accept, rebuild, reject) and pr=: the release's
-#                   PR is open; nothing else happens until it's merged or
-#                   closed, so releases are handled one at a time, in order
-#   resume-reject   version= and issue=: its compat-break issue is open
-#                   but its reject branch doesn't exist (a run that
-#                   stopped between the two)
-# and fails if a release-check branch for the release exists with no open
-# PR (a PR closed by hand, or a run that died): delete the branch to retry.
+#   none    nothing new, or the oldest new release has no image yet
+#           (nothing newer is tried before it has)
+#   start   version= and digest=: a new release, and no sync open
+#   sync    version=, digest=, pr=, sha= (the sync branch's head) and state=:
+#             needs-merge  the branch doesn't contain the tag yet (its merge
+#                          conflicted): a human merges it
+#             verify       no verifying run of this head: dispatch one
+#             running      its verifying run hasn't finished
+#             red          run=: its verifying run failed: report it
+#             green        run=: its verifying run passed: accept
+#             ready        the branch has the release's accept line: a
+#                          human merges the PR (draft=true: mark it ready
+#                          first, with the ready subcommand)
+#             bounded      two verifying runs of this head ended neither
+#                          green nor red (cancelled, say): re-run by hand
+# and fails if a release-check branch for the release it would start
+# exists without an open sync PR (a PR closed by hand, a run that died, or
+# a branch from the earlier accept/rebuild/reject flow): delete it to retry.
 #
 # With --dry-run (or RELEASE_CHECK_DRY_RUN=1), nothing is pushed, opened,
-# labeled, enabled or dispatched, except verify's own dispatch, which
-# changes nothing: each of those is printed instead, starting "dry run:".
+# filed, commented, marked or dispatched: each is printed instead, starting
+# "dry run:".
 #
 # Tokens: GH_TOKEN is the workflow's GITHUB_TOKEN, for reads, dispatches,
-# issues and auto-merge. BOT_TOKEN is the bot's token (CACHE_BOT_PR_TOKEN or
-# CACHE_BOT_SYNC_TOKEN), only for pushes and opening PRs, whose CI must run.
-# Neither is ever printed or put on a command line.
+# issues, comments and marking the PR ready. BOT_TOKEN is the sync bot's
+# (CACHE_BOT_SYNC_TOKEN), only for pushes and opening the PR, whose CI must
+# run. Neither is ever printed or put on a command line. Neither merges.
+#
+# Upstream's code never runs here: only git merges, diffs and pushes it.
+# It runs in the verifying run, remote-cache-tests.yml, with that
+# workflow's own read-only token.
 #
 # Everything from upstream or a registry is checked against a strict
 # pattern before it reaches a branch name, a file or a command. Every
 # network call is bounded. Settings (for tests): RELEASE_CHECK_REPO,
 # RELEASE_CHECK_BRANCH, RELEASE_CHECK_REMOTE, RELEASE_CHECK_UPSTREAM,
-# RELEASE_CHECK_DIR (notes passed between jobs), RELEASE_CHECK_POLL_SECONDS,
-# RELEASE_CHECK_WAIT_MINUTES, RELEASE_CHECK_MIN_HEAD_AGE.
+# RELEASE_CHECK_MIN_HEAD_AGE.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,14 +114,14 @@ server="${GITHUB_SERVER_URL:-https://github.com}"
 remote="${RELEASE_CHECK_REMOTE:-$server/$repo.git}"
 upstream="${RELEASE_CHECK_UPSTREAM:-https://github.com/dagger/dagger}"
 engine_repo=registry.dagger.io/engine
-notes="${RELEASE_CHECK_DIR:-${RUNNER_TEMP:-/tmp}/release-check}"
-poll="${RELEASE_CHECK_POLL_SECONDS:-60}"
-wait_minutes="${RELEASE_CHECK_WAIT_MINUTES:-150}"
 min_head_age="${RELEASE_CHECK_MIN_HEAD_AGE:-600}"
 dry="${RELEASE_CHECK_DRY_RUN:-}"
-auto_merge="${RELEASE_CHECK_AUTO_MERGE:-}"
 bot_name="zerobull release check"
 bot_email="release-check@users.noreply.github.com"
+sync_prefix=release-check/sync
+# The most verifying runs of one head that may end neither green nor red
+# before the check stops dispatching more.
+max_verify_dispatches=2
 
 # The release tags the check considers (zerobull-consulting/dagger#117
 # step 3), and what engines.sh takes as a version: a tag must match both.
@@ -125,6 +130,7 @@ version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
 digest_re='^sha256:[0-9a-f]{64}$'
 repo_re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 run_re='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/attempts/[0-9]+)?$'
+sha_re='^[0-9a-f]{40}$'
 
 die() {
 	echo "::error::release-check.sh: $*" >&2
@@ -144,18 +150,10 @@ need_tag() { valid_tag "$1" || die "'$1' is not a v1 release tag such as v1.0.0-
 need_digest() { [[ "$1" =~ $digest_re ]] || die "'$1' is not a sha256 digest"; }
 need_run() { [[ "$1" =~ $run_re ]] || die "'$1' is not a GitHub Actions run URL"; }
 need_number() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || die "'$1' is not a number"; }
-# need_test_ref: RELEASE_CHECK_TEST_REF, if set, is a branch name git accepts
-# (so no ':', '~', '^', '?', '*', '[', '\\', space or '..'), as the workflow
-# gives it. It is only ever used after "refs/heads/", in quoted arguments, and
-# only by verify and bundle.
-need_test_ref() {
-	[[ -z "${RELEASE_CHECK_TEST_REF:-}" ]] || git check-ref-format "refs/heads/$RELEASE_CHECK_TEST_REF" ||
-		die "RELEASE_CHECK_TEST_REF is not a branch name"
-}
+need_sha() { [[ "$1" =~ $sha_re ]] || die "'$1' is not a commit id"; }
 
 [[ "$repo" =~ $repo_re ]] || die "RELEASE_CHECK_REPO '$repo' is not owner/name"
-[[ "$poll" =~ ^[0-9]{1,4}$ && "$wait_minutes" =~ ^[0-9]{1,4}$ && "$min_head_age" =~ ^[0-9]{1,6}$ ]] ||
-	die "RELEASE_CHECK_POLL_SECONDS, RELEASE_CHECK_WAIT_MINUTES and RELEASE_CHECK_MIN_HEAD_AGE must be numbers"
+[[ "$min_head_age" =~ ^[0-9]{1,6}$ ]] || die "RELEASE_CHECK_MIN_HEAD_AGE must be a number"
 
 # api [gh api args...]: a read, or a write with GITHUB_TOKEN, bounded.
 api() { timeout 60 gh api "$@"; }
@@ -238,40 +236,14 @@ fetch_tag() {
 	timeout 600 git fetch -q --no-tags "$upstream" "+refs/tags/$1:refs/tags/$1" || die "couldn't fetch $1 from $upstream"
 }
 
-# pending_run: a dispatched candidate run whose verdict hasn't been read
-# yet. If the script ends in failure with one pending (in verify's fetches
-# and advisory diff, or in verify's or rebuild's wait or verdict read), it is
-# cancelled, best effort and with GITHUB_TOKEN, rather than left to run
-# unread (zerobull-consulting/dagger#163, zerobull-consulting/dagger#187).
-# wait_since: when verify dispatched (SECONDS), which wait_run counts its
-# deadline from.
-pending_run=""
-wait_since=""
 # tree: a fresh worktree of the branch's head (or of new_tree's argument), in
-# $tree.
+# $tree. scratch: files this run writes (PR and issue bodies, the advisory
+# diff).
 tree=""
+scratch="$(mktemp -d)"
 cleanup() {
-	local rc=$?
-	if [[ -n "$pending_run" && $rc -ne 0 ]]; then
-		local url="$server/$repo/actions/runs/$pending_run" state
-		# A run that has already ended can't be cancelled (the API refuses):
-		# it is said to have ended, not to be cancelled.
-		if api -X POST "repos/$repo/actions/runs/$pending_run/cancel" >/dev/null 2>&1; then
-			say "the candidate run $url is not awaited and no result is given: asked GitHub to cancel it"
-		else
-			# "<status> <conclusion>", read once; empty when the read fails
-			# (gh prints an error's body on stdout, so its output alone
-			# doesn't say the read worked).
-			state="$(api "repos/$repo/actions/runs/$pending_run" 2>/dev/null |
-				jq -r '"\(.status) \(.conclusion // "")"' 2>/dev/null)" || state=""
-			case "$state" in
-			"completed "*) say "the candidate run $url ended '${state#completed }' and no result is given: nothing to cancel" ;;
-			"") say "the candidate run $url is not awaited and no result is given; cancelling it and reading its state failed: it may finish unread" ;;
-			*) say "the candidate run $url is not awaited and no result is given; cancelling it failed: it will finish unread" ;;
-			esac
-		fi
-	fi
 	if [[ -n "$tree" ]]; then git worktree remove --force "$tree" >/dev/null 2>&1 || true; fi
+	rm -rf "$scratch"
 }
 trap cleanup EXIT
 new_tree() {
@@ -296,7 +268,8 @@ commit() {
 	git -C "$tree" -c user.name="$bot_name" -c user.email="$bot_email" commit -q "$@"
 }
 
-# push <branch>: pushes the worktree's HEAD as a new branch, as the bot.
+# push <branch>: pushes the worktree's HEAD to the branch, as the bot: a new
+# branch, or a fast-forward of it (never forced: a head that moved refuses).
 # The token goes in through git's environment, never its arguments.
 push() {
 	local to="$1"
@@ -309,22 +282,22 @@ push() {
 	auth="$(printf 'x-access-token:%s' "$BOT_TOKEN" | base64 -w0)"
 	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
 		timeout 300 git -C "$tree" push -q "$remote" "HEAD:refs/heads/$to" ||
-		die "pushing $to failed: is the bot's token missing, expired, or without access?"
+		die "pushing $to failed: has it moved since it was fetched, or is the bot's token missing, expired, or without access?"
 }
 
-# open_pr <head> <title> <body file>: opens a PR into the branch, as the
-# bot, and prints its number.
+# open_pr <head> <title> <body file>: opens a draft PR into the branch, as
+# the bot, and prints its number.
 open_pr() {
 	local head="$1" title="$2" body="$3"
 	if is_dry; then
-		would "open a PR from $head: '$title', with this description:"
+		would "open a draft PR from $head: '$title', with this description:"
 		sed 's/^/    | /' "$body" >&2
 		echo 0
 		return
 	fi
 	local pr
 	pr="$(jq -n --arg t "$title" --arg h "$head" --arg b "$branch" --rawfile body "$body" \
-		'{title: $t, head: $h, base: $b, body: $body, maintainer_can_modify: true}' |
+		'{title: $t, head: $h, base: $b, body: $body, draft: true, maintainer_can_modify: true}' |
 		bot_api -X POST "repos/$repo/pulls" --input - | jq -r .number)" ||
 		die "opening the PR from $head failed: is the bot's token missing, expired, or without access?"
 	need_number "$pr"
@@ -332,18 +305,33 @@ open_pr() {
 	echo "$pr"
 }
 
-# release_prs <version>: the open release-check PRs for the version, from
-# this repository's own branches (a fork's PR may use the same name), as
-# "<number> <kind>" lines.
-release_prs() {
-	api "repos/$repo/pulls?state=open&base=$branch&per_page=100" |
-		jq -r --arg v "$1" --arg r "$repo" '.[] | select(.head.repo.full_name == $r) | select(.head.ref | test("^release-check/(accept|rebuild|reject)/") ) |
-			select((.head.ref | split("/") | .[2]) == $v) | "\(.number) \(.head.ref | split("/") | .[1])"'
+# comment <issue or PR number> <body file>: a comment, with GITHUB_TOKEN.
+comment() {
+	if is_dry; then
+		would "comment on #$1:"
+		sed 's/^/    | /' "$2" >&2
+		return
+	fi
+	jq -n --rawfile b "$2" '{body: $b}' | api -X POST "repos/$repo/issues/$1/comments" --input - >/dev/null ||
+		die "commenting on #$1 failed"
 }
-# release_branches <version>: the release-check branches for the version.
+
+sync_branch() { echo "$sync_prefix/$1"; }
+
+# sync_prs: the open sync PRs into the branch, from this repository's own
+# branches (a fork's PR may use the same name), as
+# "<number> <version> <head sha> <draft>" lines.
+sync_prs() {
+	# Every page: a sync PR past the first hundred is still open.
+	api --paginate "repos/$repo/pulls?state=open&base=$branch&per_page=100" |
+		jq -r --arg r "$repo" --arg p "$sync_prefix/" '.[] | select(.head.repo.full_name == $r) | select(.head.ref | startswith($p)) |
+			"\(.number) \(.head.ref | ltrimstr($p)) \(.head.sha) \(.draft // false)"'
+}
+# release_branches <version>: the release-check branches for the version,
+# of any kind (the earlier flow's accept/rebuild/reject too).
 release_branches() {
 	api "repos/$repo/git/matching-refs/heads/release-check/" |
-		jq -r --arg v "$1" '.[].ref | sub("^refs/heads/"; "") | select(test("^release-check/(accept|rebuild|reject)/") and (split("/") | .[2]) == $v)'
+		jq -r --arg v "$1" '.[].ref | sub("^refs/heads/"; "") | select(test("^release-check/[a-z]+/") and (split("/") | .[2]) == $v)'
 }
 issue_title() { echo "compat-break: engine $1 fails against the cache service"; }
 # open_issue <version>: the open compat-break issue's number, if any.
@@ -361,126 +349,161 @@ dispatch() {
 	reply="$(jq -n --arg r "$ref" --argjson i "$inputs" '{ref: $r, inputs: $i, return_run_details: true}' |
 		api -X POST "repos/$repo/actions/workflows/$wf/dispatches" --input -)" || die "dispatching $wf on $ref failed"
 	id="$(jq -r '.workflow_run_id // empty' <<<"$reply" 2>/dev/null || true)"
-	[[ "$id" =~ ^[0-9]{1,20}$ ]] || die "dispatching $wf on $ref started a run the API didn't name; nothing waits on a guess"
+	[[ "$id" =~ ^[0-9]{1,20}$ ]] || die "dispatching $wf on $ref started a run the API didn't name"
 	echo "$id"
-}
-
-# wait_run <id>: waits, bounded, until the run completes, and prints its
-# conclusion.
-wait_run() {
-	local id="$1" deadline run status conclusion
-	# From the dispatch (wait_since, if set), not from here: work done between
-	# the two doesn't extend the wait past the step's timeout.
-	deadline=$((${wait_since:-$SECONDS} + wait_minutes * 60))
-	while :; do
-		if run="$(api "repos/$repo/actions/runs/$id")"; then
-			status="$(jq -r .status <<<"$run")"
-			conclusion="$(jq -r '.conclusion // ""' <<<"$run")"
-			if [[ "$status" == completed ]]; then
-				echo "$conclusion"
-				return
-			fi
-		else
-			say "reading run $id failed; trying again"
-		fi
-		((SECONDS < deadline)) || die "run $id didn't complete within $wait_minutes minutes"
-		sleep "$poll"
-	done
 }
 
 # The jobs of remote-cache-tests.yml whose result is the engine's
-# (engine_jobs, engine_json, is_engine, engine_jobs_unlisted), shared with
-# accept-line-only.sh.
+# (engine_jobs, engine_json, is_engine, engine_jobs_unlisted).
 # shellcheck source=engine-jobs.sh
 source "$here/engine-jobs.sh"
 
-# failing_jobs: an engine job's failures (a run's jobs JSON on stdin), as a
-# Markdown list.
-failing_jobs() {
-	jq -r --argjson e "$engine_json" \
-		'.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | select('"$is_engine"') | "- [\(.name)](\(.html_url)): \(.conclusion)"'
-}
+# run_title <version> <digest>: a candidate run's title, from
+# remote-cache-tests.yml's run-name: the runs API doesn't return a
+# dispatch's inputs, so this is how a run is matched to what it verified.
+run_title() { echo "Remote cache tests: candidate $1 $2"; }
 
-# The e2e and the sidecar demo against the candidate, waited on, write
-# <prefix>_run,
-# <prefix>_conclusion and <prefix>-jobs.md to the notes. Prints pass or
-# fail; anything else is an error.
-# start_tests <ref> <version> <digest>: the dispatch alone; prints the run's
-# id. finish_tests <id> <prefix>: the wait and the verdict. Apart, so the
-# bundle test runs while the run does.
+# start_tests <version> <digest>: dispatches remote-cache-tests.yml on the
+# sync branch with the candidate inputs. Prints the run's URL.
 start_tests() {
-	local id
-	id="$(dispatch remote-cache-tests.yml "$1" "$(jq -n --arg v "$2" --arg d "$3" '{"candidate-version": $v, "candidate-digest": $d}')")"
+	local v="$1" d="$2" ref id
+	ref="$(sync_branch "$v")"
+	if is_dry; then
+		would "dispatch remote-cache-tests.yml on $ref with candidate $v $d"
+		return
+	fi
+	id="$(dispatch remote-cache-tests.yml "$ref" "$(jq -n --arg v "$v" --arg d "$d" '{"candidate-version": $v, "candidate-digest": $d}')")"
 	need_run "$server/$repo/actions/runs/$id"
-	say "verifying $2 on $1: $server/$repo/actions/runs/$id"
-	echo "$id"
-}
-finish_tests() {
-	local id="$1" p="$2" url conclusion jobs names early other why
-	url="$server/$repo/actions/runs/$id"
-	conclusion="$(wait_run "$id")"
-	note "${p}_run" "$url"
-	note "${p}_conclusion" "$conclusion"
-	case "$conclusion" in
-	success | failure) ;;
-	*) die "the verifying run $url ended '$conclusion', neither green nor red: not deciding on it" ;;
-	esac
-	# The verdict is the engine jobs' alone, so the jobs are read, once, on
-	# a green run too (a skipped engine job leaves the run green). A failed
-	# read decides nothing.
-	# (tried three times: a transient error shouldn't cost the whole run).
-	local try
-	for try in 1 2 3; do
-		jobs="$(api "repos/$repo/actions/runs/$id/jobs?per_page=100")" && jq -e '.jobs | type == "array"' <<<"$jobs" >/dev/null && break
-		jobs=""
-		((try == 3)) || sleep "$poll"
-	done
-	[[ -n "$jobs" ]] ||
-		die "couldn't read the verifying run $url's jobs: not deciding on it"
-	# All of them listed, and each engine job there, once.
-	why="$(engine_jobs_unlisted "$jobs")"
-	[[ -z "$why" ]] || die "the verifying run $url: $why: not deciding on it"
-	# A job that isn't the engine's and didn't pass says nothing about the
-	# engine: an error, and the next hour verifies the release again.
-	other="$(jq -r --argjson e "$engine_json" \
-		'[.jobs[] | select('"$is_engine"' | not) | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name): \(.conclusion)"] | join(", ")' <<<"$jobs")"
-	[[ -z "$other" ]] || die "the verifying run $url had jobs fail that don't test the engine ($other): not deciding on it"
-	names="$(jq -r --argjson e "$engine_json" \
-		'[.jobs[] | select('"$is_engine"') | .conclusion] | join(" ")' <<<"$jobs")"
-	# Every engine job has to have run to a green or red end first: one
-	# failed and the other skipped or cancelled never tested both engines.
-	jq -e --argjson e "$engine_json" '[.jobs[] | select('"$is_engine"') | .conclusion] | all(. == "success" or . == "failure" or . == "timed_out")' <<<"$jobs" >/dev/null ||
-		die "the verifying run $url ended '$conclusion' with its engine jobs '$names': not deciding on it"
-	case " $names " in
-	*" failure "* | *" timed_out "*)
-		# A job that failed before testing anything (its checkout, or the
-		# pin step refusing the candidate) says nothing about the engine.
-		early="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
-			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
-		[[ -z "$early" ]] || die "the verifying run $url failed before testing ($early): not deciding on it"
-		failing_jobs <<<"$jobs" >"$notes/$p-jobs.md"
-		echo fail
-		;;
-	*)
-		# Green is both engine jobs green, in a run that is green.
-		[[ "$names" == "success success" && "$conclusion" == success ]] ||
-			die "the verifying run $url ended '$conclusion' with its engine jobs '$names': not deciding on it"
-		: >"$notes/$p-jobs.md"
-		echo pass
-		;;
-	esac
+	say "verifying $ref against $v: $server/$repo/actions/runs/$id"
+	echo "$server/$repo/actions/runs/$id"
 }
 
-# note <name> <value>: a scalar for a later job, in $notes/notes.env.
-note() {
-	mkdir -p "$notes"
-	[[ "$2" =~ ^[A-Za-z0-9_.:/#@+-]*$ ]] || die "note $1 has an unexpected character"
-	echo "$1=$2" >>"$notes/notes.env"
+# run_jobs <run id>: the run's jobs (one page of 100), tried three times.
+run_jobs() {
+	local try jobs
+	for try in 1 2 3; do
+		if jobs="$(api "repos/$repo/actions/runs/$1/jobs?per_page=100")" && jq -e '.jobs | type == "array"' <<<"$jobs" >/dev/null 2>&1; then
+			echo "$jobs"
+			return
+		fi
+		((try == 3)) || sleep 5
+	done
+	return 1
 }
-# get <name>: a note's last value.
-get() {
-	[[ -f "$notes/notes.env" ]] || { echo ""; return; }
-	awk -F= -v k="$1" '$1 == k { v = substr($0, length(k) + 2) } END { print v }' "$notes/notes.env"
+
+# undecided_failure <run id>: why a failed run says nothing about the code,
+# or nothing if it is red. It says nothing if its jobs listing is
+# incomplete or lacks an engine job (engine_jobs_unlisted), if no job in it
+# failed or timed out, or if a job failed before testing anything (its
+# checkout, or the pin step refusing the candidate). Any other failed job is
+# red, the unit and MinIO jobs' too: they run the sync branch's code. A jobs
+# read that fails fails the plan.
+undecided_failure() {
+	local jobs why
+	jobs="$(run_jobs "$1")" || die "couldn't read the verifying run $server/$repo/actions/runs/$1's jobs: not deciding on it"
+	why="$(engine_jobs_unlisted "$jobs")"
+	if [[ -n "$why" ]]; then
+		echo "$why"
+		return
+	fi
+	why="$(jq -r '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") |
+		select(any(.steps[]?; (.conclusion == "failure" or .conclusion == "timed_out") and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
+	if [[ -n "$why" ]]; then
+		echo "jobs failed before testing: $why"
+		return
+	fi
+	jq -e 'any(.jobs[]; .conclusion == "failure" or .conclusion == "timed_out")' <<<"$jobs" >/dev/null ||
+		echo "no job in it failed"
+}
+
+# verdict <version> <digest> <sha>: the state of the sync branch's head
+# from its verifying runs (dispatches of remote-cache-tests.yml titled for
+# the candidate, at that commit). Prints "<state> [<run URL>]": green, red,
+# running, verify or bounded. The latest run decides. Green is a green run
+# whose engine jobs both ran and passed: a run whose engine jobs were
+# skipped ends green too (zerobull-consulting/dagger#223), and decides
+# nothing.
+verdict() {
+	local v="$1" d="$2" sha="$3" runs latest id status conclusion url jobs why undecided
+	runs="$(api "repos/$repo/actions/workflows/remote-cache-tests.yml/runs?event=workflow_dispatch&head_sha=$sha&per_page=100")" ||
+		die "couldn't read the verifying runs of ${sha:0:12}"
+	jq -e '.workflow_runs | type == "array"' <<<"$runs" >/dev/null || die "the verifying runs of ${sha:0:12} aren't a list"
+	# More runs than were listed decides nothing: an unlisted run could be
+	# the latest, or one that counts toward the bound.
+	jq -e '(.total_count // (.workflow_runs | length)) <= (.workflow_runs | length)' <<<"$runs" >/dev/null ||
+		die "the head ${sha:0:12} has more verifying runs than were listed: re-run or clear them by hand"
+	runs="$(jq -c --arg t "$(run_title "$v" "$d")" '[.workflow_runs[] | select(.display_title == $t)] | sort_by(.id)' <<<"$runs")"
+	if [[ "$(jq length <<<"$runs")" == 0 ]]; then
+		echo verify
+		return
+	fi
+	latest="$(jq -c '.[-1]' <<<"$runs")"
+	id="$(jq -r .id <<<"$latest")"
+	[[ "$id" =~ ^[0-9]{1,20}$ ]] || die "a verifying run's id isn't a number"
+	status="$(jq -r .status <<<"$latest")"
+	conclusion="$(jq -r '.conclusion // ""' <<<"$latest")"
+	url="$server/$repo/actions/runs/$id"
+	need_run "$url"
+	if [[ "$status" != completed ]]; then
+		echo "running $url"
+		return
+	fi
+	case "$conclusion" in
+	failure | timed_out)
+		# verdict runs in a command substitution, where set -e doesn't
+		# reach: a failed read exits by hand.
+		why="$(undecided_failure "$id")" || exit 1
+		if [[ -z "$why" ]]; then
+			echo "red $url"
+			return
+		fi
+		say "the verifying run $url failed, but $why: it decides nothing"
+		;;
+	success)
+		if jobs="$(run_jobs "$id")"; then
+			why="$(engine_jobs_unlisted "$jobs")"
+			if [[ -z "$why" ]] && jq -e --argjson e "$engine_json" '[.jobs[] | select('"$is_engine"') | .conclusion] | all(. == "success")' <<<"$jobs" >/dev/null; then
+				echo "green $url"
+				return
+			fi
+			say "the verifying run $url is green, but its engine jobs didn't both run and pass${why:+ ($why)}: it decides nothing"
+		else
+			die "couldn't read the verifying run $url's jobs: not deciding on it"
+		fi
+		;;
+	*) say "the verifying run $url ended '$conclusion': it decides nothing" ;;
+	esac
+	# The latest run of this head ended undecided (cancelled, say): try
+	# again, a bounded number of times. Every completed run that ended
+	# undecided counts; a red one doesn't, but a failed one that decides
+	# nothing (undecided_failure) does. The latest, undecided as read above,
+	# counts without a second read.
+	local rid rconclusion early
+	undecided=1
+	while read -r rid rconclusion; do
+		case "$rconclusion" in
+		failure | timed_out)
+			early="$(undecided_failure "$rid")" || exit 1
+			[[ -z "$early" ]] || undecided=$((undecided + 1))
+			;;
+		*) undecided=$((undecided + 1)) ;;
+		esac
+	done < <(jq -r '.[:-1][] | select(.status == "completed") | "\(.id) \(.conclusion // "")"' <<<"$runs")
+	if ((undecided >= max_verify_dispatches)); then
+		echo "bounded $url"
+	else
+		echo verify
+	fi
+}
+
+# failing_jobs <run id>: the run's failed jobs, as a Markdown list.
+failing_jobs() {
+	local jobs
+	if jobs="$(run_jobs "$1")"; then
+		jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "- [\(.name)](\(.html_url)): \(.conclusion)"' <<<"$jobs"
+	else
+		echo "- (the run's jobs couldn't be read: see the run)"
+	fi
 }
 
 # merge_tag <tag>: merges the tag into the worktree. Prints merged,
@@ -492,7 +515,7 @@ merge_tag() {
 		return
 	fi
 	if git -C "$tree" -c user.name="$bot_name" -c user.email="$bot_email" merge -q --no-ff --no-edit \
-		-m "Merge upstream $tag into $branch (release check)" "refs/tags/$tag" >&2; then
+		-m "Merge upstream $tag into $(sync_branch "$tag") (release check)" "refs/tags/$tag" >&2; then
 		echo merged
 	else
 		git -C "$tree" merge --abort >/dev/null 2>&1 || true
@@ -504,14 +527,18 @@ bundle_const() {
 	git show "$1:dagql/cache_transfer_types.go" 2>/dev/null | sed -n 's/^const valueBundleVersion = \([0-9][0-9]*\)$/\1/p'
 }
 
-# advisory <tag>: the diff of the engine's side of the remote cache from the
-# manifest's base to the tag, and whether the bundle or protocol version
-# changed. Advisory: the service also depends on engine.* events and
-# session spans outside these paths, and the e2e is the gate.
+# advisory <tag>: writes $scratch/advisory.md, the diff of the engine's side
+# of the remote cache from the manifest's base (feature/remote-cache's, as
+# checked out) to the tag, and whether the bundle or protocol version
+# changed; sets reset=yes if either did. Advisory: the service also depends
+# on engine.* events and session spans outside these paths, and the
+# verifying run is the gate.
+reset=""
 advisory() {
 	local tag="$1" base old new proto=no
 	base="$("$engines" base)"
 	fetch_tag "$base"
+	fetch_tag "$tag"
 	old="$(bundle_const "refs/tags/$base")"
 	new="$(bundle_const "refs/tags/$tag")"
 	# An unread version is never "unchanged": that would keep accept lines a
@@ -520,35 +547,18 @@ advisory() {
 		die "couldn't read dagql's valueBundleVersion in $base or $tag (dagql/cache_transfer_types.go): update bundle_const for its new form"
 	local paths=(engine/remotecache cmd/engine/remotecache.go 'engine/server/remote_cache*.go' 'dagql/cache*.go' ':!**/*_test.go')
 	git diff --quiet "refs/tags/$base" "refs/tags/$tag" -- engine/remotecache/protocol ':!**/*_test.go' || proto=yes
-	local reset=no
+	reset=no
 	[[ "$old" == "$new" && "$proto" == no ]] || reset=yes
-	note reset "$reset"
 	{
-		echo "The engine's side of the remote cache, $base to $tag (advisory: the e2e is the gate):"
+		echo "The engine's side of the remote cache, $base to $tag (advisory: the verifying run is the gate):"
 		echo
 		echo '```'
 		git diff --stat "refs/tags/$base" "refs/tags/$tag" -- "${paths[@]}" || true
 		echo '```'
 		echo
-		echo "- Bundle version (dagql's valueBundleVersion): ${old:-?} in $base, ${new:-?} in $tag."
+		echo "- Bundle version (dagql's valueBundleVersion): $old in $base, $new in $tag."
 		echo "- Protocol (engine/remotecache/protocol): $([[ "$proto" == yes ]] && echo changed || echo unchanged)."
-	} >"$notes/advisory.md"
-	cat "$notes/advisory.md" >&2
-}
-
-# bundle_result: the bundle job's verdict (RELEASE_CHECK_BUNDLE, from the
-# workflow), or the notes'.
-bundle_result() { echo "${RELEASE_CHECK_BUNDLE:-$(get bundle)}"; }
-
-# bundle_test: TestBundleVersionMatchesEngineCapture in the worktree. It
-# compiles and runs upstream's code, so only cmd_bundle calls it, in a job
-# that holds no credential.
-bundle_test() {
-	if (cd "$tree" && timeout 1200 go test -count=1 -run '^TestBundleVersionMatchesEngineCapture$' ./cmd/cacheservice/metastore/ >&2); then
-		echo pass
-	else
-		echo fail
-	fi
+	} >"$scratch/advisory.md"
 }
 
 # --- the subcommands ---
@@ -561,7 +571,7 @@ cmd_publish() {
 	local head sha date age runs total ok active dispatched
 	head="$(api "repos/$repo/branches/$branch")" || die "couldn't read $branch"
 	sha="$(jq -r .commit.sha <<<"$head")"
-	[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "$branch's head isn't a commit id"
+	[[ "$sha" =~ $sha_re ]] || die "$branch's head isn't a commit id"
 	date="$(jq -r .commit.commit.committer.date <<<"$head")"
 	age=$(($(date +%s) - $(date -d "$date" +%s)))
 	runs="$(api "repos/$repo/actions/workflows/cacheservice-publish.yml/runs?head_sha=$sha&branch=$branch&per_page=100")" || die "couldn't read the publish runs of ${sha:0:12}"
@@ -604,16 +614,84 @@ cmd_publish() {
 	fi
 }
 
+# plan_sync <PR> <version> <draft>: the open sync's state.
+plan_sync() {
+	local pr="$1" v="$2" draft="$3" sha d rc=0 ref state url accepted vout
+	need_number "$pr"
+	need_tag "$v"
+	ref="$(sync_branch "$v")"
+	out action sync
+	out version "$v"
+	out pr "$pr"
+	# The branch's head as git sees it, which may be newer than the PR's
+	# listing.
+	fetch_branch "$ref"
+	fetch_tag "$v"
+	sha="$(git rev-parse release-check/head)"
+	need_sha "$sha"
+	out sha "$sha"
+	if ! git merge-base --is-ancestor "refs/tags/$v" release-check/head; then
+		say "$ref (PR #$pr) doesn't contain $v yet: merge it into the branch by hand (git merge $v, resolve, push), and it is verified the next hour"
+		out state needs-merge
+		return
+	fi
+	accepted="$(mktemp -p "$scratch")"
+	git show "release-check/head:$manifest_path" >"$accepted"
+	if ENGINES_FILE="$accepted" "$engines" pin "$v" >/dev/null 2>&1; then
+		say "$ref (PR #$pr) has $v's accept line: waiting for a human to merge it, with a merge commit"
+		out state ready
+		# Still a draft: the accept that pushed the line didn't get to mark
+		# it ready.
+		out draft "$draft"
+		return
+	fi
+	# The digest only now: a sync waiting on a human doesn't need the
+	# registry. It names the verifying runs, and the accept line.
+	d="$(image_digest "$v")" || rc=$?
+	((rc != 3)) || die "$v's sync is open, but $engine_repo:$v is gone from the registry"
+	((rc == 0)) || exit "$rc"
+	out digest "$d"
+	# Apart from the read, so a verdict that fails fails the plan.
+	vout="$(verdict "$v" "$d" "$sha")"
+	read -r state url <<<"$vout"
+	case "$state" in
+	verify) say "$ref's head ${sha:0:12} has no verifying run yet: dispatching one" ;;
+	running) say "$ref's head ${sha:0:12} is being verified: $url" ;;
+	red) say "$ref's head ${sha:0:12} fails: $url. Fixes go in as PRs into $ref" ;;
+	green) say "$ref's head ${sha:0:12} passes: $url. Adding the accept line" ;;
+	bounded)
+		say "::warning::$ref's head ${sha:0:12} has $max_verify_dispatches verifying runs that ended neither green nor red (the latest: $url). Not dispatching again: re-run it by hand."
+		echo "$ref's head ${sha:0:12} has $max_verify_dispatches verifying runs that ended neither green nor red (the latest: $url). Re-run it by hand."
+		;;
+	*) die "unexpected verdict '$state'" ;;
+	esac
+	out state "$state"
+	if [[ -n "$url" ]]; then out run "$url"; fi
+}
+
 cmd_plan() {
-	local forced="${1:-}" listed newest t prs branches issue d pr kind
+	local forced="${1:-}" listed newest t prs n pr v sha branches d
+	if [[ -n "$forced" ]]; then
+		# Starting a chosen release, listed or not, changes nothing only in
+		# a dry run.
+		is_dry || die "plan <version> is for dry runs only"
+		need_tag "$forced"
+	else
+		# One sync at a time: an open one is all there is to do.
+		prs="$(sync_prs)"
+		n="$(grep -c . <<<"$prs" || true)"
+		((n <= 1)) || die "more than one sync PR is open: $(awk '{ print "#" $1 }' <<<"$prs" | paste -sd' '). Close all but one"
+		if ((n == 1)); then
+			local draft
+			read -r pr v sha draft <<<"$prs"
+			plan_sync "$pr" "$v" "$draft"
+			return
+		fi
+	fi
 	listed="$("$engines" listed)"
 	newest="$(vsort <<<"$listed" | tail -n1)"
 	local -a tags
 	if [[ -n "$forced" ]]; then
-		# Verifying a chosen release, listed or not, changes nothing only in
-		# a dry run.
-		is_dry || die "plan <version> is for dry runs only"
-		need_tag "$forced"
 		tags=("$forced")
 	else
 		# Listed first, in this shell: a failed poll fails the run, never
@@ -627,41 +705,22 @@ cmd_plan() {
 		say "the manifest's newest version is $newest; newer upstream releases: ${tags[*]:-none}"
 	fi
 	for t in "${tags[@]}"; do
-		prs="$(release_prs "$t")"
-		if [[ -n "$prs" ]]; then
-			read -r pr kind <<<"$(head -n1 <<<"$prs")"
-			say "$t: its $kind PR $server/$repo/pull/$pr is open; waiting for it before anything newer"
-			out action pending
-			out version "$t"
-			out kind "$kind"
-			out pr "$pr"
-			return
-		fi
 		branches="$(release_branches "$t")"
-		issue="$(open_issue "$t")"
-		if [[ -n "$issue" ]] && ! grep -qxF "release-check/reject/$t" <<<"$branches"; then
-			need_number "$issue"
-			say "$t: compat-break issue #$issue is open, without its reject PR: opening it"
-			out action resume-reject
-			out version "$t"
-			out issue "$issue"
-			return
-		fi
 		if [[ -n "$branches" && -z "$forced" ]]; then
-			die "$t has release-check branch(es) with no open PR: $(paste -sd' ' <<<"$branches"). A PR closed by hand, or a run that stopped part way. Delete the branch(es) to verify $t again, or add its line to the manifest by hand"
+			die "$t has release-check branch(es) with no open sync PR: $(paste -sd' ' <<<"$branches"). A PR closed by hand, a run that stopped part way, or a branch of the earlier accept/rebuild/reject flow. Delete the branch(es) to sync $t, or add a line for it to the manifest by hand to skip it"
 		fi
 		local rc=0
 		d="$(image_digest "$t")" || rc=$?
 		if ((rc == 3)); then
-			# Not skipped past: a newer release accepted first would make
+			# Not skipped past: a newer release synced first would make
 			# this one old, and it would never be checked.
 			say "$t: no $engine_repo:$t image yet; waiting for it before anything newer"
 			out action none
 			return
 		fi
 		((rc == 0)) || exit "$rc"
-		say "$t: new, image $d: verifying it"
-		out action verify
+		say "$t: new, image $d: starting its sync"
+		out action start
 		out version "$t"
 		out digest "$d"
 		return
@@ -669,322 +728,251 @@ cmd_plan() {
 	out action none
 }
 
-# cmd_bundle: the bundle test with the tag merged, on its own: it runs
-# upstream's code, which must never share a process tree, or a job, with a
-# token (it could read one from its environment or its parent's). Refused
-# if any token is in the environment.
-cmd_bundle() {
-	local v="$1" merge bundle var
+pr_title() { echo "remote cache: sync upstream $1 (release check)"; }
+
+cmd_start() {
+	local v="$1" d="$2" ref merge old body pr
 	need_tag "$v"
-	need_test_ref
-	for var in GH_TOKEN GITHUB_TOKEN BOT_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
-		[[ -z "${!var:-}" ]] || die "$var is set: the bundle test runs upstream's code, and must run without any credential"
-	done
+	need_digest "$d"
+	ref="$(sync_branch "$v")"
 	fetch_tag "$v"
-	# The service as it is: the branch's, or in a dry run (from the workflow),
-	# the dry run's own ref, the one verify's e2e runs on.
-	new_tree "${RELEASE_CHECK_TEST_REF:-$branch}"
+	new_tree
 	merge="$(merge_tag "$v")"
-	if [[ "$merge" == conflict ]]; then
-		# Not run, so not passed: it verified nothing.
-		bundle=conflict
-	else
-		bundle="$(bundle_test)"
+	old="$(ENGINES_FILE="$tree/$manifest_path" "$engines" base)"
+	advisory "$v"
+	if [[ "$old" != "$v" ]]; then
+		manifest_edit set-base "$v"
+		git -C "$tree" add "$manifest_path"
+		commit -m "remote cache: build on upstream $v" -m "Moves the manifest's base from $old (release check)."
+	elif [[ "$merge" != merged ]]; then
+		# Nothing to change (the tag merged already, or its merge left to a
+		# human), but a PR needs a commit.
+		commit --allow-empty -m "remote cache: sync upstream $v" -m "The manifest's base is $v already (release check)."
 	fi
-	say "TestBundleVersionMatchesEngineCapture with $v merged: $bundle"
+	push "$ref"
+	body="$scratch/pr.md"
+	{
+		echo "Brings upstream \`$v\` (\`$engine_repo:$v@$d\`) into \`$branch\` (zerobull-consulting/dagger#117, D5)."
+		echo
+		case "$merge" in
+		merged) echo "- Merges upstream \`$v\`, and moves the manifest's \`base\` from \`$old\` to \`$v\`." ;;
+		ancestor) echo "- \`$branch\` contains \`$v\` already; this moves the manifest's \`base\` from \`$old\` to \`$v\`." ;;
+		conflict)
+			echo "- **Merging \`$v\` conflicts**, so this branch is \`$branch\` with only the \`base\` moved from \`$old\`. Merge the tag into it by hand, keeping a merge commit, then push:"
+			echo
+			echo '  ```sh'
+			echo "  git fetch https://github.com/dagger/dagger tag $v"
+			echo "  git switch $ref && git merge $v   # resolve, commit"
+			echo "  git push origin $ref"
+			echo '  ```'
+			;;
+		esac
+		echo
+		echo "**How this PR moves.** Each hour the release check verifies this branch's head: \`remote-cache-tests.yml\` dispatched on it with \`$v\` as the candidate engine (every job, \`TestBundleVersionMatchesEngineCapture\` among them)."
+		echo "- **Red:** a \`compat-break\` issue points at the failing run, and this PR stays a draft. Fix it with PRs **into \`$ref\`**, squash-merged; each new head is verified again."
+		echo "- **Green:** the release check adds \`$v\`'s accept line (citing the green run) and marks this PR ready."
+		echo
+		echo "**Merge it with a merge commit** (\`gh pr merge --merge\`), never a squash: upstream \`$v\` has to stay a parent, or \`fork paths\` keeps measuring from the old base and the next sync conflicts again. Newer releases wait until this merges, and are then verified against \`$branch\` with these fixes in."
+		echo
+		cat "$scratch/advisory.md"
+		echo
+		echo "See \`hack/remote-cache/README.md\`, \"Release check\"."
+	} >"$body"
+	pr="$(open_pr "$ref" "$(pr_title "$v")" "$body")"
+	out pr "$pr"
 	out merge "$merge"
-	out bundle "$bundle"
+	if [[ "$merge" == conflict ]]; then
+		say "merging $v conflicts: $ref waits for a human to merge it; nothing to verify yet"
+		return
+	fi
+	cmd_verify "$v" "$d"
 }
 
 cmd_verify() {
-	local v="$1" d="$2" a
+	local v="$1" d="$2" run
 	need_tag "$v"
 	need_digest "$d"
-	need_test_ref
-	mkdir -p "$notes"
-	: >"$notes/notes.env"
-	note version "$v"
-	note digest "$d"
-	local id
-	wait_since=$SECONDS
-	# The service as it is: the branch's, or in a dry run (from the
-	# workflow), the dry run's own ref. Dispatched first: the fetches and the
-	# advisory diff run while the candidate run does, not before it, out of
-	# the step's timeout.
-	id="$(start_tests "${RELEASE_CHECK_TEST_REF:-$branch}" "$v" "$d")"
-	# A failure from here until the verdict is read (the fetches, the
-	# advisory diff, a wait that times out, a read that fails) is an error (a
-	# step that fails), never a verdict, and the exit trap cancels the
-	# dispatched run, which nothing would read: the next hour verifies the
-	# release again.
-	pending_run="$id"
-	fetch_tag "$v"
-	advisory "$v"
-	a="$(finish_tests "$id" a)"
-	pending_run=""
-	# The e2e and the sidecar demo's verdict. A is this and the bundle job's
-	# both passing (the workflow decides): a bundle test that didn't run (the
-	# tag conflicts with the branch) verified nothing.
-	out result "$a"
-	out run "$(get a_run)"
+	run="$(start_tests "$v" "$d")"
+	if [[ -n "$run" ]]; then out run "$run"; fi
 }
 
-pr_title() { echo "remote cache: $1 engine $2 (release check)"; }
+# link_issue <PR> <issue>: the PR closes the issue when it merges: its
+# description gets "Closes #<issue>." unless it has it already.
+link_issue() {
+	local pr="$1" issue="$2" pbody
+	pbody="$(api "repos/$repo/pulls/$pr" | jq -r '.body // ""')" || die "couldn't read #$pr"
+	if grep -qF "Closes #$issue." <<<"$pbody"; then return; fi
+	if is_dry; then
+		would "add 'Closes #$issue.' to #$pr's description"
+		return
+	fi
+	jq -n --arg b "$pbody"$'\n\n'"Closes #$issue." '{body: $b}' | api -X PATCH "repos/$repo/pulls/$pr" --input - >/dev/null ||
+		die "linking #$issue from #$pr failed"
+}
 
-cmd_accept() {
-	local v="$1" d="$2" run="$3" body pr
+cmd_report() {
+	local v="$1" run="$2" pr="$3" id issue title body seen
 	need_tag "$v"
-	need_digest "$d"
 	need_run "$run"
-	new_tree
-	manifest_edit add-accept "$v" "$d" "$run" >&2
-	git -C "$tree" add "$manifest_path"
-	commit -m "remote cache: accept engine $v" -m "Verified by $run (release check)."
-	push "release-check/accept/$v"
-	body="$(mktemp)"
-	{
-		echo "The release check verified upstream \`$v\` against the cache service as it is: outcome **A**. This PR only adds its accept line:"
-		echo
-		echo '```'
-		echo "accept $v $d verified: $run"
-		echo '```'
-		echo
-		echo "- **Verifying run** (the e2e and the sidecar demo against \`$engine_repo:$v@$d\`): $run"
-		echo "- **TestBundleVersionMatchesEngineCapture** with \`$v\` merged in: $(bundle_result)."
-		echo
-		[[ -f "$notes/advisory.md" ]] && cat "$notes/advisory.md" && echo
-		if [[ "$auto_merge" == true ]]; then
-			echo "**Auto-merge** (squash) is enabled by the release check once this opens, and the \`auto-merge: adds compatible engine only\` check turns it off if this PR ever changes anything else. After the merge, the next hourly run dispatches \`cacheservice-publish.yml\`, which moves \`dagger-remote-cache:$v\`."
-		else
-			echo "**Auto-merge is off** (\`RELEASE_CHECK_AUTO_MERGE\` isn't \`true\`): merge by hand with a squash. The next hourly run then dispatches \`cacheservice-publish.yml\` if nothing published the merge."
-		fi
-		echo
-		echo "Squash title: \`$(pr_title accept "$v") (zerobull-consulting/dagger#<this PR>)\`. See \`hack/remote-cache/README.md\`, \"Release check\"."
-	} >"$body"
-	pr="$(open_pr "release-check/accept/$v" "$(pr_title accept "$v")" "$body")"
-	out pr "$pr"
-}
-
-cmd_auto_merge() {
-	local pr="$1" info files title node
 	need_number "$pr"
-	if [[ "$auto_merge" != true ]]; then
-		say "auto-merge is off: RELEASE_CHECK_AUTO_MERGE isn't true (set it once 'auto-merge: adds compatible engine only' is a required check)"
-		out auto_merge off
-		return
-	fi
-	info="$(api "repos/$repo/pulls/$pr")" || die "couldn't read PR #$pr"
-	jq -e --arg b "$branch" --arg r "$repo" '.state == "open" and .base.ref == $b and .head.repo.full_name == $r and (.head.ref | test("^release-check/accept/v1\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.]+)?$"))' <<<"$info" >/dev/null ||
-		die "PR #$pr is not an open release-check accept PR from this repository into $branch"
-	files="$(api "repos/$repo/pulls/$pr/files?per_page=100")" || die "couldn't list PR #$pr's files"
-	jq -e --arg p "$manifest_path" 'length == 1 and .[0].filename == $p and .[0].status == "modified" and .[0].additions == 1 and .[0].deletions == 0' <<<"$files" >/dev/null ||
-		die "PR #$pr changes more than one added line of $manifest_path: not enabling auto-merge"
-	if jq -e '.auto_merge != null' <<<"$info" >/dev/null; then
-		say "auto-merge is already on for #$pr"
-		out auto_merge on
-		return
-	fi
-	title="$(jq -r .title <<<"$info") (zerobull-consulting/dagger#$pr)"
-	node="$(jq -r .node_id <<<"$info")"
-	if is_dry; then
-		would "enable squash auto-merge on #$pr, titled '$title'"
-		out auto_merge on
-		return
-	fi
-	local msg="Adds the accept line the release check verified (zerobull-consulting/dagger#117, D5, outcome A)." err sha
-	# shellcheck disable=SC2016 # GraphQL variables, not shell
-	if err="$(api graphql -f query='mutation($id: ID!, $title: String!, $body: String!) {
-		enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $title, commitBody: $body}) { clientMutationId }
-	}' -f id="$node" -f title="$title" -f body="$msg" 2>&1)"; then
-		say "auto-merge (squash) enabled on #$pr"
-		out auto_merge on
-		return
-	fi
-	# GitHub refuses auto-merge on a PR whose required checks have all
-	# passed already ("clean status"): what auto-merge would do then is
-	# merge it now, so this does, with GITHUB_TOKEN, pinned to the head the
-	# files were checked at. The ruleset still applies: GITHUB_TOKEN can't
-	# bypass it, so a check that hasn't passed refuses the merge.
-	grep -qi 'clean status' <<<"$err" || { say "$err"; die "enabling auto-merge on #$pr failed"; }
-	sha="$(jq -r .head.sha <<<"$info")"
-	[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "PR #$pr's head isn't a commit id"
-	jq -n --arg t "$title" --arg m "$msg" --arg s "$sha" '{merge_method: "squash", commit_title: $t, commit_message: $m, sha: $s}' |
-		api -X PUT "repos/$repo/pulls/$pr/merge" --input - >/dev/null || die "#$pr's checks have passed, but merging it failed"
-	say "#$pr's required checks had passed already, so auto-merge couldn't be enabled: squash-merged it at ${sha:0:12}"
-	out auto_merge merged
-}
-
-cmd_rebuild() {
-	local v="$1" d="$2" merge reset run b body pr old
-	need_tag "$v"
-	need_digest "$d"
-	mkdir -p "$notes"
-	fetch_tag "$v"
-	new_tree
-	merge="$(merge_tag "$v")"
-	note b_merge "$merge"
-	case "$merge" in
-	ancestor)
-		say "$v is already merged into $branch: a rebuild would be the code A ran. Not rebuilding"
-		note b skipped
-		out result skipped
-		return
-		;;
-	conflict)
-		say "merging $v into $branch conflicts: not rebuilding"
-		note b skipped
-		out result skipped
-		return
-		;;
-	esac
-	# The rebuild's code is this same merge (plus a manifest line), whose
-	# bundle test the bundle job ran: if it didn't pass, no rebuild can.
-	if [[ "$(bundle_result)" != pass ]]; then
-		say "the bundle test with $v merged didn't pass ($(bundle_result)): a rebuild is that merge, so not rebuilding"
-		note b_merge bundle
-		note b skipped
-		out result skipped
-		return
-	fi
-	old="$("$engines" base)"
-	manifest_edit set-base "$v" >&2
-	git -C "$tree" add "$manifest_path"
-	commit -m "remote cache: build on upstream $v" -m "Moves the manifest's base from $old (release check)."
-	push "release-check/rebuild/$v"
-	if is_dry; then
-		would "verify $v on release-check/rebuild/$v, as verify does, then add its accept line and open the PR"
-		git -C "$tree" diff --stat "release-check/head" HEAD -- . >&2 || true
-		note b dry-run
-		out result dry-run
-		return
-	fi
-	local id
-	id="$(start_tests "release-check/rebuild/$v" "$v" "$d")"
-	# As in verify: a wait that times out, or a verdict that can't be read,
-	# cancels the run (zerobull-consulting/dagger#187).
-	pending_run="$id"
-	b="$(finish_tests "$id" b)"
-	pending_run=""
-	note b "$b"
-	if [[ "$b" != pass ]]; then
-		out result fail
-		return
-	fi
-	run="$(get b_run)"
-	reset="$(get reset)"
-	if [[ "$reset" == yes ]]; then
-		manifest_edit reset-accept "$v" "$d" "$run" >&2
-	else
-		manifest_edit add-accept "$v" "$d" "$run" >&2
-	fi
-	git -C "$tree" add "$manifest_path"
-	commit -m "remote cache: accept engine $v" -m "Verified by $run (release check)."
-	push "release-check/rebuild/$v"
-	body="$(mktemp)"
-	{
-		echo "Upstream \`$v\` fails against the cache service as it is ($(get a_run)), and passes once the service is rebuilt on it: outcome **B**."
-		echo
-		echo "- Merges upstream \`$v\` into \`$branch\`, and moves the manifest's \`base\` from \`$old\` to \`$v\`."
-		if [[ "$reset" == yes ]]; then
-			echo "- **The bundle or protocol version changed**, so the accept list resets to \`$v\` alone. Older builds keep serving older engines: their \`dagger-remote-cache:<version>\` tags stay where they are."
-		else
-			echo "- Adds \`$v\`'s accept line, first; the other lines stay, and the release matrix verifies each of them again once this merges."
-		fi
-		echo "- **Verifying run** of this branch against \`$engine_repo:$v@$d\`: $run"
-		echo "- Failing jobs of the run as-is:"
-		cat "$notes/a-jobs.md" 2>/dev/null || true
-		echo
-		[[ -f "$notes/advisory.md" ]] && cat "$notes/advisory.md" && echo
-		echo "**Merge this by hand, with a merge commit** (\`gh pr merge --merge\`), never a squash: upstream \`$v\` has to stay a parent, or \`fork paths\` keeps measuring from the old base and the next sync conflicts again. The release check doesn't auto-merge a rebuild. See \`hack/remote-cache/README.md\`, \"Release check\"."
-	} >"$body"
-	pr="$(open_pr "release-check/rebuild/$v" "$(pr_title "build on" "$v")" "$body")"
-	out result pass
-	out pr "$pr"
-}
-
-cmd_reject() {
-	local v="$1" issue="${2:-}" body title pr
-	need_tag "$v"
-	if [[ -z "$issue" ]]; then
-		issue="$(open_issue "$v")"
-	fi
+	id="${run##*/actions/runs/}"
+	id="${id%%/*}"
+	issue="$(open_issue "$v")"
 	title="$(issue_title "$v")"
+	body="$scratch/issue.md"
 	if [[ -z "$issue" ]]; then
-		body="$(mktemp)"
+		advisory "$v"
 		{
-			echo "Upstream \`$v\` (\`$engine_repo:$v@$(get digest)\`) fails against the cache service: the release check's outcome **C** (zerobull-consulting/dagger#117, D5)."
+			echo "Upstream \`$v\` fails against the cache service: its sync branch, \`$(sync_branch "$v")\` ($repo#$pr), is red (zerobull-consulting/dagger#117, D5)."
 			echo
-			echo "**As it is** (e2e and sidecar demo of \`$branch\` against it): $(get a_run), $(get a_conclusion)."
-			cat "$notes/a-jobs.md" 2>/dev/null || true
+			echo "**Failing run:** $run"
+			failing_jobs "$id"
 			echo
-			echo "- TestBundleVersionMatchesEngineCapture with \`$v\` merged in: $(bundle_result)."
-			case "$(get b)" in
-			fail) echo "- **Rebuilt on \`$v\`** (branch \`release-check/rebuild/$v\`): $(get b_run), $(get b_conclusion)." && cat "$notes/b-jobs.md" 2>/dev/null ;;
-			skipped)
-				case "$(get b_merge)" in
-				ancestor) echo "- **Not rebuilt:** \`$branch\` contains \`$v\` already, so a rebuild is the code above." ;;
-				conflict) echo "- **Not rebuilt:** merging \`$v\` into \`$branch\` conflicts." ;;
-				*) echo "- **Not rebuilt:** the bundle test with \`$v\` merged didn't pass, and a rebuild is that same merge." ;;
-				esac
-				;;
-			*) echo "- Not rebuilt." ;;
-			esac
+			cat "$scratch/advisory.md"
 			echo
-			[[ -f "$notes/advisory.md" ]] && cat "$notes/advisory.md" && echo
-			echo "The service refuses \`$v\` engines until this is fixed. The reject PR names this issue; once a fix lands, remove the reject line and verify \`$v\` again (\`hack/remote-cache/README.md\`, \"Release check\")."
+			echo "Fix it with PRs into \`$(sync_branch "$v")\`, squash-merged. The release check verifies each new head hourly, comments here while it stays red, and once it's green adds the accept line and marks $repo#$pr ready; merging that closes this issue. Until then the service refuses \`$v\` engines, and no newer release is synced."
 		} >"$body"
 		if is_dry; then
 			would "label compat-break and file '$title':"
 			sed 's/^/    | /' "$body" >&2
-			issue=0
-		else
-			if ! api "repos/$repo/labels/compat-break" >/dev/null 2>&1; then
-				api -X POST "repos/$repo/labels" -f name=compat-break -f color=b60205 \
-					-f description="An upstream engine release the cache service fails against (release check)" >/dev/null ||
-					die "creating the compat-break label failed"
-			fi
-			issue="$(jq -n --arg t "$title" --rawfile b "$body" '{title: $t, body: $b, labels: ["compat-break"]}' |
-				api -X POST "repos/$repo/issues" --input - | jq -r .number)" || die "filing the compat-break issue failed"
-			need_number "$issue"
-			say "filed $server/$repo/issues/$issue"
+			would "add 'Closes #<issue>' to #$pr's description"
+			out issue 0
+			return
 		fi
-	else
+		if ! api "repos/$repo/labels/compat-break" >/dev/null 2>&1; then
+			api -X POST "repos/$repo/labels" -f name=compat-break -f color=b60205 \
+				-f description="An upstream engine release the cache service fails against (release check)" >/dev/null ||
+				die "creating the compat-break label failed"
+		fi
+		issue="$(jq -n --arg t "$title" --rawfile b "$body" '{title: $t, body: $b, labels: ["compat-break"]}' |
+			api -X POST "repos/$repo/issues" --input - | jq -r .number)" || die "filing the compat-break issue failed"
 		need_number "$issue"
-		say "compat-break issue #$issue is open already"
+		say "filed $server/$repo/issues/$issue"
+		link_issue "$pr" "$issue"
+		out issue "$issue"
+		return
 	fi
+	need_number "$issue"
 	out issue "$issue"
-	new_tree
-	manifest_edit add-reject "$v" "$repo#$issue" >&2
-	git -C "$tree" add "$manifest_path"
-	commit -m "remote cache: reject engine $v" -m "It fails against the cache service: $repo#$issue (release check)."
-	push "release-check/reject/$v"
-	body="$(mktemp)"
+	# An issue filed by a run that stopped before linking it, or by the
+	# earlier flow, is linked now.
+	link_issue "$pr" "$issue"
+	# Once per run: the issue's body or a comment names it already. Both
+	# read, all pages, or nothing is decided.
+	seen="$(api "repos/$repo/issues/$issue" | jq -r '.body // ""')" || die "couldn't read #$issue"
+	seen+=$'\n'"$(api --paginate "repos/$repo/issues/$issue/comments?per_page=100" | jq -r '.[].body // ""')" ||
+		die "couldn't read #$issue's comments"
+	if grep -qF "$run" <<<"$seen"; then
+		say "#$issue names $run already"
+		return
+	fi
 	{
-		echo "Upstream \`$v\` fails against the cache service: outcome **C**. This PR adds"
-		echo
-		echo '```'
-		echo "reject $v $repo#$issue"
-		echo '```'
-		echo
-		echo "See $repo#$issue for the failing jobs and the diff. Merge it by hand (squash) once you agree. The release check handles nothing newer while this is open."
+		echo "Still red after the latest change to \`$(sync_branch "$v")\` (or a re-run): $run"
+		failing_jobs "$id"
 	} >"$body"
-	pr="$(open_pr "release-check/reject/$v" "$(pr_title reject "$v")" "$body")"
-	out pr "$pr"
+	comment "$issue" "$body"
+	say "commented on #$issue with $run"
+}
+
+# mark_ready <PR>: marks the PR ready for review, with GITHUB_TOKEN.
+mark_ready() {
+	local node
+	if is_dry; then
+		would "mark #$1 ready for review"
+		return
+	fi
+	node="$(api "repos/$repo/pulls/$1" | jq -r .node_id)" || die "couldn't read #$1"
+	# shellcheck disable=SC2016 # GraphQL variables, not shell
+	api graphql -f query='mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }' \
+		-f id="$node" >/dev/null || die "marking #$1 ready failed (the next hour tries again)"
+	say "marked #$1 ready for review"
+}
+
+# cmd_ready <version> <PR>: what accept does after its push, for a sync
+# whose accept line is pushed but whose PR is still a draft.
+cmd_ready() {
+	local v="$1" pr="$2" issue
+	need_tag "$v"
+	need_number "$pr"
+	# A human may have marked it ready since the plan read it.
+	if [[ "$(api "repos/$repo/pulls/$pr" | jq -r '.draft // false')" != true ]]; then
+		say "#$pr is ready already"
+		return
+	fi
+	# The comments first and the PR marked ready last, as in accept: a run
+	# that stops in between leaves a draft, which the next hour retries.
+	echo "\`$(sync_branch "$v")\` has \`$v\`'s accept line, pushed by an earlier run that stopped before marking this ready. Merge it **with a merge commit** (\`gh pr merge --merge\`), never a squash, once its checks pass." >"$scratch/ready.md"
+	comment "$pr" "$scratch/ready.md"
+	issue="$(open_issue "$v")"
+	if [[ -n "$issue" ]]; then
+		need_number "$issue"
+		echo "Green: #$pr has \`$v\`'s accept line and is ready to merge (with a merge commit), which closes this." >"$scratch/issue-ready.md"
+		comment "$issue" "$scratch/issue-ready.md"
+	fi
+	mark_ready "$pr"
+}
+
+cmd_accept() {
+	local v="$1" d="$2" run="$3" sha="$4" pr="$5" ref head issue body
+	need_tag "$v"
+	need_digest "$d"
+	need_run "$run"
+	need_sha "$sha"
+	need_number "$pr"
+	ref="$(sync_branch "$v")"
+	new_tree "$ref"
+	head="$(git -C "$tree" rev-parse HEAD)"
+	[[ "$head" == "$sha" ]] ||
+		die "$ref moved from ${sha:0:12}, which $run verified, to ${head:0:12}: the next hour verifies the new head"
+	# The list resets if the bundle or protocol version changed since
+	# $branch's base (the manifest as checked out).
+	advisory "$v"
+	if [[ "$reset" == yes ]]; then
+		manifest_edit reset-accept "$v" "$d" "$run"
+	else
+		manifest_edit add-accept "$v" "$d" "$run"
+	fi
+	git -C "$tree" add "$manifest_path"
+	commit -m "remote cache: accept engine $v" -m "Verified by $run (release check)."
+	push "$ref"
+	body="$scratch/green.md"
+	{
+		echo "\`$ref\` is green at \`${sha:0:12}\`: $run"
+		echo
+		if [[ "$reset" == yes ]]; then
+			echo "Added \`$v\`'s accept line. **The bundle or protocol version changed**, so the accept list resets to \`$v\` alone; older builds keep serving older engines, and their \`dagger-remote-cache:<version>\` tags stay where they are."
+		else
+			echo "Added \`$v\`'s accept line, first; the other lines stay, and the release matrix verifies each of them again once this merges."
+		fi
+		echo
+		echo "Ready to merge **with a merge commit** (\`gh pr merge --merge\`), never a squash, once its checks pass."
+	} >"$body"
+	# The comments first, the PR marked ready last: a run that stops in
+	# between leaves a draft, which a later hour's ready marks and says so
+	# again, rather than a ready PR nobody was told about.
+	comment "$pr" "$body"
+	issue="$(open_issue "$v")"
+	if [[ -n "$issue" ]]; then
+		need_number "$issue"
+		echo "Green: $run. #$pr is ready to merge (with a merge commit), which closes this." >"$scratch/issue-green.md"
+		comment "$issue" "$scratch/issue-green.md"
+	fi
+	mark_ready "$pr"
+	out accepted "$v"
 }
 
 if [[ "${1:-}" == --dry-run ]]; then
 	dry=1
 	shift
 fi
-if is_dry; then say "dry run: nothing is pushed, opened or enabled"; fi
+if is_dry; then say "dry run: nothing is pushed, opened, filed, commented, marked or dispatched"; fi
 case "${1:-}" in
 publish) [[ $# -eq 1 ]] || die "usage: release-check.sh publish"; cmd_publish ;;
 plan) [[ $# -le 2 ]] || die "usage: release-check.sh plan [<version>]"; cmd_plan "${2:-}" ;;
+start) [[ $# -eq 3 ]] || die "usage: release-check.sh start <version> <digest>"; cmd_start "$2" "$3" ;;
 verify) [[ $# -eq 3 ]] || die "usage: release-check.sh verify <version> <digest>"; cmd_verify "$2" "$3" ;;
-bundle) [[ $# -eq 2 ]] || die "usage: release-check.sh bundle <version>"; cmd_bundle "$2" ;;
-accept) [[ $# -eq 4 ]] || die "usage: release-check.sh accept <version> <digest> <run URL>"; cmd_accept "$2" "$3" "$4" ;;
-auto-merge) [[ $# -eq 2 ]] || die "usage: release-check.sh auto-merge <PR>"; cmd_auto_merge "$2" ;;
-rebuild) [[ $# -eq 3 ]] || die "usage: release-check.sh rebuild <version> <digest>"; cmd_rebuild "$2" "$3" ;;
-reject) [[ $# -le 3 && $# -ge 2 ]] || die "usage: release-check.sh reject <version> [<issue>]"; cmd_reject "$2" "${3:-}" ;;
-*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | verify <version> <digest> | bundle <version> | accept <version> <digest> <run> | auto-merge <PR> | rebuild <version> <digest> | reject <version> [<issue>]" ;;
+report) [[ $# -eq 4 ]] || die "usage: release-check.sh report <version> <run URL> <PR>"; cmd_report "$2" "$3" "$4" ;;
+ready) [[ $# -eq 3 ]] || die "usage: release-check.sh ready <version> <PR>"; cmd_ready "$2" "$3" ;;
+accept) [[ $# -eq 6 ]] || die "usage: release-check.sh accept <version> <digest> <run URL> <sha> <PR>"; cmd_accept "$2" "$3" "$4" "$5" "$6" ;;
+*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | start <version> <digest> | verify <version> <digest> | report <version> <run URL> <PR> | ready <version> <PR> | accept <version> <digest> <run URL> <sha> <PR>" ;;
 esac

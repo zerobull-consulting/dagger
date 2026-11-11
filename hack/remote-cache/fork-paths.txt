@@ -35,8 +35,7 @@ any       .github/workflows/remote-cache-tests.yml       the service's unit (the
 any       .github/workflows/remote-cache-spaces.yml      the service's DigitalOcean Spaces jobs
 any       .github/workflows/remote-cache-update.yml      fills the remote cache bucket PR checks read from: a writer sidecar runs the checks' Dagger pipelines on pushes to feature/remote-cache
 any       .github/workflows/remote-cache-fork-paths.yml  runs this check
-any       .github/workflows/remote-cache-release-check.yml  the hourly release check: verifies each new upstream release and opens its accept, rebuild or reject PR (zerobull-consulting/dagger#117, D5)
-any       .github/workflows/remote-cache-auto-merge-add-compatible-engine.yml  the "auto-merge: adds compatible engine only" check on the release check's auto-merged PRs
+any       .github/workflows/remote-cache-release-check.yml  the hourly release check: syncs each new upstream release through one release-check/sync/<version> branch at a time (zerobull-consulting/dagger#117, D5)
 
 # Changes to upstream files the fork must make.
 deleted   .github/workflows/changelog.yml                gated on a needs/changelog label this repository doesn't have, so it only ever showed as a skipped check (zerobull-consulting/dagger#122)
