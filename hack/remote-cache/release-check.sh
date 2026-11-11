@@ -321,7 +321,8 @@ sync_branch() { echo "$sync_prefix/$1"; }
 # branches (a fork's PR may use the same name), as
 # "<number> <version> <head sha> <draft>" lines.
 sync_prs() {
-	api "repos/$repo/pulls?state=open&base=$branch&per_page=100" |
+	# Every page: a sync PR past the first hundred is still open.
+	api --paginate "repos/$repo/pulls?state=open&base=$branch&per_page=100" |
 		jq -r --arg r "$repo" --arg p "$sync_prefix/" '.[] | select(.head.repo.full_name == $r) | select(.head.ref | startswith($p)) |
 			"\(.number) \(.head.ref | ltrimstr($p)) \(.head.sha) \(.draft // false)"'
 }
