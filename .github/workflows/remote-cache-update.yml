@@ -46,8 +46,10 @@ jobs:
     if: github.ref == 'refs/heads/feature/remote-cache'
     runs-on: ubuntu-24.04
     environment: pr-checks-readwrite
-    # The work, the drain (10m) and the stop's 2 minutes.
-    timeout-minutes: 40
+    # The worst case of the steps below, which this timeout also bounds: the
+    # start (30m: two image pulls of 15m, in parallel in practice), the build
+    # (20m) and the stop (12m: the drain's 10m and 2m more), plus slack.
+    timeout-minutes: 65
     steps:
       - name: Checkout
         uses: actions/checkout@v5
