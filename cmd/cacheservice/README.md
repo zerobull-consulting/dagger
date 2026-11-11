@@ -1923,13 +1923,26 @@ net/http holds with it, by trickling or stalling the body after a 401
     allocator's size classes, and 16 bytes, so a 32,769-byte one, whose copy
     takes 40,960, is charged 40,977 (`TestOTLPSingularStringCoversSizeClass`,
     [zerobull-consulting/dagger#232](https://github.com/zerobull-consulting/dagger/issues/232));
-    an empty one is charged the 16 bytes. That is the protobuf estimate. Two
-    gaps are left in the JSON one, which charges a string its bytes in the
-    body, not its size class, so a 32,769-byte `stringValue` is charged under
-    the 40,960 its copy takes (`TestOTLPJSONSingularStringSizeClassKnownGap`),
-    and charges 16 bytes for each comma, so an empty element of a repeated
-    string, `"",`, is charged 19 bytes, under what append holds for it
-    (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
+    an empty one is charged the 16 bytes. The JSON estimate charges the same
+    way, from one pass over the body that tracks whether it is in a string,
+    an object or an array, and whether a string is a key or a value, and
+    allocates nothing (`TestOTLPJSONSizeAllocatesNothing`): each object at
+    the largest message's size, 320 bytes; the body's bytes; each string
+    value its length and a quarter more and 16 bytes on top, so a 32,769-byte
+    `stringValue` is charged 40,977 (`TestOTLPJSONSingularStringCoversSizeClass`);
+    each string in an array its length and a quarter more and 64 bytes on
+    top, so 100,000 empty `idKeys`, 300 KB, are charged 6.7 MB, over the
+    3.38 MB append holds at its peak
+    (`TestOTLPJSONEmptyRepeatedStringsCoverDecodePeak`); each number in an
+    array 32 bytes, for the 8-byte scalar append grows
+    (`TestOTLPJSONRepeatedNumbersCoverAppendPeak`); a string holding an
+    escape, which the decoder unescapes by append before copying it, three
+    times its copy (`TestOTLPJSONEscapedStringCoversDecodePeak`); and a value
+    under a key that names a bytes field (a trace or span ID,
+    `bytesValue`), which is base64, also the bytes it decodes to
+    (`TestOTLPJSONBytesFieldCoversBase64Decode`)
+    ([zerobull-consulting/dagger#233](https://github.com/zerobull-consulting/dagger/issues/233)).
+    A key is charged its bytes in the body only. A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded
