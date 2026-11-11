@@ -51,10 +51,11 @@
 #       Step 3, with GITHUB_TOKEN: files the compat-break issue with the
 #       run's failing jobs and the advisory diff and links it from the PR,
 #       or comments on the open issue with the run, once per run.
-#   release-check.sh [--dry-run] ready <PR>
-#       Marks the sync PR ready (GITHUB_TOKEN), if it is still a draft
-#       once its accept line is pushed: accept does this itself, and this
-#       retries it if accept stopped after its push.
+#   release-check.sh [--dry-run] ready <version> <PR>
+#       Marks the sync PR ready and says so on it and on the issue
+#       (GITHUB_TOKEN), if it is still a draft once its accept line is
+#       pushed: accept does this itself, and this retries it if accept
+#       stopped after its push.
 #   release-check.sh [--dry-run] accept <version> <digest> <run URL> <sha> <PR>
 #       Step 4: pushes the accept line to the sync branch as the bot (only
 #       if its head is still <sha>, the commit the run verified), then
@@ -388,6 +389,17 @@ run_jobs() {
 	return 1
 }
 
+# early_failure <run id>: the run's jobs that failed before testing anything
+# (their checkout, or the pin step refusing the candidate), which says
+# nothing about the code, comma-separated; nothing if none did. A jobs read
+# that fails fails the plan.
+early_failure() {
+	local jobs
+	jobs="$(run_jobs "$1")" || die "couldn't read the verifying run $server/$repo/actions/runs/$1's jobs: not deciding on it"
+	jq -r '[.jobs[] | select(.conclusion == "failure") |
+		select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs"
+}
+
 # verdict <version> <digest> <sha>: the state of the sync branch's head
 # from its verifying runs (dispatches of remote-cache-tests.yml titled for
 # the candidate, at that commit). Prints "<state> [<run URL>]": green, red,
@@ -418,11 +430,9 @@ verdict() {
 	fi
 	case "$conclusion" in
 	failure | timed_out)
-		# A job that failed before testing anything (its checkout, or the
-		# pin step refusing the candidate) says nothing about the code.
-		jobs="$(run_jobs "$id")" || die "couldn't read the verifying run $url's jobs: not deciding on it"
-		why="$(jq -r '[.jobs[] | select(.conclusion == "failure") |
-			select(any(.steps[]?; .conclusion == "failure" and (.name == "Checkout" or .name == "The engine pin, from the manifest"))) | .name] | join(", ")' <<<"$jobs")"
+		# verdict runs in a command substitution, where set -e doesn't
+		# reach: a failed read exits by hand.
+		why="$(early_failure "$id")" || exit 1
 		if [[ -z "$why" ]]; then
 			echo "red $url"
 			return
@@ -444,10 +454,20 @@ verdict() {
 	*) say "the verifying run $url ended '$conclusion': it decides nothing" ;;
 	esac
 	# The latest run of this head ended undecided (cancelled, say): try
-	# again, a bounded number of times. Only runs that may have ended
-	# undecided count: not red ones (one that failed before testing does).
-	undecided="$(jq '[.[] | select(.conclusion != "failure" and .conclusion != "timed_out")] | length' <<<"$runs")"
-	if [[ "$conclusion" == failure || "$conclusion" == timed_out ]]; then undecided=$((undecided + 1)); fi
+	# again, a bounded number of times. Every completed run that ended
+	# undecided counts; a red one doesn't, but one that failed before
+	# testing does.
+	local rid rconclusion early
+	undecided=0
+	while read -r rid rconclusion; do
+		case "$rconclusion" in
+		failure | timed_out)
+			early="$(early_failure "$rid")" || exit 1
+			[[ -z "$early" ]] || undecided=$((undecided + 1))
+			;;
+		*) undecided=$((undecided + 1)) ;;
+		esac
+	done < <(jq -r '.[] | select(.status == "completed") | "\(.id) \(.conclusion // "")"' <<<"$runs")
 	if ((undecided >= max_verify_dispatches)); then
 		echo "bounded $url"
 	else
@@ -847,9 +867,26 @@ mark_ready() {
 	say "marked #$1 ready for review"
 }
 
+# cmd_ready <version> <PR>: what accept does after its push, for a sync
+# whose accept line is pushed but whose PR is still a draft.
 cmd_ready() {
-	need_number "$1"
-	mark_ready "$1"
+	local v="$1" pr="$2" issue
+	need_tag "$v"
+	need_number "$pr"
+	# A human may have marked it ready since the plan read it.
+	if [[ "$(api "repos/$repo/pulls/$pr" | jq -r '.draft // false')" != true ]]; then
+		say "#$pr is ready already"
+		return
+	fi
+	mark_ready "$pr"
+	echo "\`$(sync_branch "$v")\` has \`$v\`'s accept line, pushed by an earlier run that stopped before marking this ready. Merge it **with a merge commit** (\`gh pr merge --merge\`), never a squash, once its checks pass." >"$scratch/ready.md"
+	comment "$pr" "$scratch/ready.md"
+	issue="$(open_issue "$v")"
+	if [[ -n "$issue" ]]; then
+		need_number "$issue"
+		echo "Green: #$pr has \`$v\`'s accept line and is ready to merge (with a merge commit), which closes this." >"$scratch/issue-ready.md"
+		comment "$issue" "$scratch/issue-ready.md"
+	fi
 }
 
 cmd_accept() {
@@ -909,7 +946,7 @@ plan) [[ $# -le 2 ]] || die "usage: release-check.sh plan [<version>]"; cmd_plan
 start) [[ $# -eq 3 ]] || die "usage: release-check.sh start <version> <digest>"; cmd_start "$2" "$3" ;;
 verify) [[ $# -eq 3 ]] || die "usage: release-check.sh verify <version> <digest>"; cmd_verify "$2" "$3" ;;
 report) [[ $# -eq 4 ]] || die "usage: release-check.sh report <version> <run URL> <PR>"; cmd_report "$2" "$3" "$4" ;;
-ready) [[ $# -eq 2 ]] || die "usage: release-check.sh ready <PR>"; cmd_ready "$2" ;;
+ready) [[ $# -eq 3 ]] || die "usage: release-check.sh ready <version> <PR>"; cmd_ready "$2" "$3" ;;
 accept) [[ $# -eq 6 ]] || die "usage: release-check.sh accept <version> <digest> <run URL> <sha> <PR>"; cmd_accept "$2" "$3" "$4" "$5" "$6" ;;
-*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | start <version> <digest> | verify <version> <digest> | report <version> <run URL> <PR> | ready <PR> | accept <version> <digest> <run URL> <sha> <PR>" ;;
+*) die "usage: release-check.sh [--dry-run] publish | plan [<version>] | start <version> <digest> | verify <version> <digest> | report <version> <run URL> <PR> | ready <version> <PR> | accept <version> <digest> <run URL> <sha> <PR>" ;;
 esac

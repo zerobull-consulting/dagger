@@ -206,8 +206,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_CHECK_DRY_RUN: ${{ needs.check.outputs.dry }}
+          VERSION: ${{ needs.check.outputs.version }}
           PR: ${{ needs.check.outputs.pr }}
-        run: ./hack/remote-cache/release-check.sh ready "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+        run: ./hack/remote-cache/release-check.sh ready "$VERSION" "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The sync's head is green: its accept line, pushed as the sync bot; then
   # the PR marked ready and the issue told (GITHUB_TOKEN). A human merges.

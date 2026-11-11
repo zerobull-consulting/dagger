@@ -389,6 +389,9 @@ early='{"name": "real engines (e2e)", "conclusion": "failure", "html_url": "x", 
 ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
 check "plan: a run that failed before testing isn't red" has "$tmp/out" "state=verify"
 check "plan: saying why" has "$tmp/out" "failed before testing (real engines (e2e))"
+add_run 7014 "$sha" "$title26" completed failure
+ARGS=(plan); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$early" "$(job 'sidecar demo' success)")"
+check "plan: two runs that failed before testing stop the dispatches" has "$tmp/out" "state=bounded"
 ARGS=(plan); rc env FAKE_JOBS_FAIL=1
 check "plan: a red run whose jobs can't be read fails the plan" test "$status" -ne 0
 
@@ -465,8 +468,16 @@ check "accept: never prints a token" no_secret
 run plan
 check "plan: a sync with its accept line waits for a human" has "$tmp/out" "state=ready"
 check "plan: and says the PR is still a draft (the fake doesn't change it)" has "$tmp/out" "draft=true"
-run ready 1
-check "ready: marks it ready" bash -c "grep -q 'markPullRequestReadyForReview' '$FAKE/graphql' && grep -qx 'id=PR_1' '$FAKE/graphql'"
+rm -f "$FAKE/graphql"
+echo '[]' >"$FAKE/comments.json"
+run ready "$v26" 1
+check "ready: marks a draft ready" bash -c "grep -q 'markPullRequestReadyForReview' '$FAKE/graphql' && grep -qx 'id=PR_1' '$FAKE/graphql'"
+check "ready: says so on the PR" jq -e 'any(.[]; .on == 1 and (.body | test("merge commit")))' "$FAKE/comments.json"
+check "ready: and on the issue" jq -e 'any(.[]; .on == 101 and (.body | test("ready to merge")))' "$FAKE/comments.json"
+jq 'map(.draft = false)' "$FAKE/pulls.json" >"$FAKE/p.tmp" && mv "$FAKE/p.tmp" "$FAKE/pulls.json"
+rm -f "$FAKE/graphql"
+run ready "$v26" 1
+check "ready: a PR marked ready meanwhile is left alone" bash -c "test '$status' = 0 && test ! -f '$FAKE/graphql'"
 
 started
 sha="$(branch_sha "$sync26")"
