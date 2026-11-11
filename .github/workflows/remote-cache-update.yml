@@ -27,7 +27,10 @@ name: Remote cache update
 permissions:
   contents: read
 # One writer at a time: the service owns the prefix, and two writers on it
-# would race their exports. A push that arrives while one runs waits.
+# would race their exports. A push that arrives while one runs waits, but GitHub
+# keeps only the newest waiting run: with a run going and two more pushes, the
+# first of those never runs. The newest commit always does, and that is the one
+# readers want.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -52,6 +55,19 @@ jobs:
         uses: ./hack/remote-cache/ci/verify-stopped
         with:
           names: cache-update
+      # One engine's entries are for that engine: the prefix names the pinned
+      # version (cache-beta.26 for v1.0.0-beta.26), so a VERSION moved without
+      # the environment's CACHE_S3_PREFIX can't write one engine's entries
+      # under another's prefix.
+      - name: Check the prefix is for this engine version
+        env:
+          PREFIX: ${{ vars.CACHE_S3_PREFIX }}
+        run: |
+          want="cache-${VERSION#*-}"
+          if [[ "$PREFIX" != "$want" ]]; then
+            echo "::error::CACHE_S3_PREFIX is '$PREFIX', but engine $VERSION stores under '$want': move the environments' prefix and VERSION together"
+            exit 1
+          fi
       - name: Start the writer sidecar
         id: writer
         uses: ./.github/actions/remote-cache/start
