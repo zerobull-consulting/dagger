@@ -1321,8 +1321,9 @@ func (c *Collector) sweepStaging(ctx context.Context, ns string, l *listing, rul
 // abortUploads aborts the namespace's incomplete multipart uploads older than
 // StagingAge: promotions that a stopped service left.
 //
-// Every upload here is at a blob key of the namespace (survey): one of
-// another shape is a violation, and its namespace isn't collected.
+// Every upload here is at a blob key of the namespace, or at a staging key
+// (a large service-hashed promotion's private copy; survey): one of another
+// shape is a violation, and its namespace isn't collected.
 func (c *Collector) abortUploads(ctx context.Context, ns string, uploads []Upload, now time.Time, rep *Report, log *slog.Logger) {
 	prefix, _ := c.cfg.Meta.ScopePrefix(ns)
 	cutoff := now.Add(-c.cfg.StagingAge)

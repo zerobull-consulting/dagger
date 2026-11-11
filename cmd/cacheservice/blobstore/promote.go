@@ -3,12 +3,10 @@ package blobstore
 import (
 	"bytes"
 	"context"
-	"crypto/md5" //nolint:gosec // compared with the store's ETags, which are MD5s
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"net/url"
 	"strings"
@@ -50,15 +48,15 @@ const (
 //     whose checksums are per part and can't be combined into the blob's.
 //     So is a blob of another algorithm, every blob with
 //     S3Config.HashInService, and every blob once the store has returned a
-//     part copy without a checksum. The service reads the staged object and
-//     hashes it, then copies it, each part conditioned on the ETag it read
-//     (CopySourceIfMatch), so a staged object overwritten in between is not
-//     what gets promoted. A store may ignore that condition (DigitalOcean
-//     Spaces does), so the service also takes each part's MD5 as it reads,
-//     and compares it with the ETag the store returns for the part's copy:
-//     a difference is a Mismatch, and the upload never completes. A store
-//     whose ETags aren't MD5s (AWS S3 with SSE-KMS, say) shows it in the
-//     staged object's own ETag, and only the condition applies there.
+//     part copy without a checksum. The service first copies the staged
+//     object to a private key, a staging key under a stage of its own that
+//     no upload URL reaches, then reads that copy and hashes it, and copies
+//     it to the digest key. So what reaches the digest key is what the
+//     service hashed, even if the staged object is overwritten meanwhile by
+//     someone who holds its presigned PUT: no store condition
+//     (CopySourceIfMatch, which DigitalOcean Spaces ignores) and no ETag
+//     (an MD5, or not even that with SSE-KMS) is relied on
+//     (zerobull-consulting/dagger#67). It costs one more copy in the store.
 func (s *S3Store) Promote(ctx context.Context, stage Stage, dgst digest.Digest, size int64) (Promotion, error) {
 	start := time.Now()
 	p, err := s.promote(ctx, stage, dgst, size)
@@ -134,6 +132,10 @@ func (s *S3Store) promote(ctx context.Context, stage Stage, dgst digest.Digest, 
 // promoteStoreHashed copies src to dst as one part, and completes the copy
 // only if the store's SHA-256 of the part is dgst. hashed is false when the
 // store returned no checksum; nothing was written then.
+//
+// The store hashes the very bytes it copies, so an overwrite of src can't
+// slip between the hash and the copy; the condition on etag only spares a
+// copy of an object that changed since the HEAD.
 func (s *S3Store) promoteStoreHashed(ctx context.Context, src, dst, etag string, dgst digest.Digest, size int64) (_ Promotion, hashed bool, _ error) {
 	up, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:            &s.bucket,
@@ -189,27 +191,45 @@ func (s *S3Store) promoteStoreHashed(ctx context.Context, src, dst, etag string,
 	return p, true, err
 }
 
-// promoteServiceHashed reads src and hashes it, then, if it is dgst, copies
-// it to dst in parts, each conditioned on the ETag the service read.
+// promoteServiceHashed copies src to a private key, hashes that copy, and,
+// if it is dgst, copies it to dst in parts.
+//
+// The private key is a staging key under a stage of its own, new for this
+// promotion and never presigned: no upload URL reaches it, so what the
+// service hashes is what it then copies, whatever happens to src meanwhile
+// (zerobull-consulting/dagger#67). The private copy is deleted once the
+// promotion is over; one left by a service stopped midway is a staged
+// object like any other, which the lifecycle rule or GC expires.
+//
+// The copy to the private key is conditioned on the ETag the service read
+// (CopySourceIfMatch), so a store that honors it fails early when src was
+// overwritten since the HEAD; nothing relies on it.
 func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag string, dgst digest.Digest, size int64) (Promotion, error) {
-	obj, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &src, IfMatch: aws.String(etag)})
+	priv, err := s.StagingKey(NewStage(), dgst)
 	if err != nil {
-		return Promotion{}, fmt.Errorf("read %s: %w", src, err)
+		return Promotion{}, err
 	}
-	partSize := s.copyPartSize
-	if size <= s.maxPartCopy {
-		partSize = size
-	} else if least := (size + maxCopyParts - 1) / maxCopyParts; partSize < least {
-		partSize = least
+	// Deleted even when the copy to it failed: a single copy may have
+	// landed before its error.
+	defer func() {
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		_, _ = s.client.DeleteObject(dctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: &priv})
+	}()
+	if err := s.copyPrivate(ctx, src, priv, etag, size); err != nil {
+		return Promotion{}, err
+	}
+
+	obj, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &priv})
+	if err != nil {
+		return Promotion{}, fmt.Errorf("read %s: %w", priv, err)
 	}
 	h := dgst.Algorithm().Hash()
-	whole := md5.New() //nolint:gosec // see the import
-	partSums := &partMD5s{size: partSize}
-	n, err := io.Copy(io.MultiWriter(h, whole, partSums), obj.Body)
+	n, err := io.Copy(h, obj.Body)
 	_ = obj.Body.Close()
 	p := Promotion{HashedBy: HashedByService, Bytes: n}
 	if err != nil {
-		return p, fmt.Errorf("read %s: %w", src, err)
+		return p, fmt.Errorf("read %s: %w", priv, err)
 	}
 	if n != size || digest.NewDigest(dgst.Algorithm(), h) != dgst {
 		p.Outcome = Mismatch
@@ -220,18 +240,78 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 	if err != nil {
 		return p, fmt.Errorf("start copy to %s: %w", dst, err)
 	}
-	abort := s.aborter(ctx, dst, up.UploadId)
-	etagsAreMD5 := unquoteETag(etag) == hex.EncodeToString(whole.Sum(nil))
-	wantParts := partSums.sums()
+	parts, err := s.copyParts(ctx, priv, dst, "", up.UploadId, size)
+	if err != nil {
+		s.aborter(ctx, dst, up.UploadId)()
+		return p, err
+	}
+	p.Outcome, err = s.complete(ctx, dst, up.UploadId, parts, dgst)
+	return p, err
+}
+
+// copyPrivate copies src, of size bytes, to the private key priv: with one
+// CopyObject up to the largest part copy (CopyObject's limit is the same
+// 5 GiB), else as a multipart upload of part copies. Every copy is
+// conditioned on etag.
+func (s *S3Store) copyPrivate(ctx context.Context, src, priv, etag string, size int64) error {
+	if size <= s.maxPartCopy {
+		_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:            &s.bucket,
+			Key:               &priv,
+			CopySource:        aws.String(copySource(s.bucket, src)),
+			CopySourceIfMatch: aws.String(etag),
+		})
+		if err != nil {
+			return fmt.Errorf("copy %s: %w", src, err)
+		}
+		return nil
+	}
+	up, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &s.bucket, Key: &priv})
+	if err != nil {
+		return fmt.Errorf("start copy to %s: %w", priv, err)
+	}
+	abort := s.aborter(ctx, priv, up.UploadId)
+	parts, err := s.copyParts(ctx, src, priv, etag, up.UploadId, size)
+	if err != nil {
+		abort()
+		return err
+	}
+	_, err = s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          &s.bucket,
+		Key:             &priv,
+		UploadId:        up.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	if err != nil {
+		abort()
+		return fmt.Errorf("complete copy to %s: %w", priv, err)
+	}
+	return nil
+}
+
+// copyParts copies src, of size bytes, into the multipart upload uploadID
+// at dst: as one part up to the largest part copy, else in parts of
+// copyPartSize (larger when that would make over S3's 10,000 parts). Each
+// part copy is conditioned on etag, unless it is "". The caller aborts the
+// upload on an error.
+func (s *S3Store) copyParts(ctx context.Context, src, dst, etag string, uploadID *string, size int64) ([]types.CompletedPart, error) {
+	partSize := s.copyPartSize
+	if size <= s.maxPartCopy {
+		partSize = size
+	} else if least := (size + maxCopyParts - 1) / maxCopyParts; partSize < least {
+		partSize = least
+	}
 	var parts []types.CompletedPart
 	for off, num := int64(0), int32(1); off < size; off, num = off+partSize, num+1 {
 		in := &s3.UploadPartCopyInput{
-			Bucket:            &s.bucket,
-			Key:               &dst,
-			UploadId:          up.UploadId,
-			PartNumber:        aws.Int32(num),
-			CopySource:        aws.String(copySource(s.bucket, src)),
-			CopySourceIfMatch: aws.String(etag),
+			Bucket:     &s.bucket,
+			Key:        &dst,
+			UploadId:   uploadID,
+			PartNumber: aws.Int32(num),
+			CopySource: aws.String(copySource(s.bucket, src)),
+		}
+		if etag != "" {
+			in.CopySourceIfMatch = aws.String(etag)
 		}
 		if partSize < size {
 			end := min(off+partSize, size) - 1
@@ -239,67 +319,19 @@ func (s *S3Store) promoteServiceHashed(ctx context.Context, src, dst, etag strin
 		}
 		part, err := s.client.UploadPartCopy(ctx, in)
 		if err != nil {
-			abort()
-			return p, fmt.Errorf("copy %s, part %d: %w", src, num, err)
+			return nil, fmt.Errorf("copy %s, part %d: %w", src, num, err)
 		}
 		if part.CopyPartResult == nil {
-			abort()
-			return p, fmt.Errorf("copy %s, part %d: %w", src, num, errNoCopyResult)
-		}
-		if etagsAreMD5 && unquoteETag(aws.ToString(part.CopyPartResult.ETag)) != wantParts[num-1] {
-			// What the store copied isn't what the service hashed.
-			abort()
-			p.Outcome = Mismatch
-			return p, nil
+			return nil, fmt.Errorf("copy %s, part %d: %w", src, num, errNoCopyResult)
 		}
 		parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(num), ETag: part.CopyPartResult.ETag})
 	}
-	p.Outcome, err = s.complete(ctx, dst, up.UploadId, parts, dgst)
-	return p, err
+	return parts, nil
 }
 
 // errNoCopyResult is an UploadPartCopy answered without a CopyPartResult:
 // the part's ETag, which completing the upload needs, is missing.
 var errNoCopyResult = errors.New("the store answered the part copy without a CopyPartResult")
-
-// partMD5s is a writer that takes the MD5 of each size bytes written.
-type partMD5s struct {
-	size int64
-	cur  hash.Hash
-	left int64
-	done []string
-}
-
-func (w *partMD5s) Write(b []byte) (int, error) {
-	n := len(b)
-	for len(b) > 0 {
-		if w.cur == nil {
-			w.cur = md5.New() //nolint:gosec // see the import
-			w.left = w.size
-		}
-		chunk := b[:min(int64(len(b)), w.left)]
-		_, _ = w.cur.Write(chunk)
-		b = b[len(chunk):]
-		w.left -= int64(len(chunk))
-		if w.left == 0 {
-			w.done = append(w.done, hex.EncodeToString(w.cur.Sum(nil)))
-			w.cur = nil
-		}
-	}
-	return n, nil
-}
-
-// sums are the parts' MD5s in hex, the last one possibly short.
-func (w *partMD5s) sums() []string {
-	if w.cur != nil {
-		w.done = append(w.done, hex.EncodeToString(w.cur.Sum(nil)))
-		w.cur = nil
-	}
-	return w.done
-}
-
-// unquoteETag is an ETag without the quotes around it.
-func unquoteETag(etag string) string { return strings.Trim(etag, `"`) }
 
 // complete completes a copy to dst without overwriting a blob already there:
 // Promoted, or Existing when another copy completed first. Any failure
