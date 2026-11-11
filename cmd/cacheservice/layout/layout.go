@@ -17,11 +17,8 @@
 //	<prefix>/ns/<namespace>/staging/<stage>/<alg>/<hex>  uploads not yet verified
 //	<prefix>/ns/<namespace>/conditional-write-check/<nonce>  the startup probe
 //
-// Incomplete multipart uploads exist only at blob keys and staging keys: a
-// promotion copies a staged upload to its blob key as a multipart upload,
-// and a service-hashed promotion first copies it to a private staging key,
-// under a stage of its own that is never presigned, as a multipart upload
-// when it is over 5 GiB.
+// Incomplete multipart uploads exist only at blob keys: a promotion copies a
+// staged upload to its blob key as a multipart upload.
 //
 // Any other key under the prefix is not the service's: an ownership
 // violation, which GC reports and never deletes.
@@ -190,12 +187,10 @@ func Classify(rel string) (Kind, string) {
 
 // IsUploadRel reports whether an incomplete multipart upload at rel, a key
 // relative to a namespace, is of the service's: only promotions start
-// multipart uploads, at blob keys, and, for a service-hashed promotion of a
-// blob over 5 GiB, at the staging key of its private copy. Engines upload
-// with a plain PUT, never a multipart upload.
+// multipart uploads, and only at blob keys.
 func IsUploadRel(rel string) bool {
 	k, _ := Classify(rel)
-	return k == KindBlob || k == KindStaging
+	return k == KindBlob
 }
 
 // ParseBlobRel returns the digest of a blob key relative to a namespace.

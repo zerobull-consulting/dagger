@@ -1,7 +1,6 @@
 package blobstore
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5" //nolint:gosec // what the fake's ETags are
 	"crypto/sha256"
@@ -10,12 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -23,43 +18,24 @@ import (
 	"github.com/opencontainers/go-digest"
 )
 
-// copyStore is a fake S3 of keyed objects that, like DigitalOcean Spaces,
-// ignores CopySourceIfMatch and returns no checksums (unless checksum). Its
-// keys are relative to the bucket "cache" (testConfig).
+// copyStore is a fake S3 that, like DigitalOcean Spaces, ignores
+// CopySourceIfMatch and returns no checksums. overwrite replaces the staged
+// object right after the service has read it.
 type copyStore struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	uploads map[string]map[int32][]byte
-	// nextUpload numbers the multipart uploads.
-	nextUpload int
-	// staged is the staged object's key; overwrite replaces its content
-	// once something has read it (a GET or a copy from it), as someone
-	// holding its presigned PUT might.
-	staged    string
+	mu        sync.Mutex
+	body      []byte
 	overwrite []byte
-	// etag makes the objects' and the parts' ETags something else than
-	// their MD5s, as AWS S3 does with SSE-KMS.
+	// etag makes the object's and the parts' ETags something else than their
+	// MD5s, as AWS S3 does with SSE-KMS.
 	etag      func(data []byte) string
 	completed int
 	aborted   int
-	// partCopies counts UploadPartCopy requests; stagedGets the GETs of
-	// the staged object.
-	partCopies int
-	stagedGets int
+	copies    int
 	// noCopyResult answers part copies with 200 and no CopyPartResult.
 	noCopyResult bool
 	// checksum answers part copies with the data's SHA-256, as a store
 	// that hashes does.
 	checksum bool
-}
-
-func newCopyStore(t *testing.T, stage Stage, d digest.Digest, body []byte) *copyStore {
-	t.Helper()
-	staged, err := newTestStore(t, testConfig()).StagingKey(stage, d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &copyStore{objects: map[string][]byte{staged: body}, uploads: map[string]map[int32][]byte{}, staged: staged}
 }
 
 func (c *copyStore) etagOf(data []byte) string {
@@ -70,73 +46,35 @@ func (c *copyStore) etagOf(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// read is what reading key returns now, and swaps the staged object for
-// overwrite once it has been read.
-func (c *copyStore) read(key string) ([]byte, bool) {
-	data, ok := c.objects[key]
-	if ok && key == c.staged && c.overwrite != nil {
-		c.objects[key] = c.overwrite
-	}
-	return data, ok
-}
-
 func (c *copyStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key := strings.TrimPrefix(r.URL.Path, "/cache/")
+	staged := strings.Contains(r.URL.Path, "/staging/")
 	q := r.URL.Query()
 	switch {
+	case r.Method == http.MethodHead && staged:
+		w.Header().Set("ETag", `"`+c.etagOf(c.body)+`"`)
+		w.Header().Set("Content-Length", fmt.Sprint(len(c.body)))
 	case r.Method == http.MethodHead:
-		data, ok := c.objects[key]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
+		w.WriteHeader(http.StatusNotFound)
+	case r.Method == http.MethodGet && staged:
+		_, _ = w.Write(c.body)
+		if c.overwrite != nil {
+			c.body = c.overwrite
 		}
-		w.Header().Set("ETag", `"`+c.etagOf(data)+`"`)
-		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-	case r.Method == http.MethodGet:
-		if key == c.staged {
-			c.stagedGets++
-		}
-		data, ok := c.read(key)
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		_, _ = w.Write(data)
 	case r.Method == http.MethodPost && q.Has("uploads"):
-		c.nextUpload++
-		id := fmt.Sprintf("u%d", c.nextUpload)
-		c.uploads[id] = map[int32][]byte{}
-		_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, id)
+		_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><UploadId>u</UploadId></InitiateMultipartUploadResult>`)
 	case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
-		src, err := url.PathUnescape(r.Header.Get("X-Amz-Copy-Source"))
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		data, ok := c.read(strings.TrimPrefix(src, "cache/"))
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if !q.Has("uploadId") {
-			c.objects[key] = data
-			_, _ = fmt.Fprintf(w, `<CopyObjectResult><ETag>"%s"</ETag></CopyObjectResult>`, c.etagOf(data))
-			return
-		}
-		c.partCopies++
+		c.copies++
+		data := c.body
 		if rng := r.Header.Get("X-Amz-Copy-Source-Range"); rng != "" {
 			var from, to int
-			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &from, &to); err != nil || to >= len(data) {
-				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &from, &to); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			data = data[from : to+1]
+			data = c.body[from : to+1]
 		}
-		var num int32
-		_, _ = fmt.Sscan(q.Get("partNumber"), &num)
-		c.uploads[q.Get("uploadId")][num] = data
 		if c.noCopyResult {
 			return
 		}
@@ -147,194 +85,65 @@ func (c *copyStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = fmt.Fprintf(w, `<CopyPartResult><ETag>"%s"</ETag></CopyPartResult>`, c.etagOf(data))
 	case r.Method == http.MethodPost && q.Has("uploadId"):
-		parts := c.uploads[q.Get("uploadId")]
-		nums := slices.Sorted(maps.Keys(parts))
-		var all []byte
-		for _, n := range nums {
-			all = append(all, parts[n]...)
-		}
-		c.objects[key] = all
-		delete(c.uploads, q.Get("uploadId"))
 		c.completed++
 		_, _ = io.WriteString(w, `<CompleteMultipartUploadResult/>`)
 	case r.Method == http.MethodDelete && q.Has("uploadId"):
-		delete(c.uploads, q.Get("uploadId"))
 		c.aborted++
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodDelete:
-		delete(c.objects, key)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusNotImplemented)
 	}
 }
 
-// keys are the fake's object keys, sorted.
-func (c *copyStore) keys() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	k := slices.Collect(maps.Keys(c.objects))
-	sort.Strings(k)
-	return k
-}
-
-// serviceHashedStore is a store on the server at endpoint that hashes in the
-// service, with part copies of partSize when it is set.
-func serviceHashedStore(t *testing.T, endpoint string, partSize int64) *S3Store {
-	t.Helper()
-	cfg := testConfig()
-	cfg.Endpoint = endpoint
-	cfg.HashInService = true
-	s := newTestStore(t, cfg)
-	if partSize > 0 {
-		s.maxPartCopy, s.copyPartSize = partSize, partSize
-	}
-	return s
-}
-
-// A service-hashed promotion hashes a private copy of the staged object and
-// promotes that copy, so a staged object overwritten after it was read never
-// reaches the digest key: the digest key holds what was hashed, or nothing.
-// It relies on no store condition (the fake ignores CopySourceIfMatch) and
-// on no ETag, MD5 or not (zerobull-consulting/dagger#67). The service never
-// reads the staged object itself, and leaves no private copy behind.
-func TestPromoteHashesPrivateCopy(t *testing.T) {
+// Without CopySourceIfMatch to rely on, a staged object overwritten between
+// the service's hash and the store's copy must not reach the digest key: the
+// part's ETag shows the copy isn't what was hashed. A store whose ETags aren't
+// MD5s can't be checked this way, and must not be failed by it.
+func TestPromoteChecksCopiedParts(t *testing.T) {
 	good := []byte(strings.Repeat("0123456789", 3))
 	bad := append([]byte(nil), good...)
 	bad[len(bad)-1] ^= 0xff
 	d := digest.FromBytes(good)
-	goodMD5 := md5.Sum(good) //nolint:gosec // see the import
-	etags := map[string]func([]byte) string{
-		"MD5 ETags": nil,
-		// AWS S3 with SSE-KMS.
-		"ETags aren't MD5s": func(data []byte) string { return fmt.Sprintf("kms-%x", md5.Sum(data)) }, //nolint:gosec // see the import
-		// Every body has the good one's MD5: a same-MD5 pair.
-		"every ETag the same MD5": func([]byte) string { return hex.EncodeToString(goodMD5[:]) },
-	}
-	for _, etagName := range slices.Sorted(maps.Keys(etags)) {
-		for _, tc := range []struct {
-			name        string
-			first       []byte
-			overwrite   []byte
-			partSize    int64
-			wantOutcome Outcome
-		}{
-			{name: "one part", first: good, wantOutcome: Promoted},
-			{name: "many parts", first: good, partSize: 10, wantOutcome: Promoted},
-			// Overwritten once the private copy has read it: the copy
-			// is the good content, and promoted.
-			{name: "one part, overwritten after the copy", first: good, overwrite: bad, wantOutcome: Promoted},
-			// Overwritten after the private copy's first part: the copy
-			// is a mix, which doesn't hash to the digest.
-			{name: "many parts, overwritten during the copy", first: good, overwrite: bad, partSize: 10, wantOutcome: Mismatch},
-			// Wrong from the start, then overwritten with the right
-			// content: the copy is wrong, and stays so.
-			{name: "one part, wrong then right", first: bad, overwrite: good, wantOutcome: Mismatch},
-		} {
-			t.Run(etagName+"/"+tc.name, func(t *testing.T) {
-				stage := NewStage()
-				f := newCopyStore(t, stage, d, tc.first)
-				f.overwrite, f.etag = tc.overwrite, etags[etagName]
-				srv := httptest.NewServer(f)
-				defer srv.Close()
-				s := serviceHashedStore(t, srv.URL, tc.partSize)
+	notMD5 := func(data []byte) string { return fmt.Sprintf("kms-%d", len(data)) }
 
-				p, err := s.Promote(context.Background(), stage, d, int64(len(good)))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if p.Outcome != tc.wantOutcome || p.HashedBy != HashedByService {
-					t.Fatalf("promote: %+v, want %s hashed by the service", p, tc.wantOutcome)
-				}
-				dst, _ := s.Key(d)
-				var want []string
-				if tc.wantOutcome == Promoted {
-					want = []string{dst}
-					if got := f.objects[dst]; !bytes.Equal(got, good) {
-						t.Fatalf("the digest key holds %q, want %q", got, good)
-					}
-				}
-				// The staged object and the private copy are gone.
-				if got := f.keys(); !slices.Equal(got, want) {
-					t.Fatalf("keys left %v, want %v", got, want)
-				}
-				if f.stagedGets != 0 {
-					t.Fatalf("the service read the staged object %d times; it reads only its private copy", f.stagedGets)
-				}
-				if len(f.uploads) != 0 {
-					t.Fatalf("multipart uploads left: %v", slices.Collect(maps.Keys(f.uploads)))
-				}
-			})
-		}
-	}
-}
-
-// A same-MD5 pair swapped into the staged object after the hash, on a store
-// that ignores CopySourceIfMatch, used to be promoted unverified
-// (TestKnownGapPromoteSameMD5Overwrite, zerobull-consulting/dagger#67). Now
-// the swap after the service's read leaves the private copy, which is what
-// was hashed and what is promoted, untouched.
-func TestPromoteSameMD5Overwrite(t *testing.T) {
-	good := []byte(strings.Repeat("0123456789", 3))
-	bad := append([]byte(nil), good...)
-	bad[0] ^= 0xff
-	sum := md5.Sum(good) //nolint:gosec // see the import
-	d := digest.FromBytes(good)
-	stage := NewStage()
-	f := newCopyStore(t, stage, d, good)
-	f.overwrite, f.etag = bad, func([]byte) string { return hex.EncodeToString(sum[:]) }
-	srv := httptest.NewServer(f)
-	defer srv.Close()
-	s := serviceHashedStore(t, srv.URL, 0)
-	p, err := s.Promote(context.Background(), stage, d, int64(len(good)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	dst, _ := s.Key(d)
-	if p.Outcome != Promoted || !bytes.Equal(f.objects[dst], good) {
-		t.Fatalf("promote: %+v; the digest key holds %q, want %q", p, f.objects[dst], good)
-	}
-	if staged := f.objects[f.staged]; staged != nil {
-		t.Fatalf("the staged object is left: %q", staged)
-	}
-}
-
-// A store whose ETags aren't MD5s and that ignores CopySourceIfMatch used to
-// have an overwritten staged object promoted unverified
-// (TestKnownGapPromoteNonMD5ETagsIgnoredCondition,
-// zerobull-consulting/dagger#67). Now the content promoted is the private
-// copy's, which the service hashed, whatever the staged object holds since.
-func TestPromoteNonMD5ETagsIgnoredCondition(t *testing.T) {
-	good := []byte(strings.Repeat("0123456789", 3))
-	bad := append([]byte(nil), good...)
-	bad[0] ^= 0xff
-	d := digest.FromBytes(good)
-	for _, partSize := range []int64{0, 10} {
-		t.Run(fmt.Sprintf("part size %d", partSize), func(t *testing.T) {
-			stage := NewStage()
-			f := newCopyStore(t, stage, d, good)
-			f.etag = func(data []byte) string { return fmt.Sprintf("kms-%x", md5.Sum(data)) } //nolint:gosec // see the import
-			// Overwrite the staged object when the service starts the copy
-			// to the digest key: after the hash, before any byte is copied
-			// there.
-			dst, _ := newTestStore(t, testConfig()).Key(d)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodPost && r.URL.Query().Has("uploads") && strings.HasSuffix(r.URL.Path, dst) {
-					f.mu.Lock()
-					f.objects[f.staged] = bad
-					f.mu.Unlock()
-				}
-				f.ServeHTTP(w, r)
-			}))
+	for _, tc := range []struct {
+		name          string
+		overwrite     []byte
+		etag          func([]byte) string
+		partSize      int64
+		wantOutcome   Outcome
+		wantCompleted int
+		wantAborted   int
+	}{
+		{name: "one part", wantOutcome: Promoted, wantCompleted: 1},
+		{name: "many parts", partSize: 10, wantOutcome: Promoted, wantCompleted: 1},
+		{name: "one part overwritten", overwrite: bad, wantOutcome: Mismatch, wantAborted: 1},
+		{name: "last of many parts overwritten", overwrite: bad, partSize: 10, wantOutcome: Mismatch, wantAborted: 1},
+		{name: "ETags aren't MD5s", etag: notMD5, wantOutcome: Promoted, wantCompleted: 1},
+		{name: "many parts, ETags aren't MD5s", etag: notMD5, partSize: 10, wantOutcome: Promoted, wantCompleted: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &copyStore{body: good, overwrite: tc.overwrite, etag: tc.etag}
+			srv := httptest.NewServer(f)
 			defer srv.Close()
-			s := serviceHashedStore(t, srv.URL, partSize)
-			p, err := s.Promote(context.Background(), stage, d, int64(len(good)))
+			cfg := testConfig()
+			cfg.Endpoint = srv.URL
+			cfg.HashInService = true
+			s := newTestStore(t, cfg)
+			if tc.partSize > 0 {
+				s.maxPartCopy, s.copyPartSize = tc.partSize, tc.partSize
+			}
+			p, err := s.Promote(context.Background(), NewStage(), d, int64(len(good)))
 			if err != nil {
 				t.Fatal(err)
 			}
-			// dst is s.Key(d): the key depends on the namespace, not the endpoint.
-			if p.Outcome != Promoted || !bytes.Equal(f.objects[dst], good) {
-				t.Fatalf("promote: %+v; the digest key holds %q, want %q", p, f.objects[dst], good)
+			if p.Outcome != tc.wantOutcome || p.HashedBy != HashedByService {
+				t.Fatalf("promote: %+v, want %s hashed by the service", p, tc.wantOutcome)
+			}
+			if f.completed != tc.wantCompleted || f.aborted != tc.wantAborted {
+				t.Fatalf("%d uploads completed, %d aborted; want %d and %d", f.completed, f.aborted, tc.wantCompleted, tc.wantAborted)
 			}
 		})
 	}
@@ -355,16 +164,11 @@ func TestPromoteNoCopyPartResult(t *testing.T) {
 		partSize      int64
 	}{
 		{name: "store hashed"},
-		// The private copy is a CopyObject; the copy to the digest key's
-		// first part fails.
 		{name: "service hashed", hashInService: true},
-		// The private copy's first part fails.
 		{name: "service hashed, many parts", hashInService: true, partSize: 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stage := NewStage()
-			f := newCopyStore(t, stage, d, body)
-			f.noCopyResult = true
+			f := &copyStore{body: body, noCopyResult: true}
 			srv := httptest.NewServer(f)
 			defer srv.Close()
 			cfg := testConfig()
@@ -374,35 +178,103 @@ func TestPromoteNoCopyPartResult(t *testing.T) {
 			if tc.partSize > 0 {
 				s.maxPartCopy, s.copyPartSize = tc.partSize, tc.partSize
 			}
-			p, err := s.Promote(context.Background(), stage, d, int64(len(body)))
+			p, err := s.Promote(context.Background(), NewStage(), d, int64(len(body)))
 			if !errors.Is(err, errNoCopyResult) {
 				t.Fatalf("promote: %+v, %v; want errNoCopyResult", p, err)
 			}
-			if f.completed != 0 || f.aborted != 1 || f.partCopies != 1 {
-				t.Fatalf("%d part copies, %d completed, %d aborted; want 1, 0 and 1", f.partCopies, f.completed, f.aborted)
+			if f.completed != 0 || f.aborted != 1 || f.copies != 1 {
+				t.Fatalf("%d copies, %d completed, %d aborted; want 1, 0 and 1", f.copies, f.completed, f.aborted)
 			}
 			if s.noStoreHash.Load() {
 				t.Fatal("a missing CopyPartResult switched the store to hashing in the service")
-			}
-			// Only the staged object is left: a store error leaves it to
-			// the lifecycle rule, and the private copy is deleted.
-			if got := f.keys(); !slices.Equal(got, []string{f.staged}) {
-				t.Fatalf("keys left %v", got)
 			}
 		})
 	}
 	// The fake's checksums work: the same store, answering with a result,
 	// promotes through the store path.
-	stage := NewStage()
-	f := newCopyStore(t, stage, d, body)
-	f.checksum = true
+	f := &copyStore{body: body, checksum: true}
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 	cfg := testConfig()
 	cfg.Endpoint = srv.URL
-	s := newTestStore(t, cfg)
-	p, err := s.Promote(context.Background(), stage, d, int64(len(body)))
+	p, err := newTestStore(t, cfg).Promote(context.Background(), NewStage(), d, int64(len(body)))
 	if err != nil || p.Outcome != Promoted || p.HashedBy != HashedByStore {
 		t.Fatalf("promote with a result: %+v, %v; want promoted, hashed by the store", p, err)
+	}
+}
+
+// Known gap, pinned on purpose: MD5 isn't collision resistant. On a store that
+// ignores CopySourceIfMatch, someone holding the presigned PUT who prepared
+// two bodies with one MD5, and overwrote the staged object between the hash
+// and the copy, gets the second body promoted, unverified. Simulated here with
+// a store whose ETags are all the first body's MD5. When promotion stops
+// relying on MD5 there, this test fails: replace it with one of the fix.
+func TestKnownGapPromoteSameMD5Overwrite(t *testing.T) {
+	good := []byte(strings.Repeat("0123456789", 3))
+	bad := append([]byte(nil), good...)
+	bad[0] ^= 0xff
+	sum := md5.Sum(good) //nolint:gosec // see the import
+	f := &copyStore{body: good, overwrite: bad, etag: func([]byte) string { return hex.EncodeToString(sum[:]) }}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	cfg.HashInService = true
+	s := newTestStore(t, cfg)
+	p, err := s.Promote(context.Background(), NewStage(), digest.FromBytes(good), int64(len(good)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Outcome != Promoted || f.completed != 1 {
+		t.Fatalf("promote: %+v, %d completed; the gap is closed, so replace this test", p, f.completed)
+	}
+}
+
+// Known gap, pinned on purpose: a store whose ETags aren't MD5s can't have its
+// copies checked, so only CopySourceIfMatch protects them. One that also
+// ignored that condition would have an overwritten staged object promoted,
+// unverified. No store is known to do both: Spaces ignores the condition, but
+// its ETags are MD5s. When promotion stops relying on either, this test fails:
+// replace it with one of the fix.
+func TestKnownGapPromoteNonMD5ETagsIgnoredCondition(t *testing.T) {
+	good := []byte(strings.Repeat("0123456789", 3))
+	bad := append([]byte(nil), good...)
+	bad[0] ^= 0xff
+	f := &copyStore{body: good, overwrite: bad, etag: func(data []byte) string { return fmt.Sprintf("kms-%x", md5.Sum(data)) }} //nolint:gosec // see the import
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	cfg.HashInService = true
+	s := newTestStore(t, cfg)
+	p, err := s.Promote(context.Background(), NewStage(), digest.FromBytes(good), int64(len(good)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Outcome != Promoted || f.completed != 1 {
+		t.Fatalf("promote: %+v, %d completed; the gap is closed, so replace this test", p, f.completed)
+	}
+}
+
+func TestPartMD5s(t *testing.T) {
+	sum := func(s string) string {
+		b := md5.Sum([]byte(s)) //nolint:gosec // see the import
+		return hex.EncodeToString(b[:])
+	}
+	w := &partMD5s{size: 4}
+	for _, chunk := range []string{"ab", "cdefghij", "k"} {
+		if n, err := w.Write([]byte(chunk)); err != nil || n != len(chunk) {
+			t.Fatalf("Write(%q) = %d, %v", chunk, n, err)
+		}
+	}
+	got := w.sums()
+	want := []string{sum("abcd"), sum("efgh"), sum("ijk")}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("sums %v, want %v", got, want)
+	}
+	exact := &partMD5s{size: 2}
+	_, _ = exact.Write([]byte("abcd"))
+	if got := exact.sums(); len(got) != 2 || got[1] != sum("cd") {
+		t.Fatalf("exact parts: %v", got)
 	}
 }

@@ -1,15 +1,13 @@
 name: "Remote cache: stop"
 description: >-
-  Stops what remote-cache/start started: first a flush, which asks the
-  service, still fully up, to export what is pending for the engine, for up
-  to the start's settle-timeout; then the engine; then the service, which
-  runs with no drain and exits within 5s. remote-cache/start stops by itself
-  at the end of the job; use this to stop earlier, with a timeout of its
-  own: run it with if: always(), and a timeout-minutes above the
-  settle-timeout plus 3 minutes (4 for the default 10s): the flush, then
-  the engine's stop (cut off at 90s), then the service's, then the cleanup.
-  The stop at the end of the job then finds nothing to stop, and does
-  nothing; stopping twice is safe.
+  Stops what remote-cache/start started: the service first, which drains
+  its exports, then, once the drain is done, the engine, then it waits for
+  the service to exit. remote-cache/start stops by itself at the end of the
+  job; use this to stop earlier, with a timeout of its own: run it with
+  if: always(), and a timeout-minutes above the drain timeout plus 2
+  minutes: the drain's wait (the drain timeout plus 5s), then the engine's
+  stop (cut off at 90s), then the cleanup. The stop at the end of the job
+  then finds nothing to stop, and does nothing; stopping twice is safe.
 
 inputs:
   name:
@@ -25,7 +23,7 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Flush, then stop the engine, then the cache service
+    - name: Stop the cache service, then the engine
       id: stop
       shell: bash
       env:

@@ -165,11 +165,6 @@ uploads ([#23](https://github.com/zerobull-consulting/dagger/issues/23); see
 - `TestMinIOPromoteManyParts`: a blob over the part-copy limit (lowered to
   5 MiB) is hashed by the service and copied in parts; a mismatch is caught
   the same way.
-- `TestMinIOPromoteStagedOverwritten`: a staged object overwritten during a
-  service-hashed promotion never reaches the digest key: before the
-  service's private copy, the copy fails its condition (or, on a store that
-  ignores it, doesn't hash to the digest); after the hash, the content
-  promoted is the private copy's, which was hashed.
 - `TestMinIOPromoteStoreWithoutChecksums`: a store that doesn't hash on
   copy has its blobs hashed by the service.
 - `TestMinIOPromoteLatency`: logs the time to promotion of blobs of 64 KiB
@@ -325,8 +320,8 @@ from runs against a dedicated Spaces bucket on 2026-11-03. The tests pin these
 | `If-Match` on `PutObject` | Honored, quoted or not | **Honored only unquoted**; a quoted current ETag gets 412. A stale one gets 412 either way. 8 racing writers lost no update in 80. | Sends it unquoted, on every store. |
 | Store-side checksum on a one-part `UploadPartCopy` | Full SHA-256 | **None returned** | Detects it on the first copy and hashes in the service from then on, so blob bytes pass through the service. |
 | `If-None-Match: *` on `CompleteMultipartUpload` | Honored (412) | **Ignored**: overwrites | Accepts it: only verified copies complete, so racing exports write the same bytes. |
-| `CopySourceIfMatch` on copies | Honored (412) | **Ignored** | Relies on neither: a service-hashed promotion hashes a private copy of the staged object, which no upload URL reaches, and promotes that copy ([zerobull-consulting/dagger#67](https://github.com/zerobull-consulting/dagger/issues/67)). |
-| `If-Match` on `GetObject` | Honored | Honored | No longer used while hashing: the service reads its private copy, which nothing else writes. |
+| `CopySourceIfMatch` on copies | Honored (412) | **Ignored** | Compares each copied part's ETag with the MD5 it took while hashing. |
+| `If-Match` on `GetObject` | Honored | Honored | Relies on it while hashing. |
 | Presigned PUT with a signed `Content-Length`, to a staging key | Works; other sizes refused | Works; other sizes refused | None needed. |
 | Presigned expiry | 403 | 403 | None needed. |
 | Lifecycle rules | Expiry accepted; **`AbortIncompleteMultipartUpload` refused (400)**; a user without `s3:GetLifecycleConfiguration` (the read-only one) can't read them (`TestMinIOLifecycleCheckUnreadable`) | Both accepted with a full-access key; **403 with a more limited key**. A `Read/Write/Delete` limited key can't *read* them either (`GetBucketLifecycleConfiguration` 403 `AccessDenied`, observed 2026-11-07) | Set only by `cacheservice lifecycle apply`, with a full-access key, after `lifecycle claim` (on MinIO, with `-abort-rule=false`). Whether they take effect isn't checked: rules run on a scale of days. |

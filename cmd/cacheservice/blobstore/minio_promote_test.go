@@ -10,9 +10,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"os"
-	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -295,120 +293,79 @@ func TestMinIOConditionalPromotion(t *testing.T) {
 	}
 }
 
-// overwriteOnCopy overwrites the staged object, once, just before the first
-// copy request that when matches reaches the store, as a holder of the
+// overwriteOnCopy overwrites the staged object just before the first part
+// copy reaches the store: after the service hashed it, as a holder of the
 // still-valid presigned PUT could.
 type overwriteOnCopy struct {
 	aws.HTTPClient
 	once      sync.Once
-	when      func(r *http.Request) bool
 	overwrite func()
 }
 
 func (o *overwriteOnCopy) Do(r *http.Request) (*http.Response, error) {
-	if r.Header.Get("X-Amz-Copy-Source") != "" && o.when(r) {
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
 		o.once.Do(o.overwrite)
 	}
 	return o.HTTPClient.Do(r)
 }
 
-// A staged object overwritten during a service-hashed promotion never
-// reaches the digest key (zerobull-consulting/dagger#67):
-//
-//   - before the copy to the service's private key: on a store that honors
-//     CopySourceIfMatch the copy fails, and on one that ignores it the
-//     private copy is the wrong content, and doesn't hash to the digest;
-//   - after the service hashed its private copy: the copy to the digest key
-//     reads the private copy, not the staged object, so the blob is
-//     promoted with the content that was hashed, on any store.
-//
-// Either way the private copy is deleted.
+// A staged object overwritten between the service's hash and the store's copy
+// never reaches the digest key, on a store that honors CopySourceIfMatch (the
+// copy fails) and on one that ignores it (the part's ETag shows it).
 func TestMinIOPromoteStagedOverwritten(t *testing.T) {
 	ctx := context.Background()
 	for _, parts := range []struct {
 		name string
 		size int64
 	}{{"one part", 0}, {"many parts", 5 << 20}} {
-		for _, timing := range []struct {
-			name string
-			// fromStaged: overwrite at the first copy from the staged
-			// object (the private copy), else at the first copy from
-			// anything else (the copy to the digest key).
-			fromStaged bool
-		}{{"before the private copy", true}, {"after the hash", false}} {
-			t.Run(parts.name+"/"+timing.name, func(t *testing.T) {
-				hook := &overwriteOnCopy{}
-				s := newMinIOStore(t, func(c *S3Config) {
-					c.HashInService = true
-					hook.HTTPClient = c.HTTPClient
-					c.HTTPClient = hook
-				})
-				if parts.size > 0 {
-					s.maxPartCopy, s.copyPartSize = parts.size, parts.size
-				}
-				blob, d := randomBlob(t, 12<<20+3)
-				wrong := bytes.Clone(blob)
-				wrong[len(wrong)-1] ^= 0xff
-				stage := NewStage()
-				staged, _ := s.StagingKey(stage, d)
-				hook.when = func(r *http.Request) bool {
-					return strings.HasSuffix(r.Header.Get("X-Amz-Copy-Source"), copySource(s.bucket, staged)) == timing.fromStaged
-				}
-				hook.overwrite = func() {
-					if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &staged, Body: bytes.NewReader(wrong)}); err != nil {
-						t.Errorf("overwrite the staged object: %v", err)
-					}
-				}
-				put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if status := enginePut(t, put.URL, blob); status != http.StatusOK {
-					t.Fatalf("PUT: status %d", status)
-				}
-				p, err := s.Promote(ctx, stage, d, int64(len(blob)))
-				switch {
-				case !timing.fromStaged:
-					if err != nil || p.Outcome != Promoted {
-						t.Fatalf("promote: %+v, %v; want the hashed content promoted", p, err)
-					}
-					get, _ := s.PresignGet(ctx, d)
-					if status, data := httpGet(t, get.URL); status != http.StatusOK || !bytes.Equal(data, blob) {
-						t.Fatalf("GET: status %d, the hashed content %v", status, bytes.Equal(data, blob))
-					}
-				case s3test.StoreBehavior(t).CopyConditions:
-					if !isConditionFailed(err) {
-						t.Fatalf("promote: %+v, %v; want the copy to fail its condition", p, err)
-					}
-				default:
-					if err != nil || p.Outcome != Mismatch {
-						t.Fatalf("promote: %+v, %v; want a mismatch", p, err)
-					}
-				}
-				if timing.fromStaged && mustHas(t, s, d) {
-					t.Fatal("the overwritten content reached the digest key")
-				}
-				if left := listUploads(t, s); len(left) != 0 {
-					t.Fatalf("multipart uploads left: %v", left)
-				}
-				// The private copy is gone; the staged object too, unless
-				// the promotion failed (then the lifecycle rule takes it).
-				left := listKeys(t, s, s.StagingPrefix())
-				if err != nil && slices.Equal(left, []string{staged}) {
-					left = nil
-				}
-				if len(left) != 0 {
-					t.Fatalf("staged keys left: %v", left)
-				}
+		t.Run(parts.name, func(t *testing.T) {
+			hook := &overwriteOnCopy{}
+			s := newMinIOStore(t, func(c *S3Config) {
+				c.HashInService = true
+				hook.HTTPClient = c.HTTPClient
+				c.HTTPClient = hook
 			})
-		}
+			if parts.size > 0 {
+				s.maxPartCopy, s.copyPartSize = parts.size, parts.size
+			}
+			blob, d := randomBlob(t, 12<<20+3)
+			wrong := bytes.Clone(blob)
+			wrong[len(wrong)-1] ^= 0xff
+			stage := NewStage()
+			staged, _ := s.StagingKey(stage, d)
+			hook.overwrite = func() {
+				if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &staged, Body: bytes.NewReader(wrong)}); err != nil {
+					t.Errorf("overwrite the staged object: %v", err)
+				}
+			}
+			put, err := s.PresignPut(ctx, stage, d, int64(len(blob)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status := enginePut(t, put.URL, blob); status != http.StatusOK {
+				t.Fatalf("PUT: status %d", status)
+			}
+			p, err := s.Promote(ctx, stage, d, int64(len(blob)))
+			if s3test.StoreBehavior(t).CopyConditions {
+				if !isConditionFailed(err) {
+					t.Fatalf("promote: %+v, %v; want the copy to fail its condition", p, err)
+				}
+			} else if err != nil || p.Outcome != Mismatch {
+				t.Fatalf("promote: %+v, %v; want a mismatch", p, err)
+			}
+			if mustHas(t, s, d) {
+				t.Fatal("the overwritten content reached the digest key")
+			}
+			if left := listUploads(t, s); len(left) != 0 {
+				t.Fatalf("multipart uploads left: %v", left)
+			}
+		})
 	}
 }
 
 // A blob over the largest part copy (5 GiB on S3; lowered here to 5 MiB,
-// S3's smallest part) is hashed by the service and copied in parts: to its
-// private key, then from there to the digest key. A mismatch is caught the
-// same way.
+// S3's smallest part) is hashed by the service and copied in parts, each
+// conditioned on the ETag it read. A mismatch is caught the same way.
 func TestMinIOPromoteManyParts(t *testing.T) {
 	s := newMinIOStore(t, nil)
 	s.maxPartCopy, s.copyPartSize = 5<<20, 5<<20
@@ -453,9 +410,8 @@ func TestMinIOPromoteStoreWithoutChecksums(t *testing.T) {
 // Time to promotion as a function of blob size, for both ways of hashing:
 // what the README's table comes from. The sizes are small by default, to
 // keep CI fast (about a second in all); CACHESERVICE_TEST_PROMOTE_MB adds
-// one size in MiB (1024 takes about 40s against the local MinIO, and writes
-// 5 GiB: two uploads, each copied to its digest key, and the service-hashed
-// one also to its private key).
+// one size in MiB (1024 takes about 30s against the local MinIO, and writes
+// 3 GiB: the upload, its copy, and the staged copy's deletion).
 func TestMinIOPromoteLatency(t *testing.T) {
 	sizes := []int{64 << 10, 1 << 20, 16 << 20, 64 << 20}
 	if v := os.Getenv("CACHESERVICE_TEST_PROMOTE_MB"); v != "" {

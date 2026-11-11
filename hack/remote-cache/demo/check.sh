@@ -12,9 +12,8 @@
 # engine has the cache volume the cacheable step filled). It saves the
 # cacheable step's stamp and the engine's cache ID in <dir>.
 #
-# stored: after the writer's stop, its log shows exports stored, and the
-# stop's flush (zerobull-consulting/dagger#137), which left nothing it could
-# export.
+# stored: after the writer's stop, its log shows exports stored, and a
+# drain that completed.
 #
 # read-only: on a fresh engine with a read-only service, the service merged
 # the writer's entries; the cacheable step is a hit, with 0 executed and the
@@ -118,18 +117,10 @@ stored() {
 	roots="$({ grep 'msg="export stored"' "$log" || true; } | sed -nE 's/.* roots=([0-9]+).*/\1/p' | awk '{n += $1} END {print n + 0}')"
 	((exports >= 1 && roots >= 1)) && ok "the writer stored $exports export(s), $roots root(s)" ||
 		fail "the writer stored no export ($exports exports, $roots roots)"
-	# The stop's flush: complete, or paused when all it left are roots the
-	# engine refuses until its next session (an engine from v1.0.0-beta.26
-	# gives up its remote-cache work 20s after its last session). Either way
-	# it left no root it could export (leftRoots counts no paused one).
-	local flush
-	flush="$(grep 'msg="flush: done"' "$log" | tail -n 1 || true)"
-	if [[ -z "$flush" ]]; then
-		fail "the writer's log has no flush (was the stop skipped, or its settle-timeout 0?)"
-	elif [[ "$flush" =~ \ outcome=(complete|paused)\  && "$flush" =~ \ leftRoots=0( |$) ]]; then
-		ok "the writer's flush left nothing it could export: $(sed -E 's/^time=[^ ]* //' <<<"$flush")"
-	else
-		fail "the writer's flush didn't complete, or left roots: $flush"
+	grep -q 'msg="drain: done" outcome=complete' "$log" && ok "the writer's drain completed" ||
+		fail "the writer's log has no completed drain (was the stop skipped, or cut off?)"
+	if grep -q 'msg="drain: left unexported"' "$log"; then
+		fail "the writer's drain left roots unexported: $(grep 'msg="drain: left unexported"' "$log" | head -n 3 || true)"
 	fi
 	finish
 }

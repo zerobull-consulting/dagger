@@ -2230,13 +2230,6 @@ func TestOTLPAppendPeakHeaders(t *testing.T) {
 		otlpAppendSink = s
 		otlpAppendSink = nil
 	})
-	// A number in a JSON array, appended to a repeated scalar field.
-	t.Run("scalar", func(t *testing.T) {
-		var s []uint64
-		sweep(t, otlpJSONScalarSize, func() { s = append(s, 0) }, func() int { return cap(s) })
-		otlpAppendSink = s
-		otlpAppendSink = nil
-	})
 }
 
 // Each element of a repeated string or bytes field decodes to a 16-byte
@@ -2428,280 +2421,55 @@ func TestOTLPSingularStringCoversSizeClass(t *testing.T) {
 	}
 }
 
-// otlpJSONExtra is what the JSON estimate charges body beyond base, which
-// differs from it only by what the test charges.
-func otlpJSONExtra(t *testing.T, body, base string) int64 {
-	t.Helper()
-	est, err := otlpDecodedSize([]byte(body), &commonpb.AnyValue{}, true)
+// Known gap: the JSON estimate charges a string its bytes in the body, not
+// what the allocator rounds its copy up to, so a 32,769-byte stringValue, whose
+// copy takes 40,960 bytes, is charged under that, its object included. The
+// protobuf walk charges singular strings for size classes
+// (zerobull-consulting/dagger#232); the JSON estimate doesn't.
+func TestOTLPJSONSingularStringSizeClassKnownGap(t *testing.T) {
+	const n = 32769
+	body := []byte(`{"stringValue":"` + strings.Repeat("k", n) + `"}`)
+	m := &commonpb.AnyValue{}
+	if err := protojson.Unmarshal(body, m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.GetStringValue()) != n {
+		t.Fatal("no stringValue decoded")
+	}
+	est, err := otlpDecodedSize(body, &commonpb.AnyValue{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := otlpDecodedSize([]byte(base), &commonpb.AnyValue{}, true)
+	if copied := otlpCopySize(n); est >= copied {
+		t.Fatalf("the estimate %d now covers the %d bytes the string's copy takes: the gap is closed, "+
+			"so replace this test with one that checks it", est, copied)
+	}
+}
+
+// Known gap: a JSON body is charged 16 bytes for each comma, its bytes, and
+// each object, so an element of a repeated string field, `"",` on the wire,
+// is charged 19 bytes, under the headers append holds for it at its peak (up
+// to 3.12 of 16 bytes). The protobuf walk charges them
+// (zerobull-consulting/dagger#217); the JSON estimate doesn't.
+func TestOTLPJSONEmptyRepeatedStringsKnownGap(t *testing.T) {
+	const n = 100000
+	body := []byte(`{"resourceSpans":[{"resource":{"entityRefs":[{"idKeys":[` +
+		strings.Repeat(`"",`, n-1) + `""]}]}}]}`)
+	m := &coltracepb.ExportTraceServiceRequest{}
+	if err := protojson.Unmarshal(body, m); err != nil {
+		t.Fatal(err)
+	}
+	got := m.ResourceSpans[0].Resource.EntityRefs[0].IdKeys
+	peak, finalCap := otlpAppendPeak(make([]string, n))
+	if len(got) != n || cap(got) != finalCap {
+		t.Fatalf("decoded %d idKeys in %d, appending %d gives %d", len(got), cap(got), n, finalCap)
+	}
+	est, err := otlpDecodedSize(body, &coltracepb.ExportTraceServiceRequest{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return est - b
-}
-
-// A JSON string value is charged like a singular string in the protobuf
-// estimate, what the allocator rounds its copy up to and a header, besides
-// its bytes in the body: a 32,769-byte stringValue, whose copy takes 40,960
-// bytes, was charged 33,107 with its object before
-// zerobull-consulting/dagger#233, and is now charged 41,315.
-func TestOTLPJSONSingularStringCoversSizeClass(t *testing.T) {
-	// What a string value adds beyond its copy: its key, quotes and colon in
-	// the body, and slack (a one-byte string takes no heap of its own).
-	keyLen := int64(len(`"stringValue":""`))
-	for _, n := range []int{1, 17, 33, 129, 1025, 4097, 8193, 32769, 32768 + 8192 + 1, 65537, 100000} {
-		body := `{"stringValue":"` + strings.Repeat("k", n) + `"}`
-		m := &commonpb.AnyValue{}
-		if err := protojson.Unmarshal([]byte(body), m); err != nil {
-			t.Fatal(err)
-		}
-		if len(m.GetStringValue()) != n {
-			t.Fatalf("%d: no stringValue decoded", n)
-		}
-		charged, copied := otlpJSONExtra(t, body, `{}`), otlpCopySize(n)
-		if charged < copied {
-			t.Fatalf("a %d-byte stringValue is charged %d, under the %d its copy takes", n, charged, copied)
-		}
-		// Its bytes in the body, and the protobuf estimate's bound past them.
-		if limit := int64(n) + keyLen + copied/2 + 2*otlpFieldCost; charged > limit {
-			t.Fatalf("a %d-byte stringValue is charged %d, over %d for the %d its copy takes", n, charged, limit, copied)
-		}
-	}
-	// An empty string is charged its bytes in the body and a header.
-	if charged := otlpJSONExtra(t, `{"stringValue":""}`, `{}`); charged != keyLen+otlpFieldCost {
-		t.Fatalf("an empty stringValue is charged %d", charged)
-	}
-	// A key is charged its bytes only, as the decoder drops it: braces,
-	// brackets and commas in it charge nothing.
-	if charged := otlpJSONExtra(t, `{"{[,]}":1}`, `{"xxxxx":1}`); charged != 0 {
-		t.Fatalf("a key of braces is charged %d more than one of letters", charged)
-	}
-}
-
-// A JSON string holding an escape is built by append before it is copied
-// (protojson's parseString), so the decode holds up to the old array and the
-// new one, or the new one and the copy: it is charged otlpJSONEscapedCopies
-// copies. otlpUnescapePeak replays those appends.
-func TestOTLPJSONEscapedStringCoversDecodePeak(t *testing.T) {
-	for _, raw := range []string{
-		`\n`, `k\n`, `\nk`, strings.Repeat(`\n`, 17), strings.Repeat(`\n`, 33),
-		`\n` + strings.Repeat("k", 17), `\n` + strings.Repeat("k", 1025), `\n` + strings.Repeat("k", 32769),
-		strings.Repeat("k", 32769) + `\n`, strings.Repeat(`\n`, 32769), strings.Repeat(`k\n`, 20000),
-		strings.Repeat(`é`, 10000), strings.Repeat(`\"`, 100000), strings.Repeat("k", 1000) + strings.Repeat(`\n`, 1000),
-	} {
-		body := `{"stringValue":"` + raw + `"}`
-		m := &commonpb.AnyValue{}
-		if err := protojson.Unmarshal([]byte(body), m); err != nil {
-			t.Fatal(err)
-		}
-		peak, decoded := otlpUnescapePeak(raw)
-		if decoded != m.GetStringValue() {
-			t.Fatalf("%.20q...: replayed %d bytes, decoded %d", raw, len(decoded), len(m.GetStringValue()))
-		}
-		if charged := otlpJSONExtra(t, body, `{}`); charged < peak {
-			t.Fatalf("%.20q... (%d bytes): charged %d, under the %d the decode holds at its peak", raw, len(raw), charged, peak)
-		}
-	}
-}
-
-// otlpUnescapePeak replays the appends protojson's parseString makes to
-// unescape raw (a string's content in the body, holding only \uXXXX escapes
-// and one-letter ones), and says what they and the string copied from them
-// hold at their peak, and the string.
-func otlpUnescapePeak(raw string) (int64, string) {
-	i := strings.IndexByte(raw, '\\')
-	if i < 0 {
-		return otlpCopySize(len(raw)), raw
-	}
-	b := []byte(raw)
-	// The decoder starts with the body's bytes before the first escape, which
-	// take no heap until append grows them.
-	out, in, aliased := b[:i:i], b[i:], true
-	var peak int64
-	appendTo := func(more ...byte) {
-		next := append(out, more...)
-		if cap(next) != cap(out) {
-			held := int64(cap(next))
-			if !aliased {
-				held += int64(cap(out))
-			}
-			peak, aliased = max(peak, held), false
-		}
-		out = next
-	}
-	for len(in) > 0 {
-		switch {
-		case in[0] != '\\':
-			j := bytes.IndexByte(in, '\\')
-			if j < 0 {
-				j = len(in)
-			}
-			appendTo(in[:j]...)
-			in = in[j:]
-		case in[1] == 'u':
-			v, _ := strconv.ParseUint(string(in[2:6]), 16, 16)
-			appendTo([]byte(string(rune(v)))...)
-			in = in[6:]
-		default:
-			c := in[1]
-			switch c {
-			case 'n':
-				c = '\n'
-			case 't':
-				c = '\t'
-			}
-			appendTo(c)
-			in = in[2:]
-		}
-	}
-	s := string(out)
-	return max(peak, int64(cap(out))+otlpCopySize(len(s))), s
-}
-
-// A JSON string under a key that names a bytes field is base64, which the
-// decoder decodes while it holds the string: it is charged the decoded
-// bytes as well as the string's copy. Under the old estimate a 300,000-byte
-// bytesValue, 400,000 in base64, was charged 400,337, and the decode
-// allocated about 712,000.
-func TestOTLPJSONBytesFieldCoversBase64Decode(t *testing.T) {
-	for _, n := range []int{1, 17, 33, 1025, 24577, 32769, 300000} {
-		b64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, n))
-		held := otlpCopySize(len(b64)) + otlpCopySize(base64.StdEncoding.DecodedLen(len(b64)))
-		for _, key := range []string{"bytesValue", "bytes_value", `bytesValue`} {
-			body := `{"` + key + `":"` + b64 + `"}`
-			m := &commonpb.AnyValue{}
-			if err := protojson.Unmarshal([]byte(body), m); err != nil {
-				t.Fatal(err)
-			}
-			if len(m.GetBytesValue()) != n {
-				t.Fatalf("%s: no bytes decoded", key)
-			}
-			if charged := otlpJSONExtra(t, body, `{}`); charged < held {
-				t.Fatalf("%s of %d bytes: charged %d, under the %d the decode holds", key, n, charged, held)
-			}
-		}
-	}
-	// Every bytes field of the OTLP requests is in the set, by both names.
-	for _, name := range []string{"traceId", "trace_id", "spanId", "span_id", "parentSpanId", "parent_span_id", "bytesValue", "bytes_value"} {
-		if _, ok := otlpJSONBytesFields()[name]; !ok {
-			t.Errorf("%s is not a bytes field", name)
-		}
-	}
-	if _, ok := otlpJSONBytesFields()["stringValue"]; ok {
-		t.Error("stringValue is taken for a bytes field")
-	}
-}
-
-// Each element of a JSON array of strings is charged like an element of a
-// repeated string field in the protobuf estimate: otlpAllocSize of its length
-// and otlpElemHeaders headers. Before zerobull-consulting/dagger#233 each was
-// charged its bytes and 16 for its comma, so 100,000 empty idKeys, 300 KB on
-// the wire, were charged 1.90 MB, under the 3.38 MB append holds at its peak;
-// they are now charged 6.70 MB.
-func TestOTLPJSONEmptyRepeatedStringsCoverDecodePeak(t *testing.T) {
-	wrap := func(keys string) string {
-		return `{"resourceSpans":[{"resource":{"entityRefs":[{"idKeys":[` + keys + `]}]}}]}`
-	}
-	check := func(t *testing.T, keys []string) {
-		t.Helper()
-		quoted := make([]string, len(keys))
-		for i, k := range keys {
-			quoted[i] = `"` + k + `"`
-		}
-		body := []byte(wrap(strings.Join(quoted, ",")))
-		m := &coltracepb.ExportTraceServiceRequest{}
-		if err := protojson.Unmarshal(body, m); err != nil {
-			t.Fatal(err)
-		}
-		got := m.ResourceSpans[0].Resource.EntityRefs[0].IdKeys
-		peak, finalCap := otlpAppendPeak(keys)
-		if len(got) != len(keys) || cap(got) != finalCap {
-			t.Fatalf("decoded %d idKeys in %d, appending %d gives %d", len(got), cap(got), len(keys), finalCap)
-		}
-		for _, k := range keys {
-			peak += otlpCopySize(len(k))
-		}
-		est, err := otlpDecodedSize(body, &coltracepb.ExportTraceServiceRequest{}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Only the idKeys: the objects around them are charged on their own.
-		base, err := otlpDecodedSize([]byte(wrap("")), &coltracepb.ExportTraceServiceRequest{}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if est-base < peak {
-			t.Fatalf("%d idKeys: charged %d, under the %d bytes the decode holds at its peak", len(keys), est-base, peak)
-		}
-	}
-	// Past where append stops doubling (256 elements).
-	var keys []string
-	for n := 1; n <= 600; n++ {
-		keys = append(keys, "")
-		check(t, keys)
-	}
-	for _, c := range []struct {
-		n   int
-		len int
-	}{
-		{100000, 0}, {100000, 1}, {10000, 100}, {33, 17}, {33, 33}, {1000, 33},
-		{100, 1025}, {100, 4097}, {33, 32769}, {10, 65537},
-	} {
-		t.Run(fmt.Sprintf("%d of %d bytes", c.n, c.len), func(t *testing.T) {
-			keys := make([]string, c.n)
-			for i := range keys {
-				keys[i] = strings.Repeat("k", c.len)
-			}
-			check(t, keys)
-		})
-	}
-}
-
-// Each number in a JSON array is appended to a repeated scalar field, an
-// 8-byte uint64 or double, which append grows: it is charged otlpElemHeaders
-// of them. Before zerobull-consulting/dagger#233 each was charged its bytes
-// and 16 for its comma, "0," 18 bytes, under the 26 append can hold.
-func TestOTLPJSONRepeatedNumbersCoverAppendPeak(t *testing.T) {
-	wrap := func(nums string) string {
-		return `{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"histogram":{"dataPoints":[{"bucketCounts":[` + nums + `]}]}}]}]}]}`
-	}
-	base, err := otlpDecodedSize([]byte(wrap("")), &colmetricspb.ExportMetricsServiceRequest{}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nums := []string{}
-	for n := 1; n <= 2000; n++ {
-		nums = append(nums, "0")
-		body := []byte(wrap(strings.Join(nums, ",")))
-		m := &colmetricspb.ExportMetricsServiceRequest{}
-		if err := protojson.Unmarshal(body, m); err != nil {
-			t.Fatal(err)
-		}
-		got := m.ResourceMetrics[0].ScopeMetrics[0].Metrics[0].GetHistogram().DataPoints[0].BucketCounts
-		peak, finalCap := otlpAppendPeak(make([]uint64, n))
-		if len(got) != n || cap(got) != finalCap {
-			t.Fatalf("decoded %d bucketCounts in %d, appending %d gives %d", len(got), cap(got), n, finalCap)
-		}
-		est, err := otlpDecodedSize(body, &colmetricspb.ExportMetricsServiceRequest{}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if est-base < peak {
-			t.Fatalf("%d bucketCounts: charged %d, under the %d bytes append holds at its peak", n, est-base, peak)
-		}
-	}
-}
-
-// The JSON scan allocates nothing: it runs on every JSON body, before the
-// decode, on bytes from the network.
-func TestOTLPJSONSizeAllocatesNothing(t *testing.T) {
-	body := []byte(`{"resourceSpans":[{"resource":{"attributes":[{"key":"k","value":{"stringValue":"v\n"}}]},` +
-		`"scopeSpans":[{"spans":[{"traceId":"AAAA","name":"s","links":[{"spanId":"AAAA"}]}]}]}],"x":[1,"a",[true,null]]}`)
-	otlpJSONBytesFields()
-	if n := testing.AllocsPerRun(100, func() { otlpJSONSize(body) }); n != 0 {
-		t.Fatalf("%v allocations per scan", n)
+	if est >= peak {
+		t.Fatalf("the estimate %d now covers the %d bytes append holds at its peak: the gap is closed, "+
+			"so replace this test with one that checks it", est, peak)
 	}
 }

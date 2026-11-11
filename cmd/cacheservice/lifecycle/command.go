@@ -359,7 +359,7 @@ func runCheck(o Options, rules []types.LifecycleRule, out io.Writer, fail func(i
 	if rep.Abort {
 		fmt.Fprintln(out, "ok       incomplete multipart uploads under the prefix are aborted by a rule")
 	} else {
-		fmt.Fprintln(out, "note     no rule aborts incomplete multipart uploads under the prefix (GC aborts stale ones at blob and staging keys; MinIO refuses such a rule and drops them itself)")
+		fmt.Fprintln(out, "note     no rule aborts incomplete multipart uploads under the prefix (GC aborts stale ones at blob keys; MinIO refuses such a rule and drops them itself)")
 	}
 	if !rep.OK() {
 		fmt.Fprintln(out, "check: rules are missing or too broad: run cacheservice lifecycle plan, then apply it with the admin key")

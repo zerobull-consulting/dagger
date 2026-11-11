@@ -279,7 +279,7 @@ jobs:
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
   # The sidecar demo (hack/remote-cache/demo) through the composite action
   # (.github/actions/remote-cache/start and stop), against MinIO: a writer
-  # phase (start, the demo, an explicit stop, which flushes), then a read-only
+  # phase (start, the demo, an explicit stop, which drains), then a read-only
   # phase on a fresh engine (-export=false and MinIO's read-only user) that is
   # stopped by the start's own post step,
   # after a step that failed. Each start's time is reported in the step
@@ -420,15 +420,14 @@ jobs:
           SERVICE: ${{ steps.writer.outputs.service-container }}
           DAGGER: ${{ steps.writer.outputs.dagger }}
         run: ./hack/remote-cache/demo/check.sh writer "$SERVICE" "$RUNNER_TEMP/demo/writer"
-      # Explicit: the flush must be done before the export is checked, and
+      # Explicit: the drain must be done before the export is checked, and
       # before the next phase. The start's post step then finds nothing to
       # stop.
       - name: "Writer: stop the sidecar"
         id: writer-stop
         if: always()
-        # The settle timeout (10s) plus 3 minutes: the flush, the engine's
-        # stop (cut off at 90s), the service's, the cleanup.
-        timeout-minutes: 4
+        # Above the drain timeout (10m) plus 5s.
+        timeout-minutes: 12
         uses: ./.github/actions/remote-cache/stop
         with:
           name: demo-writer
@@ -479,7 +478,7 @@ jobs:
       # finds nothing to stop.
       - name: "Read-only: stop the sidecar, to upload its logs"
         if: failure()
-        timeout-minutes: 4
+        timeout-minutes: 12
         uses: ./.github/actions/remote-cache/stop
         with:
           name: demo-reader
