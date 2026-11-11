@@ -1,87 +1,91 @@
-# A remote cache service for the engine's remote cache protocol
+# A reference implementation of the remote cache protocol, on object storage
 
 *Draft for the Dagger maintainers. Not yet posted anywhere.*
 
 ## Table of Contents
 
 - [Problem](#problem)
-- [Solution](#solution)
-- [Where it lives](#where-it-lives)
+- [What this is, and is not](#what-this-is-and-is-not)
+- [Limits](#limits)
+- [Options for the tree](#options-for-the-tree)
+- [Layout, if any of it lands](#layout-if-any-of-it-lands)
 - [How it is tested](#how-it-is-tested)
 - [What stays out](#what-stays-out)
-- [Landing it](#landing-it)
 - [Status](#status)
 
 ## Problem
 
-1. **Half a protocol** - `engine/remotecache` and `engine/remotecache/protocol` connect an engine to "the remote cache service", but the tree holds no service. The engine side can only be exercised against fakes.
-2. **No open implementation** - Anyone who wants the feature, including Dagger's own CI, needs a service that speaks the protocol. Today the only working one is a fork's.
-3. **Drift** - A service developed apart from the engine follows the protocol by chasing it. The fork does this by hand, release by release, with a compatibility manifest and an hourly check.
-4. **Not includable as it stands** - The fork's service is `cmd/cacheservice` with 70 Go files and ~27k lines of production code, ~45k lines of tests, and ~9.6k lines of scripts and workflows. Its tests lean on a live DigitalOcean Spaces bucket, which an upstream project should not need to keep.
+1. **A protocol with no inspectable counterpart** - `engine/remotecache` and `engine/remotecache/protocol` connect an engine to "the remote cache service", but the tree holds no service, so the engine side is exercised only against fakes.
+2. **Nothing for people who self-host** - Teams that cannot or will not use a hosted cache have no working example of how an engine's cache is stored, expired and served from a bucket they own.
+3. **Drift** - The service in this proposal follows the protocol from outside the tree, by hand, release by release.
 
-## Solution
+## What this is, and is not
 
-Contribute the service as the reference counterpart of the protocol: one binary, built and tested from the same tree and commit as the engine, with MinIO-backed tests, recorded fixtures for the one real store it has to behave against, and none of the fork's release or sync machinery.
+Dagger offers caching as part of its paid platform, together with compute and scheduling. This proposal does not ask Dagger to carry a competing product, and the service is not one:
 
-The service imports 49 packages from `internal/buildkit`, plus `engine/snapshots`, `internal/fsutil`, `internal/cloud` and others. Go does not allow another module to import `internal/`, so a standalone repository would have to copy or sync that code. That is the cost the fork pays today. In the tree, those imports are ordinary.
+| | |
+| --- | --- |
+| **Is** | A reference architecture for an engine cache on object storage: how the protocol's exports, imports, lookups, garbage collection and bucket ownership map onto S3 conditional writes. A working, tested example of the protocol's other half. |
+| **Is not** | A hosted service, a scheduler, a compute layer, or a managed multi-tenant cache. It has none of the integration a platform offers. |
 
-| Option | Cost | Verdict |
+It was built by one person, with AI assistance, in a few weeks, and is used in production CI by one consumer. The platform's investment is of a different order; this proposal does not claim parity with it.
+
+## Limits
+
+| Limit | What is true today |
+| --- | --- |
+| **Object storage only** | S3-compatible stores: MinIO is tested in CI; DigitalOcean Spaces by hand. |
+| **A sidecar** | The service starts beside the engine in a job and stops with it. It does not run as a shared, always-on service in anything we have tested. |
+| **Concurrent writers** | Safe by design, best avoided. Index updates are conditional writes with retry (`UpdateIndex`, up to 50 attempts), racing exports are resolved by `If-None-Match` (`TestVerifyRacingExports`, `TestWritersRaceOnEmptyPrefix`). Throughput under contention is not measured. The fork's workflows run one writer per prefix. |
+| **Break-even** | It helps a job only when the time it saves on cache hits exceeds the time to start it: pull two images (each bounded at 15 minutes) and connect. The action reports the start time and `hack/remote-cache/speedup/run.sh` counts cache hits against executed steps, but no break-even figure has been published. *[add: measured start time, and hit/miss numbers from the consumer's jobs]* |
+| **One engine version** | The service accepts the engine version it was built with. The protocol's handshake carries `EngineVersion`; how a tree-built service would enforce it is to be settled. |
+
+## Options for the tree
+
+Each is a complete answer; a "no" to all of them is fine, and leaves the service where it is.
+
+| Option | What Dagger would carry | Cost to Dagger |
 | --- | --- | --- |
-| **In the tree, nested Go module** | One more directory to own; S3 SDK stays out of the root `go.mod` | Proposed |
-| **Separate repository** | Copy or sync `internal/` packages; version-pair the service with every engine release | Only if the maintainers don't want it in core |
-| **Stay a fork** | Every protocol change is a manual follow-up by the fork's author | Works today; doesn't scale |
+| **A. Conformance suite** | The service's protocol tests and the fake engine, as a test harness for `engine/remotecache` that runs against any implementation, plus a short "how an implementation behaves" document | Low: tests and docs; no binary, no image |
+| **B. Reference example** | A, plus the service as an example module or `contrib/` directory, labeled unsupported | Medium: a directory that builds and is tested |
+| **C. Companion** | B as a supported component, with its image published | High; likely overlaps the paid offering |
+| **D. Nothing** | Nothing; the service stays an independent project that follows the protocol | None |
 
-## Where it lives
+The proposal is for A, with B open to discussion. C is not proposed.
 
-A nested module follows the pattern `internal/fastbolt` and `sdk/go` already use: its own `go.mod` with a `replace` to the root. Import visibility is by path, so it keeps access to `internal/`.
+The service imports 49 packages from `internal/buildkit`, plus `engine/snapshots`, `internal/fsutil`, `internal/cloud` and others. Go does not allow another module to import `internal/`, so as an independent project it keeps a synced copy of what it needs. In the tree, those imports are ordinary.
+
+## Layout, if any of it lands
+
+A nested Go module, as `internal/fastbolt` and `sdk/go` use: its own `go.mod` with a `replace` to the root, which keeps the S3 SDK out of the root `go.mod`.
 
 | Piece | Proposed location | Today |
 | --- | --- | --- |
-| Binary (`main` only) | `cmd/dagger-remote-cache/` (named for its image) | `cmd/cacheservice/` |
-| Service packages (server, exporter, importer, blobstore, metastore, gc, lifecycle) | `engine/remotecache/service/...`, nested module | `cmd/cacheservice/*` |
-| Test support (S3 guard, fake engine) | `engine/remotecache/service/internal/` | `cmd/cacheservice/internal/` |
-| Build, test and publish | A dev module under `.dagger/modules/`, like `engine-dev` and `test-split` | `.dagger/modules/cacheservice` (exists) |
-| Consumer-facing CI integration (sidecar that starts the service beside an engine) | To be decided with the maintainers: a module under `modules/`, or kept in the author's repository | `.github/actions/remote-cache/` |
-
-The service accepts the engine whose version it was built with. The protocol's handshake already carries `EngineVersion`; this replaces the fork's accept-line manifest, which exists only because the two ship separately.
+| Conformance tests, fake engine (A) | `engine/remotecache/conformance/` | `cmd/cacheservice/internal/fakeengine/` and the protocol tests |
+| Service packages, binary (B) | `contrib/remote-cache/`, nested module | `cmd/cacheservice/` |
+| Build and test | A dev module under `.dagger/modules/`, like `engine-dev` and `test-split` | `.dagger/modules/cacheservice` (exists) |
 
 ## How it is tested
 
 | Tier | What | Runs |
 | --- | --- | --- |
-| Unit | Hermetic Go tests, no store, no Docker | `test-split:test-packages` picks them up |
-| Store | The `TestMinIO...` tests against MinIO as a Dagger service, with a read-only user for the permission tests | `dagger check cacheservice:test-minio` (exists; 125 tests pass) |
-| Recorded | The few tests that pin where DigitalOcean Spaces differs from MinIO (copy hashing, conditional copies, bucket policy behavior), replayed from fixtures recorded against a real bucket | CI, no secrets, no bucket |
-| Live | Real-engine end-to-end and the live Spaces run | Sporadically, by the maintainer of the service, outside the tree |
+| Unit | Hermetic Go tests, no store, no Docker | `test-split:test-packages` |
+| Store | The `TestMinIO...` tests against MinIO as a Dagger service | `dagger check cacheservice:test-minio` (exists; 125 tests pass) |
+| Recorded | The few tests that pin where Spaces differs from MinIO, replayed from fixtures recorded against a real bucket | CI, no secrets, no bucket *(planned)* |
+| Live | Real-engine end-to-end and live Spaces | Sporadically, by the service's maintainer, outside the tree |
 
-Recorded fixtures are request-and-response pairs matched on method, normalized key, query and body digest, with credentials, signatures, dates and run-unique prefixes removed. They show that the client builds the expected requests and parses the recorded answers. They do not show that Spaces still behaves that way; re-recording is the refresh.
+Recorded fixtures show that the client builds the expected requests and parses the recorded answers. They do not show that a store still behaves that way; re-recording is the refresh.
 
 ## What stays out
 
-These exist because the service is versioned apart from the engine, or because the fork needs them. They stay with the fork.
-
 | Not proposed | Why |
 | --- | --- |
-| Engine compatibility manifest, accept lines, release check | Compatibility by construction in the tree |
-| Fork-paths check, upstream sync, merge-commit rules | No fork |
+| Compatibility manifest, accept lines, release check | Needed only because the service is versioned apart from the engine |
+| Fork-paths check, upstream sync | No fork |
 | Spaces bucket, Terraform, Spaces workflows | Replaced by the recorded tier |
-| Real-engine e2e in CI | Out of scope for now; live tier |
-| Prompt templates and work-item process docs | Fork process |
-
-## Landing it
-
-Slices a reviewer can read, each with its tests and docs:
-
-1. Test support and the S3 guard, with the module's `test-minio` check.
-2. Blob store and metastore.
-3. Importer and exporter.
-4. Server and garbage collection.
-5. Binary, image and publish module.
-
-Before slice 1, the layout above needs the maintainers' agreement. If they would rather not carry a service in core, the same layout becomes its own repository with a pinned Dagger version and a documented sync of the `internal/` packages it needs.
-
-The measured benefit and who runs it today go here before this is posted: *[add: speedup numbers from the consumer's CI, and how long it has run]*.
+| The sidecar GitHub Action | Consumer tooling; stays with its author |
+| Prompt templates and process docs | Fork process |
 
 ## Status
 
-Draft. The service works and is in use; the MinIO check and the image build and publish already run as Dagger modules on the fork. Nothing in this proposal has been reviewed by the maintainers.
+Draft. The service works and runs the author's CI; the MinIO check and the image build and publish already run as Dagger modules in the fork. Nothing here has been reviewed by the maintainers.
