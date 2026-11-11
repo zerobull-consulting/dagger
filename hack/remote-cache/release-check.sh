@@ -346,8 +346,7 @@ dispatch() {
 }
 
 # The jobs of remote-cache-tests.yml whose result is the engine's
-# (engine_jobs, engine_json, is_engine, engine_jobs_unlisted), shared with
-# accept-line-only.sh.
+# (engine_jobs, engine_json, is_engine, engine_jobs_unlisted).
 # shellcheck source=engine-jobs.sh
 source "$here/engine-jobs.sh"
 

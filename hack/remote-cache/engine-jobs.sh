@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# The engine jobs of remote-cache-tests.yml, shared by release-check.sh and
-# accept-line-only.sh, which source this file (it runs nothing on its own).
+# The engine jobs of remote-cache-tests.yml, for release-check.sh, which
+# sources this file (it runs nothing on its own).
 #
 # A run's verdict on an engine is these jobs' alone
 # (zerobull-consulting/dagger#166): any other job (unit tests, the MinIO
