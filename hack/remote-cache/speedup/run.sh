@@ -64,8 +64,16 @@ base_hit=0 base_executed=0
 # Runs a dagger shell script; prints its result.
 dagger_c() {
 	local out
-	out="$(cd "$root" && "$dagger" --progress=plain --no-load-module -c "$1" 2>>"$dir/$label.log")" ||
-		{ echo "run.sh: the $pipeline pipeline failed: see $dir/$label.log" >&2; tail -n 60 "$dir/$label.log" >&2; exit 1; }
+	out="$(cd "$root" && "$dagger" --progress=plain --no-load-module -c "$1" 2>>"$dir/$label.log")" || {
+		echo "run.sh: the $pipeline pipeline failed: see $dir/$label.log" >&2
+		tail -n 60 "$dir/$label.log" >&2
+		# The CLI's error trailer can push the failing tests out of the tail.
+		if grep -qE -- '--- FAIL|\| (FAIL|panic:)' "$dir/$label.log"; then
+			echo "run.sh: the failures, from the log:" >&2
+			grep -E -- '--- FAIL|\| (FAIL|panic:)' "$dir/$label.log" | head -n 50 >&2
+		fi
+		exit 1
+	}
 	printf '%s\n' "$out"
 }
 
@@ -154,6 +162,7 @@ container |
   with-directory /src \$(host | directory . --include=cmd/cacheservice,engine/remotecache,engine/server/remote_cache.go,engine/server/engine_status.go,.github/actions/remote-cache,.github/workflows,hack/remote-cache) |
   with-exec -- go test -race -count=1 -cover $tests |
   stdout" >"$dir/$label.test.log"
+	cat "$dir/$label.test.log"
 	echo "$label: the tests passed in $((SECONDS - start))s (output: $dir/$label.test.log)"
 }
 
@@ -162,18 +171,23 @@ start=$SECONDS
 
 [[ -n "$service" ]] || exit 0
 
-# The spans arrive a moment after the run: wait for the first of this run's,
-# then a short settle for the rest. Polls every 3s, since the verbose log is
-# long.
+# The spans arrive a moment after the run: wait for one per withExec of the
+# pipeline (build: 1; unit: go list and three layers, 4), each a hit or an
+# execution. Polls every 3s, since the verbose log is long. Fewer by the
+# deadline is reported as it is; none fails.
+expect=1
+[[ "$pipeline" == unit ]] && expect=4
 deadline=$((SECONDS + timeout_s))
 while :; do
 	read -r hit executed <<<"$(spans)"
-	((hit + executed > base_hit + base_executed)) && break
-	((SECONDS < deadline)) || { echo "run.sh: no withExec cache span reached the service within ${timeout_s}s (does the CLI inherit an unsampled TRACEPARENT?)" >&2; exit 1; }
+	hit=$((hit - base_hit)) executed=$((executed - base_executed))
+	((hit + executed >= expect)) && break
+	if ((SECONDS >= deadline)); then
+		((hit + executed > 0)) || { echo "run.sh: no withExec cache span reached the service within ${timeout_s}s (does the CLI inherit an unsampled TRACEPARENT?)" >&2; exit 1; }
+		echo "run.sh: $((hit + executed)) of the $expect withExec cache spans reached the service within ${timeout_s}s" >&2
+		break
+	fi
 	sleep 3
 done
-sleep 2
-read -r hit executed <<<"$(spans)"
-hit=$((hit - base_hit)) executed=$((executed - base_executed))
 echo "$hit $executed" >"$dir/$label.spans"
 echo "$label: Container.withExec spans: $hit hit, $executed executed"

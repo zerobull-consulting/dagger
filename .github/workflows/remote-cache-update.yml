@@ -64,15 +64,10 @@ jobs:
       # version (cache-beta.26 for v1.0.0-beta.26), so a VERSION moved without
       # the environment's CACHE_S3_PREFIX can't write one engine's entries
       # under another's prefix.
-      - name: Check the prefix is for this engine version
+      - name: Check the cache prefix and the engine pins
         env:
           PREFIX: ${{ vars.CACHE_S3_PREFIX }}
-        run: |
-          want="cache-${VERSION#*-}"
-          if [[ "$PREFIX" != "$want" ]]; then
-            echo "::error::CACHE_S3_PREFIX is '$PREFIX', but engine $VERSION stores under '$want': move the environments' prefix and VERSION together"
-            exit 1
-          fi
+        run: ./hack/remote-cache/ci/check-cache-prefix.sh "$VERSION" "$PREFIX"
       - name: Start the writer sidecar
         id: writer
         uses: ./.github/actions/remote-cache/start
@@ -119,7 +114,13 @@ jobs:
       - name: Check the export was stored
         env:
           LOGS: ${{ steps.stop.outputs.logs }}
+          UNIT: ${{ steps.unit.outcome }}
         run: |
+          # The job doesn't fail on it, but a unit run that failed may have
+          # stored less than its layers (see its log): say so.
+          if [[ "$UNIT" == failure ]]; then
+            echo "::warning::the unit pipeline failed (failing tests, or a layer that didn't build): see the 'Unit tests' step"
+          fi
           executed=0
           for p in build unit; do
             # A failed run (tests that failed) writes no spans.
