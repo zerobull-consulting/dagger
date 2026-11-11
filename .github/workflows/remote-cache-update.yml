@@ -15,8 +15,10 @@ name: Remote cache update
 # feature/remote-cache (Settings > Environments) too.
 #
 # The engine version is pinned, not read from the manifest's first accept line,
-# so a new accept line doesn't change what fills the cache: when one is
-# verified, move VERSION and the environments' CACHE_S3_PREFIX together.
+# so a new accept line doesn't change what fills the cache. It must be an accept
+# line of cmd/cacheservice/compat/engines.txt, or the start fails; when a new
+# one is verified, move VERSION and the environments' CACHE_S3_PREFIX
+# (cache-<version>) together, since one engine's entries are for that engine.
 "on":
   push:
     branches:
@@ -30,7 +32,7 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 env:
-  VERSION: v1.0.0-beta.25
+  VERSION: v1.0.0-beta.26
   # What some runners export: an unsampled trace. The CLI the start sets up
   # must not continue it, or the service learns no entries and nothing is
   # exported (see the sidecar demo job).
