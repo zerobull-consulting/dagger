@@ -807,9 +807,9 @@ sync is still to be built. Each token is an environment secret:
 - **Scope.** Both tokens are owned by `zerobull-consulting` and reach this
   repository only.
 - **Why two.** Merges from upstream regularly change `.github/workflows/`,
-  and GitHub refuses that push without Workflows permission. The
-  accept-line PR changes only `cmd/cacheservice/compat/engines.txt`, so its
-  token can't touch CI.
+  and GitHub refuses that push without Workflows permission, so the sync
+  token has it. The PR token, without it, was for the accept-line PRs the
+  release check no longer opens: nothing uses it now.
 - **Expiry.** Each token expires 90 days after it's created; the token's
   settings page shows the date. Rotate both together before the earlier
   expiry: regenerate each one with the same permissions, then update its
@@ -975,8 +975,9 @@ To skip a release instead (one upstream fixed in the next, say), close its
 sync PR, delete its branch, and add a `reject <version> <issue>` line to the
 manifest by hand: a listed version is no longer new.
 
-**Merging it.** When the bot marks the PR ready (after its own CI is
-green), merge it **with a merge commit**, `gh pr merge --merge`, never a
+**Merging it.** The bot marks the PR ready once the verifying run is
+green and the accept line is pushed; that push starts the PR's own CI. When
+that CI is green, merge it **with a merge commit**, `gh pr merge --merge`, never a
 squash: upstream's tag must stay a parent, or `fork paths` keeps the old
 base and the next sync conflicts again. Its push's
 `cacheservice-publish.yml` run moves `dagger-remote-cache:<version>`, and

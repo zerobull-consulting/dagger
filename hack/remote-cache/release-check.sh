@@ -599,12 +599,8 @@ plan_sync() {
 	need_number "$pr"
 	need_tag "$v"
 	ref="$(sync_branch "$v")"
-	d="$(image_digest "$v")" || rc=$?
-	((rc != 3)) || die "$v's sync is open, but $engine_repo:$v is gone from the registry"
-	((rc == 0)) || exit "$rc"
 	out action sync
 	out version "$v"
-	out digest "$d"
 	out pr "$pr"
 	# The branch's head as git sees it, which may be newer than the PR's
 	# listing.
@@ -628,6 +624,12 @@ plan_sync() {
 		out draft "$draft"
 		return
 	fi
+	# The digest only now: a sync waiting on a human doesn't need the
+	# registry. It names the verifying runs, and the accept line.
+	d="$(image_digest "$v")" || rc=$?
+	((rc != 3)) || die "$v's sync is open, but $engine_repo:$v is gone from the registry"
+	((rc == 0)) || exit "$rc"
+	out digest "$d"
 	# Apart from the read, so a verdict that fails fails the plan.
 	vout="$(verdict "$v" "$d" "$sha")"
 	read -r state url <<<"$vout"

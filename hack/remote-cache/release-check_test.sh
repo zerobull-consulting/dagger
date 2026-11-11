@@ -467,6 +467,8 @@ check "accept: and on the issue" jq -e 'any(.[]; .on == 101 and (.body | test("a
 check "accept: never prints a token" no_secret
 run plan
 check "plan: a sync with its accept line waits for a human" has "$tmp/out" "state=ready"
+ARGS=(plan); rc env FAKE_REGISTRY_ERROR="unexpected status 503"
+check "plan: a sync waiting on a human doesn't need the registry" has "$tmp/out" "state=ready"
 check "plan: and says the PR is still a draft (the fake doesn't change it)" has "$tmp/out" "draft=true"
 rm -f "$FAKE/graphql"
 echo '[]' >"$FAKE/comments.json"
