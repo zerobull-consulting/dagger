@@ -65,83 +65,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.candidate-version }}${{ inputs.engine-version && format('-matrix-{0}-{1}', inputs.engine-version, github.sha) || '' }}
   cancel-in-progress: true
 jobs:
-  # Its first step, the service's, client's and protocol's tests, runs as a
-  # Dagger pipeline (hack/remote-cache/speedup/run.sh, unit) on an engine with
-  # a read-only remote cache sidecar (the pr-checks-readonly environment): it
-  # fetches the layers the update job (remote-cache-update.yml) stored for
-  # feature/remote-cache's newest commit (the modules and the -race build of
-  # every package the tests import) and runs only what changed. A layer that
-  # misses runs here, as it would without the cache; nothing is stored. The
-  # bucket is the PR checks' cache, not a test store: no test here reaches it
-  # (TestWorkflowOnlySpacesJobsAreExternal).
   unit:
     name: unit tests
     # Not in the release matrix (workflow_call): it doesn't depend on the
     # engine.
     if: inputs.engine-version == ''
     runs-on: ubuntu-24.04
-    environment: pr-checks-readonly
-    # The start (30m at worst: two image pulls of 15m, in parallel in
-    # practice), the Dagger tests (30m), the stop (12m) and the other steps.
-    timeout-minutes: 90
-    env:
-      # The update job's engine (remote-cache-update.yml, VERSION): the cache
-      # holds that engine's entries only, so the two, and the environments'
-      # CACHE_S3_PREFIX (cache-<version>), move together.
-      DAGGER_VERSION: v1.0.0-beta.26
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Verify the sidecar is stopped at the job's end
-        uses: ./hack/remote-cache/ci/verify-stopped
-        with:
-          names: unit
-      - name: Check the cache prefix is for the sidecar's engine
-        env:
-          PREFIX: ${{ vars.CACHE_S3_PREFIX }}
-        run: |
-          want="cache-${DAGGER_VERSION#*-}"
-          if [[ "$PREFIX" != "$want" ]]; then
-            echo "::error::CACHE_S3_PREFIX is '$PREFIX', but engine $DAGGER_VERSION reads under '$want': move the environments' prefix, DAGGER_VERSION and remote-cache-update.yml's VERSION together"
-            exit 1
-          fi
-      - name: Note the time
-        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
-      - name: Start the read-only sidecar
-        id: reader
-        uses: ./.github/actions/remote-cache/start
-        with:
-          role: read-only
-          name: unit
-          version: ${{ env.DAGGER_VERSION }}
-          verbose: "true"
-          s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
-          s3-region: ${{ vars.CACHE_S3_REGION }}
-          s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
-          s3-prefix: ${{ vars.CACHE_S3_PREFIX }}
-          s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
-          s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
-      - name: Report the start's time
-        run: ./hack/remote-cache/ci/report-start-time.sh "read-only" "$T0"
-      # The remote cache service, the engine's client of it and their wire
-      # protocol: every test in these packages, in Dagger.
-      - name: Service, client and protocol
-        timeout-minutes: 30
-        env:
-          SERVICE: ${{ steps.reader.outputs.service-container }}
-          DAGGER: ${{ steps.reader.outputs.dagger }}
-        run: |
-          ./hack/remote-cache/speedup/run.sh unit unit "$RUNNER_TEMP/unit" "$SERVICE"
-          read -r hit executed <"$RUNNER_TEMP/unit/unit.spans"
-          echo "- service, client and protocol: **$hit** withExec step(s) from the remote cache, **$executed** run" >>"$GITHUB_STEP_SUMMARY"
-      - name: Stop the read-only sidecar
-        if: always()
-        timeout-minutes: 12
-        uses: ./.github/actions/remote-cache/stop
-        with:
-          name: unit
       - name: Setup Go
         id: setup-go
         uses: actions/setup-go@v6
@@ -165,6 +100,10 @@ jobs:
           restore-keys: |
             go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
             go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      # The remote cache service, the engine's client of it and their wire
+      # protocol: every test in these packages.
+      - name: Service, client and protocol
+        run: go test -race -count=1 -cover ./cmd/cacheservice/... ./engine/remotecache/...
       # How the release workflow moves the image's engine-version tags
       # (cacheservice-publish.yml), against a fake registry.
       - name: Release tags
@@ -185,15 +124,6 @@ jobs:
         run: |
           go test -race -count=1 -run 'RemoteCache|SkippedMessage|ExportLogAttrs' \
             ./engine/server/ ./cmd/engine/ ./core/schema/
-      - name: Upload the Dagger tests' logs
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: unit-dagger-logs
-          path: |
-            ${{ runner.temp }}/remote-cache-sidecar/*/logs
-            ${{ runner.temp }}/unit
-          if-no-files-found: ignore
       - name: Save Go cache
         if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
         uses: actions/cache/save@v5
