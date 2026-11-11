@@ -10,7 +10,7 @@
 // composite can pin it by commit: a composite action can't reference a
 // sibling at its own commit (a local `uses: ./...` resolves against the
 // caller's workspace), and a pin to the shim never pins the script.
-const { spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -61,18 +61,59 @@ function stopTimeoutMs(file) {
   return stopSeconds(file) * 1000 + stopSlackMs;
 }
 
+// Signals the shim passes on to the script: a cancelled job's, and a hangup.
+const forwarded = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+// setTimeout's limit: a longer delay fires at once. About 24.8 days, so no
+// bound here gets near it short of an absurd drain-timeout.
+const maxTimerMs = 2 ** 31 - 1;
+
+// Runs the script in a process group of its own (detached), so the bound can
+// kill all it spawned (docker, timeout, a pull), not only bash
+// (zerobull-consulting/dagger#209). Being in its own group, the script no
+// longer gets a signal sent to the shim's group, so the shim passes SIGINT,
+// SIGTERM and SIGHUP on to it, and the bound still holds after one. Once bash
+// exits, whatever it left in the group (a background job of a start that
+// failed) is killed too. sidecar.sh keeps its `timeout` calls in the group
+// (--foreground). Resolves to the script's exit code, or 1 when it didn't
+// finish or a signal ended it.
 function run(command, env, timeoutMs) {
-  const r = spawnSync('bash', [scriptOf(env), command], {
-    env,
-    stdio: 'inherit',
-    timeout: timeoutMs,
-    killSignal: 'SIGKILL',
+  const script = scriptOf(env);
+  return new Promise((resolve) => {
+    // SIDECAR_GROUP_KILLED: the script may keep its timeout calls in this
+    // group (sidecar.sh), since the group is killed at the bound.
+    const childEnv = { ...env, SIDECAR_GROUP_KILLED: '1' };
+    const child = spawn('bash', [script, command], { env: childEnv, stdio: 'inherit', detached: true });
+    const killGroup = (signal) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (_) {
+        // The group is gone already, or never was (the spawn failed).
+      }
+    };
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup('SIGKILL');
+    }, Math.min(timeoutMs, maxTimerMs));
+    for (const s of forwarded) process.on(s, killGroup);
+    const done = (code) => {
+      clearTimeout(timer);
+      for (const s of forwarded) process.removeListener(s, killGroup);
+      resolve(code);
+    };
+    child.on('error', (e) => {
+      console.log(`::error::remote-cache-sidecar: ${command} did not finish: ${e.message}`);
+      done(1);
+    });
+    child.on('exit', (code) => {
+      killGroup('SIGKILL');
+      if (timedOut) {
+        console.log(`::error::remote-cache-sidecar: ${command} did not finish: killed after its bound of ${timeoutMs}ms`);
+        return done(1);
+      }
+      done(code === null ? 1 : code);
+    });
   });
-  if (r.error) {
-    console.log(`::error::remote-cache-sidecar: ${command} did not finish: ${r.error.message}`);
-    return 1;
-  }
-  return r.status === null ? 1 : r.status;
 }
 
 // Values the main step saves for the post step (STATE_<name> there).
@@ -81,7 +122,7 @@ function saveState(env, key, value) {
   fs.appendFileSync(env.GITHUB_STATE, `${key}=${value}\n`);
 }
 
-function main(env) {
+async function main(env) {
   const name = env.SIDECAR_NAME || 'remote-cache';
   // Saved first: the post step must stop what a start that failed halfway
   // left.
@@ -91,7 +132,7 @@ function main(env) {
   return run('start', env, startMs);
 }
 
-function post(env) {
+async function post(env) {
   const name = env.STATE_name || env.SIDECAR_NAME || 'remote-cache';
   const dir = env.STATE_dir || sidecarDir(env);
   // Always `sidecar.sh stop`, which knows where its state is and says
@@ -130,10 +171,12 @@ module.exports = { main, post, run, stopSeconds, stopTimeoutMs, sidecarDir };
 if (require.main === module) {
   // The runner hands the values main saved to the post step as STATE_<key>.
   const isPost = process.env.STATE_isPost === 'true';
-  try {
-    process.exitCode = isPost ? post(process.env) : main(process.env);
-  } catch (e) {
-    console.log(`::error::remote-cache-sidecar: ${e.message}`);
-    process.exitCode = 1;
-  }
+  (async () => {
+    try {
+      process.exitCode = await (isPost ? post(process.env) : main(process.env));
+    } catch (e) {
+      console.log(`::error::remote-cache-sidecar: ${e.message}`);
+      process.exitCode = 1;
+    }
+  })();
 }

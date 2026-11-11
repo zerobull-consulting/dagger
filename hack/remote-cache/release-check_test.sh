@@ -130,7 +130,8 @@ case "$method $path" in
 	# FAKE_JOBS: the jobs array as it is; otherwise the four jobs of a
 	# candidate run, all green in a green run and with the e2e red in a red
 	# one (at FAKE_FAILED_STEP).
-	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{\"jobs\": $FAKE_JOBS}"; exit 0; fi
+	# FAKE_JOBS_TOTAL: the listing's total_count (none by default).
+	if [[ -n "${FAKE_JOBS:-}" ]]; then echo "{${FAKE_JOBS_TOTAL:+\"total_count\": $FAKE_JOBS_TOTAL, }\"jobs\": $FAKE_JOBS}"; exit 0; fi
 	failed_step="${FAKE_FAILED_STEP:-Real engines}"
 	rid="${path#repos/o/r/actions/runs/}"; rid="${rid%%/*}"
 	e2e=success; [[ "$(cat "$FAKE/run-$rid")" == failure ]] && e2e=failure
@@ -372,6 +373,15 @@ setup
 echo failure >"$FAKE/conclusions"
 ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
 check "verify: a red run whose every job is green is an error" test "$status" -ne 0
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_TOTAL=101 FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: a run with more jobs than were listed is an error" test "$status" -ne 0
+check "verify: ... and says so" has "$tmp/out" "more jobs than were listed"
+setup
+echo success >"$FAKE/conclusions"
+ARGS=(verify v1.0.0-beta.26 "$d2"); rc env FAKE_JOBS_TOTAL=3 FAKE_JOBS="$(jobs_of "$(job 'unit tests' success)" "$(job "$e2e" success)" "$(job 'sidecar demo' success)")"
+check "verify: ... while one whose jobs were all listed passes" has "$tmp/out" "result=pass"
 
 echo "--- the bundle test"
 setup
@@ -800,6 +810,19 @@ check "dry run: no branch pushed" test -z "$(git -C "$FAKE/origin.git" for-each-
 run accept v1.0.0-beta.26 "$d2" https://github.com/o/r/actions/runs/5001
 check "no bot token: accept fails" test "$status" -ne 0
 check "no bot token: and says the token is missing" has "$tmp/out" "BOT_TOKEN is not set"
+
+echo "--- remote-cache-tests.yml's checkouts (zerobull-consulting/dagger#165, lead 2)"
+# B's verifying run executes remote-cache-tests.yml as the rebuild branch has
+# it, after upstream's tag was merged in: no checkout there may leave the
+# job's token in .git/config.
+tests_yml="$here/../../.github/workflows/remote-cache-tests.yml"
+checkouts_without_persist_off() {
+	awk '/uses: actions\/checkout@/ { n++; want = 1; next }
+		want && /persist-credentials: false/ { want = 0; ok++ }
+		want && /^      - name:/ { want = 0 }
+		END { if (n == 0 || n != ok) { print n+0 " checkouts, " ok+0 " with persist-credentials: false"; exit 1 } }' "$tests_yml"
+}
+check "every checkout in remote-cache-tests.yml has persist-credentials: false" checkouts_without_persist_off
 
 echo
 if ((failures > 0)); then

@@ -385,16 +385,16 @@ func TestServiceRestartMergesPrunedEntriesAgainOnce(t *testing.T) {
 	}
 }
 
-// KNOWN GAP (#12, case 3): the export path learns entries only from session
-// spans, and keeps them in memory. An export pending or in flight when the
-// service stops without a drain (a crash, SIGKILL, or -drain-timeout 0) is
-// lost: the restarted service doesn't know the entries, and exports them
-// only once a later session's spans name them again. What was stored is not
-// lost, and the restarted service resumes exporting new sessions at once. A
-// clean stop drains first, and stores it
-// (TestDrainedRestartStoresPendingExport). Tracked in
+// Accepted, not planned to change (#45; #12, case 3): the export path learns
+// entries only from session spans, and keeps them in memory. An export
+// pending or in flight when the service stops without a drain (a crash,
+// SIGKILL, or -drain-timeout 0) is lost: the restarted service doesn't know
+// the entries, and exports them only once a later session's spans name them
+// again. What was stored is not lost, and the restarted service resumes
+// exporting new sessions at once. A clean stop drains first, and stores it
+// (TestDrainedRestartStoresPendingExport). Decided in
 // https://github.com/zerobull-consulting/dagger/issues/45.
-func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
+func TestServiceRestartForgetsPendingExport(t *testing.T) {
 	blobs, meta := newMemStores(t)
 	r := newRestartable(t, blobs, meta)
 	svc := r.start()
@@ -416,10 +416,10 @@ func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
 	// Long enough for many scheduler ticks (10ms) and a retry.
 	time.Sleep(500 * time.Millisecond)
 	if n := indexEntries(t, meta); n != 0 {
-		t.Fatalf("the index has %d entries: the gap is fixed; update this test, the README's known gaps, and the issue", n)
+		t.Fatalf("the index has %d entries: a stop without a drain no longer loses them, against the decision in #45; update this test, the README, and the issue", n)
 	}
 	if entries, err := svc.Entries(conn.id); err != nil || len(entries) != 0 {
-		t.Fatalf("the restarted service tracks %+v (%v): the gap is fixed; update this test", entries, err)
+		t.Fatalf("the restarted service tracks %+v (%v): the tracker is now kept across a restart, against the decision in #45; update this test", entries, err)
 	}
 
 	// A later session that touches the entries exports them.
@@ -431,7 +431,7 @@ func TestKnownGapServiceRestartForgetsPendingExport(t *testing.T) {
 // A clean stop (SIGTERM) drains: the export in flight, and a session in its
 // quiet period, are stored before the service goes away, so the restarted
 // service has them without a later session naming them again. This is what
-// TestKnownGapServiceRestartForgetsPendingExport loses without the drain.
+// TestServiceRestartForgetsPendingExport loses without the drain.
 func TestDrainedRestartStoresPendingExport(t *testing.T) {
 	blobs, meta := newMemStores(t)
 	r := newRestartable(t, blobs, meta)
@@ -460,7 +460,7 @@ func TestDrainedRestartStoresPendingExport(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the drained stop didn't return")
 	}
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[a.ID] != 3 || rep.LeftRoots() != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, a.ID) != 3 || rep.LeftRoots() != 0 {
 		t.Fatalf("drain report %+v", rep)
 	}
 	if n := indexEntries(t, meta); n != 3 {
@@ -544,7 +544,10 @@ func testImportBundleNearMergeLimit(t *testing.T, blobs blobstore.Store, meta *m
 	if err != nil {
 		t.Fatal(err)
 	}
-	merge := importer.MergeSize(capt.Bundle, len(data), addr, testScope)
+	merge, err := importer.MergeSize(capt.Bundle, addr, testScope)
+	if err != nil {
+		t.Fatal(err)
+	}
 	limit := tc.limit(merge, len(data))
 	t.Logf("the bundle is %d bytes; its merge, with %d byte GETs, is estimated at %d; the limit is %d", len(data), addr, merge, limit)
 

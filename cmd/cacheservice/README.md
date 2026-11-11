@@ -24,7 +24,7 @@ spike, and only logs what the engine does on the wire.
 | `-debug-listen` | `GET /debug/engines/{conn}/entries` | What the export path tracks of the engine's cache, with each entry's `dirty` and `dueAt` |
 | `-debug-listen` | `POST /debug/engines/{conn}/import` | Merges and offers now what the engine lacks. Answers with what was merged, failed and offered. 503 while draining |
 | `-debug-listen` | `GET /debug/engines/{conn}/imports` | What the import path merged into the engine, and the entries it landed on |
-| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) |
+| `-debug-listen` | `POST /debug/gc[?dry-run]` | Runs garbage collection now, over every namespace, and answers with what it did (see [Retention and garbage collection](#retention-and-garbage-collection)). 503 while draining; 409 on a read-only instance (`-export=false`) or with `-gc-mode=off`; the answer says the `mode` |
 | `-debug-listen` | `GET /debug/identity` | The service's identity: its base release (or `dev`), the engine versions it accepts and its revision (see [Engine versions](#engine-versions)) |
 | `-debug-listen` | `GET /debug/drain` | Whether the service is draining, what is left to export while it does, and the drain's report once it ended (see [Stopping and draining](#stopping-and-draining)) |
 | `-debug-listen`, and `-metrics-listen` (off) | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)). `-metrics-listen` serves them alone, without credentials, for a scraper that shouldn't reach the debug API |
@@ -47,6 +47,9 @@ On the engine WebSocket, the service:
 - answers WebSocket pings (the library does this; `-v` logs each one).
 - answers `renew` with fresh presigned GETs when the import path is on and
   every layer is stored, and with `{"unavailable": true}` otherwise.
+- answers `open`, `claims`, `settle` and `lookup`, which engines send since
+  `v1.0.0-beta.26` (see
+  [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)).
 - answers any other request from the engine with an `error` reply.
 - logs every envelope in both directions: direction, type, `id`, `re`, message
   size, body size, and a short summary for the known body types.
@@ -69,8 +72,8 @@ The list is the manifest [`compat/engines.txt`](compat/engines.txt),
 embedded in the binary:
 
 ```
-base v1.0.0-beta.25
-accept v1.0.0-beta.25 sha256:39abecfe… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
+base v1.0.0-beta.26
+accept v1.0.0-beta.26 sha256:53c0411c… verified: https://github.com/zerobull-consulting/dagger/actions/runs/…
 reject v1.0.0-beta.NN zerobull-consulting/dagger#NNN
 ```
 
@@ -153,7 +156,7 @@ the checkout, and says so in the run's output. The default is strict.
 revision, not `internal/version/VERSION` (which tracks upstream main):
 
 ```json
-{"base": "dev", "accept": ["v1.0.0-beta.25", "v1.0.0-beta.24"], "revision": "<commit>"}
+{"base": "dev", "accept": ["v1.0.0-beta.26"], "revision": "<commit>"}
 ```
 
 It is in the welcome (`{"service": {...}}`, alongside `protocol.Welcome`'s
@@ -167,6 +170,150 @@ reports `dev`. A build
 stamped as another release than the manifest's `base` refuses to start.
 The revision is the image's `REVISION`, else the build's VCS revision, else
 `dev`.
+
+## Engines from v1.0.0-beta.26
+
+`v1.0.0-beta.26` changed the engine's side of the remote cache, and a
+service built on `v1.0.0-beta.25` stored nothing from such an engine
+([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)).
+This is what the service does about each change. It serves engines of that
+bundle version only: a `v1.0.0-beta.25` engine is no longer accepted, and
+keeps the service image tagged for it, `dagger-remote-cache:v1.0.0-beta.25`,
+the last build that accepted it (see [Image](#image)).
+
+**Bundles are version 7** (`metastore.BundleVersion`). A version 7 bundle
+can lean on what its recipient holds, or on its own other outputs. A stored
+bundle is merged whole into any engine, so the service stores neither
+(`metastore.ValidateBundle`):
+
+- **Held rows.** Once the service merged a bundle into an engine, the
+  engine sends the rows that merge landed on with no record, as *held
+  rows*, in its later exports over that connection: it expects the service
+  to hold them. Another engine holds no such row, and would refuse the
+  whole merge as stale. So the exporter releases an export with held rows,
+  with an `upload` that doesn't say `merged`, which makes the engine forget
+  that the service holds them, and asks for the same roots again at once:
+  that bundle carries them in full (a release that fails ends the export
+  instead, as a failure of its roots: the engine forgot nothing, and would
+  send the same held rows again; one the engine cut off as it gave up its
+  remote-cache work pauses them, see below). A held row stands for everything below
+  it in an export that selects no parts, so such an export takes one try
+  per level of merged rows under its roots (at most 256); a try is one
+  round trip and uploads nothing. The rows the engine imported still keep
+  their stored entries' numbers (see [Imported entries](#imported-entries)),
+  so nothing is stored twice. The service never says `merged`: it records a
+  bundle only after its blobs are uploaded.
+- **Chain prefixes.** An output whose layers are the first of another
+  output's chain names that chain instead of listing them. The exporter
+  gives each output its own chain (`dagql.ResolveChainPrefixes`) before it
+  stores the bundle.
+- **Computed layers.** Each layer says whether that export computed its
+  blob or found it, which differs between a layer's first export and every
+  later one. It is cleared before the bundle is stored, like the other
+  fields that would make the same values a different bundle (see
+  [Export path](#export-path)).
+
+A merge lists its chains' layers, and each blob's address, once on the wire
+(`protocol.Merge`'s encoding), so the bound on a merge's size
+(`importer.MergeSize`) starts from that form.
+
+**A store written for earlier engines** keeps its version 3 bundles. They
+aren't merged into a `v1.0.0-beta.26` engine: each fails to build a merge
+(`unsupported bundle version 3`), is logged, and is given up on after
+`MergeAttempts` tries per connection. Their entries stay until they expire
+or pass the namespace's max age, and GC then deletes them as any other; a
+value exported again gets a version 7 record. To drop them at once, empty
+the prefix (`cacheservice wipe`) or use a new one.
+
+**The engine's own requests.** Besides `renew`, the engine now sends:
+
+| Engine sends | Service answers | What the service does |
+| --- | --- | --- |
+| `open` | `opened` | A session started on an engine with none live, which begins a new idle period. The roots the engine refused while it had given up (below) are due at once. |
+| `claims` | `claimed` | Nothing: the Dagger Cloud claim of each session, which this service has no use for. |
+| `settle` | `settled`, or the error `stale settle` | No session is live, and the engine asks the service to finish what it wants of it. The service answers once it has nothing left to export for the engine's cache now: no root dirty, in flight, or waiting for another try due within 10s of the settle (`DefaultSettleRetryWait`), and no session whose spans may still come. A root whose try is due later, as after several busy answers, isn't waited for: an engine that hears no `settled` gives up and then refuses that try and every other export, while one that settled takes it once its 20s have passed. Until then the service starts no export of a cache it answered `settled` for (22s from the settle, `DefaultSettleQuiet`; a flush, a drain or the engine's next `open` ends that): the engine's 20s run whether it settled or not, and an export in progress when they pass makes it give up all the same. Nor is a root the engine already refused as paused. A listed session whose engine sent its completion marker, and of which no span reached the service yet, is waited for up to 5s (`DefaultSettleMarkerWait`): spans reach the service through the session's client, so the settle can come first. A settle for a period that is no longer the connection's is stale, and one not settled within 2m (`MaxSettleWait`, far past the engine's own 20s) gets an error. With the export path off, it answers at once. |
+| `lookup` | `lookedUp`, every miss `unknown` | Nothing: the calls the engine's cache missed. This service keeps no index of its values by call, and merges every stored root into every engine anyway (see [Import path](#import-path)), so it looks nothing up and sends no merge for a lookup. |
+
+**An engine that isn't answered gives up.** 20s after its last session
+ended, an engine whose `settle` got no `settled`, or that still has an
+export in progress, gives up its remote-cache work: it cancels its exports
+in progress and refuses every root of a new one, until a session starts
+again. That is why an unanswered `settle` stored nothing. The service
+doesn't settle such roots as refused, which would end their exports for
+good: they are *paused* (`exporter.Result.Paused`), count no failure, and
+are due again when the engine sends `open`, or connects again, or after a
+minute (`exporter.DefaultPausedWait`). **So an export has about 20s after
+the last session's end to finish**; one that takes longer, such as a large
+upload on a slow link, is cut, and goes on in the engine's next session:
+its roots are paused too, and the blobs that arrived stay stored, so the
+next export uploads only the rest. The engine doesn't always say why it
+cut an export off (one waiting for its upload is dropped without a word,
+and a blob being sent ends with `context canceled`, or `operation was
+canceled` before it connected), so the exporter asks once more for an
+export that ended so: a paused
+engine then refuses its roots, and any other goes on.
+
+**What a paused engine holds is left, and may be lost.** Only a new session
+on the engine ends its pause; nothing the service does can. So a flush or a
+drain neither waits for the paused roots nor asks for them again: it
+finishes at once what it can, counts them apart (`paused`, in the flush's
+and the drain's reports, `drain_paused_roots_total` and
+`flush_paused_roots_total`), and ends. A flush of a cache whose engine has
+gone away says `not_connected`, paused roots or not. They aren't a failure of the flush or the drain. Where the engine
+doesn't outlive its job, as with the
+[sidecar](../../.github/actions/remote-cache/README.md), there is no next
+session: **what the engine hadn't finished exporting about 20s after the
+job's last `dagger` call is not stored by that job**, and a later job that
+builds the same values exports them. The store is left whole either way:
+the index names a bundle only once all its blobs are stored, and the blobs
+a cut upload did store are either named by a later export or deleted by GC
+as any unreferenced blob.
+Sessions that overlap keep the engine from asking to settle at all.
+
+**Known limits, accepted.** Each is pinned by a test that fails when the
+behavior changes, so that this list is then updated
+([zerobull-consulting/dagger#227](https://github.com/zerobull-consulting/dagger/issues/227)):
+
+- **A stored bundle can be much larger than its merge.** The bound on a
+  bundle (the 64 MiB message limit, by `importer.MergeSize`) is on
+  the merge as sent, which lists each layer once. The bundle is stored with
+  every output's chain in full, so that it stands on its own: outputs that
+  build on each other make it larger by about half the chain's depth (9
+  times for 60 outputs on a chain 60 deep), and every engine's import path
+  reads and keeps it. Earlier engines sent every chain in full, so the
+  message limit bounded the stored bundle too; a closure whose full form
+  is over it was split then, and is stored whole now
+  (`TestKnownGapStoredBundleLargerThanItsMerge`).
+- **An upload the engine never answers holds its cache's exports for
+  `UploadTimeout`** (1h). An engine that gives up its remote-cache work at
+  the instant an upload reaches it can drop it without a reply. Until the
+  timeout, or the engine's connection ends, nothing else of that cache is
+  exported, and a drain waits for it up to its deadline
+  (`TestKnownGapUnansweredUploadHoldsExportUntilUploadTimeout`).
+- **A settle can wait 5s for a session whose spans came long ago.** The
+  engine lists every ended session no `settled` has covered; the service
+  remembers one it is done with for 2m, and not across its own restart
+  (`TestKnownGapUnseenSessionsForgetsLongEndedSessions`).
+- **A root can be settled twice by one export**, when a try with held rows
+  is followed by one too large for a message: the split asks again for
+  the roots the first try had already skipped. A busy root then backs off
+  one step further than it should; nothing is stored wrong
+  (`TestKnownGapSplitAfterHeldRowsSettlesRootTwice`).
+- **Sizing a merge encodes each output's layers**, to find those it lists
+  once (`dagql.ShareChainLayers`), on every try of an export. It is paid
+  per export, not per merge, and hasn't been measured as a cost.
+
+**The engine downloads what it is offered at once.** An offered part's
+blobs are fetched when the merge offers it, ahead of any read, so the blob
+GETs follow each merge within milliseconds, and `renew` is rare: it takes a
+download that failed, and a read after the GET expired.
+
+**A stopping engine waits for its exports.** On SIGTERM the engine lets
+its exports in progress finish, for up to its stop budget (5m by default)
+less 30s, before it closes its connection. Give its container a stop
+timeout that covers that: an engine killed while it waits (docker's default
+is 10s) comes back with a new, empty cache, and the export is lost with
+the old one.
 
 ## Code layout
 
@@ -201,7 +348,9 @@ key the service writes is in [`layout`](layout/), and the ownership marker
 and its startup check in [`ownership`](ownership/). The one-shot
 `cacheservice lifecycle` subcommand, which sets the bucket's lifecycle rules,
 is [`lifecycle`](lifecycle/) (see
-[The lifecycle command](#the-lifecycle-command)).
+[The lifecycle command](#the-lifecycle-command)), and the one-shot
+`cacheservice gc` subcommand, which runs one garbage collection, is
+[`gccmd`](gccmd/) (see [The gc command](#the-gc-command)).
 
 ## Bucket ownership
 
@@ -286,10 +435,31 @@ checks the prefix:
   instance: with no marker of its own, an instance also reads the marker
   position of each ancestor prefix (`cache/` for `cache/team`, and the
   bucket's top), and refuses if any holds one, of any content: that
-  service owns everything under it (`TestNestedPrefixRefused`). Best
-  effort: an ancestor the key can't read (403, for a key allowed only its
-  own prefix) is skipped. A nested claim it misses costs no data, only the
-  ancestor's GC, which stops on the nested prefix's keys.
+  service owns everything under it (`TestNestedPrefixRefused`). What it
+  does on each answer for an ancestor's marker:
+  - **found** (of any content): refused, naming the ancestor.
+  - **not found** (404): skipped; that ancestor holds no store.
+  - **access denied** (403, for a key allowed only its own prefix):
+    skipped. A nested claim it misses costs no data, only the ancestor's
+    GC, which stops on the nested prefix's keys.
+  - **any other answer or error** (a 5xx, a 401, a store-specific code, a
+    timeout error, a dropped connection): refused, after the S3 client's
+    own retries, with `can't read <key>, an ancestor's ownership marker
+    position, to check that prefix <prefix>/ isn't inside another
+    service's: <the store's error>`. The check doesn't guess, and adds no
+    retries of its own: start again once the store answers
+    (`TestAncestorUnreadRefused`, `TestStartupAncestorMarkerErrors`,
+    `TestClaimAncestorMarkerErrors`).
+
+  Only those two answers are skipped, so a key allowed only its own prefix
+  must be denied the ancestors' markers with a 403. A key that a store
+  refuses with a 401, or with a code of its own, can't start or claim
+  there. Any 403
+  counts as denied, whatever its code: a marker that exists but that a
+  store answers with a 403 of another code (`InvalidObjectState`, say) is
+  skipped too (`TestClaimAncestorInvalidObjectStateSkippedKnownGap`). An
+  interrupt, or the caller's own deadline, ending the check while it reads
+  an ancestor's marker stops it with that error, not this refusal.
 - **An upload in progress counts too.** An object listing doesn't show
   multipart uploads, so a writer about to claim an empty prefix also lists
   them, and refuses one with any, after reading the marker once more, since a
@@ -347,9 +517,99 @@ re-run the cache-warming job. The first writer claims the empty prefix, and
 the cache fills again. Pull-request jobs before that run start with nothing
 to import (see [Read-only instances](#read-only-instances)).
 
+**Stop every writer on the prefix, and on its ancestor prefixes, first.**
+The command can't see running services: a writer still exporting during the
+wipe leaves new keys behind, and the wipe then exits 3. A writer that claims
+an ancestor prefix during the wipe stops it before its next delete, with
+exit 1, since that store's keys may be under the prefix
+(`TestAncestorClaimedDuringWipeStops`, `TestAncestorClaimedBeforeAbortsStops`).
+So does a writer that claims the prefix itself after the wipe deleted its
+marker: the new marker, and the keys written after it, are left alone, and it
+exits 1 (`TestMarkerReclaimedAfterStep1Stops`, `TestMarkerReclaimedBetweenPagesStops`,
+`TestMarkerReclaimedBeforeAbortsStops`, `TestMarkerReclaimedBetweenUploadPagesStops`).
+This only narrows what a mistake costs: the check is one request before each
+delete request, so a writer that claims the prefix in the moment between the
+two is not caught. Never run a writer on a prefix being wiped.
+
+`cacheservice wipe` empties the prefix, of any layout (layout 1 included,
+which has no marker). It reads the same `CACHESERVICE_S3_*` settings as the
+service, with a key that can list the prefix and its multipart uploads, and
+delete and abort there (a Read/Write/Delete key), and that should be able to
+read the bucket's versioning setting (see below):
+
 ```bash
-aws s3 rm --recursive s3://dagger-cache/cache/   # or: mc rm --recursive --force local/dagger-cache/cache/
+cacheservice wipe                                         # dry run: what the prefix holds, and the marker's layout
+cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
 ```
+
+- **A dry run is the default.** It reports the object count, their bytes,
+  the incomplete multipart uploads, up to 20 keys of each, and the ownership
+  marker's layout version (or why the service would refuse it), and deletes
+  nothing. It warns about any other ownership marker under the prefix: a
+  store nested in it, which the wipe deletes too
+  (`TestDryRunWarnsNestedMarkers`, `TestMinIODryRunWarnsNestedMarkers`).
+- **Deleting needs `-dry-run=false` and `-confirm=<bucket>/<prefix>`**,
+  repeating exactly the bucket and the prefix (without surrounding slashes).
+  A missing or wrong one exits 2 before any request. So does an empty
+  `CACHESERVICE_S3_PREFIX`: wiping a whole bucket isn't supported.
+- **Before deleting anything,** a wipe lists the prefix's objects and
+  uploads, read-only, as a dry run does: a listing the key isn't allowed
+  refuses it then, not halfway through (`TestUploadListingRefusedBeforeDelete`),
+  and it prints the same warning about nested stores
+  (`TestWipeWarnsNestedMarkers`).
+- **The order:** the ownership marker first, so a wipe cut off halfway leaves
+  keys without a marker, which every instance refuses
+  (`TestInterruptedWipeLeavesRefusedPrefix`,
+  `TestMinIOInterruptedWipeRefused`); then the objects, 1,000 per request;
+  then the incomplete multipart uploads; then it lists the prefix again.
+  If the marker can't be read (a dry run too) or deleted, nothing else is
+  deleted, and it exits 1.
+- **Checked again before each delete request:** before each page of objects
+  and before each page of uploads to abort, the wipe reads the ancestors' markers
+  again, then the prefix's own. An ancestor's marker, or the prefix's own
+  marker back after the wipe deleted it, is a writer's: the wipe stops with
+  nothing more deleted, says a writer claimed the prefix during the wipe and
+  that its marker and what it wrote were left alone, and exits 1. A marker
+  it can't read stops it too: when it can't tell, it doesn't delete. This
+  costs one more GET per page of 1,000 keys or uploads, beside the ancestor
+  reads. When a delete request fails, the count in "deleted N objects" is
+  reported as "at least": the keys of that page deleted one by one before the
+  failure (those XML can't carry, below) aren't in it
+  (`TestBatchRequestFailureKeepsKeyFailures`).
+- **Not inside another store:** a prefix under one whose ancestor (the
+  bucket's top included) holds an ownership marker is refused, by a dry run
+  and a wipe, naming that marker: wiping it would delete part of that store.
+  As the service's own check, an ancestor's marker not found (404) or that
+  the key may not read (403) is skipped, and any other answer refuses
+  (`TestAncestorMarkerRefused`, `TestAncestorMarkerErrors`,
+  `TestMinIOAncestorMarkerRefused`).
+- **Only under the prefix:** it deletes only keys a listing under
+  `<prefix>/` returned, so `cache2/` and the bucket's top are untouched when
+  wiping `cache` (`TestWipeEmptiesPrefix`, `TestMinIOWipe`).
+- **Exit codes:** 0 a dry run reported, or the prefix is empty after the
+  wipe; 1 an error, a refusal, a wipe stopped because a writer claimed the
+  prefix or an ancestor during it, or a key or upload that failed (up to 20
+  are listed, also when a later request stopped the wipe); 2 usage or
+  confirmation; 3 every request succeeded but the prefix isn't empty
+  after the wipe (a writer is running). `-timeout` (default 30m, room for
+  about one to two million keys) bounds the run, and each request is bounded
+  to 30s.
+- **Versioned buckets are refused:** a delete without a version ID leaves
+  the noncurrent versions, which the listings don't show, so before deleting
+  anything a wipe reads the bucket's versioning (`s3:GetBucketVersioning`)
+  and exits 1 if it is Enabled or Suspended. A key that may not read it (403)
+  gets a warning and the wipe goes on; any other error refuses. A dry run
+  reports it (`TestVersionedBucket`). Not run on a versioned bucket.
+- **Keys XML can't carry** (a control character such as U+0001, which MinIO
+  stores): the listings ask for URL-encoded keys, so a dry run names them,
+  and the wipe deletes each such key with a `DeleteObject` of its own, since
+  MinIO answers a `DeleteObjects` of one without an error and keeps it
+  (both seen on MinIO; `TestMinIOControlCharKeyDeleted`,
+  `TestMinIODeleteObjectsKeepsControlCharKey`).
+- **What the store answers is printed escaped:** keys are quoted, and errors
+  and failure reasons have their control characters escaped, the marker's
+  key too
+  (`TestStoreStringsEscaped`).
 
 **Later: import from one prefix, export to another.** Images are pinned by
 SHA, so an old image can still read the old prefix: run an engine with a
@@ -587,15 +847,25 @@ shell, in this order:
    claim a writer makes at startup. It doesn't need the admin key (a
    Read/Write/Delete key can claim), only a key that can list the prefix and
    its multipart uploads, and `s3:GetObject` and `s3:PutObject` on the marker
-   (`<prefix>/cacheservice.json`), plus `s3:GetObject` on each ancestor
-   prefix's marker for the nested-prefix check (see the keys table); on a
-   fresh bucket, that is the admin key.
+   (`<prefix>/cacheservice.json`); on a fresh bucket, that is the admin key.
+   `s3:GetObject` on each ancestor prefix's marker is optional (see the keys
+   table): on a 403, the nested-prefix check skips that ancestor. Any other
+   error reading it (a 5xx, a timeout error) refuses the claim; run `claim`
+   again.
 2. `lifecycle apply -tokens-file tokens -confirm=<bucket>/<prefix>` (on
    MinIO, with `-abort-rule=false`).
 3. `lifecycle check -tokens-file tokens`: exit 0.
 
 Then start the service with its own key (the Read/Write/Delete one). A prefix
 a writer already started on needs no `claim`; running it anyway is harmless.
+
+**From Terraform,** `cacheservice provision claim|rules create|read|update|delete`
+does `claim` and `apply -allow-removals` as two declarative resources, for the
+shell provider's `shell_script` (package `provision`): the settings come from
+`CACHESERVICE_S3_*`, `CACHESERVICE_NAMESPACES` and `CACHESERVICE_ABORT_RULE`,
+the resource's state goes to stdout as JSON, and a read reports drift. It
+takes no `-confirm`: Terraform's plan is the confirmation.
+[`hack/remote-cache/spaces`](../../hack/remote-cache/spaces/README.md) uses it.
 
 **Run `apply` with the admin key, interactively.** Setting lifecycle rules
 takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
@@ -624,7 +894,8 @@ What it does:
   nothing and exits 0. It exits 1, writing nothing, on a prefix that holds keys
   and no marker, one with a marker of another layout, a prefix inside another
   service's, an upload in progress under it, or a store error (a 403 is
-  explained as needing a key that can write there). There is no
+  explained as needing a key that can list the prefix and its uploads and read
+  and write the marker). There is no
   `apply -claim`: keeping the steps apart keeps `apply`'s refusal of an
   unowned prefix a real check.
 - **`plan`** prints the bucket and prefix, the namespaces and where they came
@@ -806,7 +1077,10 @@ records into it. Each scope (a team, a tenant) has:
   is written once (`If-None-Match: *`) and never changes. Storing it again
   writes nothing. Reading it checks its content against the ID. Only bundles
   of the version the engine imports are stored: the service's own
-  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture writes.
+  `metastore.BundleVersion`, which a test pins to what `dagql`'s capture
+  writes, and only bundles that stand on their own, with no held row and a
+  chain for every output (see
+  [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)).
 - **resolutions**, at `<prefix>/ns/<scope>/resolutions/<id>.json`: one per
   export, the service number each of the bundle's values resolved to when
   the export was recorded, which merges of that bundle send (see
@@ -1254,7 +1528,7 @@ garbage collection expires. An export that fails as a whole (S3 down) counts a f
 roots, which are tried again with backoff (2s doubling), up to 5 times per
 value.
 
-**Known gaps.** Without `-tokens-file`, nothing is authenticated: the
+**Known gaps and decided limits.** Without `-tokens-file`, nothing is authenticated: the
 WebSocket takes any token, and the OTLP receivers take any request, so anyone
 who can reach the service can forge spans, which make it export (or stop
 exporting) a connected engine's entries, or connect as an engine and offer it
@@ -1270,9 +1544,14 @@ clients send no spans to the service are invisible (see
 is in memory, so after a service restart entries are learned again from new
 spans; what is in S3 is not lost, and a re-export uploads nothing already
 stored. An export pending or in flight when the service stops is lost until a
-later session names its entries
+later session names its entries. That is accepted, not planned to change
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45), pinned by
-`TestKnownGapServiceRestartForgetsPendingExport`).
+`TestServiceRestartForgetsPendingExport`). The tracker keeps what it hasn't
+stored only in memory, so a stop without a drain loses every export not yet
+stored. `-export-settle` and `-export-max-delay` bound how long a changed
+entry waits before its export is first tried. A clean stop drains first, and
+stores what the drain finishes (see
+[Stopping and draining](#stopping-and-draining)).
 
 ## Import path
 
@@ -1285,7 +1564,16 @@ bundles, with presigned GETs of its own namespace's blobs.
 **When.** Each welcomed connection gets a sync loop. It syncs on `hello`,
 again whenever another engine's export is stored, and every `-import-poll`
 (30s), which picks up bundles stored by other service replicas. `POST
-/debug/engines/{conn}/import` syncs now.
+/debug/engines/{conn}/import` syncs now. The loop's first sync is logged
+once, when it ends, even when it merged nothing: `msg="import sync: first
+done" merged=N failed=N`, with `error=true` when it failed (the failure has
+its own `import sync failed` warning). `GET /debug/engines` says the same in
+each engine's `firstSyncDone`. A sync cut short by the connection's end
+isn't the first done, and neither is any sync of a connection revoked
+before its first sync ran: a revoked connection syncs nothing, so it never
+logs the line, and the engine's next connection has its own. Later syncs are logged as `import sync` only when they
+merged or failed something
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 
 **One sync.**
 
@@ -1402,8 +1690,8 @@ What it does, and doesn't:
 - **No conditional write check at startup.** It checks the index's
   conditional writes, which only the export path makes, and it writes. The
   service logs that it skipped it, and why.
-- **No GC.** GC deletes, so it is forced off whatever `-gc-interval` says,
-  and `POST /debug/gc` answers 409, `gc is off: the instance is read-only
+- **No GC.** GC deletes, so it is `-gc-mode=off` (an explicit `service` or `batch` is refused at
+  startup), and `POST /debug/gc` answers 409, `gc is off: the instance is read-only
   (-export=false), and never deletes from the bucket`. This goes beyond
   [#65](https://github.com/zerobull-consulting/dagger/issues/65)'s "GC
   unchanged": a read-only key couldn't delete anyway, and a GC that fails
@@ -1431,10 +1719,11 @@ naming both settings, before anything connects to the bucket:
 - `-export=false` without `CACHESERVICE_S3_BUCKET`: a read-only instance
   only imports from the bucket, so it would have nothing to do either, and a
   typo in the variable would otherwise go unnoticed.
-- `-export=false` with an explicit nonzero `-gc-interval` (even `1h`, the
-  default, when it's set on the command line): it asks for GC, which a
-  read-only instance never runs. The default alone is fine; `-gc-interval=0`
-  too.
+- `-export=false` with an explicit `-gc-mode=service` or `-gc-mode=batch`:
+  they ask for GC, which a read-only instance never runs. The default
+  alone is fine, and so is an explicit `-gc-mode=off`, which states what
+  already happens (`POST /debug/gc` keeps the read-only reason). An explicit
+  `-gc-interval` is refused too: it belongs to `-gc-mode=service`.
 
 The startup log has one line of the mode, `msg=mode export=off import=on
 gc=off readOnly=true`, and `cacheservice_export_enabled` is 0, so a
@@ -1541,12 +1830,14 @@ The OTLP receivers bound what a request can make the service read and hold
 item 1). Before, each body was read whole, and gunzipped whole with
 `Content-Encoding: gzip`, so a gzip bomb of a few kilobytes could run the
 service out of memory, with no token in unauthenticated mode. With tokens,
-the token is checked first, and a request without a known one is refused
-with 401 before any of its body is read (`TestOTLPUnauthenticatedBodyNotRead`).
-net/http then reads up to 256 KiB more of the body after the handler, and
-discards it, to reuse the connection; the read timeout, set before the token
-is checked, bounds how long that takes, so a client can't hold the connection
-by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
+the token is checked before any of the body is read, once the request and its
+headers are reserved from the budget (below), and a request without a known
+one is refused with 401 (`TestOTLPUnauthenticatedBodyNotRead`). net/http then
+reads up to 256 KiB more of the body after the handler, and discards it, to
+reuse the connection; the 401 cuts the connection's read deadline to 1s
+(`otlpRefusalDrain`), so a client can't hold the connection, or the headers
+net/http holds with it, by trickling or stalling the body after a 401
+(`TestOTLPRefusedTokenSlowBodyCutOff`).
 
 | Route | Limit, as received and decoded | Largest request in six e2e runs | Margin |
 | --- | --- | --- | --- |
@@ -1566,8 +1857,48 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   three routes, and each reserves what it holds before allocating it:
   - **itself**, 16 KiB (its goroutine and the server's buffers), before
     anything is read, so the budget also bounds how many requests are read
-    at once, stalled ones included: about 8,000
-    (`TestOTLPStalledRequestsBounded`);
+    at once, stalled ones included: about 7,000 with the engines' usual
+    headers, and at least 2,600 with the largest headers allowed (see the
+    next item) (`TestOTLPStalledRequestsBounded`);
+  - its **headers**, with it, before any of the body is read: net/http has
+    parsed and holds them while the handler runs. They are estimated from
+    the request (`otlpHeaderReserve`): the bytes of every key and value, 112
+    per key and 32 per value (measured against the heap of parsed requests:
+    `TestOTLPHeaderReserveCoversParsedHeaders`), the host, and the request URI
+    twice. Real engines' requests come to about 1.5 to 3.2 KiB (see **Headers are
+    bounded**, below), small beside the 16 KiB; but a client sending 24 KiB
+    of headers and then stalling its body holds that much of the budget
+    beside the 16 KiB, not the 16 KiB alone (one over 32 KiB is refused, below)
+    ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
+    `TestOTLPRequestHeadersInBudget`, `TestOTLPHeaderReserve`). The estimate
+    counts the names a chunked request declares in its `Trailer` header too,
+    which net/http moves out of the headers (68 KB of them held 1.5 MB; they
+    reserved nothing before). It is not bounded by `MaxHeaderBytes`: 68 KB of
+    5-byte headers would reserve over 1 MB, which is also about what they
+    hold. So a request whose headers would reserve more than 32 KiB
+    (`server.MaxOTLPHeaderReserve`, ten times what the largest real
+    requests reserve) is answered **431**, counted as `too_large`, before it
+    reserves anything (`TestOTLPHeaderReserveCap`). The most one request
+    holds while it waits on its body is then its headers' 32 KiB, its 16 KiB
+    and its first buffer: about 49 KiB, so the budget holds at least 2,600
+    stalled requests, not the 90 that 1.4 MB each would allow. A refused
+    request's unread body is drained for at most 1s (`otlpRefusalDrain`),
+    not until the 30s read timeout: net/http holds the request, headers
+    included, while it drains, and 200 refused requests with 40 KiB headers
+    and stalled bodies held 12.7 MB for the whole timeout, with nothing
+    reserved (`TestOTLPRefusedStalledBodyConnectionClosed`). The request and
+    its headers are reserved before the token is checked, so a request with
+    a missing or unknown token holds them in the budget too while its handler
+    runs, and is answered 431 or 503 as above, before the check, when they
+    don't fit; it gives them back on the 401, and its drain is cut to 1s
+    like any refusal's. That drain comes after the handler, once the
+    reservation is given back: for up to 1s, a refused request's headers
+    are held outside the budget. 200 such requests with 24 KiB headers and a stalled
+    body held 9.6 MB of heap for the whole 30s, with nothing reserved; now
+    0.3 MB is left 3s after they are sent
+    ([zerobull-consulting/dagger#219](https://github.com/zerobull-consulting/dagger/issues/219),
+    `TestOTLPRefusedTokenHeadersInBudget`, `TestOTLPFullBudgetRefusedBeforeToken`,
+    `TestOTLPHeaderReserveCapBeforeToken`);
   - a gzipped body's **decompressor**, 64 KiB, before it is built
     (`TestOTLPGzipDecompressorReserved`);
   - the body's **buffer**, doubling from 512 bytes up to the limit as the
@@ -1577,11 +1908,67 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
     three times while it grows;
   - the **decoded message**, estimated from the body before it is decoded,
     from each OTLP message's Go struct size, each repeated element and each
-    string (`TestOTLPDecodedSizeEstimate`). A body decodes to more than its
+    string (`TestOTLPDecodedSizeEstimate`), each element of a repeated string
+    field (`EntityRef.id_keys`, the only one) at its length and a quarter, for
+    the allocator's size classes, and 64 bytes, for its 16-byte header in a
+    slice that append grows, even when it is empty
+    (`TestOTLPAppendPeakHeaders`, `TestOTLPEmptyRepeatedStringsCoverDecodePeak`,
+    [zerobull-consulting/dagger#217](https://github.com/zerobull-consulting/dagger/issues/217)),
+    and each field the message
+    doesn't know, or that arrives with the wrong wire type for its number,
+    at three times its wire size and at least 16 bytes, for the slice the
+    decoder appends it to (`TestOTLPUnknownFieldsEstimateCoversDecodePeak`,
+    `TestOTLPWrongWireTypeChargedAsUnknown`). A singular string or bytes field
+    (a trace or span ID is one) is charged its length and a quarter, for the
+    allocator's size classes, and 16 bytes, so a 32,769-byte one, whose copy
+    takes 40,960, is charged 40,977 (`TestOTLPSingularStringCoversSizeClass`,
+    [zerobull-consulting/dagger#232](https://github.com/zerobull-consulting/dagger/issues/232));
+    an empty one is charged the 16 bytes. That is the protobuf estimate. Two
+    gaps are left in the JSON one, which charges a string its bytes in the
+    body, not its size class, so a 32,769-byte `stringValue` is charged under
+    the 40,960 its copy takes (`TestOTLPJSONSingularStringSizeClassKnownGap`),
+    and charges 16 bytes for each comma, so an empty element of a repeated
+    string, `"",`, is charged 19 bytes, under what append holds for it
+    (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded
     (`TestOTLPAmplifiedBodyRefused`).
+
+- **Nesting is bounded.** A body that nests deeper than the service decodes
+  is refused with **400**, counted as `too_deep`, before it is decoded
+  (`TestOTLPDeeplyNestedBodyRefused`, `TestOTLPNestedGroupsRefused`,
+  `TestOTLPDeeplyNestedJSONBodyRefused`,
+  [zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86)).
+  The estimate and `proto.Unmarshal` each recurse once per level, and the
+  stack that takes was not in the decode budget. The limit was 10,000 levels,
+  which a body of 40 KB reached, and the walk and the decode took a few MiB of
+  stack (scratch measurements: the goroutine's stack grew to 2 to 4 MiB for
+  the walk, and 4 to 8 MiB for the decode).
+  - **Protobuf: 64 levels** (`otlpMaxDepth`, the request being level 0),
+    counting nested groups, which the walk follows itself, without recursion,
+    since `protowire.ConsumeFieldValue` would walk them uncounted
+    (`TestOTLPNestedGroupsRefused`: 9,000 nested groups, 36 KB, were taken).
+    OTLP's own messages nest 8 levels down to the first `AnyValue`
+    (`TestOTLPFixedNestingDepth`), and an `AnyValue` nested through arrays adds
+    2 levels each, so 64 leaves 28 arrays below the deepest attribute. A body
+    at 64 levels is taken (`TestOTLPBodyAtMaxDepthTaken`).
+  - **JSON: 128 objects and arrays deep** (`otlpMaxJSONDepth`, twice the
+    other, since a message in a repeated field takes an array and an object),
+    counted outside strings (`TestOTLPJSONBracesInStringsNotCounted`).
+  - **The stack is reserved** before the body is walked (a request whose
+    stack doesn't fit is answered 503 without being walked,
+    `TestOTLPDecodeStackReservedBeforeWalk`), and apart from the 16 KiB each
+    request reserves: 64 KiB for a protobuf body (`otlpDecodeStack`) and
+    128 KiB for JSON (`otlpJSONDecodeStack`). At the limits, the goroutine's
+    stack grew to 16 to 32 KiB for the walk and 32 to 64 KiB for the decode of
+    a protobuf body, and 64 to 128 KiB for the decode of a JSON one (a stack
+    grows by doubling, so these are ranges). These are scratch measurements,
+    not a test.
+  - The e2e's `otlp-sizes` scenario logs how deep the real engines' requests
+    nest (`nestingDepth` in the `otlp request accepted` record) and fails if
+    the deepest is over half of 64 (`server.MaxOTLPNesting`), or if any
+    request taken was JSON, whose depth is not measured (`-1`).
 
   Since the decoded message counts too, the route limits are not the only
   bound on a body: one that decodes to more than the budget can hold is
@@ -1597,6 +1984,79 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   one beside them; two at-limit requests at once may have one refused, and
   retried. Without the budget, N requests at the limit would hold N times
   the limit, and their messages more.
+- **Idle connections are closed.** Every listener (`server.NewHTTPServer`)
+  sets `IdleTimeout` to 120s (`server.IdleTimeout`): a keep-alive connection
+  with no request on it is closed after that
+  (`TestIdleKeepAliveConnectionClosed`). It is above the 90s the engine's
+  Cloud exporters keep an idle connection (`IdleConnTimeout` of
+  `cloudExportTransport` in `engine/telemetry`, measured: a test server saw
+  that transport close an idle connection after 90.08s), so the exporters'
+  client closes first. Were the server's below the client's, a client reusing
+  a connection as the server closed it would get a transport error that Go
+  doesn't retry for a POST: in a test with the server's at half the client's,
+  5 of 5 runs failed with `EOF` or `connection reset by peer`
+  (`TestExporterClientPostsAcrossIdleGaps`, over HTTP/1.1). Over HTTP/2
+  (`-tls-cert`) the race did not occur in a run: a client with
+  `ForceAttemptHTTP2` and an idle timeout of 300ms made 24 POSTs with the
+  server's idle timeout at the real ratio above it, and 24 with it at half the
+  client's, and none failed (the server ends an idle HTTP/2 connection with a
+  GOAWAY, and the client dials another). That run is not a test, as it passes
+  in both orders. The engine WebSocket
+  is unaffected, as a hijacked connection is out of the server's hands. The
+  same timeout applies to the debug and metrics listeners, whose clients are
+  scrapers sending GETs: Go's transport retries an idempotent request that
+  fails on a reused connection the server closed, so those are covered (read
+  from the code, not run; not checked for other scrapers). There
+  is no cap on the number of connections: a client can still hold many open
+  while it is sending, and what bounds that is left to the network.
+- **Headers are bounded.** Every listener (`server.NewHTTPServer`: the
+  engine and OTLP listener, the debug listener and the metrics listener)
+  sets `MaxHeaderBytes` to 64 KiB (`server.MaxHeaderBytes`), where net/http's
+  default is 1 MiB. net/http allows 4 KiB more than that for its read buffer,
+  so a request line and headers of up to about 68 KiB are read; over
+  HTTP/1 a larger one is answered **431** before any handler runs, so it
+  reserves nothing and records nothing (`TestOTLPRequestOverHeaderLimit`).
+  Over HTTP/2 (`-tls-cert`) the server advertises the limit
+  (`SETTINGS_MAX_HEADER_LIST_SIZE`), and a client that honors it, as Go's does,
+  refuses to send a larger header list ("request header list larger than
+  peer's advertised limit"); a client that doesn't was not tried. Trailers
+  are bounded by net/http too, to a few KiB: a chunked request whose trailer
+  is 1 KiB is taken, one of 4 KiB or more is answered **400** and records
+  nothing (`TestOTLPRequestOverTrailerLimit`), inside the 16 KiB each request
+  reserves. Before
+  ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85)),
+  up to 1 MiB of headers per request was held outside the budget, so about
+  8,000 requests stalled after their headers held about 8 GB it didn't count.
+  The limit was chosen from what real callers send, measured by running the
+  engine's own client code against a server that logged each request's raw
+  header block:
+  - the engine's OTLP exporters (`newCloudExporters`, `POST /v1/traces`;
+    `/v1/logs` and `/v1/metrics` send the same headers): **402 bytes** with
+    a Basic engine token (`Authorization`, `Content-Type`, `User-Agent`,
+    `X-Dagger-Export`, `X-Dagger-Org`, `Accept-Encoding`, `Content-Length`),
+    **1,811 bytes** with a 1.5 KiB bearer token (an OIDC or OAuth token,
+    which dominates the size);
+  - the engine's WebSocket upgrade (`remotecache.dialService`): **431
+    bytes** with a 64-character token (`Authorization`, and the
+    WebSocket upgrade headers);
+  - the debug API is called by operators with `curl` or a script, with a
+    bearer token: a few hundred bytes. A browser's cookies could add more,
+    but a debug client is not a browser, and 64 KiB is far over it.
+
+  64 KiB is over 30 times the largest of these on the wire (1,811 bytes), and
+  about 20 times the largest reserve (3.2 KiB: the 1,811 bytes, nine headers
+  at 144 bytes each, and the host and URI). The e2e's `otlp-sizes`
+  scenario logs the headers' reserve of every OTLP request the real engines
+  sent (`headerBytes` in the `otlp request accepted` record) and fails if the
+  largest is within a tenth of `MaxOTLPHeaderReserve`; every real engine's
+  WebSocket upgrade also has to pass the limit for the run to connect at all.
+  The reserve is never less than the headers' wire bytes (each header adds at
+  least 144 bytes against at most 4 of framing), so the check bounds the wire
+  too: it can fail early for many short headers, never late.
+  The cap is the same on the debug and metrics listeners, with no setting to
+  raise it: operators' `curl` and scripts send a few hundred bytes, but a
+  browser or proxy adding large cookies or forwarded-for chains to the debug
+  API could meet it.
 - **A read timeout.** Each body must arrive within 30s of its handler
   starting (`server.OTLPReadTimeout`), a read deadline on the OTLP routes
   alone, set before the token is checked (`http.ResponseController`, per
@@ -1606,10 +2066,8 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
   bounds a request's headers to 10s (`server.ReadHeaderTimeout`). Neither
   applies to the engine WebSocket on the same listener, which stays
   connected past both (same test): the server sets no `ReadTimeout`, which
-  would cut it off. Idle keep-alive connections aren't bounded, as before;
-  they hold no part of the budget
-  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
-  `TestIdleKeepAliveConnectionsUnbounded`).
+  would cut it off. Idle keep-alive connections are closed after
+  `server.IdleTimeout` (above).
 - **Engine IDs are validated before they key anything.** An engine cache ID
   (the `<cacheID>` of a span's or event's `dagger.io/engine.cache`, an
   engine start's wiped cache, an engine's hello) and a span's session
@@ -1647,12 +2105,6 @@ by trickling the body after a 401 (`TestOTLPRefusedTokenSlowBodyCutOff`).
 
 **Known gaps**, each pinned by a test:
 
-- Idle keep-alive connections aren't bounded
-  ([zerobull-consulting/dagger#83](https://github.com/zerobull-consulting/dagger/issues/83),
-  `TestIdleKeepAliveConnectionsUnbounded`).
-- A request's headers, up to net/http's 1 MiB default, aren't in the budget
-  ([zerobull-consulting/dagger#85](https://github.com/zerobull-consulting/dagger/issues/85),
-  `TestOTLPRequestHeadersNotInBudget`).
 - Walking a deeply nested body (OTLP values nest) takes stack the budget
   doesn't count; its structs are counted
   ([zerobull-consulting/dagger#86](https://github.com/zerobull-consulting/dagger/issues/86),
@@ -1743,10 +2195,11 @@ them in constant time, and logs only a short fingerprint (the hash's first 4
 bytes).
 
 An engine sends its token as the HTTP Basic username, from
-`DAGGER_CLOUD_TOKEN`
-([#13](https://github.com/zerobull-consulting/dagger/issues/13) will let its
-config set it). On the WebSocket, an unknown or missing token is refused with
-401 before the upgrade, so it never gets a protocol message. A token is
+`DAGGER_CLOUD_TOKEN`. The engine's config can't set it, and that isn't
+planned: that would be a change to the engine, which this fork doesn't carry
+([#13](https://github.com/zerobull-consulting/dagger/issues/13)). On the
+WebSocket, an unknown or missing token is refused with 401 before the
+upgrade, so it never gets a protocol message. A token is
 checked again when its connection says `hello`, against the tokens of that
 moment.
 
@@ -1779,10 +2232,11 @@ A request with another namespace's token, or none, can't change what the
 importer or tracker knows of an engine (`TestForgedTelemetryIgnored`). Within
 a namespace, tokens trust each other further: a connection may say `hello`
 with another engine's cache ID, and then takes over its exports and its
-engine events. That is a known gap
+engine events. That is by design: the namespace is the trust boundary, and a
+cache ID isn't bound to a token within it
 ([#51](https://github.com/zerobull-consulting/dagger/issues/51),
-`TestKnownGapSameNamespaceTokenClaimsCacheID`); give engines you don't trust
-with each other different namespaces.
+`TestSameNamespaceTokenClaimsCacheID`). Give engines you don't trust with
+each other different namespaces.
 
 ### Reloading and revocation
 
@@ -2003,11 +2457,26 @@ nothing an engine reports (`engine.prune`, an offer's `gone`, a failed
 signals describe one engine's cache, not the stored copy (see
 [#11](https://github.com/zerobull-consulting/dagger/issues/11#issuecomment-6561084554)).
 
-It runs every `-gc-interval` (1h, jittered by ±25%, so replicas spread out;
-0 runs it only on `POST /debug/gc`), with the S3 stores
-(`CACHESERVICE_S3_BUCKET`). It is off on a read-only instance
-(`-export=false`), whatever `-gc-interval` says; an explicit nonzero one is
-refused at startup (see [Read-only instances](#read-only-instances)). Without limits (`-max-age` and `-max-bytes` are 0
+`-gc-mode` says who collects, with the S3 stores
+(`CACHESERVICE_S3_BUCKET`):
+
+| `-gc-mode` | The service's schedule | `POST /debug/gc` | Meant for |
+|---|---|---|---|
+| `service` (default) | every `-gc-interval` (1h, jittered by ±25%, so replicas spread out) | runs | a service with no job beside it |
+| `batch` | none | runs, on demand | a bucket that a [`cacheservice gc`](#the-gc-command) job collects |
+| `off` | none | 409, `gc is off: -gc-mode=off, ...` | a bucket nothing collects: it grows without bound, so the startup log warns |
+
+A zero `-gc-interval` is refused at startup (it used to mean "only on `POST
+/debug/gc`", which is `-gc-mode=batch`), and so is a negative interval, an
+explicit `-gc-interval` with `batch` or `off`, and an unknown mode. A
+read-only instance (`-export=false`) is `off`; an explicit `service` or
+`batch` is refused at startup (see [Read-only instances](#read-only-instances)).
+The startup log says the mode (`msg=mode ... gc=service`, and `gc on
+mode=service`, or the warning `gc off`), and so does `POST /debug/gc`'s
+answer (`"mode"`).
+
+`-gc-dry-run`, `-gc-grace`, `-gc-staging-age` and `-gc-max-deletes` apply to
+`service` and `batch`. With `off` they are accepted and unused. Without limits (`-max-age` and `-max-bytes` are 0
 by default, and no namespaces file), it expires only what engines gave an
 expiry, and deletes only what nothing names: bundles and blobs of exports
 that were never recorded or were superseded, and staged uploads. So an
@@ -2441,7 +2910,8 @@ first.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-gc-interval` | `1h` | Time between runs, jittered by ±25% (0: only `POST /debug/gc`; a negative interval is refused at startup, rather than taken as 0). GC is off with `-export=false`, which refuses an explicit nonzero value |
+| `-gc-mode` | `service` | Who collects garbage: `service` (the service, every `-gc-interval`, and on `POST /debug/gc`), `batch` (a `cacheservice gc` job collects; no schedule, and `POST /debug/gc` still runs), or `off` (nothing collects, so the bucket grows without bound; `POST /debug/gc` answers 409). `-export=false` is `off`, and refuses an explicit `service` or `batch` |
+| `-gc-interval` | `1h` | Time between runs with `-gc-mode=service`, jittered by ±25%. 0 and negative values are refused at startup, and so is any explicit value with `batch` or `off` |
 | `-gc-dry-run` | false | Log and report what a run would do; change nothing |
 | `-gc-grace` | `2h` | How old an unreferenced bundle, resolution or blob must be to be deleted |
 | `-gc-staging-age` | `2h` | How old a staged upload, or an incomplete multipart upload, must be to be deleted |
@@ -2449,6 +2919,11 @@ first.
 | `-max-age` | 0 | Default max age of a namespace's roots, such as `720h` (0: none) |
 | `-max-bytes` | 0 | Default max size of what a namespace keeps, such as `500GiB` (0: none) |
 | `-namespaces-file` | none | Per-namespace limits (see [The namespaces file](#the-namespaces-file)) |
+
+`cacheservice gc` takes `-max-age`, `-max-bytes`, `-namespaces-file`,
+`-gc-grace`, `-gc-staging-age` and `-gc-max-deletes` under the same names,
+defaults and rules, from the same code (`gc.RegisterFlags`); see
+[The gc command](#the-gc-command).
 
 The service's credentials also need `s3:ListBucket`,
 `s3:ListBucketMultipartUploads` (without it, GC does nothing:
@@ -2465,7 +2940,7 @@ Keep three credentials, each with only what it needs
 | --- | --- | --- |
 | **Read** | pull-request jobs, read-only instances (`-export=false`) | `s3:GetObject` under the prefix, `s3:ListBucket` for it (see [A read-only key](#a-read-only-key)). On Spaces, a limited key with `Read` on the bucket. |
 | **Read/Write/Delete** | the writer service, export-capable jobs, GC | the above, plus `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads` under the prefix; `s3:GetLifecycleConfiguration` on the bucket is optional (without it, GC expires every namespace's staged uploads itself, and `lifecycle check` can't run). On Spaces, a limited key with `Read/Write/Delete` on the bucket. |
-| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs none of the lifecycle permissions, only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor), so the Read/Write/Delete key can claim a prefix, and so can an admin key that also has these (on Spaces, a full-access key does). |
+| **Admin** | an operator, once per bucket and after a change of namespaces | `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` on the bucket, and `s3:GetObject` on the ownership marker: what [`lifecycle apply`](#the-lifecycle-command) needs; `lifecycle plan` and `check` need only `s3:GetLifecycleConfiguration`. On Spaces, `apply`, `plan` and `check` need a full-access key: a limited key gets 403. `lifecycle claim` needs none of the lifecycle permissions, only what a writer's startup check needs on a fresh prefix (`s3:ListBucket` and `s3:ListBucketMultipartUploads` for the prefix, and `s3:GetObject` and `s3:PutObject` on the marker, `<prefix>/cacheservice.json`, which it reads before anything else; `s3:GetObject` on each ancestor prefix's marker too, or the [nested-prefix check](#at-startup) skips that ancestor on its 403; any other error reading it refuses), so the Read/Write/Delete key can claim a prefix, and so can an admin key that also has these (on Spaces, a full-access key does). |
 
 The admin key is the most powerful: a lifecycle rule can expire anything in
 the bucket. Use it for `lifecycle apply`, and for `plan` and `check` where the writer's
@@ -2484,6 +2959,72 @@ staged uploads itself" on each run, the fallback above, which is safe but
 costs requests; and `lifecycle check` needs the admin key there. A writer
 with such a key also claimed an empty prefix at startup, creating the marker
 with `If-None-Match: *`.
+
+### The gc command
+
+`cacheservice gc` runs one garbage collection over every namespace under the
+prefix, and exits: what collects a bucket whose writers run with
+`-gc-mode=batch`
+([zerobull-consulting/dagger#249](https://github.com/zerobull-consulting/dagger/issues/249)).
+It is a subcommand of the service's binary, so it ships in the image. It
+reads the same `CACHESERVICE_S3_*` settings as the service, with a key that
+can do what GC does (the Read/Write/Delete key, see [The keys](#the-keys)),
+and runs the same collector as `POST /debug/gc`, one pass, with the limits
+and settings its flags give. Scheduling it (a CronJob, a timer, a CI
+schedule) is up to the operator.
+
+```bash
+cacheservice gc                                              # dry run: report only
+cacheservice gc -max-age=720h -max-bytes=500GiB -confirm=dagger-cache/cache   # collect
+cacheservice gc -namespaces-file limits -confirm=dagger-cache/cache
+```
+
+- **A dry run is the default.** Without `-confirm`, it reports what a run
+  would expire and delete, and changes nothing: no object, no index, no
+  upload (`TestDryRunChangesNothing`). Without limits it still runs, and says
+  on stderr that no limits were given, so the report shows only what each
+  entry's own expiry and reachability decide.
+- **A confirmed run collects.** `-confirm=<bucket>/<prefix>` must repeat the
+  bucket and prefix of the settings (the prefix without surrounding slashes);
+  any other value exits 2 before anything is read, so a confirmation for one
+  prefix can't collect another (`TestConfirmMismatchExits2`). It does what
+  `POST /debug/gc` does on the same bucket (`TestConfirmedRunMatchesService`).
+- **A confirmed run needs explicit limits:** `-namespaces-file`, or both
+  `-max-age` and `-max-bytes`. `0` is a limit (none), so `-max-age=0
+  -max-bytes=0` collects with no age or size limit, on purpose. A confirmed
+  run without them exits 2 and names the flag it lacks
+  (`TestConfirmedRunNeedsExplicitLimits`): a job that deletes shouldn't do so
+  under limits nobody chose. `-namespaces-file` alone satisfies this, but a
+  file with no `*` line leaves every namespace it doesn't list with no limit
+  (`-max-age` and `-max-bytes` are 0 unless given), as in the service
+  (`TestNamespacesFileLimits`): put a `*` line in the file for defaults.
+- **An empty `-confirm=`** (say `-confirm="$VAR"` with `VAR` unset) exits 2:
+  it is not a dry run. Leave `-confirm` out for one.
+- **Flags:** `-confirm`, `-max-age`, `-max-bytes`, `-namespaces-file` (read
+  once; there is no SIGHUP), `-gc-grace`, `-gc-staging-age` and
+  `-gc-max-deletes`: the service's, with the same defaults. It has no
+  `-gc-mode` and no `-gc-interval`: `batch` is the service's setting, and a
+  job doesn't look at it. It has no `-gc-dry-run` either: no `-confirm` is its
+  dry run.
+- **Output:** the reports (`[]gc.Report`, the same fields as `POST /debug/gc`'s
+  `reports`) as a JSON array on stdout, and nothing else. Logs and errors go
+  to stderr. A run that did nothing prints `[]`, or the one report that says
+  why. No metrics are served.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | a clean run, or a dry run that ran cleanly |
+  | 1 | a namespace's report has errors, the run failed, the stores couldn't be opened, or a signal ended it; a dry run too |
+  | 2 | bad flags, or a `-confirm` that is wrong or without explicit limits; nothing was read or deleted |
+  | 3 | the run refused to do anything (`gc.ErrNotOwned`): no ownership marker, a marker of another layout, keys of no known shape at the root of the prefix, or the marker or the multipart uploads couldn't be read (so an unreachable store is 3 too). Nothing was changed |
+
+- **SIGTERM or an interrupt** ends the run's context. The collector still
+  finishes the claims it made, within a minute, so none is left in progress
+  for others to wait on until it goes stale
+  (`TestSigtermAfterClaimFinishesClaims`), then the process exits 1 with the
+  report so far. A second signal doesn't end the process or cut the finish
+  off; the process manager's kill is the last resort.
 
 ## Stopping and draining
 
@@ -2506,7 +3047,15 @@ A read-only instance (`-export=false`) has nothing to flush: its drain
 logs `drain: nothing to export (read-only: -export=false)`, and returns at
 once, unless an explicit import admitted before it still runs, which it
 waits for, up to its deadline (logged as `drain: waiting for explicit
-requests`).
+requests`). A drain called once the export path's context already ended
+(the stop began) has nothing to export either: it logs `drain: nothing to
+export (the service is stopping)`, reports what is left, and returns at
+once: `complete` when nothing is left that it could export (an export in
+flight, or a root of a connected engine) and no explicit request runs,
+otherwise `deadline` if its own deadline passed and `canceled` if not
+([zerobull-consulting/dagger#74](https://github.com/zerobull-consulting/dagger/issues/74)). A second
+call to `Drain` returns `canceled` at once and doesn't end the first: only
+the first call's context cancels a drain.
 
 1. **It takes no new work.** A new engine WebSocket gets 503 with
    `Retry-After: 10` before the upgrade, and one upgraded but not yet
@@ -2534,7 +3083,16 @@ requests`).
    ended with some of its counted spans missing is waited for (`sessions`)
    until they are in, or `-export-settle` (at most 2s) passed with none of them. Roots
    waiting for another try (busy, failed, interrupted, or waiting for their
-   engine) are due at once too. The drain runs those exports, one at a time
+   engine to connect) are due at once too. Roots an engine refused because
+   it has given up its remote-cache work until its next session
+   (`paused`, see
+   [Engines from v1.0.0-beta.26](#engines-from-v100-beta26)) are neither
+   waited for nor asked for again: one found so during the drain is asked
+   for once. They are reported apart from what the drain left unexported
+   (`pausedRoots` in `drain: done`, a `drain: left for an engine that gave
+   up its remote-cache work` line per cache, and `paused` in
+   `GET /debug/drain`), and a drain that left only those is `complete`. The
+   drain runs those exports, one at a time
    per engine cache as the scheduler does, and waits for them, their uploads,
    verification and index writes included.
 3. **It starts nothing past its deadline.** Each pass checks the deadline,
@@ -2636,21 +3194,44 @@ curl -fsS -X POST -u "sidecar-engine:" "http://localhost:8090/v1/engines/flush?t
 - **What it does.** Every dirty entry of the cache is due at once, without
   waiting for `-export-settle`, and stays so while the flush runs, so what
   becomes dirty meanwhile is exported too. Roots waiting out a retry's
-  backoff (busy, failed, interrupted) are due now, once; a retry after that
-  waits its normal backoff. A session whose spans may still come (one that
+  backoff (busy, failed, interrupted) are due now, once, except a failed
+  root whose wait a flush's own failed try started (below); a retry after
+  that waits its normal backoff. A session whose spans may still come (one that
   hasn't ended, or ended with some of the cache spans its carrier counted
   missing) is waited for until it ended with every span in, or
   `-export-settle` (at most 2s) passed since its last span: so a flush right
   after the client returned waits for its last spans and its carrier, which
-  are on their way. Its late spans are taken and exported. A flush starts
-  each failing root's retry at once: a caller that loops flushes retries
-  them at its own rate. The scheduler runs the exports, one
-  at a time per engine cache: the flush starts none of its own. Other
-  caches are scheduled as usual.
+  are on their way. Its late spans are taken and exported. A caller that
+  loops flushes doesn't retry a failing root at its own rate: a flush cuts
+  short a failed root's wait only if a flush didn't cause the try that
+  started it, so after a second failed try in a row the root waits out its
+  backoff (or its value changes), and reaches the last of its 5 failed tries (after which it isn't
+  tried again until its value changes) at most twice as fast as its
+  backoff alone would take it there
+  (`TestTrackerLoopedFlushesDontRushFailures`). A busy root, which doesn't
+  count toward that limit, is retried at every flush. The scheduler runs
+  the exports, one at a time per engine cache: the flush starts none of its
+  own. Other caches are scheduled as usual.
+- **It can't wait for spans it hasn't heard of.** A session holds a flush
+  only once the service has seen at least one of its spans. A flush that
+  comes before any span of a session reaches the service doesn't wait for
+  it: with nothing else left, it returns `complete` at once, and the
+  session's spans, arriving after, wait for `-export-settle` as usual
+  (`TestKnownGapFlushDoesNotWaitForUnseenSession`). Closing this needs the
+  engine's OTLP batching to hold back every span of a session until after
+  its client returned, a change to the engine. On a real engine
+  (`TestRealEngines/flush`, in
+  [zerobull-consulting/dagger#157](https://github.com/zerobull-consulting/dagger/pull/157)),
+  the flush right after the CLI returned found and exported all three
+  roots
+  ([zerobull-consulting/dagger#160](https://github.com/zerobull-consulting/dagger/issues/160)).
 - **It isn't a drain.** New engines, sessions and spans are taken as usual.
   An engine still running builds can keep a flush busy until its timeout.
 - **When it returns:** once nothing of the cache is dirty, waiting for
-  spans, in flight or due for a retry before the timeout (`complete`); once
+  spans, in flight or due for a retry before the timeout (`complete`, or
+  `paused` when roots are left that the engine refuses because it has given
+  up its remote-cache work until its next session: the flush tries a dirty
+  root once, and neither waits for a paused one nor asks for it again); once
   the timeout passes, or only retries due after it are left (`timeout`; such
   a retry isn't waited for, and is counted `later`); at once, with what is
   left, when the cache's engine isn't connected or disconnects
@@ -2678,14 +3259,16 @@ only for auth, bad requests and refusals. The report:
 }
 ```
 
-- `outcome`: `complete` (nothing left), `timeout`, `not_connected` or
-  `canceled`.
+- `outcome`: `complete` (nothing left), `paused` (only roots of a paused
+  engine left), `timeout`, `not_connected` or `canceled`.
 - `stored`: the roots stored by exports of the cache that ended during the
   flush.
 - `left`, as the drain counts them: `dirty` (worth exporting, not in flight
   or waiting for a retry), `waitingSpans` (sessions still waited
   for), `inFlight`, `retrying` (a retry due before the timeout), `later` (a
-  retry due after it).
+  retry due after it), and `paused` (roots the engine refuses until its next
+  session; left out when 0, and not among the roots `flush: done` and
+  `flush_unexported_roots_total` count as left).
 
 Each flush logs one `flush: done` line, with the outcome and these counts,
 and is counted in `flush_total{outcome}`, `flush_duration_seconds` and
@@ -2763,10 +3346,16 @@ wait for), `deadline` or `canceled`. `GET /debug/drain` shows it under
 
 The drain logs, when it starts, what each engine cache (by cache ID, never
 the token) has pending, in flight and waiting for a retry, and when it ends,
-the roots stored by cache ID, and what was left unexported by cache ID and
-root count (`drain: left unexported`, a warning), with its outcome:
+the roots stored by namespace and cache ID (two namespaces whose engines
+say hello with the same cache ID are two caches), and what was left
+unexported by namespace, cache ID and root count (`drain: left
+unexported`, a warning), with its outcome:
 `complete`, `deadline` or `canceled`. `GET /debug/drain` shows the same while
-it runs, and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
+it runs, and its report once it ended: `stored` is a list of `{"namespace",
+"cacheID", "roots"}`, one per engine cache that stored any, sorted by
+namespace and cache ID as `left` is (it was an object keyed by cache ID
+alone before
+[zerobull-consulting/dagger#160](https://github.com/zerobull-consulting/dagger/issues/160)), and the [metrics](#metrics) `draining`, `drain_duration_seconds`,
 `drain_stored_roots_total`, `drain_unexported_roots_total` and
 `drain_refused_total` measure it.
 
@@ -2813,9 +3402,10 @@ to reorder them.
 
 **An engine that goes away mid-drain.** Its exports are interrupted, as on
 any disconnect, and it can't reconnect to a draining service: the drain
-doesn't wait for it, and logs its roots as left (`connected=false`). Known
-gap, pinned by `TestDrainEngineDisconnectDoesNotHang`
-([#70](https://github.com/zerobull-consulting/dagger/issues/70)).
+doesn't wait for it, and logs its roots as left (`connected=false`). This
+is accepted for now, and pinned by `TestDrainEngineDisconnectDoesNotHang`
+([#70](https://github.com/zerobull-consulting/dagger/issues/70)): it is to be
+looked at again when a shared service is deployed.
 
 **An explicit export or import admitted just before the drain.** The hooks
 are admitted under the drain's lock, so each one is either admitted before
@@ -2826,9 +3416,22 @@ cache's export slot runs once it has it. While the drain waits, `GET
 /debug/drain` counts them in `explicit`. Roots such an export stores while
 draining are counted in the report's `stored`. One still running when the
 drain ends (at its deadline, or canceled) is counted in the report's
-`explicit`, logged as `explicitLeft`, and runs on until it ends or the stop
-that follows cuts it off (an export cut off publishes nothing); what it
-stores after the drain ended isn't in the report. Pinned by
+`explicit`, logged as `explicitLeft`, and runs on until it ends or the
+service's paths stop, which cancels it (an export cut off publishes
+nothing); what it stores after the drain ended isn't in the report. The
+paths stop as the linger that follows the drain starts, or, without a
+linger, as the shutdown starts, before it waits for the HTTP servers: an
+explicit request still running then is canceled, answers 503, and the
+shutdown waits for it to end with the rest of the service's work. One asked
+for once the stop began answers 503 too
+(`TestStopCancelsAndWaitsForExplicitHooks`,
+`TestShutdownCancelsExplicitExport`,
+[#202](https://github.com/zerobull-consulting/dagger/issues/202)). An
+import sync waits for the one under way of the same engine cache only as
+long as its context lives: one whose context is done, before it waits or
+while it does, returns the context's cause without waiting
+(`TestImportSyncCanceledDoesNotWaitForSyncLock`,
+[#240](https://github.com/zerobull-consulting/dagger/issues/240)). Pinned by
 `TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
 `TestDrainRunsExplicitExportWaitingForSlot`, the
 `TestDrainEndsAtDeadlineWith…` tests and
@@ -2839,8 +3442,9 @@ stores after the drain ended isn't in the report. Pinned by
 SIGKILL (including a process manager's, past its stop timeout), or
 `-drain-timeout 0` still loses the exports pending or in flight
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45)): the tracker
-keeps them only in memory. What was stored is never lost, and blobs uploaded
-by an export cut off are named by nothing, and GC deletes them.
+keeps them only in memory. This is accepted (see
+[Export path](#export-path)). What was stored is never lost, and blobs
+uploaded by an export cut off are named by nothing, and GC deletes them.
 
 **A service that doesn't export** (no `CACHESERVICE_S3_BUCKET`) has nothing
 to drain: it refuses new engines, and stops at once
@@ -2882,7 +3486,7 @@ paths record into them through their metadata store. All are prefixed
 | `import_sync_duration_seconds` | | Time per import sync |
 | `export_batches_total` | `scope`, `outcome` | Export batches: `ok`, `error` or `interrupted` |
 | `export_batch_duration_seconds`, `export_batch_roots` | | Time and roots per export batch |
-| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused` or `failed` |
+| `export_roots_total` | `result` | Roots exported: `stored`, `gone`, `busy`, `refused`, `failed` or `paused` (refused by an engine that gave up its remote-cache work until its next session) |
 | `export_blobs_total` | `result` | Layer blobs: `uploaded` (and verified), `present` (the store had them), or `rejected` (an upload that failed verification, counted per try) |
 | `export_bundles_total` | | Bundles published |
 | `export_roots_waiting` | `scope` | Roots due for export and waiting, as the scheduler last saw them: for their engine cache's export in flight to end, or for the next batch |
@@ -2904,15 +3508,17 @@ paths record into them through their metadata store. All are prefixed
 | `export_collected_total` | `scope` | Export tries refused because GC deleted, or was deleting, an object they named; each is tried again |
 | `export_enabled` | | 1 when the export path is on, 0 when it is off: a read-only instance (`-export=false`), or no bucket |
 | `draining` | | 1 once the service started draining (SIGTERM), 0 before |
-| `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed) or `canceled` (a second signal) |
+| `drain_duration_seconds` | `outcome` | Time of the drain: `complete` (nothing left it could export), `deadline` (`-drain-timeout` passed) or `canceled` (a second signal, or a drain that began after the export path stopped): both cut short, usually with work left, which the drain report's `left` and `drain_unexported_roots_total` count |
 | `drain_stored_roots_total` | | Roots stored by exports that ended while draining |
 | `drain_unexported_roots_total` | | Roots left unexported when the drain ended: pending, in flight, waiting for a retry, or of an engine that went away |
 | `engine_version_mismatch_total` | `outcome` | Engine hellos whose version isn't an accept line (see [Engine versions](#engine-versions)): `refused` (closed before the welcome, status 4002) or `allowed` (welcomed by `-allow-engine-version-mismatch`). The version is in the log, not a label |
-| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
+| `drain_paused_roots_total` | | Roots a drain left because their engine refuses them until its next session (it gave up its remote-cache work). Not in `drain_unexported_roots_total`; lost if the engine stops before a session starts on it |
+| `flush_paused_roots_total` | | The same, for each flush: a count per flush, not of the roots lost. Not in `flush_unexported_roots_total` |
+| `flush_total` | `outcome` | Flushes of one engine cache: `complete`, `paused`, `timeout`, `not_connected` or `canceled` (see [Flushing one engine cache](#flushing-one-engine-cache)) |
 | `flush_duration_seconds` | | Time of each flush |
-| `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry |
+| `flush_unexported_roots_total` | | Roots a flush left unexported when it ended: dirty, in flight, or waiting for a retry. Each flush adds what it left, so overlapping flushes of one cache each count the same roots: a count per flush, not of the roots lost |
 | `drain_refused_total` | `kind` | New work refused while draining: `connection` (an engine WebSocket) or `span` (a span or session end of a session the service doesn't track) |
-| `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full) or `timeout` (408). Nothing of them is recorded |
+| `otlp_refused_total` | `route`, `reason` | OTLP requests refused for their body (see [OTLP limits](#otlp-limits)), by route (`traces`, `logs`, `metrics`) and reason: `too_large` (413), `busy` (503, the decode budget full), `timeout` (408) or `too_deep` (400, nested past the limit). Nothing of them is recorded |
 | `otlp_request_bytes` | `route`, `form` | Size of each OTLP request taken: `received` (as sent, gzipped or not) or `decoded`. Compare with the routes' limits |
 
 `scope` is the namespace (see [Auth and namespaces](#auth-and-namespaces)).
@@ -2982,7 +3588,7 @@ D4 and D6), `linux/amd64` only, from
 The name doesn't depend on this repository, so a later extraction keeps the
 pull paths.
 
-- **`:<engine version>`**, such as `:v1.0.0-beta.25`: a **floating** tag,
+- **`:<engine version>`**, such as `:v1.0.0-beta.26`: a **floating** tag,
   one per `accept` line, on the newest verified build that accepts that
   engine. Pull this tag for the engine you run. A version that a newer
   build no longer accepts keeps its tag on the last build that did.
@@ -3079,7 +3685,7 @@ There is no `HEALTHCHECK`: the image has no shell, and the engine reconnects
 with backoff. To try it, unauthenticated and with no store (export path off):
 
 ```bash
-docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25
+docker run --rm -p 127.0.0.1:8090:8090 ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26
 ```
 
 The engine that connects to it is a stock Dagger release whose version is
@@ -3108,7 +3714,7 @@ On GitHub Actions, use the composite action, which does everything below
 - uses: zerobull-consulting/dagger/.github/actions/remote-cache/start@<commit SHA>
   with:
     role: writer                    # read-only in pull-request jobs
-    version: v1.0.0-beta.25         # the engine and the CLI; selects the service image too
+    version: v1.0.0-beta.26         # the engine and the CLI; selects the service image too
     s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
     s3-region: ${{ vars.CACHE_S3_REGION }}
     s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
@@ -3165,10 +3771,12 @@ docker run -d --name remote-cache-service --network remote-cache-net -p "$gw::80
   -e CACHESERVICE_S3_ENDPOINT -e CACHESERVICE_S3_REGION -e CACHESERVICE_S3_BUCKET \
   -e CACHESERVICE_S3_PREFIX -e CACHESERVICE_S3_ACCESS_KEY_ID -e CACHESERVICE_S3_SECRET_ACCESS_KEY \
   -e CACHESERVICE_S3_PATH_STYLE \
-  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.25 \
-  -scope default -drain-timeout 10m -drain-linger 15s -gc-interval=0
+  ghcr.io/zerobull-consulting/dagger-remote-cache:v1.0.0-beta.26 \
+  -scope default -drain-timeout 10m -drain-linger 15s -gc-mode=batch
 url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
 ```
+
+`-gc-mode` needs an image built at or after zerobull-consulting/dagger#248. The tag above is the floating `:<engine version>` tag, which carries it once the publish workflow has moved it to a build with that change; an image pinned to an older commit does not.
 
 - **No `-tokens-file`**: the service is unauthenticated, and every engine is
   in the `-scope` namespace. That is fine on a runner's private network, and
@@ -3176,7 +3784,8 @@ url="http://$(docker port remote-cache-service 8090/tcp | head -n1)"
   namespace. Its OTLP bodies are bounded either way (see
   [OTLP limits](#otlp-limits)); `cacheservice_otlp_refused_total` should stay
   at 0 for a sidecar's engines.
-- **`-gc-interval=0`** on writers: scheduled GC belongs to a job of its own
+- **`-gc-mode=batch`** on writers: the service has no GC schedule, and
+  `POST /debug/gc` still runs GC; collecting belongs to a job of its own
   ([zerobull-consulting/dagger#61](https://github.com/zerobull-consulting/dagger/issues/61)).
 - **`-drain-timeout 10m`**: the stop's chance to store what the job built
   (see step 4); **`-drain-linger 15s`** (its default) lets the engine's stop
@@ -3204,7 +3813,7 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   -e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
   -e DAGGER_CLOUD_URL="$url" \
   -e DAGGER_CLOUD_TOKEN=sidecar-engine \
-  registry.dagger.io/engine:v1.0.0-beta.25@sha256:39abecfe0eba4c91035dcfc9f72c8a3963ae60481326082b48d78f2230202834 --debug
+  registry.dagger.io/engine:v1.0.0-beta.26@sha256:53c0411ca73af93ceb88e97834a992754786d4919505394b699cc34fb76dd3e4 --debug
 ```
 
 - `DAGGER_CLOUD_TOKEN` is a placeholder (any string but `oidc`): without a
@@ -3219,6 +3828,11 @@ docker run -d --privileged --name remote-cache-engine --network remote-cache-net
   `msg="engine refused: its version is not accepted"`, the service and the
   engine disagree: the engine would build without the cache. `msg="engine
   connected"` comes before either, and says nothing about the version.
+- Then the first import sync: the service logs `msg="import sync: first
+  done"` once it has merged what is stored, even when that was nothing.
+  The action's start waits for it, for up to 30s, so the first build
+  doesn't race the merge
+  ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 
 Then the CLI, which must be the engine's version (the engine is pinned by
 digest, the CLI only by its release tag; the action installs it with
@@ -3318,16 +3932,20 @@ ends the linger at once, and the engine's last event goes undelivered.
   session's end.
 
 **Pull-request jobs:** the same, with `-export=false` instead of
-`-gc-interval=0` (GC is off anyway, and an explicit nonzero `-gc-interval`
-is refused), and a read-only key (see
+`-gc-mode=batch` (GC is off anyway, and an explicit `-gc-mode=service` or
+`batch` is refused), and a read-only key (see
 [A read-only key](#a-read-only-key)): `s3:GetObject` and `s3:ListBucket` on
 the prefix. A job that forgets `-export=false` with that key fails at
 startup, exit 1, rather than running as a writer. Its drain has nothing to
 flush, so the stop is quick. The service merges what is stored as the
-engine connects, within a second or two; there's no signal for when that
-first merge is done, so a build that starts at once can miss what it hasn't
-merged yet
+engine connects, within a second or two, and logs `msg="import sync: first
+done" merged=N` once that first sync ends, even when it merged nothing (see
+[Import path](#import-path)). The action's start waits for that line, in
+both roles, so a build that starts right after it doesn't miss what the
+service hadn't merged yet
 ([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
+The wait is bounded at 30s: a service image from before the line never logs
+it, and the start goes on after that with a warning.
 
 - **DigitalOcean Spaces' `Read` key** was run against the service on
   2026-11-07, after this walk-through (which had no Spaces key); CI's Spaces
@@ -3697,7 +4315,7 @@ timeouts, a restart with state to compare) or would cost minutes.
 | --- | --- | --- | --- |
 | Connection lost mid-upload | both | e2e `disconnect`; `TestConnectionLostMidUpload`, `TestExportHookInterruptedNotFailed`, engine's `TestExportReleasedWhenTheConnectionDrops` | The real engine shows the release and the reconnect; the fake one checks the chains are released before the retry. |
 | Engine restart, new generation | real engines (export side) | e2e `engine-restart`; import side: `TestSyncStaleGeneration`, `TestOfferPendingStaleGeneration`, `TestTrackerGenerationFence`, `TestRecordFencesOlderGenerations` | Whether entry numbers survive a restart is the engine's: only a real one shows the cut export runs again under the same numbers. |
-| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestKnownGapServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the gap of a stop without a drain exactly. |
+| Service restart | both | e2e `service-restart`; `TestServiceRestartMergesPrunedEntriesAgainOnce`, `TestServiceRestartForgetsPendingExport`, `TestRestartKeepsState`, `TestMinIOMetastoreRestart` | Real reconnect backoff, and a measured redo; the fake engine pins the pruned-entry redo and the accepted limit of a stop without a drain exactly. |
 | Clean stop (drain) | both, and the binary | e2e `drain`; `TestDrain*`, `TestDrainedRestartStoresPendingExport`, `TestMinIODrain`, `TestMinIOBinaryDrainsOnSIGTERM`, `TestMinIOBinarySecondSIGTERMStopsAtOnce` | The real engine shows it stays connected and finishes its upload while the service drains; the fake engine controls the timing (quiet sessions, late spans, deadlines, disconnects); only the built command shows the signal wiring. |
 | S3 throttling, 5xx, outage | real engines | e2e `s3-faults`; `TestExportRetriesFailedUploads`, `TestExportGivesUpOnFailingUploads`, `TestExportBlobStoreFailureReleases`, `TestUpdateIndexRetriesOnAFreshIndex` | Who retries what is split between the engine's PUTs and the service's AWS SDK client, which only the real pair shows. |
 | Oversized messages | fake engine, and MinIO | `TestImportBundleNearMergeLimit` (and `TestMinIO…`), `TestExportSplitsBundleTooLargeToImport`, `TestExportOneRootBundleTooLargeToImport`, `TestMergeSizeBoundsBuildMerge`; splitting: `TestExportSplitsTooLarge`, `TestSyncTooLarge`, `TestSyncSplitsLargeOffers` | A real bundle near 64 MiB would take minutes to build and move; the limit is a setting, lowered in tests. |
@@ -3716,7 +4334,7 @@ live bundle again, once, pruned entries included: see
 [Import path](#import-path). The real run measured it: 8 bundles, 61 values,
 merged into B within 187ms of its `hello`.
 
-**Known gaps.** An export pending or in flight when the service stops
+**Accepted limits.** An export pending or in flight when the service stops
 without a drain (a crash, SIGKILL, or `-drain-timeout 0`) is lost until a
 later session names its entries
 ([#45](https://github.com/zerobull-consulting/dagger/issues/45)). A clean
@@ -3778,7 +4396,10 @@ This section comes from reading `engine/remotecache`, `cmd/engine` and
   should never show one.
 
 The engine sends nothing else on its own initiative. It does not announce new
-cache entries over the WebSocket.
+cache entries over the WebSocket. Since `v1.0.0-beta.26` it also sends
+`open`, `claims`, `settle` and `lookup` (see
+[Engines from v1.0.0-beta.26](#engines-from-v100-beta26)); this section and
+the live run below are of `v1.0.0-beta.23`.
 
 ### On the WebSocket, what the engine sends only when asked
 

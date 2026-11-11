@@ -157,7 +157,7 @@ func TestTrackEventValidatesEngineIDs(t *testing.T) {
 // and never registered.
 func TestHelloValidatesCacheID(t *testing.T) {
 	for _, id := range []string{"", strings.Repeat("x", MaxEngineIDLen+1), "bad cache!"} {
-		svc, _, srv := newTestService(t, "")
+		svc, rec, srv := newTestService(t, "")
 		e := dialRaw(t, srv, "tok")
 		env, err := protocol.NewEnvelope(1, 0, protocol.TypeHello, protocol.Hello{EngineVersion: testEngineVersion, CacheID: id, Generation: 1, EngineName: "e"})
 		require.NoError(t, err)
@@ -167,6 +167,17 @@ func TestHelloValidatesCacheID(t *testing.T) {
 		require.Equal(t, "invalid cache ID", decodeBody[protocol.Error](t, reply).Message)
 		require.Empty(t, svc.Engines())
 		require.Equal(t, 1.0, engineIDsRefused(t, svc, "hello"))
+		// The refusal record names the connection, so an operator needn't
+		// match it to the "engine disconnected" record by time.
+		waitUntil(t, 5*time.Second, "the disconnect logged", func() bool { return len(rec.find("engine disconnected")) == 1 })
+		refused := rec.find(LogEngineIDsRefused)
+		require.Len(t, refused, 1, "%q", id)
+		disconnected := rec.find("engine disconnected")[0]
+		require.NotEmpty(t, refused[0]["conn"])
+		require.Equal(t, disconnected["conn"], refused[0]["conn"])
+		require.Equal(t, disconnected["namespace"], refused[0]["namespace"])
+		require.NotEmpty(t, refused[0]["remote"])
+		require.Equal(t, "hello", refused[0]["source"])
 	}
 	// A real engine's is welcomed.
 	svc, _, srv := newTestService(t, "")

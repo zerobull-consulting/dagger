@@ -3,7 +3,8 @@ description: >-
   Gets the dagger CLI (dagger/dagger-for-github), runs the remote cache
   service and a stock engine of the same version on this runner, and puts a
   wrapper of the CLI first on PATH for later steps; ready once the service
-  has welcomed the engine. The sidecar is stopped, draining its exports, at
+  has welcomed the engine and its first import sync is done (or 30s after
+  the welcome, with a warning). The sidecar is stopped, draining its exports, at
   the end of the job, whatever happened; remote-cache/stop stops it earlier.
 
 inputs:
@@ -209,7 +210,7 @@ runs:
     # variables only, never expanded into a script.
     - name: Start the cache service and the engine
       id: start
-      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@32ed76f8c5ee68ac142273af836b546b9da77fca
+      uses: zerobull-consulting/dagger/.github/actions/remote-cache/start/run@387320cc09574aa2addc3b77da03649d6ddc65e2
       env:
         SIDECAR_SCRIPT: ${{ github.action_path }}/../sidecar.sh
         SIDECAR_ROLE: ${{ inputs.role }}

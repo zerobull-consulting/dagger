@@ -543,12 +543,12 @@ func TestReadOnlyNoGC(t *testing.T) {
 	if len(h.logs.find("gc off")) != 1 {
 		t.Error("no gc off log")
 	}
-	if err := h.svc.EnableGC(context.Background(), GCConfig{Interval: time.Hour}); !errors.Is(err, ErrGCReadOnly) {
+	if err := h.svc.EnableGC(context.Background(), GCConfig{Mode: GCModeService, Interval: time.Hour}); !errors.Is(err, ErrGCReadOnly) {
 		t.Errorf("EnableGC: %v, want ErrGCReadOnly", err)
 	}
 
 	opts := readOnlyOptions()
-	opts.GC = &GCConfig{Interval: time.Hour}
+	opts.GC = &GCConfig{Mode: GCModeService, Interval: time.Hour}
 	svc := New(slog.New(slog.DiscardHandler), "")
 	err := svc.enableStores(context.Background(), storeSet{Blobs: stores.blobs, Meta: stores.meta}, opts)
 	if err == nil || !strings.Contains(err.Error(), "NoExport") {

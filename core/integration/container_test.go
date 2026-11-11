@@ -1828,6 +1828,24 @@ func (ContainerSuite) TestWithMountedFiles(ctx context.Context, t *testctx.T) {
 		require.Equal(t, "one", contents)
 	})
 
+	t.Run("files of a layered snapshot, read again", func(ctx context.Context, t *testctx.T) {
+		// One file changed in the snapshot's topmost layer, shadowing its old
+		// contents below, and one only in a layer below. The second read of each
+		// finds its layer already known.
+		layered := ctr.
+			WithExec([]string{"sh", "-c", "mkdir /out; echo old > /out/changed; echo kept > /out/kept; chmod 640 /out/changed /out/kept"}).
+			WithExec([]string{"sh", "-c", "echo new > /out/changed; chmod 640 /out/changed"})
+		files := []*sdkcore.File{layered.File("/out/changed"), layered.File("/out/kept")}
+		mounted := ctr.WithMountedFiles("/mnt/files", files)
+		for _, read := range []string{"first", "second"} {
+			out, err := mounted.
+				WithExec([]string{"sh", "-c", "echo " + read + "; cat /mnt/files/changed /mnt/files/kept; stat -c %a /mnt/files/changed /mnt/files/kept"}).
+				Stdout(ctx)
+			require.NoError(t, err)
+			require.Equal(t, read+"\nnew\nkept\n640\n640\n", out)
+		}
+	})
+
 	t.Run("empty list", func(ctx context.Context, t *testctx.T) {
 		out, err := ctr.WithMountedFiles("/mnt/files", []*sdkcore.File{}).
 			WithExec([]string{"sh", "-c", "test -d /mnt/files && ls -A /mnt/files"}).
@@ -4797,6 +4815,39 @@ func kernelAtLeast(t testing.TB, release string, major, minor int) bool {
 	_, err := fmt.Sscanf(strings.TrimSpace(release), "%d.%d", &gotMajor, &gotMinor)
 	require.NoError(t, err)
 	return gotMajor > major || gotMajor == major && gotMinor >= minor
+}
+
+// An exec whose process the kernel's OOM killer killed fails with an error
+// that says so, not only with its exit code.
+func (ContainerSuite) TestExecOOMKilled(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	ctr := sdkcore.NewQuery(c).Container().From(alpineImage)
+	out, err := ctr.
+		WithExec([]string{"sh", "-c", "test -f /sys/fs/cgroup/cgroup.controllers || echo no-cgroup-v2"}).
+		Stdout(ctx)
+	require.NoError(t, err)
+	if strings.TrimSpace(out) == "no-cgroup-v2" {
+		t.Skip("the engine's execs aren't on cgroup v2")
+	}
+
+	// Give a process a memory limit it exceeds, in a cgroup of its own below
+	// the exec's. A cgroup with children can't hold processes, so the exec's
+	// processes move to a sibling first.
+	_, err = ctr.
+		WithExec([]string{"sh", "-c", `
+cd /sys/fs/cgroup
+mkdir procs oom
+for pid in $(cat cgroup.procs); do echo $pid > procs/cgroup.procs 2>/dev/null || :; done
+set -e
+echo +memory > cgroup.subtree_control
+echo 16M > oom/memory.max
+sh -c 'echo $$ > /sys/fs/cgroup/oom/cgroup.procs && exec tail /dev/zero'
+`}, sdkcore.ContainerWithExecOpts{
+			InsecureRootCapabilities: true,
+		}).
+		Sync(ctx)
+	requireErrOut(t, err, "exit code: 137: out of memory")
 }
 
 func (ContainerSuite) TestInsecureRootCapabilitesWithService(ctx context.Context, t *testctx.T) {

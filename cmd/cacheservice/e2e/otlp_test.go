@@ -16,6 +16,11 @@ import (
 // either (cmd/cacheservice's README, "OTLP limits").
 const otlpMargin = 10
 
+// otlpDepthMargin is the least factor by which MaxOTLPNesting must exceed the
+// deepest nesting real engines sent in the run. OTLP's own messages take 8
+// levels before an AnyValue, so a margin of otlpMargin is out of reach.
+const otlpDepthMargin = 2
+
 // otlpRoutes are the OTLP routes, and their limits.
 var otlpRoutes = []struct {
 	name  string
@@ -43,8 +48,13 @@ type otlpSizes struct {
 }
 
 // routeSizes are a route's requests taken: how many, and the largest as
-// received, decoded, and as the decoded message's estimated heap.
-type routeSizes struct{ n, received, decoded, message int64 }
+// received, decoded, as the decoded message's estimated heap, and how many
+// levels of messages the deepest nests.
+type routeSizes struct {
+	n, received, decoded, message, headers, depth int64
+	// json is whether any request taken was JSON, whose depth isn't measured.
+	json bool
+}
 
 // otlpSizesOf reads the OTLP records of the logs.
 func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
@@ -55,7 +65,9 @@ func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
 			decoded, err2 := attrInt(rec, "decodedBytes")
 			peak, err3 := attrInt(rec, "budgetPeak")
 			message, err4 := attrInt(rec, "messageBytes")
-			if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+			headers, err5 := attrInt(rec, "headerBytes")
+			depth, err6 := attrInt(rec, "nestingDepth")
+			if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil || err6 != nil {
 				out.malformed = append(out.malformed, rec)
 				continue
 			}
@@ -69,6 +81,11 @@ func otlpSizesOf(logs ...*LogRecorder) otlpSizes {
 			sz.received = max(sz.received, received)
 			sz.decoded = max(sz.decoded, decoded)
 			sz.message = max(sz.message, message)
+			sz.headers = max(sz.headers, headers)
+			if depth < 0 {
+				sz.json = true
+			}
+			sz.depth = max(sz.depth, depth)
 			out.budgetPeak = max(out.budgetPeak, peak)
 		}
 		out.refused = append(out.refused, l.Since(0, "otlp request refused", nil)...)
@@ -105,6 +122,20 @@ func (s *state) otlpSizes(t *testing.T) {
 		Check(t, largest*otlpMargin <= route.limit,
 			"%s: %d requests, largest %d bytes received, %d decoded; limit %d (%.0fx the largest)",
 			route.name, sz.n, sz.received, sz.decoded, route.limit, float64(route.limit)/float64(max(largest, 1)))
+		// The headers' reserve (otlpHeaderReserve) is what the service
+		// refuses over MaxOTLPHeaderReserve. It is never less than their
+		// wire bytes, so the margin bounds those against MaxHeaderBytes too.
+		Check(t, sz.headers*otlpMargin <= server.MaxOTLPHeaderReserve,
+			"%s: largest request headers reserved at %d bytes; MaxOTLPHeaderReserve %d", route.name, sz.headers, int64(server.MaxOTLPHeaderReserve))
+		// A body nested past MaxOTLPNesting is refused before it is decoded
+		// (zerobull-consulting/dagger#86). OTLP's own messages nest 8 deep to
+		// an AnyValue, so this is a margin of 2, not otlpMargin.
+		// A JSON request's depth is not measured (-1): real engines send
+		// protobuf, so one in JSON is a change to look at, not to pass.
+		Check(t, !sz.json, "%s: every request taken was protobuf, so its nesting was measured", route.name)
+		t.Logf("%s: deepest request nests %d levels of messages; limit %d", route.name, sz.depth, server.MaxOTLPNesting)
+		Check(t, sz.depth*otlpDepthMargin <= server.MaxOTLPNesting,
+			"%s: deepest request nests %d levels; MaxOTLPNesting %d", route.name, sz.depth, server.MaxOTLPNesting)
 		Check(t, sz.message*otlpMargin <= server.OTLPDecodeBudget,
 			"%s: largest decoded message estimated at %d bytes; budget %d", route.name, sz.message, int64(server.OTLPDecodeBudget))
 	}

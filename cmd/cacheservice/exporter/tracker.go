@@ -35,6 +35,16 @@ const (
 	// DefaultMaxFailures is how many failed exports of the same value a
 	// root gets before the tracker stops trying it.
 	DefaultMaxFailures = 5
+	// DefaultPausedWait is how long a root waits to be exported again after
+	// its engine refused it as paused (Result.Paused), unless the engine
+	// opens a new idle period or connects again first, which make it due.
+	DefaultPausedWait = time.Minute
+	// seenSessionRetention is how long the tracker remembers a session it
+	// stopped tracking, for UnseenSessions.
+	seenSessionRetention = 2 * time.Minute
+	// maxSeenSessions bounds the sessions a cache remembers so; past it the
+	// memory starts afresh.
+	maxSeenSessions = 4096
 	// maxBatchRoots bounds the roots of one export, so its request stays
 	// small. More roots due wait for the next batch.
 	maxBatchRoots = 1000
@@ -53,6 +63,7 @@ type TrackerConfig struct {
 	BusyBackoff    time.Duration
 	MaxBusyBackoff time.Duration
 	MaxFailures    int
+	PausedWait     time.Duration
 	// Notify, if set, is called when something may have become due sooner
 	// than NextDue said, or an export slot was freed: the scheduler should
 	// call Due again. It is called with the tracker's lock held, so it
@@ -82,6 +93,10 @@ type TrackerConfig struct {
 //     not exported again. Nor is one imported from the store with them
 //     (Imported), one refused for the same value, or one whose expiry or
 //     retention has lapsed.
+//   - A root its engine refused because it has given up its remote-cache
+//     work until its next session (Result.Paused) waits for the engine: it
+//     is due again when the engine opens a new idle period (Opened) or
+//     connects again, or after PausedWait. It counts no failure.
 //   - Busy roots, and roots whose export failed, are exported again later,
 //     with backoff. A root whose value changed while its export was in
 //     flight is dirty again, and due by the same rule.
@@ -127,6 +142,26 @@ type trackedCache struct {
 	// engine number: what the merge left on each entry. Kept apart from
 	// entries, which are forgotten when their spans stop.
 	imports map[uint64]*exportedValue
+	// engineWakes counts the times the cache's engine came back for the
+	// entries that wait for it (wakeEngineWaitLocked): a batch claimed
+	// before the latest one doesn't make its roots wait for the next.
+	engineWakes uint64
+	// quietUntil, when set, holds the cache's exports back until then
+	// (Quiet): its engine settled, and pauses if an export is in progress
+	// when its bound after its last session passes.
+	quietUntil time.Time
+	// seen are the sessions no longer tracked, with when their tracking
+	// ended: every counted span in, or their spans stopped (UnseenSessions).
+	seen map[string]time.Time
+}
+
+// untrackLocked stops tracking a session, and remembers it as seen.
+func (c *trackedCache) untrackLocked(id string, now time.Time) {
+	delete(c.sessions, id)
+	if c.seen == nil || len(c.seen) >= maxSeenSessions {
+		c.seen = map[string]time.Time{}
+	}
+	c.seen[id] = now
 }
 
 // trackedSession is what the carrier's speed-up needs of a session.
@@ -164,11 +199,22 @@ type trackedEntry struct {
 	refusedMessage string
 	// retryAt is when a busy or failed root is due again; zero when it
 	// isn't waiting.
-	retryAt  time.Time
+	retryAt time.Time
+	// engineWaitAt is set while the entry waits for its cache's engine to
+	// connect (Requeue, Interrupted), not for a backoff: Connected makes it
+	// due. Every other write of retryAt clears it.
+	engineWaitAt time.Time
+	// paused is set while the wait is for an engine that refused the root
+	// because it has given up its remote-cache work (Result.Paused); see
+	// isPaused.
+	paused   bool
 	busy     int
 	failures int
 	// failedValue is the value failures counts for.
 	failedValue *exportedValue
+	// flushRetry is where the entry is in a flush's retry of a failed
+	// root (see StartFlush and flushRetry).
+	flushRetry flushRetry
 	// inFlight is set while a batch holds the entry.
 	inFlight bool
 	// recheck is set when a newer generation cleared the entry's
@@ -188,6 +234,36 @@ type trackedEntry struct {
 	changedAt time.Time
 	busyAt    time.Time
 }
+
+// isPaused reports whether the entry waits for an engine that has given up
+// its remote-cache work until its next session: only the engine's open or
+// a new connection ends that, so a drain or a flush neither waits for the
+// entry nor tries it (DrainState.Paused).
+func (e *trackedEntry) isPaused() bool {
+	return e.paused && !e.engineWaitAt.IsZero()
+}
+
+// flushRetry is how a flush's retry of a failed root stands. A flush cuts
+// short a failed root's wait (flushRetryCut) unless a try that a flush made
+// due started it (flushRetryFailed): so each failure wait is cut short by a
+// flush at most once in a row, and a caller that loops flushes can't make a
+// failing root reach MaxFailures at its own rate.
+type flushRetry uint8
+
+const (
+	// flushRetryNone: the entry's wait, if any, wasn't cut short by a
+	// flush, and wasn't started by a try a flush made due.
+	flushRetryNone flushRetry = iota
+	// flushRetryCut: a flush cut short the wait after a failed try; the
+	// entry's next try is the flush's.
+	flushRetryCut
+	// flushRetryTrying: the flush's try is in flight.
+	flushRetryTrying
+	// flushRetryFailed: the flush's try failed, for the value it is
+	// waiting with. No flush cuts the wait it started short; one does
+	// once the value changed.
+	flushRetryFailed
+)
 
 // exportedValue is the state of a value an export covered.
 type exportedValue struct {
@@ -236,6 +312,9 @@ func NewTracker(cfg TrackerConfig) *Tracker {
 	}
 	if cfg.MaxFailures <= 0 {
 		cfg.MaxFailures = DefaultMaxFailures
+	}
+	if cfg.PausedWait <= 0 {
+		cfg.PausedWait = DefaultPausedWait
 	}
 	return &Tracker{
 		cfg:         cfg,
@@ -424,7 +503,7 @@ func (t *Tracker) accelerateIfInLocked(c *trackedCache, id string, s *trackedSes
 			t.scheduleLocked(c, n, e, now)
 		}
 	}
-	delete(c.sessions, id)
+	c.untrackLocked(id, now)
 }
 
 // scheduleLocked brings NextDue forward to when entry n is due, if that is
@@ -596,14 +675,96 @@ func (t *Tracker) Started(cacheID string, generation uint64, wipedCache string) 
 // as a span or event of that generation would. A newer generation clears the
 // cache's stale-generation refusals, which are exported again (see cache),
 // even when no span or event of that generation reaches this service, as
-// when it goes to another replica.
-func (t *Tracker) Connected(cacheID string, generation uint64) {
+// when it goes to another replica. An entry waiting for an engine of that
+// generation to connect (see Requeue, Interrupted) is due at now: not at the
+// end of its wait. A backoff after a failed or busy export is left to run.
+func (t *Tracker) Connected(cacheID string, generation uint64, now time.Time) {
 	if cacheID == "" {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.cache(cacheID, generation)
+	c := t.cache(cacheID, generation)
+	if c == nil {
+		// An older generation than the tracker's: the engine entries
+		// wait for is not this one. Past this check the hello is at the
+		// tracker's generation or newer, so the connection can serve them.
+		return
+	}
+	t.wakeEngineWaitLocked(c, now)
+}
+
+// Opened records that an engine of cacheID at generation opened a new idle
+// period (protocol.Open): a session started on it, so it takes exports
+// again. The entries that wait for the engine, as those it refused while
+// paused do (Result.Paused), are due at now.
+func (t *Tracker) Opened(cacheID string, generation uint64, now time.Time) {
+	t.WakeEngineWait(cacheID, generation, now)
+}
+
+// Quiet holds the exports of cacheID back until until, unless a flush or a
+// drain makes them urgent, or its engine opens a new idle period or
+// connects again first. A settle that answered settled calls it: the engine
+// gives up its remote-cache work, and cancels its exports, if one is in
+// progress when its bound after its last session passes, settled or not;
+// once that moment has passed with none, it takes exports until its next
+// session. So what comes due meanwhile, as a retry or a late span's entry,
+// waits for it.
+//
+// wakes is EngineWakes as read before the caller decided the engine was
+// settled: if the engine opened a period or connected since, that decision
+// is of an earlier period, and the quiet isn't set. Without it, an open
+// that lands between the decision and this call would end the quiet first,
+// and this call would then put the earlier period's back.
+func (t *Tracker) Quiet(cacheID string, until time.Time, wakes uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c := t.caches[cacheID]; c != nil && c.engineWakes == wakes && until.After(c.quietUntil) {
+		c.quietUntil = until
+	}
+}
+
+// EngineWakes counts the times the engine of cacheID opened a new idle
+// period or connected (Opened, Connected, WakeEngineWait), for Quiet.
+func (t *Tracker) EngineWakes(cacheID string) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c := t.caches[cacheID]; c != nil {
+		return c.engineWakes
+	}
+	return 0
+}
+
+// WakeEngineWait makes the entries of a cache that wait for its engine due at
+// now, when an engine of generation, or a newer one than the tracker's, is
+// connected. Unlike Connected it records nothing of the generation: it is for
+// a connection already welcomed, found after a requeue (see Requeue) that a
+// hello's Connected ran too early to wake.
+func (t *Tracker) WakeEngineWait(cacheID string, generation uint64, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c := t.caches[cacheID]; c != nil && generation >= c.generation {
+		t.wakeEngineWaitLocked(c, now)
+	}
+}
+
+func (t *Tracker) wakeEngineWaitLocked(c *trackedCache, now time.Time) {
+	c.engineWakes++
+	// A session started, or the engine connected anew: its bound after
+	// the last session no longer runs.
+	c.quietUntil = time.Time{}
+	woke := false
+	for _, e := range c.entries {
+		// A paused entry's own wait may have passed with a drain leaving
+		// it be: it is due now all the same.
+		if !e.engineWaitAt.IsZero() && (e.retryAt.After(now) || e.paused) {
+			e.retryAt, e.engineWaitAt = now, time.Time{}
+			woke = true
+		}
+	}
+	if woke {
+		t.soonLocked(now)
+	}
 }
 
 // ImportedValue is a stored value merged into an engine cache: the engine
@@ -649,6 +810,8 @@ type Batch struct {
 	values map[uint64]*exportedValue
 	// generation is the cache's generation when the batch was claimed.
 	generation uint64
+	// engineWakes is the cache's count of them when the batch was claimed.
+	engineWakes uint64
 	// slot is set when the batch holds its cache's slot (Due, DrainDue):
 	// Done, Interrupted or Requeue frees it.
 	slot bool
@@ -716,7 +879,12 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 				// and takes no more of it; an ended one is waited for
 				// until its spans are in, or have settled.
 				drain && (!s.ended() || now.Sub(s.lastSpanAt) >= t.drainSessionWait()):
-				delete(c.sessions, id)
+				c.untrackLocked(id, now)
+			}
+		}
+		for id, at := range c.seen {
+			if now.Sub(at) >= seenSessionRetention {
+				delete(c.seen, id)
 			}
 		}
 		held := t.heldLocked(cacheID)
@@ -733,7 +901,7 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 			if !t.wantedLocked(c, n, e, now) {
 				// No longer worth exporting, as once stored, pruned or
 				// expired: stop waiting, so the entry can be forgotten.
-				e.retryAt, e.recheck, e.accel, e.dirtySince = time.Time{}, false, false, time.Time{}
+				e.retryAt, e.engineWaitAt, e.recheck, e.accel, e.dirtySince = time.Time{}, time.Time{}, false, false, time.Time{}
 				// An entry the engine no longer keeps (not retained,
 				// pruned or expired) is forgotten once its spans have
 				// stopped coming. A stored one is kept, so its stored
@@ -741,6 +909,12 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 				if t.lapsedLocked(e, now) && now.Sub(e.lastSeen) >= t.cfg.ForgetAfter {
 					delete(c.entries, n)
 				}
+				continue
+			}
+			if t.draining && e.isPaused() {
+				// A drain asks a paused engine nothing more: its answer
+				// is known, and only its open or a new connection, which
+				// make the entry due, change it.
 				continue
 			}
 			at, ok := t.dueAtLocked(e, now, urgent)
@@ -764,6 +938,13 @@ func (t *Tracker) due(now time.Time, drain bool) []Batch {
 		}
 		if held {
 			t.waiting += len(due)
+			continue
+		}
+		if !urgent && now.Before(c.quietUntil) {
+			// Quiet: what is due waits for the engine's bound to pass.
+			if len(due) > 0 && (t.next.IsZero() || c.quietUntil.Before(t.next)) {
+				t.next = c.quietUntil
+			}
 			continue
 		}
 		// The longest due first, so that under a backlog of more than a
@@ -827,12 +1008,12 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 			if !e.inFlight {
 				// No longer worth a retry, as once pruned or expired: stop
 				// waiting, so the entry can be forgotten.
-				e.retryAt = time.Time{}
+				e.retryAt, e.engineWaitAt = time.Time{}, time.Time{}
 			}
 			continue
 		}
 		if cur == nil || len(cur.Request.Roots) >= maxBatchRoots {
-			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}, generation: c.generation})
+			batches = append(batches, Batch{CacheID: cacheID, values: map[uint64]*exportedValue{}, generation: c.generation, engineWakes: c.engineWakes})
 			cur = &batches[len(batches)-1]
 		}
 		t.claimLocked(e)
@@ -849,7 +1030,12 @@ func (t *Tracker) batchesLocked(cacheID string, c *trackedCache, numbers []uint6
 // now, so it is no longer dirty. A change from now on makes it dirty again.
 func (t *Tracker) claimLocked(e *trackedEntry) {
 	e.inFlight = true
-	e.retryAt, e.recheck = time.Time{}, false
+	if e.flushRetry == flushRetryCut {
+		e.flushRetry = flushRetryTrying
+	} else {
+		e.flushRetry = flushRetryNone
+	}
+	e.retryAt, e.engineWaitAt, e.recheck, e.paused = time.Time{}, time.Time{}, false, false
 	e.dirtySince, e.accel, e.busyAt = time.Time{}, false, time.Time{}
 }
 
@@ -990,9 +1176,25 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		}
 		settled[s.Number] = true
 	}
+	for _, n := range res.Paused {
+		// The engine's refusal, not the value's: it waits for the engine,
+		// as a root given back for a connection does. An engine that came
+		// back while the export was in flight (Opened, Connected) isn't
+		// waited for again: the root is due now.
+		if e := entry(n); e != nil {
+			if b.engineWakes != c.engineWakes {
+				e.retryAt, e.engineWaitAt = now, time.Time{}
+			} else {
+				at := now.Add(t.cfg.PausedWait)
+				e.retryAt, e.engineWaitAt, e.paused = at, at, true
+			}
+			e.flushRetry = givenBack(e.flushRetry)
+		}
+		settled[n] = true
+	}
 	for _, s := range res.Busy {
 		if e := entry(s.Number); e != nil {
-			e.retryAt = now.Add(t.backoff(e.busy))
+			e.retryAt, e.engineWaitAt = now.Add(t.backoff(e.busy)), time.Time{}
 			e.busy++
 			e.busyAt = now
 		}
@@ -1009,7 +1211,10 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		}
 		e.failures++
 		if e.failures < t.cfg.MaxFailures {
-			e.retryAt = now.Add(t.backoff(e.failures - 1))
+			e.retryAt, e.engineWaitAt = now.Add(t.backoff(e.failures-1)), time.Time{}
+			if e.flushRetry == flushRetryTrying {
+				e.flushRetry = flushRetryFailed
+			}
 		}
 	}
 	for _, f := range res.Failed {
@@ -1020,7 +1225,8 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		if !settled[n] {
 			if !interruptedRetry.IsZero() {
 				if e := c.entries[n]; e != nil {
-					e.retryAt = interruptedRetry
+					e.retryAt, e.engineWaitAt = interruptedRetry, interruptedRetry
+					e.flushRetry = givenBack(e.flushRetry)
 				}
 			} else {
 				failed(n)
@@ -1031,6 +1237,10 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 			continue
 		}
 		e.inFlight = false
+		if e.flushRetry == flushRetryTrying {
+			// Stored, refused, gone, busy, or failed for the last time.
+			e.flushRetry = flushRetryNone
+		}
 		// The value may have changed since the snapshot exported, or been
 		// stored or refused for it. A value that changed in flight is
 		// dirty again, and is due once it settles, or MaxDelay after the
@@ -1039,7 +1249,7 @@ func (t *Tracker) done(b Batch, res Result, now, interruptedRetry time.Time) {
 		// change, as when a stale refusal was dropped, is due now.
 		if t.wantedLocked(c, n, e, now) {
 			if e.retryAt.IsZero() && e.dirtySince.IsZero() {
-				e.retryAt = now
+				e.retryAt, e.engineWaitAt = now, time.Time{}
 			}
 			t.scheduleLocked(c, n, e, now)
 		}
@@ -1058,7 +1268,7 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 	if c == nil {
 		return b, nil
 	}
-	b.generation = c.generation
+	b.generation, b.engineWakes = c.generation, c.engineWakes
 	for _, n := range req.Roots {
 		if e := c.entries[n]; e != nil && e.inFlight {
 			return Batch{}, fmt.Errorf("root %d is already being exported", n)
@@ -1071,6 +1281,15 @@ func (t *Tracker) Claim(cacheID string, req Request) (Batch, error) {
 		}
 	}
 	return b, nil
+}
+
+// givenBack is a flush retry's state once its try was given back before it
+// ran (Requeue, Interrupted): the try that runs later is still the flush's.
+func givenBack(r flushRetry) flushRetry {
+	if r == flushRetryTrying {
+		return flushRetryCut
+	}
+	return r
 }
 
 func (t *Tracker) backoff(n int) time.Duration {
@@ -1170,7 +1389,8 @@ func (t *Tracker) Requeue(b Batch, at time.Time) {
 	for n := range b.values {
 		if e := c.entries[n]; e != nil {
 			e.inFlight = false
-			e.retryAt = at
+			e.retryAt, e.engineWaitAt = at, at
+			e.flushRetry = givenBack(e.flushRetry)
 			t.soonLocked(at)
 		}
 	}
@@ -1190,8 +1410,8 @@ func (t *Tracker) StartDrain(now time.Time) {
 	t.draining = true
 	for _, c := range t.caches {
 		for _, e := range c.entries {
-			if !e.inFlight && e.retryAt.After(now) {
-				e.retryAt = now
+			if !e.inFlight && e.retryAt.After(now) && !e.isPaused() {
+				e.retryAt, e.engineWaitAt = now, time.Time{}
 			}
 		}
 	}
@@ -1218,9 +1438,16 @@ type DrainState struct {
 	// deadline, and Later those whose try is due after it.
 	Retrying int `json:"retrying"`
 	Later    int `json:"later"`
+	// Paused are the roots the cache's engine refused because it has given
+	// up its remote-cache work until its next session (Result.Paused). A
+	// drain or a flush neither waits for them nor tries them again: they
+	// are left, and are lost if the engine stops before a session starts
+	// on it. They aren't among Roots.
+	Paused int `json:"paused,omitempty"`
 }
 
-// Roots is how many roots the cache has left to export.
+// Roots is how many roots the cache has left that the service can still
+// export: all but Paused.
 func (s DrainState) Roots() int { return s.Pending + s.InFlight + s.Retrying + s.Later }
 
 // DrainStatus returns what each cache has left to export at now, for a drain
@@ -1231,7 +1458,7 @@ func (t *Tracker) DrainStatus(now, deadline time.Time) []DrainState {
 	var out []DrainState
 	for _, cacheID := range slices.Sorted(maps.Keys(t.caches)) {
 		st := t.leftLocked(t.caches[cacheID], now, deadline, true)
-		if st.Sessions > 0 || st.Roots() > 0 {
+		if st.Sessions > 0 || st.Roots() > 0 || st.Paused > 0 {
 			out = append(out, st)
 		}
 	}
@@ -1254,6 +1481,8 @@ func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain boo
 		case e.inFlight:
 			st.InFlight++
 		case !t.wantedLocked(c, n, e, now):
+		case e.isPaused():
+			st.Paused++
 		case e.recheck && e.retryAt.IsZero():
 			// Due at the next Due or DrainDue (see cache).
 			st.Retrying++
@@ -1278,10 +1507,42 @@ func (t *Tracker) leftLocked(c *trackedCache, now, deadline time.Time, drain boo
 	return st
 }
 
+// UnseenSessions is how many of the given sessions of cacheID the tracker has
+// seen nothing of: no span and no carrier, now or in the last
+// seenSessionRetention. A settle (protocol.Settle) waits a while for those
+// whose engine sent their completion marker: their spans are on their way,
+// and FlushStatus counts a session only once one of them came.
+func (t *Tracker) UnseenSessions(cacheID string, sessions []string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c := t.caches[cacheID]
+	if c == nil {
+		return len(sessions)
+	}
+	n := 0
+	for _, id := range sessions {
+		if _, tracked := c.sessions[id]; tracked {
+			continue
+		}
+		if _, seen := c.seen[id]; seen {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // StartFlush starts a flush of one cache: until end is called, every
 // dirty entry of cacheID is due at once, without waiting for it to settle,
 // as in a drain; and every root of it waiting for another try is due now,
-// once. Retries after that wait their normal backoff. Unlike StartDrain, it
+// once. Retries after that wait their normal backoff. A failed root whose
+// wait began with a try a flush made due, and that failed again, isn't due
+// at once: it waits out that backoff, and a flush after its next try, or
+// once its value changed, may cut its wait short again. So looped flushes retry a failing root at most
+// once per backoff of its own, and it reaches MaxFailures at most twice as
+// fast as its backoff alone would take it there; a busy root, which doesn't count toward MaxFailures, or one
+// waiting for its engine to connect, is due at every flush. One its engine
+// refused as paused isn't (DrainState.Paused). Unlike StartDrain, it
 // changes nothing else: spans, session ends and other caches are taken and
 // scheduled as usual, and the scheduler runs the exports (Due), one at a
 // time per cache. Flushes of one cache may overlap: the cache is flushing
@@ -1292,9 +1553,15 @@ func (t *Tracker) StartFlush(cacheID string, now time.Time) (end func()) {
 	t.flushing[cacheID]++
 	if c := t.caches[cacheID]; c != nil {
 		for _, e := range c.entries {
-			if !e.inFlight && e.retryAt.After(now) {
-				e.retryAt = now
+			if e.inFlight || !e.retryAt.After(now) || e.isPaused() || (e.flushRetry == flushRetryFailed && e.failedValue.covers(e)) {
+				continue
 			}
+			// A wait after a failed try: neither busy nor for the engine.
+			e.flushRetry = flushRetryNone
+			if e.busyAt.IsZero() && e.engineWaitAt.IsZero() && e.failures > 0 {
+				e.flushRetry = flushRetryCut
+			}
+			e.retryAt, e.engineWaitAt = now, time.Time{}
 		}
 	}
 	// Due at once: wake the scheduler. It finds nothing to do for a cache

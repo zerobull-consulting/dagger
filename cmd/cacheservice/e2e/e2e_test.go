@@ -111,6 +111,9 @@ func TestRealEngines(t *testing.T) {
 	// A clean stop (#63): the service drains with an export in flight, and
 	// replaces the main service once more.
 	env.Run("drain", st.drain)
+	// Over every service's log: the two leads of
+	// zerobull-consulting/dagger#154, as real engines report spans.
+	env.Run("leads", st.leads)
 	// Last, over every service's log: the largest OTLP requests the engines
 	// sent, against the limits (zerobull-consulting/dagger#77).
 	env.Run("otlp-sizes", st.otlpSizes)
@@ -247,6 +250,11 @@ func (s *state) hit() bool {
 	engines := env.StartEngines(s.main, "a", "b")
 	s.a, s.b = engines[0], engines[1]
 	cacheB := s.b.CacheID()
+	// From before A builds: since v1.0.0-beta.26 an engine downloads an
+	// offered part's blobs when the merge offers it, ahead of the read
+	// (dagql's part prefetch), so B reads A's layers as soon as they are
+	// merged into it, before its own query.
+	s3Mark := s.env.Proxy.Mark()
 
 	res, timeA := s.a.Query("run-a", pipeline)
 	// Trimmed, as the outputs compared with it are: the file ends with a
@@ -274,7 +282,7 @@ func (s *state) hit() bool {
 		return err == nil && len(st.Merged) > 0, err
 	})
 
-	logMark, s3Mark := s.main.Logs.Mark(), env.Proxy.Mark()
+	logMark := s.main.Logs.Mark()
 	res, timeB := s.b.Query("run-b", pipeline)
 	stampB := strings.TrimSpace(Field(res, stampPath))
 	t.Logf("B took %s. Stamp:\n%s", timeB.Round(10*time.Millisecond), stampB)
@@ -469,9 +477,18 @@ func envelopes(svc *Service, mark int, conn uint64, types ...protocol.Type) []Lo
 
 // renew (#31): a pull survives presigned GET expiry through renew; a missing
 // layer degrades to a cache miss.
+//
+// Since v1.0.0-beta.26 an engine downloads an offered part's blobs when the
+// merge offers it (dagql's part prefetch), within milliseconds, so a merged
+// GET is used long before it expires. To still read through expired GETs,
+// the S3 proxy refuses C's and D's blob downloads until the merged GETs
+// have expired: their prefetch fails, and the read after that finds only
+// expired addresses.
 func (s *state) renew(t *testing.T) {
 	env := s.env
 	s.startReplica()
+	noPrefetch := env.Proxy.Inject(&Fault{Name: "refuse-blob-gets", Match: Methods("/blobs/", http.MethodGet), Status: http.StatusServiceUnavailable, Code: "SlowDown"})
+	t.Cleanup(func() { env.Proxy.Remove(noPrefetch) })
 	engines := env.StartEngines(s.replica, "c", "d")
 	c, d := engines[0], engines[1]
 	s.c = c
@@ -480,13 +497,24 @@ func (s *state) renew(t *testing.T) {
 	s.waitMergedAll(s.replica, d, roots)
 	mergedAt := time.Now()
 	wait := env.Settings.GetExpiry + 2*time.Second
-	t.Logf("waiting %s for the merged GETs to expire", wait)
+	t.Logf("waiting %s for the merged GETs to expire, with blob downloads refused", wait)
 	time.Sleep(wait)
+	env.Proxy.Remove(noPrefetch)
+	t.Logf("blob downloads go through again, after %d were refused", env.Proxy.Hits(noPrefetch))
 
 	// C reads the layers, after the GETs expired.
 	logMark, s3Mark := s.replica.Logs.Mark(), env.Proxy.Mark()
 	res, timeC := c.Query("renew-verify-c", verifyQuery())
 	outC := strings.TrimSpace(Field(res, verifyPath))
+	// D must not download the last exec's layer before it is deleted below:
+	// the merge of C's verify exec, exported next, offers D that layer again
+	// with fresh GETs, which D would prefetch.
+	top := s.layersA[len(s.layersA)-1]
+	refuseTop := env.Proxy.Inject(&Fault{Name: "refuse-top-layer", Status: http.StatusServiceUnavailable, Code: "SlowDown",
+		Match: func(method, path string) bool {
+			return method == http.MethodGet && strings.HasSuffix(path, "/blobs/"+top.Algorithm().String()+"/"+top.Encoded())
+		}})
+	t.Cleanup(func() { env.Proxy.Remove(refuseTop) })
 	t.Logf("C took %s, %s after the merge. Output:\n%s", timeC.Round(10*time.Millisecond), time.Since(mergedAt).Round(time.Second), outC)
 	renews := envelopes(s.replica, logMark, c.Conn, protocol.TypeRenew)
 	reneweds := envelopes(s.replica, logMark, c.Conn, protocol.TypeRenewed)
@@ -525,9 +553,10 @@ func (s *state) renew(t *testing.T) {
 	// layer deleted before it: the service asks only for the blobs the store
 	// lacks, and C has them all on disk now.
 	s.waitStored(s.replica, c, "C's verify exec to be stored")
-	top := s.layersA[len(s.layersA)-1]
-	t.Logf("deleting the last exec's layer %s... from MinIO, and reading the layers on D", Short(top.String()))
+	t.Logf("deleting the last exec's layer %s... from MinIO, waiting %s for D's GETs to expire, and reading the layers on D", Short(top.String()), wait)
 	env.DeleteBlob(top)
+	env.Proxy.Remove(refuseTop)
+	time.Sleep(wait)
 	logMark = s.replica.Logs.Mark()
 	res, timeD := d.Query("renew-verify-d", verifyQuery())
 	outD := strings.TrimSpace(Field(res, verifyPath))
@@ -785,6 +814,9 @@ func (s *state) superseded(t *testing.T) {
 		r2.engineNum, r2.serviceNum, Short(r2.bundle), Short(r2.layer.String()), r2.replacements)
 
 	t.Log("starting engine F, with an empty cache, and reading the value on it")
+	// From before F connects: it downloads a merged part's blobs when the
+	// merge offers it, ahead of its read (see hit).
+	s3Mark := env.Proxy.Mark()
 	f := env.StartEngines(s.main, "f")[0]
 	cacheF := f.CacheID()
 	// Both bundles, before F reads: the importer records each merge as it
@@ -827,7 +859,7 @@ func (s *state) superseded(t *testing.T) {
 		tooShort("before F read it")
 	}
 	t.Logf("F reads the value %s before it expires", time.Until(r2.expiresAt).Round(100*time.Millisecond))
-	mark, s3Mark := s.main.Logs.Mark(), env.Proxy.Mark()
+	mark = s.main.Logs.Mark()
 	_, timeF := f.CLI(nil, "superseded-read-f", "", "-m", mod, "call", "stamp-2", "file", "--path", "/stamp2", "contents")
 	readF := lastSpan(mark, cacheF)
 	gets := env.Proxy.Blobs(s3Mark, http.MethodGet)

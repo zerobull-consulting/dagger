@@ -91,18 +91,20 @@
 //     never writes to or deletes from the bucket, so it runs with a
 //     read-only key: no export path (spans are received and dropped), no
 //     conditional write check at startup, no GC, and no import records in
-//     the index. It refuses -import=false, no CACHESERVICE_S3_BUCKET, and
-//     an explicit nonzero -gc-interval. See README.md, "Read-only
-//     instances".
+//     the index. It is -gc-mode=off. It refuses -import=false, no
+//     CACHESERVICE_S3_BUCKET, and an explicit -gc-mode=service or batch.
+//     See README.md, "Read-only instances".
 //
-//   - with CACHESERVICE_S3_BUCKET set, garbage collection, every
-//     -gc-interval: per namespace in the bucket, it expires entries past
-//     their expiry, -max-age or -max-bytes (per namespace with
-//     -namespaces-file, which SIGHUP reloads too), and deletes what no live
-//     entry names, and staged and incomplete multipart uploads older than
-//     -gc-staging-age (an export's upload timeout plus an hour). POST
-//     /debug/gc runs it now (?dry-run: report only). See
-//     README.md, "Retention and garbage collection".
+//   - with CACHESERVICE_S3_BUCKET set, garbage collection, by -gc-mode:
+//     service (the default) runs it every -gc-interval, batch only on POST
+//     /debug/gc (a 'cacheservice gc' job collects), off never. Per
+//     namespace in the bucket, it expires entries past their expiry,
+//     -max-age or -max-bytes (per namespace with -namespaces-file, which
+//     SIGHUP reloads too), and deletes what no live entry names, and staged
+//     and incomplete multipart uploads older than -gc-staging-age (an
+//     export's upload timeout plus an hour). POST /debug/gc runs it now
+//     (?dry-run: report only; off answers 409). See README.md, "Retention
+//     and garbage collection".
 //
 // With -tls-cert and -tls-key, the engine address serves HTTPS (wss:// for
 // the WebSocket); otherwise run it behind a TLS-terminating proxy. See
@@ -117,6 +119,19 @@
 // `cacheservice lifecycle plan|claim|apply|check` is a one-shot subcommand, not
 // the service: it claims the prefix, sets or checks the bucket's lifecycle
 // rules, with the admin key (package lifecycle; README.md, "The lifecycle command").
+//
+// `cacheservice wipe` is another: it empties the prefix, of any layout, a dry
+// run unless given -dry-run=false and -confirm=<bucket>/<prefix> (package
+// wipe; README.md, "Changing layouts").
+//
+// `cacheservice gc` is a third: it runs one garbage collection over every
+// namespace and exits, a dry run unless given -confirm=<bucket>/<prefix> and
+// explicit limits; the job that collects a bucket whose writers run with
+// -gc-mode=batch (package gccmd; README.md, "The gc command").
+//
+// `cacheservice provision claim|rules create|read|update|delete` does what
+// lifecycle claim and apply do, as two declarative resources, for
+// Terraform's shell provider (package provision).
 package main
 
 import (
@@ -137,18 +152,29 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/compat"
 	"github.com/dagger/dagger/cmd/cacheservice/exporter"
 	"github.com/dagger/dagger/cmd/cacheservice/gc"
+	"github.com/dagger/dagger/cmd/cacheservice/gccmd"
 	"github.com/dagger/dagger/cmd/cacheservice/lifecycle"
+	"github.com/dagger/dagger/cmd/cacheservice/provision"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
+	"github.com/dagger/dagger/cmd/cacheservice/wipe"
 )
 
 // subcommands are the one-shot commands of the binary, by name: each reads
 // the CACHESERVICE_S3_* settings as the service does, and returns its exit
-// code. A later one, such as wipe (zerobull-consulting/dagger#94), follows
-// lifecycle's shape: plan by default, -confirm=<bucket>/<prefix> to change
-// anything, exit 2 on a mismatch.
+// code. Each reports by default, needs -confirm=<bucket>/<prefix> to change
+// anything (gc: collect), and exits 2 on a mismatch.
 var subcommands = map[string]func(ctx context.Context, args []string) int{
 	"lifecycle": func(ctx context.Context, args []string) int {
 		return lifecycle.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
+	},
+	"gc": func(ctx context.Context, args []string) int {
+		return gccmd.Main(ctx, args, os.Stdout, os.Stderr, gccmd.OpenS3)
+	},
+	"wipe": func(ctx context.Context, args []string) int {
+		return wipe.Main(ctx, args, os.Stdout, os.Stderr, wipe.OpenS3)
+	},
+	"provision": func(ctx context.Context, args []string) int {
+		return provision.Main(ctx, args, os.Stdout, os.Stderr, lifecycle.OpenS3)
 	},
 }
 
@@ -178,14 +204,8 @@ func main() {
 		debugToken    string
 		tlsCert       string
 		tlsKey        string
-		nsFile        string
-		maxAge        string
-		maxBytes      string
 		gcInterval    time.Duration
-		gcDryRun      bool
-		gcGrace       time.Duration
-		gcStagingAge  time.Duration
-		gcMaxDeletes  int
+		gcModeFlag    string
 		drainTimeout  time.Duration
 		drainLinger   time.Duration
 		allowVersions bool
@@ -207,17 +227,13 @@ func main() {
 	flag.BoolVar(&exports, "export", true, "export engines' entries to the bucket, and run garbage collection (needs "+blobstore.EnvBucket+"); false: read-only, it only imports, and never writes to or deletes from the bucket, so it runs with a read-only key; can't be combined with -import=false, and needs "+blobstore.EnvBucket)
 	flag.BoolVar(&imports, "import", true, "merge stored entries into connected engines (needs "+blobstore.EnvBucket+")")
 	flag.DurationVar(&importPoll, "import-poll", server.DefaultImportPoll, "how often to look for stored entries a connected engine lacks (0: only on hello and after an export)")
-	flag.StringVar(&nsFile, "namespaces-file", "", "file of per-namespace limits, one '<namespace> max-age=<duration> max-bytes=<size>' per line, '*' for the defaults; SIGHUP reloads it (empty: -max-age and -max-bytes for every namespace)")
-	flag.StringVar(&maxAge, "max-age", "0", "default max age of a namespace's roots, from when an export last recorded them, such as 720h (0: no limit)")
-	flag.StringVar(&maxBytes, "max-bytes", "0", "default max size of what a namespace keeps, such as 500GiB (0: no limit)")
-	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25% (0: only POST /debug/gc; needs "+blobstore.EnvBucket+"); GC is off with -export=false, which refuses an explicit nonzero value")
-	flag.BoolVar(&gcDryRun, "gc-dry-run", false, "garbage collection logs what it would expire and delete, and changes nothing")
-	flag.DurationVar(&gcGrace, "gc-grace", gc.DefaultGrace, "how old an unreferenced bundle, resolution or blob must be before garbage collection deletes it")
-	flag.DurationVar(&gcStagingAge, "gc-staging-age", gc.DefaultStagingAge, "how old a staged upload or incomplete multipart upload must be before garbage collection deletes it")
+	// The limit and collector flags are the ones `cacheservice gc` takes too.
+	gcFlags := gc.RegisterFlags(flag.CommandLine, true)
+	flag.StringVar(&gcModeFlag, "gc-mode", string(server.GCModeService), gcModeUsage+" (needs "+blobstore.EnvBucket+")")
+	flag.DurationVar(&gcInterval, "gc-interval", gc.DefaultInterval, "time between garbage collection runs, jittered by 25%, with -gc-mode=service (the default; 0 and negative values are refused, and so is any explicit value with batch or off)")
 	flag.DurationVar(&drainTimeout, "drain-timeout", DefaultDrainTimeout, "on SIGTERM or an interrupt, how long to finish pending exports before stopping (0: stop at once, with no drain and no linger); -drain-linger and a shutdown of at most 5s follow, so the process manager's stop timeout must be longer than this plus -drain-linger plus 5s")
 	flag.DurationVar(&drainLinger, "drain-linger", DefaultDrainLinger, "after the drain, at most how long to keep answering the engines' OTLP requests, storing nothing, so that each engine connected when the drain started whose events come here can deliver its engine.stop when it is stopped next; it ends once they all did, or at a second signal (0: stop right after the drain)")
 	flag.BoolVar(&allowVersions, "allow-engine-version-mismatch", false, "DEVELOPMENT ONLY: welcome engines whose version isn't on an accept line of the service's manifest (cmd/cacheservice/compat/engines.txt), logging each; by default they are refused before the welcome (close status 4002)")
-	flag.IntVar(&gcMaxDeletes, "gc-max-deletes", gc.DefaultMaxDeletes, "most bundles, resolutions and blobs one garbage collection run deletes per namespace")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -251,12 +267,17 @@ func main() {
 		logger.Warn(w)
 	}
 
-	if err := checkReadOnly(exports, imports, os.Getenv(blobstore.EnvBucket) != "", gcInterval, explicitFlags()); err != nil {
+	if err := checkReadOnly(exports, imports, os.Getenv(blobstore.EnvBucket) != ""); err != nil {
+		logger.Error(err.Error())
+		os.Exit(2)
+	}
+	gcMode, err := resolveGCMode(gcModeFlag, gcInterval, exports, explicitFlags())
+	if err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
 	}
 
-	debugListen, err := checkDebugListen(debugListen, debugToken, tokensFile, explicitFlags()["debug-listen"], logger)
+	debugListen, err = checkDebugListen(debugListen, debugToken, tokensFile, explicitFlags()["debug-listen"], logger)
 	if err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
@@ -294,16 +315,16 @@ func main() {
 		logger.Error("scope", "error", err)
 		os.Exit(2)
 	}
-	defaults, err := parseLimits(maxAge, maxBytes)
+	defaults, err := gcFlags.Limits()
 	if err != nil {
 		logger.Error("limits", "error", err)
 		os.Exit(2)
 	}
-	if err := svc.UseLimits(nsFile, defaults); err != nil {
+	if err := svc.UseLimits(gcFlags.NamespacesFile, defaults); err != nil {
 		logger.Error("namespaces file", "error", err)
 		os.Exit(1)
 	}
-	if tokensFile != "" || nsFile != "" || debugToken != "" {
+	if tokensFile != "" || gcFlags.NamespacesFile != "" || debugToken != "" {
 		// SIGHUP reloads the files; one that doesn't parse leaves what it
 		// set as it was.
 		hup := make(chan os.Signal, 1)
@@ -313,7 +334,7 @@ func main() {
 				if tokensFile != "" {
 					_ = svc.ReloadTokens()
 				}
-				if nsFile != "" {
+				if gcFlags.NamespacesFile != "" {
 					_ = svc.ReloadLimits()
 				}
 				if debugToken != "" {
@@ -354,19 +375,15 @@ func main() {
 				NoImport:   !imports,
 				ImportPoll: importPoll,
 			}
-			// A read-only instance never deletes from the bucket: GC is
-			// off whatever -gc-interval says (its default; an explicit
-			// one was refused above).
+			// A read-only instance never deletes from the bucket: its mode
+			// is off whatever -gc-mode says (an explicit service or batch
+			// was refused above), and it takes no GC options.
 			if exports {
-				opts.GC = &server.GCConfig{
-					Interval: gcInterval,
-					Collector: gc.Config{
-						DryRun:     gcDryRun,
-						Grace:      gcGrace,
-						StagingAge: gcStagingAge,
-						MaxDeletes: gcMaxDeletes,
-					},
+				gcCfg := &server.GCConfig{Mode: gcMode, Collector: gcFlags.Collector()}
+				if gcMode == server.GCModeService {
+					gcCfg.Interval = gcInterval
 				}
+				opts.GC = gcCfg
 			}
 			err = svc.EnableS3(ctx, cfg, opts)
 		}
@@ -381,12 +398,13 @@ func main() {
 	} else {
 		logger.Info("export path off: set " + blobstore.EnvBucket + " to store exports in S3")
 	}
-	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", onOff(store && exports), "readOnly", !exports)
+	logger.Info("mode", "export", onOff(store && exports), "import", onOff(store && imports), "gc", gcModeLog(store, gcMode), "readOnly", !exports)
 
-	// Every listener bounds reading a request's headers
-	// (server.ReadHeaderTimeout), and none sets a ReadTimeout, which would
-	// cut off the engine WebSocket; the OTLP routes bound their bodies
-	// themselves.
+	// Every listener bounds reading a request's headers in time
+	// (server.ReadHeaderTimeout) and in size (server.MaxHeaderBytes), and
+	// none sets a ReadTimeout, which would cut off the engine WebSocket; the
+	// OTLP routes bound their bodies themselves. Build a listener's server
+	// with server.NewHTTPServer: a bare http.Server allows 1 MiB of headers.
 	servers := []*http.Server{server.NewHTTPServer(listen, svc.Handler())}
 	names := []string{"engine"}
 	if debugListen != "" {
@@ -540,12 +558,13 @@ func stopService(svc *server.Service, servers []*http.Server, serversDone <-chan
 }
 
 // logUncleanStop logs why shutdown reported an unclean stop: err's text is the
-// reason, and the message names the bound only when it passed
-// (errShutdownGrace), as the wait on requests or the service's paths does.
-// Other causes, such as the engine connections still closing after the
-// 2s close bound (about 2.5s in), come well before it.
+// reason, and the message says it exits without waiting only when the bound
+// passed (errShutdownGrace), as the wait on requests or the service's paths
+// does. Other causes, such as the engine connections still closing after the
+// 2s close bound (about 2.5s in), come well before it, with everything else
+// waited for.
 func logUncleanStop(logger *slog.Logger, svc *server.Service, err error, grace time.Duration) {
-	msg := "stopped uncleanly; exiting without waiting for the rest"
+	msg := "stopped uncleanly"
 	attrs := []any{"error", err}
 	if errors.Is(err, errShutdownGrace) {
 		msg = "stopped uncleanly: the shutdown's bound passed with work still running; exiting without waiting for it"
@@ -770,11 +789,9 @@ func explicitFlags() map[string]bool {
 
 // checkReadOnly refuses the flag combinations -export=false can't honor:
 // with -import=false too, or with no bucket (store), the service would have
-// nothing to do; and an explicit nonzero -gc-interval asks for GC, which a
-// read-only instance never runs (it never deletes from the bucket). The
-// default -gc-interval alone is fine: GC is then off. set holds the flags
-// set on the command line.
-func checkReadOnly(exports, imports, store bool, gcInterval time.Duration, set map[string]bool) error {
+// nothing to do. (An explicit -gc-mode or -gc-interval with it is
+// resolveGCMode's to refuse.)
+func checkReadOnly(exports, imports, store bool) error {
 	if exports {
 		return nil
 	}
@@ -784,10 +801,16 @@ func checkReadOnly(exports, imports, store bool, gcInterval time.Duration, set m
 	if !store {
 		return errors.New("-export=false without " + blobstore.EnvBucket + ": a read-only instance only imports from the bucket, so it would have nothing to do; set " + blobstore.EnvBucket + ", or drop -export=false")
 	}
-	if set["gc-interval"] && gcInterval != 0 {
-		return fmt.Errorf("-gc-interval=%s and -export=false: a read-only instance never runs garbage collection, which deletes from the bucket; drop -gc-interval, or set it to 0", gcInterval)
-	}
 	return nil
+}
+
+// gcModeLog is the "gc" value of the startup log: the mode, or off with no
+// bucket to collect.
+func gcModeLog(store bool, m server.GCMode) string {
+	if !store {
+		return string(server.GCModeOff)
+	}
+	return string(m)
 }
 
 func onOff(on bool) string {
@@ -795,17 +818,4 @@ func onOff(on bool) string {
 		return "on"
 	}
 	return "off"
-}
-
-// parseLimits reads -max-age and -max-bytes.
-func parseLimits(maxAge, maxBytes string) (gc.Limits, error) {
-	age, err := gc.ParseAge(maxAge)
-	if err != nil {
-		return gc.Limits{}, fmt.Errorf("-max-age: %w", err)
-	}
-	size, err := gc.ParseSize(maxBytes)
-	if err != nil {
-		return gc.Limits{}, fmt.Errorf("-max-bytes: %w", err)
-	}
-	return gc.Limits{MaxAge: age, MaxBytes: size}, nil
 }

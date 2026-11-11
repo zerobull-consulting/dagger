@@ -394,6 +394,148 @@ func TestTrackerSkippedRoots(t *testing.T) {
 	}
 }
 
+// A caller that loops flushes doesn't retry a failing root at its own rate:
+// a flush cuts short a failure wait only if a flush didn't cause the try
+// that started it, so the root waits out the backoff after a second failed
+// try, and a flush after its next try, the backoff's own, may cut it short
+// again. A busy root, which doesn't count toward MaxFailures, is due at
+// every flush (zerobull-consulting/dagger#160).
+func TestTrackerLoopedFlushesDontRushFailures(t *testing.T) {
+	tr := NewTracker(TrackerConfig{Settle: testSettle, MaxDelay: testMaxDelay, ForgetAfter: testForget,
+		BusyBackoff: time.Second, MaxBusyBackoff: 8 * time.Second, MaxFailures: 5})
+	tr.Observe(state(1, 10, fsPart), t0)
+	// loop flushes 20 times, 10ms apart, answering each try with answer,
+	// and returns the tries.
+	now := t0
+	loop := func(answer func(Batch) Result) int {
+		tries := 0
+		for range 20 {
+			end := tr.StartFlush("c", now)
+			for _, b := range tr.Due(now) {
+				tries++
+				tr.Done(b, answer(b), now)
+			}
+			end()
+			now = now.Add(10 * time.Millisecond)
+		}
+		return tries
+	}
+	fail := func(Batch) Result { return Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}} }
+	failures := func() int { return tr.Entries("c")[0].Failures }
+
+	// The first flush's try fails, and the second flush cuts its wait
+	// short; that try fails too, and no flush cuts the wait it started.
+	if tries := loop(fail); tries != 2 || failures() != 2 {
+		t.Fatalf("looped flushes: %d tries, %d failures, want 2 and 2", tries, failures())
+	}
+	// The backoff's own try (2s after the second): a flush may cut the
+	// wait after it short again, once.
+	now = now.Add(2 * time.Second)
+	if bs := tr.Due(now); len(bs) != 1 {
+		t.Fatalf("not due once its backoff passed: %d batches", len(bs))
+	} else {
+		tr.Done(bs[0], fail(bs[0]), now)
+	}
+	if tries := loop(fail); tries != 1 || failures() != 4 {
+		t.Fatalf("looped flushes after the backoff's try: %d tries, %d failures, want 1 and 4", tries, failures())
+	}
+
+	// A busy root is due at every flush.
+	tr.Observe(state(2, 10, fsPart), t0)
+	busy := func(b Batch) Result {
+		var res Result
+		for _, n := range b.Request.Roots {
+			if n == 2 {
+				res.Busy = append(res.Busy, protocol.SkippedRoot{Number: 2, Reason: protocol.SkipBusy})
+			} else {
+				res.Failed = append(res.Failed, FailedRoot{Number: n, Error: "upload"})
+			}
+		}
+		return res
+	}
+	if tries := loop(busy); tries != 20 {
+		t.Fatalf("looped flushes of a busy root: %d tries, want 20", tries)
+	}
+	if e := tr.Entries("c"); e[1].Failures != 0 || e[0].Failures != 4 {
+		t.Fatalf("entries %+v", e)
+	}
+}
+
+// A failed root whose wait no flush cuts short (see
+// TestTrackerLoopedFlushesDontRushFailures) is due at the next flush once
+// its value changed: the failures counted were the old value's.
+func TestTrackerFlushRetriesChangedValueAfterFlushFailure(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	fail := func(now time.Time) int {
+		end := tr.StartFlush("c", now)
+		defer end()
+		bs := tr.Due(now)
+		for _, b := range bs {
+			tr.Done(b, Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, now)
+		}
+		return len(bs)
+	}
+	// The first flush's try fails, the second flush cuts its wait short,
+	// and that try fails too: the third flush leaves the wait it started.
+	if n := fail(t0) + fail(t0); n != 2 {
+		t.Fatalf("%d tries, want 2", n)
+	}
+	if n := fail(t0); n != 0 {
+		t.Fatal("the flush cut short a wait a flush's try started")
+	}
+	o := state(1, 10, fsPart)
+	o.Replacements = 1
+	tr.Observe(o, t0)
+	end := tr.StartFlush("c", t0)
+	defer end()
+	if got := roots(tr.Due(t0)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("the changed value isn't due at the flush: %v", got)
+	}
+}
+
+// A flush's try given back before it ran (Requeue, or Interrupted with the
+// root unsettled) is still the flush's when it runs: if it fails, the next
+// flush leaves the wait it started.
+func TestTrackerFlushTryGivenBackStaysTheFlushs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		giveBack func(*Tracker, Batch, time.Time)
+	}{
+		{"requeued", func(tr *Tracker, b Batch, now time.Time) { tr.Requeue(b, now.Add(time.Hour)) }},
+		{"interrupted", func(tr *Tracker, b Batch, now time.Time) { tr.Interrupted(b, Result{}, now, now.Add(time.Hour)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTestTracker()
+			tr.Observe(state(1, 10, fsPart), t0)
+			failed := Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}
+			// A try of its own, failed: a wait no flush caused.
+			b := tr.All("c", t0)
+			tr.Done(b[0], failed, t0)
+			// A flush cuts it short; its try is given back to wait for
+			// the engine, which then connects.
+			end := tr.StartFlush("c", t0)
+			bs := tr.Due(t0)
+			if len(bs) != 1 {
+				t.Fatalf("not due at the flush: %d batches", len(bs))
+			}
+			tc.giveBack(tr, bs[0], t0)
+			end()
+			tr.WakeEngineWait("c", 1, t0)
+			bs = tr.Due(t0)
+			if len(bs) != 1 {
+				t.Fatalf("not due once the engine connected: %d batches", len(bs))
+			}
+			tr.Done(bs[0], failed, t0)
+			end = tr.StartFlush("c", t0)
+			defer end()
+			if got := roots(tr.Due(t0)); len(got) != 0 {
+				t.Fatalf("the flush cut short the wait its own try started: %v", got)
+			}
+		})
+	}
+}
+
 func TestTrackerFailuresBackOffThenStop(t *testing.T) {
 	tr := newTestTracker()
 	tr.Observe(state(1, 10, fsPart), t0)
@@ -433,6 +575,83 @@ func TestTrackerRequeue(t *testing.T) {
 	if e := tr.Entries("c"); e[0].Failures != 0 {
 		t.Fatal("requeue counted as a failure")
 	}
+}
+
+// The hello of the generation a requeued root waits for makes it due at
+// once; a backoff, and the hello of an older generation, don't
+// (zerobull-consulting/dagger#132).
+func TestTrackerConnectedWakesEngineWait(t *testing.T) {
+	setup := func() (*Tracker, Batch) {
+		tr := newTestTracker()
+		o := state(1, 10, fsPart)
+		o.Generation = 2
+		tr.Observe(o, t0)
+		return tr, tr.All("c", t0)[0]
+	}
+	wait := t0.Add(10 * time.Second)
+	now := t0.Add(time.Second)
+
+	t.Run("newer generation's hello", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		tr.Connected("c", 2, now)
+		if got := roots(tr.Due(now)); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("not due at the hello: %v", got)
+		}
+	})
+	t.Run("older generation's hello", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		tr.Connected("c", 1, now)
+		if got := roots(tr.Due(now)); len(got) != 0 {
+			t.Fatalf("an older generation's hello made it due: %v", got)
+		}
+	})
+	t.Run("backoff", func(t *testing.T) {
+		tr, b := setup()
+		tr.Done(b, Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, t0)
+		retry := tr.Entries("c")[0].RetryAt
+		now := t0.Add(time.Millisecond) // inside the backoff
+		tr.Connected("c", 2, now)
+		if got := tr.Entries("c")[0].RetryAt; got != retry {
+			t.Fatalf("a hello moved a backoff: %s, was %s", got, retry)
+		}
+		if got := roots(tr.Due(now)); len(got) != 0 {
+			t.Fatalf("a hello made a backed-off root due: %v", got)
+		}
+	})
+	t.Run("interrupted export", func(t *testing.T) {
+		tr, b := setup()
+		tr.Interrupted(b, Result{}, t0, wait)
+		if got := roots(tr.Due(now)); len(got) != 0 {
+			t.Fatalf("due before the hello: %v", got)
+		}
+		tr.Connected("c", 2, now)
+		if got := roots(tr.Due(now)); !slices.Equal(got, []uint64{1}) {
+			t.Fatalf("an interrupted root not due at the hello: %v", got)
+		}
+	})
+	t.Run("claimed entry", func(t *testing.T) {
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		tr.Due(wait) // claims it
+		tr.Connected("c", 2, wait.Add(time.Second))
+		if got := tr.Entries("c")[0].RetryAt; got != "" {
+			t.Fatalf("a hello gave a claimed entry a retry time: %s", got)
+		}
+	})
+	t.Run("stale wait", func(t *testing.T) {
+		// The entry waited until `wait`, was claimed, failed, and its
+		// backoff ends at the same instant: still a backoff.
+		tr, b := setup()
+		tr.Requeue(b, wait)
+		b2 := tr.Due(wait)
+		tr.Done(b2[0], Result{Failed: []FailedRoot{{Number: 1, Error: "upload"}}}, wait.Add(-time.Second))
+		tr.Connected("c", 2, wait.Add(-500*time.Millisecond))
+		if got := roots(tr.Due(wait.Add(-500 * time.Millisecond))); len(got) != 0 {
+			t.Fatalf("a hello cut a backoff short: %v", got)
+		}
+	})
 }
 
 func TestTrackerWipedCache(t *testing.T) {
@@ -708,5 +927,188 @@ func TestTrackerStartDrainOnce(t *testing.T) {
 	tr.StartDrain(t0.Add(100 * time.Millisecond))
 	if got := roots(tr.DrainDue(t0.Add(100 * time.Millisecond))); len(got) != 0 {
 		t.Fatalf("a second StartDrain cut the retry's backoff short: %v", got)
+	}
+}
+
+// A root its engine refused because it has given up its remote-cache work
+// (Result.Paused) is neither refused for good nor failed: it waits for the
+// engine, and its next open makes it due; without one, PausedWait does.
+func TestTrackerPausedRootsWaitForOpen(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.Observe(state(2, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Paused: []uint64{1, 2}}, t0)
+	for _, e := range tr.EntriesAt("c", t0) {
+		if e.Refused != "" || e.Failures != 0 || e.Stored || e.RetryAt == "" {
+			t.Fatalf("a paused root is settled as %+v, want only waiting", e)
+		}
+	}
+	if got := roots(tr.Due(t0.Add(DefaultPausedWait - time.Second))); len(got) != 0 {
+		t.Fatalf("paused roots exported before the engine opened: %v", got)
+	}
+	// An older generation's open isn't the engine they wait for.
+	tr.Opened("c", 0, t0.Add(time.Second))
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("paused roots exported on an older generation's open: %v", got)
+	}
+	tr.Opened("c", 1, t0.Add(2*time.Second))
+	due := tr.Due(t0.Add(2 * time.Second))
+	if got := roots(due); !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("due after the open: %v, want [1 2]", got)
+	}
+	// Refused again, with no open after: due once PausedWait passed.
+	at := t0.Add(2 * time.Second)
+	tr.Done(due[0], Result{Paused: []uint64{1, 2}}, at)
+	if got := roots(tr.Due(at.Add(DefaultPausedWait - time.Second))); len(got) != 0 {
+		t.Fatalf("paused roots exported before PausedWait: %v", got)
+	}
+	if got := roots(tr.Due(at.Add(DefaultPausedWait))); !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("due after PausedWait: %v, want [1 2]", got)
+	}
+}
+
+// An engine that opened while the export it refused as paused was still in
+// flight isn't waited for again: the open came before the roots waited for
+// it, and the next may be a session away.
+func TestTrackerPausedAfterOpenIsDueNow(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Opened("c", 1, t0.Add(time.Second))
+	at := t0.Add(2 * time.Second)
+	tr.Done(b[0], Result{Paused: []uint64{1}}, at)
+	due := tr.Due(at)
+	if got := roots(due); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after a paused result that an open preceded: %v, want [1]", got)
+	}
+	if e := tr.EntriesAt("c", at)[0]; e.Failures != 0 || e.Refused != "" {
+		t.Fatalf("the root is settled as %+v, want only due", e)
+	}
+	// Refused again with no open since: it waits.
+	tr.Done(due[0], Result{Paused: []uint64{1}}, at)
+	if got := roots(tr.Due(at.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("a paused root exported with no open since its batch: %v", got)
+	}
+}
+
+// UnseenSessions counts the sessions the tracker saw nothing of: not those
+// it tracks, nor those it stopped tracking lately.
+func TestTrackerUnseenSessions(t *testing.T) {
+	tr := newTestTracker()
+	if got := tr.UnseenSessions("c", []string{"s1", "s2"}); got != 2 {
+		t.Fatalf("an unknown cache: %d unseen, want 2", got)
+	}
+	tr.Observe(state(1, 10, fsPart), t0)
+	if got := tr.UnseenSessions("c", []string{"s1", "s2"}); got != 1 {
+		t.Fatalf("with a span of s1: %d unseen, want 1", got)
+	}
+	// s1 ends with its span in, and is no longer tracked; s2 only ever
+	// sends its carrier.
+	tr.SessionEnded("c", 1, "s1", 1, t0)
+	tr.SessionEnded("c", 1, "s2", 0, t0)
+	if got := tr.UnseenSessions("c", []string{"s1", "s2", "s3"}); got != 1 {
+		t.Fatalf("after s1 and s2 ended: %d unseen, want only s3", got)
+	}
+	// Forgotten once seenSessionRetention passed.
+	tr.Due(t0.Add(seenSessionRetention))
+	if got := tr.UnseenSessions("c", []string{"s1", "s2"}); got != 2 {
+		t.Fatalf("after the retention: %d unseen, want 2", got)
+	}
+}
+
+// A root its engine refused as paused is counted apart (DrainState.Paused):
+// a flush doesn't make it due, a drain neither makes it due nor lets its
+// own wait do so, and the engine's open still does.
+func TestTrackerPausedRootsAreLeftByFlushAndDrain(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	b := tr.All("c", t0)
+	tr.Done(b[0], Result{Paused: []uint64{1}}, t0)
+	if st := tr.FlushStatus("c", t0, t0.Add(time.Hour)); st.Paused != 1 || st.Roots() != 0 {
+		t.Fatalf("status %+v, want one paused root and none other", st)
+	}
+	end := tr.StartFlush("c", t0)
+	if got := roots(tr.Due(t0.Add(time.Second))); len(got) != 0 {
+		t.Fatalf("a flush made a paused root due: %v", got)
+	}
+	end()
+	tr.StartDrain(t0.Add(time.Second))
+	if got := roots(tr.DrainDue(t0.Add(2 * DefaultPausedWait))); len(got) != 0 {
+		t.Fatalf("a drain made a paused root due: %v", got)
+	}
+	if st := tr.DrainStatus(t0.Add(2*DefaultPausedWait), time.Time{}); len(st) != 1 || st[0].Paused != 1 || st[0].Roots() != 0 {
+		t.Fatalf("drain status %+v, want one paused root", st)
+	}
+	tr.Opened("c", 1, t0.Add(3*DefaultPausedWait))
+	if got := roots(tr.DrainDue(t0.Add(3 * DefaultPausedWait))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after the open: %v, want [1]", got)
+	}
+}
+
+// Known gap, pinned on purpose (zerobull-consulting/dagger#227): the engine
+// lists in a settle every ended session no Settled has covered, however
+// long ago it ended, and the tracker remembers a session it stopped
+// tracking only for seenSessionRetention (and not across a restart of the
+// service). A session listed after that counts as never seen, so a settle
+// waits its marker wait (5s of the engine's 20s) for spans that came long
+// ago. Closing it means remembering sessions until a Settled covers them.
+func TestKnownGapUnseenSessionsForgetsLongEndedSessions(t *testing.T) {
+	tr := newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	tr.SessionEnded("c", 1, "s1", 1, t0)
+	if got := tr.UnseenSessions("c", []string{"s1"}); got != 0 {
+		t.Fatalf("just ended: %d unseen, want 0", got)
+	}
+	tr.Due(t0.Add(seenSessionRetention))
+	if got := tr.UnseenSessions("c", []string{"s1"}); got != 1 {
+		t.Fatalf("after the retention: %d unseen, want 1: the gap is closed, update the README", got)
+	}
+}
+
+// A cache made quiet starts no export until then, unless a flush or a drain
+// asks, or its engine opens a new period first: an engine that settled
+// still gives up if an export is in progress when its bound passes.
+func TestTrackerQuietHoldsExports(t *testing.T) {
+	until := t0.Add(22 * time.Second)
+	newQuiet := func() *Tracker {
+		tr := newTestTracker()
+		tr.Observe(state(1, 10, fsPart), t0)
+		tr.Quiet("c", until, tr.EngineWakes("c"))
+		return tr
+	}
+	tr := newQuiet()
+	if got := roots(tr.Due(until.Add(-time.Second))); len(got) != 0 {
+		t.Fatalf("exported while quiet: %v", got)
+	}
+	if next := tr.NextDue(); !next.Equal(until) {
+		t.Fatalf("next due %s, want the end of the quiet %s", next, until)
+	}
+	if got := roots(tr.Due(until)); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due once the quiet passed: %v, want [1]", got)
+	}
+
+	tr = newQuiet()
+	tr.Opened("c", 1, t0.Add(time.Minute/2))
+	if got := roots(tr.Due(until.Add(-time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after an open ended the quiet: %v, want [1]", got)
+	}
+
+	// A settle decided before an open, and applied after it, sets no
+	// quiet: it would put back the one the open ended.
+	tr = newTestTracker()
+	tr.Observe(state(1, 10, fsPart), t0)
+	wakes := tr.EngineWakes("c")
+	tr.Opened("c", 1, t0)
+	tr.Quiet("c", until, wakes)
+	if got := roots(tr.Due(until.Add(-time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due after a quiet from before the open was refused: %v, want [1]", got)
+	}
+
+	tr = newQuiet()
+	end := tr.StartFlush("c", t0.Add(time.Second))
+	defer end()
+	if got := roots(tr.Due(t0.Add(time.Second))); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("due in a flush, quiet or not: %v, want [1]", got)
 	}
 }
