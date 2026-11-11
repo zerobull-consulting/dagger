@@ -101,9 +101,10 @@ jobs:
             go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
             go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
       # The remote cache service, the engine's client of it and their wire
-      # protocol: every test in these packages.
-      - name: Service, client and protocol
-        run: go test -race -count=1 -cover ./cmd/cacheservice/... ./engine/remotecache/...
+      # protocol (every test in ./cmd/cacheservice/... and
+      # ./engine/remotecache/...) run in Dagger, with the remote cache:
+      # remote-cache-pr-checks.yml on pull requests, the update job
+      # (remote-cache-update.yml) on pushes to feature/remote-cache.
       # How the release workflow moves the image's engine-version tags
       # (cacheservice-publish.yml), against a fake registry.
       - name: Release tags

@@ -1,0 +1,102 @@
+name: Remote cache PR checks
+# Pull-request checks that run as Dagger pipelines on an engine with a
+# read-only remote cache sidecar (the pr-checks-readonly environment): each
+# fetches the layers the update job (remote-cache-update.yml) stored for
+# feature/remote-cache's newest commit, and runs only what the pull request
+# changed. A layer that misses runs here, as it would without the cache;
+# nothing is stored.
+#
+# Apart from remote-cache-tests.yml, whose jobs never reach Spaces
+# (TestWorkflowOnlySpacesJobsAreExternal): these read the PR-checks bucket.
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  # The update job's engine (remote-cache-update.yml, VERSION): the cache holds
+  # that engine's entries only, so the two, and the environments'
+  # CACHE_S3_PREFIX (cache-<version>), move together.
+  VERSION: v1.0.0-beta.26
+jobs:
+  # The unit tests of the service, its client and their protocol (every test in
+  # ./cmd/cacheservice/... and ./engine/remotecache/...), as
+  # hack/remote-cache/speedup/run.sh's unit pipeline: the modules and the -race
+  # build of every package the tests import come from the cache, unless the
+  # pull request changes them.
+  dagger-unit:
+    name: unit tests in Dagger (remote cache)
+    runs-on: ubuntu-24.04
+    environment: pr-checks-readonly
+    # The start (30m at worst: two image pulls of 15m, in parallel in
+    # practice), the tests (30m) and the stop (12m), plus slack.
+    timeout-minutes: 80
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Verify the sidecar is stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: dagger-unit
+      - name: Check the prefix is for this engine version
+        env:
+          PREFIX: ${{ vars.CACHE_S3_PREFIX }}
+        run: |
+          want="cache-${VERSION#*-}"
+          if [[ "$PREFIX" != "$want" ]]; then
+            echo "::error::CACHE_S3_PREFIX is '$PREFIX', but engine $VERSION reads under '$want': move the environments' prefix, this workflow's VERSION and remote-cache-update.yml's together"
+            exit 1
+          fi
+      - name: Note the time
+        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
+      - name: Start the read-only sidecar
+        id: reader
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: read-only
+          name: dagger-unit
+          version: ${{ env.VERSION }}
+          verbose: "true"
+          s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
+          s3-region: ${{ vars.CACHE_S3_REGION }}
+          s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
+          s3-prefix: ${{ vars.CACHE_S3_PREFIX }}
+          s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
+      - name: Report the start's time
+        run: ./hack/remote-cache/ci/report-start-time.sh "read-only" "$T0"
+      - name: Service, client and protocol
+        timeout-minutes: 30
+        env:
+          SERVICE: ${{ steps.reader.outputs.service-container }}
+          DAGGER: ${{ steps.reader.outputs.dagger }}
+        run: |
+          ./hack/remote-cache/speedup/run.sh unit unit "$RUNNER_TEMP/dagger-unit" "$SERVICE"
+          read -r hit executed <"$RUNNER_TEMP/dagger-unit/unit.spans"
+          echo "- unit tests: **$hit** withExec step(s) from the cache, **$executed** run" >>"$GITHUB_STEP_SUMMARY"
+      - name: Stop the read-only sidecar
+        if: always()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: dagger-unit
+      # The service's and the engine's logs, and the pipeline's.
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: dagger-unit-logs
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/dagger-unit
+          if-no-files-found: ignore
