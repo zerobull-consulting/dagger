@@ -26,6 +26,7 @@
 # The service and its tooling.
 any       cmd/cacheservice/                              the cache service, its tests and its docs
 any       hack/remote-cache/                             the service's dev scripts, demo, docs and this check
+any       .dagger/modules/cacheservice/                  the Dagger module that builds and publishes the service's image
 any       .github/actions/remote-cache/                  the remote-cache actions (start, stop, the script they share) that run the service next to an engine in CI
 
 # The fork's own workflows, by name. Upstream's workflows aren't the fork's.
@@ -39,6 +40,7 @@ any       .github/workflows/remote-cache-release-check.yml  the hourly release c
 
 # Changes to upstream files the fork must make.
 deleted   .github/workflows/changelog.yml                gated on a needs/changelog label this repository doesn't have, so it only ever showed as a skipped check (zerobull-consulting/dagger#122)
+add-lines dagger.toml                                    registers the cacheservice module and its SDK scope
 go-mod    go.mod                                         the service's own dependencies (the S3 SDK, prometheus/client_model) share the root module; moves out with the service's own module (zerobull-consulting/dagger#117, D7 spike)
 add-lines go.sum                                         the checksums of those dependencies
 add-lines .gitignore                                     ignores dotenvx's .env.keys, the private key for cmd/cacheservice/.env's encrypted values; a nested .gitignore wouldn't cover a key file written at the root

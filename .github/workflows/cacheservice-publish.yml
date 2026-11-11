@@ -62,13 +62,19 @@ jobs:
           echo "base=$base" >>"$GITHUB_OUTPUT"
           echo "versions=$versions" >>"$GITHUB_OUTPUT"
           echo "base $base, accepts $versions" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Set up Dagger
+        uses: ./.github/actions/remote-cache/setup-dagger
+      # Built by the cacheservice module (.dagger/modules/cacheservice).
       - name: Build
         env:
           REVISION: ${{ github.sha }}
           RELEASE: ${{ steps.manifest.outputs.base }}
         run: |
-          docker build -f cmd/cacheservice/Dockerfile \
-            --build-arg REVISION="$REVISION" --build-arg RELEASE="$RELEASE" -t cacheservice:release .
+          mkdir -p "$RUNNER_TEMP/release-image"
+          dagger -m .dagger/modules/cacheservice call image \
+            --release "$RELEASE" --revision "$REVISION" \
+            as-tarball export --path "$RUNNER_TEMP/release-image/image.tar"
+          ./hack/remote-cache/load-image.sh "$RUNNER_TEMP/release-image/image.tar" cacheservice:release
           docker image inspect cacheservice:release \
             --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
       # Its identity must report the base, not dev, and this commit.
@@ -78,16 +84,12 @@ jobs:
           EXPECT_REVISION: ${{ github.sha }}
         run: ./hack/remote-cache/image-smoke.sh cacheservice:release
       # The image the matrix tests is the one published: the matrix loads
-      # it, and publish pushes it.
-      - name: Save the image
-        run: |
-          mkdir -p "$RUNNER_TEMP/release-image"
-          docker save cacheservice:release | gzip >"$RUNNER_TEMP/release-image/image.tar.gz"
+      # this tarball, and publish pushes it.
       - name: Upload the image
         uses: actions/upload-artifact@v6
         with:
           name: release-image
-          path: ${{ runner.temp }}/release-image/image.tar.gz
+          path: ${{ runner.temp }}/release-image/image.tar
           retention-days: 3
           if-no-files-found: error
       - name: Dry run
@@ -121,37 +123,38 @@ jobs:
       contents: read
       packages: write
     steps:
+      # The module and the setup action are read from the commit.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Download the image
         uses: actions/download-artifact@v7
         with:
           name: release-image
           path: ${{ runner.temp }}/release-image
-      - name: Load the image
-        env:
-          REVISION: ${{ github.sha }}
-        run: |
-          timeout 300 docker load -i "$RUNNER_TEMP/release-image/image.tar.gz"
-          docker tag cacheservice:release "$IMAGE:$REVISION"
-      - name: Log in to GHCR
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      # The old name gets a registry-side copy of the same manifest, with
-      # the same digest.
+      - name: Set up Dagger
+        uses: ./.github/actions/remote-cache/setup-dagger
+      # The cacheservice module's publish pushes the tested tarball (not a
+      # rebuild) to the commit's tag, and to the old name: the same manifest
+      # both times, so the digests must match.
       - name: Push
         env:
           REVISION: ${{ github.sha }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          timeout 600 docker push "$IMAGE:$REVISION"
-          timeout 300 docker buildx imagetools create --prefer-index=false -t "$OLD_IMAGE:$REVISION" "$IMAGE:$REVISION"
-          digest="$(timeout 60 docker buildx imagetools inspect "$IMAGE:$REVISION" --format '{{.Manifest.Digest}}')"
+          push() {
+            dagger -m .dagger/modules/cacheservice call publish \
+              --tarball "$RUNNER_TEMP/release-image/image.tar" --address "$1" \
+              --registry ghcr.io --username "$GITHUB_ACTOR" --password env://REGISTRY_PASSWORD
+          }
+          pushed="$(push "$IMAGE:$REVISION")"
+          copied="$(push "$OLD_IMAGE:$REVISION")"
           {
-            echo "pushed $IMAGE:$REVISION ($digest)"
-            echo "copied to $OLD_IMAGE:$REVISION"
+            echo "pushed $pushed"
+            echo "pushed $copied"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Log out of GHCR
-        if: always()
-        run: docker logout ghcr.io
+          [[ "${pushed##*@}" == "${copied##*@}" ]] || { echo "the two names got different digests" >&2; exit 1; }
 
   # Moves the floating tags, after a publish pushed its commit's tag.
   # :<engine version> is the newest verified build that accepts that engine:

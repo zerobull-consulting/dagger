@@ -1,0 +1,16 @@
+name: Set up the Dagger CLI
+description: >-
+  Installs the Dagger CLI at the version of the remote cache service's engine
+  manifest (its first accept line, hack/remote-cache/engines.sh pin), so the
+  cacheservice module (.dagger/modules/cacheservice) runs on the engine the
+  service is verified against, and no second pin exists.
+runs:
+  using: composite
+  steps:
+    - name: Install dagger
+      shell: bash
+      run: |
+        eval "$(./hack/remote-cache/engines.sh pin)"
+        curl -fsSL https://dl.dagger.io/dagger/install.sh |
+          DAGGER_VERSION="$STOCK_ENGINE_TAG" BIN_DIR=/usr/local/bin sudo -E sh
+        dagger version

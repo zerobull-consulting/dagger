@@ -25,6 +25,9 @@ name: Cache service image
       - go.mod
       - go.sum
       - hack/remote-cache/image-smoke.sh
+      - hack/remote-cache/load-image.sh
+      - .dagger/modules/cacheservice/**
+      - .github/actions/remote-cache/setup-dagger/**
       - hack/remote-cache/engines.sh
       - .github/workflows/cacheservice-image.yml
   workflow_dispatch: {}
@@ -41,9 +44,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-      # The Go build runs inside the Dockerfile (the builder stage), so the
-      # image builds the same from a fresh clone and here; its cache mounts
-      # start empty on each runner.
+      - name: Set up Dagger
+        uses: ./.github/actions/remote-cache/setup-dagger
+      # Built by the cacheservice module (.dagger/modules/cacheservice) from
+      # cmd/cacheservice/Dockerfile, so the image builds the same here, in the
+      # release workflow and locally.
       # Stamped as the manifest's base release, as cacheservice-publish.yml
       # stamps the release images, so the smoke test checks the identity a
       # published image will report.
@@ -53,8 +58,10 @@ jobs:
         run: |
           release="$(./hack/remote-cache/engines.sh base)"
           echo "RELEASE=$release" >>"$GITHUB_ENV"
-          docker build -f cmd/cacheservice/Dockerfile \
-            --build-arg REVISION="$REVISION" --build-arg RELEASE="$release" -t cacheservice:ci .
+          dagger -m .dagger/modules/cacheservice call image \
+            --release "$release" --revision "$REVISION" \
+            as-tarball export --path "$RUNNER_TEMP/cacheservice.tar"
+          ./hack/remote-cache/load-image.sh "$RUNNER_TEMP/cacheservice.tar" cacheservice:ci
           docker image inspect cacheservice:ci \
             --format 'size: {{.Size}} bytes, user: {{.Config.User}}' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Smoke test
