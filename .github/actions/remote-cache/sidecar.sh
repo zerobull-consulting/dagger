@@ -862,10 +862,11 @@ flush_engine() {
 		return 0
 	fi
 	echo "remote-cache-sidecar: flushing the engine's pending exports, for up to ${settle}s"
-	# Bounded twice: curl's own --max-time, and timeout, for a curl that
-	# doesn't end at it.
-	code="$(timeout $((settle + flush_slack_seconds + 5)) curl -sS -X POST -u sidecar-engine: \
-		--max-time $((settle + flush_slack_seconds)) -o "$report" -w '%{http_code}' \
+	# Bounded twice, within the flush_slack_seconds the stop's bound
+	# (stop_seconds) allows: curl's own --max-time, and timeout, for a curl
+	# that doesn't end at it.
+	code="$(timeout $((settle + flush_slack_seconds)) curl -sS -X POST -u sidecar-engine: \
+		--max-time $((settle + flush_slack_seconds - 2)) -o "$report" -w '%{http_code}' \
 		"$url/v1/engines/flush?timeout=${settle}s" 2>"$report.err")" || rc=$?
 	err="$(head -c 300 "$report.err" 2>/dev/null | tr '\n' ' ' || true)"
 	rm -f "$report.err"
@@ -917,13 +918,15 @@ cleanup_did() { [[ "$cleanup_done" == *" $1 "* ]]; }
 # under its name, with this sidecar's label (the start labels everything it
 # creates with its name).
 labeled_ours() {
-	local label
+	local what=container name_ field=.Config.Labels label
 	case "$1" in
-	service) label="$(cleanup_call 30 docker container inspect -f '{{index .Config.Labels "remote-cache-sidecar"}}' "$st_service" 2>/dev/null || true)" ;;
-	engine) label="$(cleanup_call 30 docker container inspect -f '{{index .Config.Labels "remote-cache-sidecar"}}' "$st_engine" 2>/dev/null || true)" ;;
-	volume) label="$(cleanup_call 30 docker volume inspect -f '{{index .Labels "remote-cache-sidecar"}}' "$st_volume" 2>/dev/null || true)" ;;
-	network) label="$(cleanup_call 30 docker network inspect -f '{{index .Labels "remote-cache-sidecar"}}' "$st_network" 2>/dev/null || true)" ;;
+	service) name_="$st_service" ;;
+	engine) name_="$st_engine" ;;
+	volume) what=volume name_="$st_volume" field=.Labels ;;
+	network) what=network name_="$st_network" field=.Labels ;;
+	*) return 1 ;;
 	esac
+	label="$(cleanup_call 30 docker "$what" inspect -f "{{index $field \"remote-cache-sidecar\"}}" "$name_" 2>/dev/null || true)"
 	[[ -n "$label" && "$label" == "$name" ]]
 }
 
@@ -1014,7 +1017,10 @@ stop_signaled() {
 	# went to /dev/null.
 	exec 1>&8 2>&9
 	local sig="$1" num="$2"
-	if [[ -z "${st_logs:-}" ]]; then
+	# Only once the whole state is read: a cleanup from part of it would
+	# remove some of what the start created, then the state that names the
+	# rest.
+	if [[ "${state_read:-}" != true ]]; then
 		echo "::error::remote-cache-sidecar: the stop got SIG$sig before it read its state, and removed nothing" >&2
 		exit $((128 + num))
 	fi
@@ -1039,7 +1045,7 @@ stop_signaled() {
 stop() {
 	# Before anything else: a signal from here on ends the stop only after
 	# its cleanup (stop_signaled).
-	local st_logs=""
+	local st_logs="" state_read=false
 	on_signals stop_signaled
 	local name="${SIDECAR_NAME:-remote-cache}"
 	valid_name "$name" || die "name '$name' isn't valid"
@@ -1052,6 +1058,7 @@ stop() {
 		echo "remote-cache-sidecar: nothing to stop: no state at $state (did the start step run?)"
 		return 0
 	fi
+	state_read=true
 	# What a start cut off by a signal began to create, and docker has.
 	adopt_creating
 	cleanup_done+=" adopt "

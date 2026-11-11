@@ -343,7 +343,7 @@ check "a clean stop passes" stop_with 0 T_SUMMARY="$tmp/summary"
 check "... it flushes, stops the engine, then signals the service (zerobull-consulting/dagger#137)" \
 	in_order "curl " "stop --time 30 t-engine" "kill -s TERM t-service" "inspect -f {{.State.Running}} t-service"
 check "... the flush is the token form, on the service's URL, with the settle timeout" \
-	grep -qF -- "-u sidecar-engine: --max-time 6 -o $tmp/sc/t/logs/flush.json -w %{http_code} http://10.9.0.1:30000/v1/engines/flush?timeout=1s" <<<"$(calls)"
+	grep -qF -- "-u sidecar-engine: --max-time 4 -o $tmp/sc/t/logs/flush.json -w %{http_code} http://10.9.0.1:30000/v1/engines/flush?timeout=1s" <<<"$(calls)"
 check "... while the engine runs" called "FLUSHED WHILE THE ENGINE RAN"
 check "... and the engine is stopped while the service runs" called "ENGINE STOPPED WHILE THE SERVICE RAN"
 check "... the service gets no second signal" not called "stop --time 5 t-service"
@@ -1251,7 +1251,7 @@ cleanup_bounded() {
 		source "$here/sidecar.sh"
 		signal_cleanup_seconds=3
 		on_signals stop_signaled
-		local name=t state="$tmp/sig/sc/t/state" st_logs="" st_service="" st_engine="" st_volume="" st_network=""
+		local name=t state="$tmp/sig/sc/t/state" st_logs="" state_read=true st_service="" st_engine="" st_volume="" st_network=""
 		local st_stop_seconds="" st_settle_seconds="" st_url="" st_role="" st_created=" " st_creating=" " st_old_state=false
 		local leftovers="" cleanup_done=" " code="" flush_result=""
 		read_state "$state"
