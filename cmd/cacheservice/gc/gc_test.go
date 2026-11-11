@@ -500,6 +500,10 @@ func TestStagingAndUploads(t *testing.T) {
 	oldA := e.view("team-a").PutStaged(blobstore.NewStage(), layer("old", 100))
 	oldB := e.view("team-b").PutStaged(blobstore.NewStage(), layer("old", 100))
 	e.bucket.AddUpload(Upload{Key: uploadKey("team-a", "old"), ID: "1", Initiated: e.clock.Now()})
+	// A large service-hashed promotion's private copy, left by a service
+	// stopped midway: an upload at a staging key.
+	privateKey := nsPrefix("team-a") + layout.StagingRel(string(blobstore.NewStage()), digest.FromString("private"))
+	e.bucket.AddUpload(Upload{Key: privateKey, ID: "3", Initiated: e.clock.Now()})
 	e.clock.Add(3 * time.Hour)
 	young := e.view("team-a").PutStaged(blobstore.NewStage(), layer("young", 100))
 	e.bucket.AddUpload(Upload{Key: uploadKey("team-a", "young"), ID: "2", Initiated: e.clock.Now()})
@@ -510,8 +514,8 @@ func TestStagingAndUploads(t *testing.T) {
 	if a.StagingRule != "missing" || b.StagingRule != "present" {
 		t.Fatalf("rules: a %s, b %s", a.StagingRule, b.StagingRule)
 	}
-	if a.Deleted["staging"] != 1 || a.Deleted["upload"] != 1 {
-		t.Fatalf("team-a deleted %v", a.Deleted)
+	if a.Deleted["staging"] != 1 || a.Deleted["upload"] != 2 || a.UnexpectedCount != 0 {
+		t.Fatalf("team-a deleted %v, %d unexpected", a.Deleted, a.UnexpectedCount)
 	}
 	if got := e.view("team-a").Staged(); !slices.Equal(got, []digest.Digest{young}) {
 		t.Fatalf("team-a staged %v, want only %s (not %s)", got, young, oldA)
