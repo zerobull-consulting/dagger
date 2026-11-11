@@ -281,10 +281,22 @@ documented bound plus 5 minutes). So set the job's timeout above the job's
 work plus `settle-timeout` (10s) plus 3 minutes: the flush, the engine's
 stop (cut off at 90s), the service's, then the cleanup. A job cancelled
 gets the runner's cancellation grace (about 5 minutes) for the stop, which
-is more than the stop takes with the default `settle-timeout`. The shim
-passes a SIGINT, SIGTERM or SIGHUP it gets on to the script's whole process
-group, and `sidecar.sh` traps none, so a start or stop that gets one ends at
-once, its cleanup with it.
+is more than the stop takes with the default `settle-timeout`.
+
+**Signals.** The shim passes a SIGINT, SIGTERM or SIGHUP it gets on to the
+script's whole process group, so the Docker call the script is in dies with
+it, and `sidecar.sh` traps all three
+([zerobull-consulting/dagger#244](https://github.com/zerobull-consulting/dagger/issues/244)).
+A **start** that gets one exits at once, with 128 plus the signal's number:
+it records each container, volume and network as begun (`creating=` in its
+state) before it creates it, and as created after, so whatever the daemon
+made before the signal is the stop's to remove. The stop takes one only if
+Docker has it under its name with this sidecar's label, so the next start on
+a kept runner finds its names free. A **stop** that gets one ignores any that
+follow (a cancelled job's runner sends SIGINT, then SIGTERM), finishes its
+cleanup, keeping both logs and removing what the start created, within 60s,
+each Docker call bounded and out of the signals' reach, then fails the step
+with 128 plus the signal's number, saying so in its step summary.
 
 **What the stop can't store.** Since `v1.0.0-beta.26` an engine gives up
 its remote-cache work 20s after its last session ended, if an export is

@@ -1022,6 +1022,248 @@ second_start_refused() {
 }
 check "a second start with a name in use is refused, and touches nothing of the first" second_start_refused
 
+# --- signals: start and stop each trap TERM, INT and HUP (#244) ---
+# start/run passes a cancelled job's SIGINT, SIGTERM or SIGHUP on to the
+# script's whole process group, so the docker call it is in dies with it.
+# A docker that keeps what it creates as files: exists.<name> (holding the
+# sidecar label's value) and, for a container, running.<name>. With
+# FAKE_HANG, the call named hangs after the daemon did its work, as a
+# create can when the signal comes: network or volume (their create),
+# service or engine (their docker run), or engine-stop (the engine's
+# docker stop). FAKE_RM_SLEEP makes each removal take that long. Every call
+# is logged to $FAKE_DIR/calls.
+mkdir -p "$tmp/sigbin"
+cat >"$tmp/sigbin/docker" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_DIR/calls"
+d="$FAKE_DIR" last="${!#}"
+hang() { : >"$d/hanging"; sleep 30; exit 1; }
+label_of() { local a; for a in "$@"; do [[ "$a" == remote-cache-sidecar=* ]] && echo "${a#remote-cache-sidecar=}"; done; return 0; }
+case "$1 $2" in
+"container inspect" | "volume inspect" | "network inspect")
+	[[ -f "$d/exists.$last" ]] || exit 1
+	case "$*" in
+	*IPAM*) echo 10.9.0.1 ;;
+	*Labels*) cat "$d/exists.$last" ;;
+	esac
+	;;
+"image inspect" | "pull -q") exit 0 ;;
+"network create" | "volume create")
+	label_of "$@" >"$d/exists.$last"
+	[[ "${FAKE_HANG:-}" == "$1" ]] && hang
+	exit 0
+	;;
+"run -d")
+	name=""
+	for ((i = 1; i < $#; i++)); do [[ "${!i}" == --name ]] && { j=$((i + 1)); name="${!j}"; }; done
+	label_of "$@" >"$d/exists.$name"
+	: >"$d/running.$name"
+	[[ "${FAKE_HANG:-}" == service && "$name" == *-service ]] && hang
+	[[ "${FAKE_HANG:-}" == engine && "$name" == *-engine ]] && hang
+	exit 0
+	;;
+"port "*) echo 10.9.0.1:30000 ;;
+"inspect -f")
+	case "$3" in
+	*Running*) [[ -f "$d/running.$4" ]] && echo true || echo false ;;
+	*ExitCode*) echo 0 ;;
+	esac
+	;;
+"kill -s") rm -f "$d/running.$4" ;;
+"stop --time")
+	[[ "${FAKE_HANG:-}" == engine-stop && "$4" == *-engine ]] && hang
+	rm -f "$d/running.$4"
+	;;
+"rm -f" | "volume rm" | "network rm")
+	: >"$d/rm-started"
+	[[ -n "${FAKE_RM_SLEEP:-}" ]] && sleep "$FAKE_RM_SLEEP"
+	[[ -f "$d/exists.$last" ]] || { echo "no such object: $last" >&2; exit 1; }
+	rm -f "$d/exists.$last" "$d/running.$last"
+	;;
+"logs "*) echo 'time=x level=INFO msg=listening addr=:8090' ;;
+*) exit 0 ;;
+esac
+FAKE
+chmod +x "$tmp/sigbin/docker"
+# A process with SIGINT at its default: a background job of this script
+# starts with it ignored, which bash can't trap; start/run's child doesn't.
+default_int=()
+env --default-signal=INT true 2>/dev/null && default_int=(env --default-signal=INT)
+# signaled <SIG> <start|stop> [VAR=value...]: runs `sidecar.sh <command>` as
+# start/run does (in a process group of its own, with
+# SIDECAR_GROUP_KILLED=1), against sigbin's docker, in $tmp/sig; once the
+# fake docker hangs, sends SIG to the whole group, as start/run passes a
+# cancel's on. With T_SECOND, it sends that signal too, once the cleanup's
+# first removal began. Its output is in $tmp/sig.out, its exit code in
+# $tmp/sig.rc, and how long it took after the signal, in seconds, in
+# $tmp/sig.took.
+signaled() {
+	local sig="$1" cmd="$2" pid rc i t
+	shift 2
+	rm -f "$tmp/sig/fake/hanging" "$tmp/sig/fake/rm-started"
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc" SIDECAR_GROUP_KILLED=1
+		export SIDECAR_ROLE=writer SIDECAR_SERVICE_IMAGE=s SIDECAR_START_TIMEOUT=5
+		export CACHESERVICE_S3_ENDPOINT=http://x CACHESERVICE_S3_REGION=r CACHESERVICE_S3_BUCKET=b
+		export CACHESERVICE_S3_ACCESS_KEY_ID=a CACHESERVICE_S3_SECRET_ACCESS_KEY=s
+		unset GITHUB_ACTIONS GITHUB_ENV GITHUB_OUTPUT GITHUB_STEP_SUMMARY T_SECOND
+		(($#)) && export "$@"
+		[[ -n "${T_SUMMARY:-}" ]] && export GITHUB_STEP_SUMMARY="$T_SUMMARY"
+		exec setsid "${default_int[@]}" "$here/sidecar.sh" "$cmd"
+	) >"$tmp/sig.out" 2>&1 &
+	pid=$!
+	for ((i = 0; i < 100; i++)); do
+		[[ -f "$tmp/sig/fake/hanging" ]] && break
+		sleep 0.1
+	done
+	t=$SECONDS
+	kill -"$sig" -- -"$pid" 2>/dev/null
+	if [[ -n "${T_SECOND:-}" ]]; then
+		for ((i = 0; i < 100; i++)); do
+			[[ -f "$tmp/sig/fake/rm-started" ]] && break
+			sleep 0.1
+		done
+		kill -"$T_SECOND" -- -"$pid" 2>/dev/null
+	fi
+	wait "$pid"
+	rc=$?
+	echo "$rc" >"$tmp/sig.rc"
+	echo $((SECONDS - t)) >"$tmp/sig.took"
+}
+sig_rc() { [[ "$(cat "$tmp/sig.rc")" == "$1" ]]; }
+sig_calls() { cat "$tmp/sig/fake/calls" 2>/dev/null; }
+sig_called() { sig_calls | grep -qxF -- "$1"; }
+sig_state() { cat "$tmp/sig/sc/${1:-remote-cache}/state" 2>/dev/null; }
+# What docker still has: the names of the exists.* files.
+sig_left() { (cd "$tmp/sig/fake" && for f in exists.*; do [[ -e "$f" ]] && echo "${f#exists.}"; done) | tr '\n' ' '; }
+# sig_stop: the stop that follows (start's post step), unsignaled.
+sig_stop() {
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc"
+		unset GITHUB_ACTIONS GITHUB_OUTPUT GITHUB_STEP_SUMMARY
+		(($#)) && export "$@"
+		"$here/sidecar.sh" stop
+	) >"$tmp/sig.stop.out" 2>&1
+}
+sig_fresh() { rm -rf "$tmp/sig" && mkdir -p "$tmp/sig/fake"; }
+
+# A signal during the network's create, after the daemon made it: the state
+# says the start began to create it, and the stop removes it, so the next
+# start on a kept runner finds its name free.
+sig_fresh
+signaled TERM start FAKE_HANG=network
+check "a SIGTERM during the network's create ends the start, with 143" sig_rc 143
+check "... at once" [ "$(cat "$tmp/sig.took")" -le 3 ]
+check "... says so" grep -q "the start got SIGTERM, and stopped; what it created or began to create is in its state" "$tmp/sig.out"
+check "... and the state says it began to create the network" grep -qx creating=network <<<"$(sig_state)"
+check "... which docker has" [ "$(sig_left)" = "remote-cache-net " ]
+check "the stop that follows removes it" sig_stop
+check "... it says why" grep -q "the start was cut off while it created the network; docker has it" "$tmp/sig.stop.out"
+check "... and removed it" sig_called "network rm remote-cache-net"
+check "... so docker has nothing of the sidecar's left" [ -z "$(sig_left)" ]
+check "... nor is the state" [ -z "$(sig_state)" ]
+
+# A SIGHUP during the service's docker run: the container is there, the
+# state says created=network and creating=service.
+sig_fresh
+signaled HUP start FAKE_HANG=service SIDECAR_SETTLE_TIMEOUT=0
+check "a SIGHUP during the service's docker run ends the start, with 129" sig_rc 129
+check "... the state says it began to create the service" grep -qx creating=service <<<"$(sig_state)"
+check "... and created the network" grep -qx created=network <<<"$(sig_state)"
+check "... both of which docker has" [ "$(sig_left)" = "remote-cache-net remote-cache-service " ]
+check "the stop that follows removes both" sig_stop
+check "... the service" sig_called "rm -f remote-cache-service"
+check "... and the network" sig_called "network rm remote-cache-net"
+check "... and docker has nothing of the sidecar's left" [ -z "$(sig_left)" ]
+check "... and keeps the service's log" [ -f "$tmp/sig/sc/remote-cache/logs/service.log" ]
+
+if ((${#default_int[@]})); then
+	# A SIGINT (a cancelled job's first) during the engine's state volume's
+	# create.
+	sig_fresh
+	signaled INT start FAKE_HANG=volume SIDECAR_SETTLE_TIMEOUT=0
+	check "a SIGINT during the volume's create ends the start, with 130" sig_rc 130
+	check "... the state says it began to create the volume" grep -qx creating=volume <<<"$(sig_state)"
+	check "the stop that follows removes the volume, the service and the network" sig_stop
+	check "... and docker has nothing of the sidecar's left" [ -z "$(sig_left)" ]
+else
+	echo "skip  a SIGINT during the start: this env has no --default-signal"
+fi
+
+# A create the daemon never did is no one's to remove; nor is a network of
+# that name with another sidecar's label (or none).
+sig_fresh
+mkdir -p "$tmp/sig/sc/remote-cache/logs"
+echo other >"$tmp/sig/fake/exists.remote-cache-net"
+printf '%s\n' service=remote-cache-service engine=remote-cache-engine volume=remote-cache-engine-state \
+	network=remote-cache-net stop_seconds=105 settle_seconds=0 "logs=$tmp/sig/sc/remote-cache/logs" role=writer \
+	creating=network creating=volume >"$tmp/sig/sc/remote-cache/state"
+check "a state that says the start began to create a network and a volume, neither of them its: the stop passes" sig_stop
+check "... and removes neither" [ -z "$(sig_calls | grep -E '^(network|volume) rm' || true)" ]
+check "... nor reports them left behind" not grep -q "left behind" "$tmp/sig.stop.out"
+check "... the other sidecar's network is still there" [ "$(sig_left)" = "remote-cache-net " ]
+
+# A signal during the stop (here, during the engine's docker stop): the
+# stop keeps both logs and removes everything, then exits 128 plus the
+# signal.
+sig_stop_state() {
+	sig_fresh
+	mkdir -p "$tmp/sig/sc/t/logs"
+	local n
+	for n in t-service t-engine; do echo t >"$tmp/sig/fake/exists.$n" && : >"$tmp/sig/fake/running.$n"; done
+	echo t >"$tmp/sig/fake/exists.t-engine-state"
+	echo t >"$tmp/sig/fake/exists.t-net"
+	printf '%s\n' service=t-service engine=t-engine volume=t-engine-state network=t-net \
+		stop_seconds=105 settle_seconds=0 "logs=$tmp/sig/sc/t/logs" role=writer \
+		created=network created=service created=volume created=engine >"$tmp/sig/sc/t/state"
+}
+sig_cleaned_up() {
+	sig_called "rm -f t-service" && sig_called "rm -f t-engine" && sig_called "volume rm -f t-engine-state" &&
+		sig_called "network rm t-net" && [[ -z "$(sig_left)" && -z "$(sig_state t)" ]]
+}
+sig_stop_state
+rm -f "$tmp/summary"
+signaled TERM stop SIDECAR_NAME=t FAKE_HANG=engine-stop T_SUMMARY="$tmp/summary"
+check "a SIGTERM during the stop: it exits 143" sig_rc 143
+check "... after its cleanup, in seconds" [ "$(cat "$tmp/sig.took")" -le 5 ]
+check "... says so" grep -q "the stop got SIGTERM: keeping the logs and removing the sidecar" "$tmp/sig.out"
+check "... removed the containers, the volume, the network and the state" sig_cleaned_up
+check "... kept both logs" [ -f "$tmp/sig/sc/t/logs/service.log" -a -f "$tmp/sig/sc/t/logs/engine.log" ]
+check "... and fails, saying why, in the step summary too" grep -q "^- \*\*failed:\*\* the stop got SIGTERM before it ended: it kept the logs and removed what the start created" "$tmp/summary"
+# A cancelled job's runner sends SIGINT, then SIGTERM: a second signal
+# during the cleanup doesn't cut it off.
+sig_stop_state
+signaled HUP stop SIDECAR_NAME=t FAKE_HANG=engine-stop FAKE_RM_SLEEP=1 T_SECOND=TERM
+check "a SIGHUP during the stop, then a SIGTERM during its cleanup: it exits 129" sig_rc 129
+check "... the second signal didn't cut the cleanup off: everything is removed" sig_cleaned_up
+check "... and both logs kept" [ -f "$tmp/sig/sc/t/logs/service.log" -a -f "$tmp/sig/sc/t/logs/engine.log" ]
+check "... within the cleanup's bound" [ "$(cat "$tmp/sig.took")" -le 15 ]
+# The cleanup's own bound: a removal that hangs is cut off at the cleanup's
+# time, and the stop still exits.
+cleanup_bounded() {
+	sig_stop_state
+	local t=$SECONDS
+	# The stop's locals, which the sourced stop_signaled reads.
+	# shellcheck disable=SC2034
+	(
+		export PATH="$tmp/sigbin:$PATH" FAKE_DIR="$tmp/sig/fake" SIDECAR_DIR="$tmp/sig/sc" SIDECAR_NAME=t FAKE_RM_SLEEP=30
+		set +e
+		source "$here/sidecar.sh"
+		signal_cleanup_seconds=3
+		on_signals stop_signaled
+		local name=t state="$tmp/sig/sc/t/state" st_logs="" st_service="" st_engine="" st_volume="" st_network=""
+		local st_stop_seconds="" st_settle_seconds="" st_url="" st_role="" st_created=" " st_creating=" " st_old_state=false
+		local leftovers="" cleanup_done=" " code="" flush_result=""
+		read_state "$state"
+		stop_signaled TERM 15
+	) >"$tmp/sig.bound.out" 2>&1
+	local rc=$?
+	# Its 3s, then 1s for each call after it, and the killed calls' 2s.
+	[[ $rc == 143 && $((SECONDS - t)) -le 10 ]]
+}
+check "the cleanup after a signal is bounded: removals that hang are cut off, and the stop exits 143" cleanup_bounded
+check "... and says what it left behind" grep -q "but for container t-service, container t-engine, volume t-engine-state, network t-net" "$tmp/sig.bound.out"
+
 # --- check.sh stored reports a writer that stored nothing ---
 printf '%s\n' 'time=x level=INFO msg="flush: done" namespace=default cacheID=c1 outcome=complete took=1ms storedRoots=0 leftRoots=0' >"$tmp/no-exports.log"
 stored_out="$("$here/../../../hack/remote-cache/demo/check.sh" stored "$tmp/no-exports.log" "$tmp/stored" 2>&1)"

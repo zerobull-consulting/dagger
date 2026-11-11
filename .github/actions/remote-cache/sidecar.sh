@@ -12,6 +12,10 @@
 #                      service; keep their logs; remove the containers, the
 #                      engine's state and the network
 #
+# Both trap SIGINT, SIGTERM and SIGHUP: a start records what it creates
+# before it does, and a stop finishes its cleanup, bounded, then each exits
+# 128 plus the signal's number.
+#
 # The actions start/ and stop/ run it (start through a small JavaScript
 # shim, start/run, which also runs the stop at the end of the job), and so
 # does hack/remote-cache/demo/run.sh, locally. Its settings are environment
@@ -94,7 +98,9 @@ group_killed() {
 	[[ "${SIDECAR_GROUP_KILLED:-}" == 1 ]] && command timeout --foreground 5 true 2>/dev/null
 }
 if group_killed; then
-	timeout() { command timeout --foreground "$@"; }
+	# Without the output on_signals keeps for the signal handlers (fds 8 and
+	# 9), which a call that outlives its bound would hold open.
+	timeout() { command timeout --foreground "$@" 8>&- 9>&-; }
 fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -294,6 +300,10 @@ read_state() {
 		# What this sidecar's start created, one line each as it did: the
 		# stop touches nothing else.
 		created) case "$value" in service | engine | volume | network | debug-token) st_created+=" $value " ;; esac ;;
+		# What it began to create: a signal may have ended it during the
+		# create (zerobull-consulting/dagger#244). The stop takes it for
+		# this sidecar's only if docker has it, with this sidecar's label.
+		creating) case "$value" in service | engine | volume | network) st_creating+=" $value " ;; esac ;;
 		esac
 	done <"$file"
 	valid_name "$st_service" && valid_name "$st_engine" && valid_name "$st_volume" &&
@@ -419,7 +429,40 @@ pull_images() {
 	[[ -z "$failed" ]] || die "${failed# }"
 }
 
+# on_signals FUNCTION: runs FUNCTION SIGNAL NUMBER on a SIGINT, SIGTERM or
+# SIGHUP. start/run passes a cancelled job's signals on to this script's
+# whole process group, so its docker call dies with it; without a trap, so
+# would the script, at once (zerobull-consulting/dagger#244).
+on_signals() {
+	# The output as it is now, for the handler: a signal can come while a
+	# function runs with its output redirected (the timeout wrapper above,
+	# with >/dev/null 2>&1), and the handler runs inside that.
+	exec 8>&1 9>&2
+	# shellcheck disable=SC2064 # $1 now, on purpose
+	trap "$1 INT 2" INT
+	# shellcheck disable=SC2064
+	trap "$1 TERM 15" TERM
+	# shellcheck disable=SC2064
+	trap "$1 HUP 1" HUP
+}
+
+# A signal during the start: what it created, or began to create, is in the
+# state already (each create is recorded before it runs), so the stop, the
+# start's post step or remote-cache/stop, removes it. It exits 128 plus the
+# signal's number.
+start_signaled() {
+	trap '' INT TERM HUP
+	exec 1>&8 2>&9
+	if [[ -n "${state:-}" && -f "$state" ]]; then
+		echo "::error::remote-cache-sidecar: the start got SIG$1, and stopped; what it created or began to create is in its state ($state), which the stop removes" >&2
+	else
+		echo "::error::remote-cache-sidecar: the start got SIG$1, and stopped before it created anything" >&2
+	fi
+	exit $((128 + $2))
+}
+
 start() {
+	on_signals start_signaled
 	local role="${SIDECAR_ROLE:-}"
 	local name="${SIDECAR_NAME:-remote-cache}"
 	local namespace="${SIDECAR_NAMESPACE:-default}"
@@ -515,6 +558,11 @@ start() {
 	pull_images "$service_image" "$service_floating" "$engine_image"
 	echo "remote-cache-sidecar: images ready in $((SECONDS - pulled_at))s"
 
+	# Each create is recorded as begun (creating=) before it runs, and as done
+	# (created=) after: a signal can end the script during the create, after
+	# the daemon made it, and the stop then still finds it, by its name and
+	# this sidecar's label (zerobull-consulting/dagger#244).
+	echo "creating=network" >>"$state"
 	timeout 60 docker network create --label remote-cache-sidecar="$name" "$network" >/dev/null ||
 		die "creating the network $network failed"
 	echo "created=network" >>"$state"
@@ -576,6 +624,7 @@ start() {
 	done
 
 	echo "remote-cache-sidecar: starting the $role service ($service_image)"
+	echo "creating=service" >>"$state"
 	timeout 120 docker run -d --name "$service" --network "$network" \
 		--label remote-cache-sidecar="$name" "${publish[@]}" "${token_mount[@]}" "${s3env[@]}" \
 		"$service_image" "${flags[@]}" >/dev/null || die "starting the service failed"
@@ -617,6 +666,7 @@ start() {
 	# service's log from here on only.
 	local since
 	since="$(date +%s)"
+	echo "creating=volume" >>"$state"
 	timeout 60 docker volume create --label remote-cache-sidecar="$name" "$volume" >/dev/null ||
 		die "creating the volume $volume failed"
 	echo "created=volume" >>"$state"
@@ -624,6 +674,7 @@ start() {
 	# remote cache URL, and DAGGER_CLOUD_URL for its cache events. The token
 	# is a placeholder: the service runs without a tokens file, and takes any
 	# token but "oidc".
+	echo "creating=engine" >>"$state"
 	timeout 120 docker run -d --privileged --name "$engine" --network "$network" \
 		--label remote-cache-sidecar="$name" -v "$volume:/var/lib/dagger" "${mounts[@]}" \
 		-e _EXPERIMENTAL_DAGGER_REMOTE_CACHE_URL="$url" \
@@ -835,17 +886,175 @@ flush_engine() {
 	warn "the flush: $flush_result. The stop goes on: what the engine hadn't exported is lost with it"
 }
 
+# How long the stop's cleanup may take after a signal: it keeps both logs
+# and removes what the start created, then exits
+# (zerobull-consulting/dagger#244).
+signal_cleanup_seconds=60
+
+# cleanup_call BOUND CMD...: a docker call of the stop's cleanup, bounded by
+# BOUND seconds. After a signal (cleanup_deadline set), it is bounded by what
+# is left of the cleanup's time too, and by GNU timeout's own: one that puts
+# itself and the call in a process group of their own, out of reach of the
+# signals that may follow (a cancelled job's runner sends SIGINT, then
+# SIGTERM, and start/run passes each on to the script's whole group), and
+# kills the call 2s after its bound, so none outlives the cleanup's time.
+cleanup_call() {
+	local bound="$1"
+	shift
+	if [[ -z "${cleanup_deadline:-}" ]]; then
+		timeout "$bound" "$@"
+		return
+	fi
+	local left=$((cleanup_deadline - SECONDS))
+	((left < 1)) && left=1
+	((bound > left)) && bound=$left
+	command timeout -k 2 "$bound" "$@"
+}
+
+cleanup_did() { [[ "$cleanup_done" == *" $1 "* ]]; }
+
+# Whether docker has this sidecar's KIND (service, engine, volume or network)
+# under its name, with this sidecar's label (the start labels everything it
+# creates with its name).
+labeled_ours() {
+	local label
+	case "$1" in
+	service) label="$(cleanup_call 30 docker container inspect -f '{{index .Config.Labels "remote-cache-sidecar"}}' "$st_service" 2>/dev/null || true)" ;;
+	engine) label="$(cleanup_call 30 docker container inspect -f '{{index .Config.Labels "remote-cache-sidecar"}}' "$st_engine" 2>/dev/null || true)" ;;
+	volume) label="$(cleanup_call 30 docker volume inspect -f '{{index .Labels "remote-cache-sidecar"}}' "$st_volume" 2>/dev/null || true)" ;;
+	network) label="$(cleanup_call 30 docker network inspect -f '{{index .Labels "remote-cache-sidecar"}}' "$st_network" 2>/dev/null || true)" ;;
+	esac
+	[[ -n "$label" && "$label" == "$name" ]]
+}
+
+# What the start began to create (creating=) and never recorded as created:
+# a signal ended it during the create, which docker may have done all the
+# same. It is this sidecar's when docker has it, with this sidecar's label,
+# and removed with the rest; otherwise it was never created.
+adopt_creating() {
+	local kind
+	for kind in network service volume engine; do
+		if [[ "$st_creating" == *" $kind "* ]] && ! created "$kind" && labeled_ours "$kind"; then
+			st_created+=" $kind "
+			echo "remote-cache-sidecar: the start was cut off while it created the $kind; docker has it, so it is removed with the rest" >&2
+		fi
+	done
+}
+
+# A removal that failed leaves KIND NAME behind only if docker still has it:
+# a removal a signal cut off may have been done.
+left_behind() {
+	cleanup_call 30 docker "$1" inspect "$2" >/dev/null 2>&1 && leftovers+="${leftovers:+, }$1 $2"
+	return 0
+}
+
+# stop_cleanup: keeps both logs, reads the service's exit code (in a stop
+# that no signal cut off, of a state of this action's start), and removes
+# what the start created, then the state. Each step runs once: a cleanup a
+# signal cut off is resumed by the signal's own (stop_signaled), at the step
+# it was at.
+stop_cleanup() {
+	if ! cleanup_did adopt; then
+		adopt_creating
+		cleanup_done+=" adopt "
+	fi
+	if ! cleanup_did engine-log; then
+		if created engine && cleanup_call 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
+			cleanup_call 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
+		fi
+		cleanup_done+=" engine-log "
+	fi
+	if ! cleanup_did service-log; then
+		if created service && cleanup_call 30 docker container inspect "$st_service" >/dev/null 2>&1; then
+			if [[ "$st_old_state" != true && -z "${cleanup_deadline:-}" ]]; then
+				code="$(exit_code "$st_service")"
+				[[ "$code" != unknown ]] || code=""
+			fi
+			cleanup_call 60 docker logs "$st_service" 2>&1 | redact >"$st_logs/service.log" || true
+		fi
+		cleanup_done+=" service-log "
+	fi
+	# Only what this sidecar's start created.
+	# A removal that fails is reported, with its name and kind, but doesn't
+	# change the stop's exit status: an ephemeral runner discards what is
+	# left, and a self-hosted one's next start says what is in its way.
+	local kind
+	for kind in service engine volume network; do
+		if ! created "$kind" || cleanup_did "rm-$kind"; then
+			continue
+		fi
+		case "$kind" in
+		service) cleanup_call 60 docker rm -f "$st_service" >/dev/null 2>&1 || left_behind container "$st_service" ;;
+		engine) cleanup_call 60 docker rm -f "$st_engine" >/dev/null 2>&1 || left_behind container "$st_engine" ;;
+		volume) cleanup_call 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || left_behind volume "$st_volume" ;;
+		network) cleanup_call 60 docker network rm "$st_network" >/dev/null 2>&1 || left_behind network "$st_network" ;;
+		esac
+		cleanup_done+=" rm-$kind "
+	done
+	cleanup_did files && return 0
+	[[ -z "$leftovers" ]] || echo "remote-cache-sidecar: couldn't remove, so left behind: $leftovers; remove them by hand if the runner is kept" >&2
+	rm -f "$state"
+	# The debug token, if this start generated it: it opened only this
+	# service. Its directory goes only if nothing else is in it.
+	if created debug-token; then
+		rm -f -- "$(sidecar_dir)/$name/secrets/debug-token"
+		rmdir -- "$(sidecar_dir)/$name/secrets" 2>/dev/null || true
+	fi
+	[[ -z "${GITHUB_OUTPUT:-}" ]] || echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
+	cleanup_done+=" files "
+}
+
+# A signal during the stop (zerobull-consulting/dagger#244): it ignores any
+# that follow, finishes the cleanup, within signal_cleanup_seconds (each
+# docker call bounded, and out of the signals' reach: cleanup_call), says so
+# in the step summary, and exits 128 plus the signal's number.
+stop_signaled() {
+	trap '' INT TERM HUP
+	# The output on_signals saved: this may run inside a call whose output
+	# went to /dev/null.
+	exec 1>&8 2>&9
+	local sig="$1" num="$2"
+	if [[ -z "${st_logs:-}" ]]; then
+		echo "::error::remote-cache-sidecar: the stop got SIG$sig before it read its state, and removed nothing" >&2
+		exit $((128 + num))
+	fi
+	cleanup_deadline=$((SECONDS + signal_cleanup_seconds))
+	echo "remote-cache-sidecar: the stop got SIG$sig: keeping the logs and removing the sidecar, for up to ${signal_cleanup_seconds}s, then exiting; further signals are ignored" >&2
+	stop_cleanup
+	local why="the stop got SIG$sig before it ended: it kept the logs and removed what the start created${leftovers:+, but for $leftovers}; what the engine hadn't exported is lost"
+	if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+		{
+			echo "### remote-cache-sidecar: ${st_role:-sidecar} stopped by SIG$sig"
+			echo
+			[[ -z "${flush_result:-}" ]] || echo "- flush: $flush_result"
+			echo "- logs: \`$st_logs\`"
+			[[ -z "$leftovers" ]] || echo "- **left behind (couldn't be removed):** $leftovers"
+			echo "- **failed:** $why"
+		} >>"$GITHUB_STEP_SUMMARY"
+	fi
+	echo "::error::remote-cache-sidecar: $why" >&2
+	exit $((128 + num))
+}
+
 stop() {
+	# Before anything else: a signal from here on ends the stop only after
+	# its cleanup (stop_signaled).
+	local st_logs=""
+	on_signals stop_signaled
 	local name="${SIDECAR_NAME:-remote-cache}"
 	valid_name "$name" || die "name '$name' isn't valid"
 	local state
 	state="$(sidecar_dir)/$name/state"
 	local st_service="" st_engine="" st_volume="" st_network="" st_stop_seconds="" st_settle_seconds="" st_url=""
-	local st_logs="" st_role="" st_created=" " st_old_state=false
+	local st_role="" st_created=" " st_creating=" " st_old_state=false
+	local leftovers="" cleanup_done=" " code="" flush_result=""
 	if ! read_state "$state"; then
 		echo "remote-cache-sidecar: nothing to stop: no state at $state (did the start step run?)"
 		return 0
 	fi
+	# What a start cut off by a signal began to create, and docker has.
+	adopt_creating
+	cleanup_done+=" adopt "
 	local failed="" old_state=""
 	if [[ "$st_old_state" == true ]]; then
 		# A start from before zerobull-consulting/dagger#137 ran its service
@@ -863,7 +1072,7 @@ stop() {
 	# with no drain: it stops at once, within its shutdown's 5s
 	# (zerobull-consulting/dagger#137). Every wait is bounded, and the
 	# cleanup below runs whatever they found.
-	local was_running=false code="" still_running=false overran=false engine_code="" flush_result=""
+	local was_running=false still_running=false overran=false engine_code=""
 	if [[ "$st_old_state" != true ]]; then
 		# A docker that fails here says nothing about the service: it is
 		# taken for running, so it is still flushed and stopped. The probe
@@ -914,34 +1123,7 @@ stop() {
 			fi
 		fi
 	fi
-	if created engine && timeout 30 docker container inspect "$st_engine" >/dev/null 2>&1; then
-		timeout 60 docker logs "$st_engine" 2>&1 | redact >"$st_logs/engine.log" || true
-	fi
-	if created service && timeout 30 docker container inspect "$st_service" >/dev/null 2>&1; then
-		if [[ "$st_old_state" != true ]]; then
-			code="$(exit_code "$st_service")"
-			[[ "$code" != unknown ]] || code=""
-		fi
-		timeout 60 docker logs "$st_service" 2>&1 | redact >"$st_logs/service.log" || true
-	fi
-	# Only what this sidecar's start created.
-	# A removal that fails is reported, with its name and kind, but doesn't
-	# change the stop's exit status: an ephemeral runner discards what is
-	# left, and a self-hosted one's next start says what is in its way.
-	local leftovers=""
-	created service && { timeout 60 docker rm -f "$st_service" >/dev/null 2>&1 || leftovers+="${leftovers:+, }container $st_service"; }
-	created engine && { timeout 60 docker rm -f "$st_engine" >/dev/null 2>&1 || leftovers+="${leftovers:+, }container $st_engine"; }
-	created volume && { timeout 60 docker volume rm -f "$st_volume" >/dev/null 2>&1 || leftovers+="${leftovers:+, }volume $st_volume"; }
-	created network && { timeout 60 docker network rm "$st_network" >/dev/null 2>&1 || leftovers+="${leftovers:+, }network $st_network"; }
-	[[ -z "$leftovers" ]] || echo "remote-cache-sidecar: couldn't remove, so left behind: $leftovers; remove them by hand if the runner is kept" >&2
-	rm -f "$state"
-	# The debug token, if this start generated it: it opened only this
-	# service. Its directory goes only if nothing else is in it.
-	if created debug-token; then
-		rm -f -- "$(sidecar_dir)/$name/secrets/debug-token"
-		rmdir -- "$(sidecar_dir)/$name/secrets" 2>/dev/null || true
-	fi
-	[[ -n "${GITHUB_OUTPUT:-}" ]] && echo "logs=$st_logs" >>"$GITHUB_OUTPUT"
+	stop_cleanup
 
 	if [[ -f "$st_logs/service.log" ]]; then
 		echo "remote-cache-sidecar: the flush and the stop, from the service's log:"
