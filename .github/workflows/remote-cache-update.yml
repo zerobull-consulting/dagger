@@ -5,10 +5,10 @@ name: Remote cache update
 # stores their results under the bucket's prefix (cache-<engine version>).
 #
 # The pipelines are hack/remote-cache/speedup/run.sh's: a build of
-# cmd/cacheservice, and the unit tests' "service, client and protocol" step,
-# which remote-cache-pr-checks.yml runs on pull requests with a read-only
-# sidecar (pr-checks-readonly). Each job moved to Dagger adds its own
-# pipeline here.
+# cmd/cacheservice, and the "service, client and protocol" step of
+# remote-cache-tests.yml's unit job, which runs the same pipeline with a
+# read-only sidecar (pr-checks-readonly). Each job moved to Dagger adds its
+# own pipeline here.
 #
 # Only feature/remote-cache runs it: the job is skipped on any other ref of a
 # manual run. That `if` is in the branch's own copy of this file, so it is not
@@ -18,7 +18,7 @@ name: Remote cache update
 # The engine version is pinned, not read from the manifest's first accept line,
 # so a new accept line doesn't change what fills the cache. It must be an accept
 # line of cmd/cacheservice/compat/engines.txt, or the start fails; when a new
-# one is verified, move VERSION, remote-cache-pr-checks.yml's VERSION and the
+# one is verified, move VERSION, remote-cache-tests.yml's DAGGER_VERSION and the
 # environments' CACHE_S3_PREFIX (cache-<version>) together, since one
 # engine's entries are for that engine.
 "on":
@@ -93,10 +93,14 @@ jobs:
           SERVICE: ${{ steps.writer.outputs.service-container }}
           DAGGER: ${{ steps.writer.outputs.dagger }}
         run: ./hack/remote-cache/speedup/run.sh build build "$RUNNER_TEMP/update" "$SERVICE"
-      # The layers a pull request's run fetches (see run.sh, unit_pipeline). A
-      # test that fails here fails the job, and stores nothing of its layer.
+      # The layers the unit job's run fetches (see run.sh, unit_pipeline). Only
+      # the layers matter here, not the tests' result: remote-cache-tests.yml
+      # reports that. A failing test stores nothing of the last layer, and the
+      # layers under it are stored all the same.
       - name: Unit tests (service, client and protocol)
+        id: unit
         timeout-minutes: 30
+        continue-on-error: true
         env:
           SERVICE: ${{ steps.writer.outputs.service-container }}
           DAGGER: ${{ steps.writer.outputs.dagger }}
@@ -118,6 +122,8 @@ jobs:
         run: |
           executed=0
           for p in build unit; do
+            # A failed run (tests that failed) writes no spans.
+            [[ -f "$RUNNER_TEMP/update/$p.spans" ]] || { echo "$p: no spans (the run failed)" | tee -a "$GITHUB_STEP_SUMMARY"; continue; }
             read -r h e <"$RUNNER_TEMP/update/$p.spans"
             echo "$p: $h hit, $e executed" | tee -a "$GITHUB_STEP_SUMMARY"
             executed=$((executed + e))
