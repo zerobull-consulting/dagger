@@ -38,6 +38,8 @@ type fakeStore struct {
 	afterDelete    func(f *fakeStore)
 	deleteFailures map[string]bool
 	abortErr       func(u Upload) error
+	// afterAbort, when set, runs after each abort, without f.mu held.
+	afterAbort func(f *fakeStore)
 	// extraListed is a key a listing returns whatever the prefix.
 	extraListed string
 	// exactKey lists uploads as MinIO does: by prefix, only an upload at
@@ -176,13 +178,20 @@ func (f *fakeStore) Delete(_ context.Context, keys []string) ([]Failure, error) 
 		f.mu.Unlock()
 		return nil, fmt.Errorf("delete: %d keys, over %d", len(keys), PageSize)
 	}
+	var failed []Failure
 	if f.deleteErr != nil {
 		if err := f.deleteErr(keys); err != nil {
+			// As S3Store.Delete: the failures collected before the request
+			// failed come back with the error; nothing was deleted.
+			for _, k := range keys {
+				if f.deleteFailures[k] {
+					failed = append(failed, Failure{Key: k, Reason: "AccessDenied: no"})
+				}
+			}
 			f.mu.Unlock()
-			return nil, err
+			return failed, err
 		}
 	}
-	var failed []Failure
 	for _, k := range keys {
 		if f.deleteFailures[k] {
 			failed = append(failed, Failure{Key: k, Reason: "AccessDenied: no"})
@@ -199,7 +208,18 @@ func (f *fakeStore) Delete(_ context.Context, keys []string) ([]Failure, error) 
 	return failed, nil
 }
 
-func (f *fakeStore) Abort(_ context.Context, u Upload) error {
+func (f *fakeStore) Abort(ctx context.Context, u Upload) error {
+	err := f.abort(u)
+	f.mu.Lock()
+	hook := f.afterAbort
+	f.mu.Unlock()
+	if hook != nil && err == nil {
+		hook(f)
+	}
+	return err
+}
+
+func (f *fakeStore) abort(u Upload) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "abort "+u.Key)
@@ -1068,6 +1088,267 @@ func TestXMLSafe(t *testing.T) {
 	} {
 		if got := xmlSafe(k); got != want {
 			t.Errorf("xmlSafe(%q) = %v, want %v", k, got, want)
+		}
+	}
+}
+
+// deletes is how many Delete requests f has seen. Read from a hook, which
+// runs without f.mu held.
+func (f *fakeStore) deletes() int {
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "delete ") {
+			n++
+		}
+	}
+	return n
+}
+
+// claimAfterDelete makes f, once its nth Delete request has run, write a
+// new marker for prefix and a first data key, as a writer claiming the
+// emptied prefix does; claimed reports that it did, so that a test can tell
+// "the marker survived" from "it was never written".
+func claimAfterDelete(f *fakeStore, prefix string, n int) (claimed *bool) {
+	claimed = new(bool)
+	f.afterDelete = func(f *fakeStore) {
+		if f.deletes() != n || *claimed {
+			return
+		}
+		f.mu.Lock()
+		f.putMarker(prefix, 2)
+		f.put(layout.Root(prefix)+"ns/new/index.json", 9)
+		f.mu.Unlock()
+		*claimed = true
+	}
+	return claimed
+}
+
+const reclaimMsg = "a writer claimed the prefix during the wipe; its marker and anything written after it were left alone"
+
+// checkReclaimStopped checks what every re-claim test expects: exit 1, the
+// message, the new marker and data still there, and nothing aborted.
+func checkReclaimStopped(t *testing.T, f *fakeStore, claimed *bool, code int, out string) {
+	t.Helper()
+	if !*claimed {
+		t.Fatalf("the fake never wrote the new marker:\n%s", out)
+	}
+	if code != ExitError || !strings.Contains(out, reclaimMsg) || !strings.Contains(out, "cache/cacheservice.json") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	for _, k := range []string{"cache/cacheservice.json", "cache/ns/new/index.json"} {
+		if _, ok := f.objects[k]; !ok {
+			t.Errorf("%s was deleted\n%s", k, out)
+		}
+	}
+	if len(f.aborted) > 0 {
+		t.Errorf("aborted %v", f.aborted)
+	}
+}
+
+// A writer claims the prefix once the wipe has deleted the old marker: the
+// wipe stops before its first page, and the new marker and the data written
+// with it stay.
+func TestMarkerReclaimedAfterStep1Stops(t *testing.T) {
+	f := newFake()
+	f.pageSize = 4
+	seed(f, 2)
+	claimed := claimAfterDelete(f, "cache", 1)
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	checkReclaimStopped(t, f, claimed, code, out)
+	if n := f.deletes(); n != 1 {
+		t.Fatalf("%d deletes, want the old marker's only", n)
+	}
+}
+
+// A writer claims the prefix after a page, with more pages expected, and the
+// next page lists the new marker: it isn't deleted, nor the rest of its page.
+func TestMarkerReclaimedBetweenPagesStops(t *testing.T) {
+	f := newFake()
+	f.pageSize = 4
+	f.putMarker("cache", 2)
+	for i := range 5 { // sorted before the marker's key
+		f.put(fmt.Sprintf("cache/blobs/k%02d", i), 1)
+	}
+	f.uploads = []Upload{{Key: "cache/staging/x", ID: "1"}}
+	claimed := claimAfterDelete(f, "cache", 2) // the first page's delete
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	checkReclaimStopped(t, f, claimed, code, out)
+	if !slices.Contains(f.keys(), "cache/blobs/k04") {
+		t.Errorf("the second page was partly deleted: %v", f.keys())
+	}
+	if n := f.deletes(); n != 2 {
+		t.Fatalf("%d deletes, want the marker's and the first page's", n)
+	}
+}
+
+// A writer claims the prefix after the last object delete: no upload is
+// aborted.
+func TestMarkerReclaimedBeforeAbortsStops(t *testing.T) {
+	f := newFake()
+	f.putMarker("cache", 2)
+	f.put("cache/blobs/k", 1)
+	f.uploads = []Upload{{Key: "cache/staging/x", ID: "1"}}
+	claimed := claimAfterDelete(f, "cache", 2)
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	checkReclaimStopped(t, f, claimed, code, out)
+	if len(f.uploads) != 1 {
+		t.Errorf("uploads left: %v", f.uploads)
+	}
+}
+
+// A layout 1 prefix has no marker to delete: one appearing during the wipe
+// stops it all the same.
+func TestMarkerReclaimedLayout1Stops(t *testing.T) {
+	f := newFake()
+	f.pageSize = 4
+	for i := range 9 {
+		f.put(fmt.Sprintf("cache/blobs/k%02d", i), 1)
+	}
+	claimed := claimAfterDelete(f, "cache", 1)
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	checkReclaimStopped(t, f, claimed, code, out)
+	if strings.Contains(out, "deleted the old one") || !strings.Contains(out, "the prefix had none") {
+		t.Errorf("the message claims a marker was deleted:\n%s", out)
+	}
+}
+
+// A writer claims the prefix between two pages of uploads: the next page
+// aborts nothing.
+func TestMarkerReclaimedBetweenUploadPagesStops(t *testing.T) {
+	f := newFake()
+	f.pageSize = 1
+	f.putMarker("cache", 2)
+	f.uploads = []Upload{{Key: "cache/staging/a", ID: "1"}, {Key: "cache/staging/b", ID: "2"}, {Key: "cache/staging/c", ID: "3"}}
+	claimed := new(bool)
+	f.afterAbort = func(f *fakeStore) {
+		if *claimed {
+			return
+		}
+		f.mu.Lock()
+		f.putMarker("cache", 2)
+		f.put("cache/ns/new/index.json", 9)
+		f.mu.Unlock()
+		*claimed = true
+	}
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	if !*claimed || code != ExitError || !strings.Contains(out, reclaimMsg) {
+		t.Fatalf("claimed %v, exit %d\n%s", *claimed, code, out)
+	}
+	for _, k := range []string{"cache/cacheservice.json", "cache/ns/new/index.json"} {
+		if _, ok := f.objects[k]; !ok {
+			t.Errorf("%s was deleted", k)
+		}
+	}
+	if len(f.aborted) != 1 || len(f.uploads) != 2 {
+		t.Fatalf("aborted %v, uploads left %v: want the first page's only", f.aborted, f.uploads)
+	}
+}
+
+// An ancestor claimed between two pages of uploads stops the wipe too: the
+// shared re-check covers step 3 page by page.
+func TestAncestorClaimedBetweenUploadPagesStops(t *testing.T) {
+	f := newFake()
+	f.pageSize = 1
+	f.uploads = []Upload{{Key: "a/ns/staging/a", ID: "1"}, {Key: "a/ns/staging/b", ID: "2"}}
+	claimed := false
+	f.afterAbort = func(f *fakeStore) {
+		f.mu.Lock()
+		f.putMarker("a", 2)
+		f.mu.Unlock()
+		claimed = true
+	}
+	code, out := run(t, f, Options{Prefix: "a/ns", Confirm: "bkt/a/ns"})
+	if !claimed || code != ExitError || len(f.aborted) != 1 || !strings.Contains(out, "holds an ownership marker (a/cacheservice.json)") {
+		t.Fatalf("claimed %v, exit %d, aborted %v\n%s", claimed, code, f.aborted, out)
+	}
+}
+
+// A marker read that fails during the re-check (not "absent") stops the
+// wipe: when it can't tell, it doesn't delete.
+func TestMarkerUnreadableDuringWipeStops(t *testing.T) {
+	for name, at := range map[string]int{"before a page": 1, "before the aborts": 2} {
+		t.Run(name, func(t *testing.T) {
+			f := newFake()
+			f.pageSize = 4
+			f.putMarker("cache", 2)
+			f.put("cache/blobs/k", 1)
+			f.uploads = []Upload{{Key: "cache/staging/x", ID: "1"}}
+			// The marker's read fails once the nth delete has run.
+			f.getErr = func(key string) error {
+				if key == "cache/cacheservice.json" && len(f.deleted) >= at {
+					return errors.New("503 SlowDown")
+				}
+				return nil
+			}
+			code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+			if code != ExitError || !strings.Contains(out, "can't read the ownership marker cache/cacheservice.json: 503 SlowDown") {
+				t.Fatalf("exit %d\n%s", code, out)
+			}
+			if len(f.aborted) > 0 {
+				t.Errorf("aborted %v", f.aborted)
+			}
+			if _, ok := f.objects["cache/blobs/k"]; ok != (at == 1) {
+				t.Errorf("data key present %v after the stop at %d\n%s", ok, at, out)
+			}
+		})
+	}
+}
+
+// Every line that names the marker's key prints it escaped, whatever stops
+// the wipe.
+func TestMarkerKeyPrintedEscaped(t *testing.T) {
+	const prefix = "c\x1b[2Jx"
+	const confirm = "bkt/" + prefix
+	key := layout.MarkerKey(prefix)
+	for name, setup := range map[string]func(f *fakeStore){
+		"wiped":   func(f *fakeStore) {},
+		"reclaim": func(f *fakeStore) { claimAfterDelete(f, prefix, 1) },
+		"unreadable at the start": func(f *fakeStore) {
+			f.getErr = func(k string) error {
+				if k == key {
+					return errors.New("503")
+				}
+				return nil
+			}
+		},
+		"marker delete fails": func(f *fakeStore) { f.deleteFailures = map[string]bool{key: true} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFake()
+			f.putMarker(prefix, 2)
+			f.put(layout.Root(prefix)+"blobs/k", 1)
+			setup(f)
+			var out, errOut bytes.Buffer
+			Run(context.Background(), Options{Bucket: "bkt", Prefix: prefix, Confirm: confirm}, f, &out, &errOut)
+			all := out.String() + errOut.String()
+			if strings.Contains(all, "\x1b") {
+				t.Fatalf("printed a raw escape:\n%q", all)
+			}
+			if !strings.Contains(all, `c\x1b[2Jx/cacheservice.json`) {
+				t.Fatalf("never names the marker, escaped:\n%s", all)
+			}
+		})
+	}
+}
+
+// A failed batch request keeps the failures it had before: the run counts
+// and prints them, then stops with exit 1.
+func TestBatchRequestFailureKeepsKeyFailures(t *testing.T) {
+	f := newFake()
+	f.putMarker("cache", 2)
+	f.put("cache/blobs/a", 1)
+	f.put("cache/blobs/b", 1)
+	f.deleteFailures = map[string]bool{"cache/blobs/a": true}
+	f.deleteErr = func(keys []string) error {
+		if len(keys) == 2 {
+			return errors.New("delete 2 objects: 500")
+		}
+		return nil
+	}
+	code, out := run(t, f, Options{Prefix: "cache", Confirm: "bkt/cache"})
+	for _, want := range []string{`FAILED "cache/blobs/a"`, "; 1 failed", "delete 2 objects: 500", "deleted at least 0 objects, at least 0 bytes"} {
+		if code != ExitError || !strings.Contains(out, want) {
+			t.Fatalf("exit %d, output lacks %q:\n%s", code, want, out)
 		}
 	}
 }

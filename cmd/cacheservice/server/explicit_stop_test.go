@@ -162,15 +162,22 @@ func TestExplicitHooksRefusedOnceThePathsStopped(t *testing.T) {
 	}
 }
 
-// Known gap: an import sync waits for the engine cache's sync lock
-// (importer.Importer.Sync, st.sync.Lock) whatever its context says, so a
-// sync whose context is already canceled waits for the sync under way to
-// end. Explicit imports asked for once the stop began are refused before
-// they reach it (admitExplicit), but a sync loop's sync, or an explicit
-// import admitted while another one is held, still waits there.
-func TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx(t *testing.T) {
+// An import sync whose context is done doesn't wait for the engine cache's
+// sync lock (importer.Importer.Sync) while another sync holds it, as a sync
+// loop's sync or an explicit import admitted during another one could: it
+// returns the context's cause, and the held import finishes normally.
+func TestImportSyncCanceledDoesNotWaitForSyncLock(t *testing.T) {
 	h, done, release := newHeldImportHarness(t)
-	defer func() { release(); <-done }()
+	drained := false
+	defer func() {
+		release()
+		if !drained {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}()
 	c, err := h.svc.conn(h.engine.id)
 	if err != nil {
 		t.Fatal(err)
@@ -184,13 +191,26 @@ func TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx(t *testing.T) {
 	}()
 	select {
 	case err := <-synced:
-		t.Fatalf("the sync with a canceled context returned (%v) while another held the sync lock: the gap is closed, update this test", err)
-	case <-time.After(300 * time.Millisecond):
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the canceled sync returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sync with a canceled context waited for the held import's sync lock")
+	}
+	select {
+	case err := <-done:
+		drained = true
+		t.Fatalf("the held import returned early: %v", err)
+	default:
 	}
 	release()
 	select {
-	case <-synced:
+	case err := <-done:
+		drained = true
+		if err != nil {
+			t.Fatalf("the held import: %v", err)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the sync didn't return once the held one ended")
+		t.Fatal("the held import didn't finish once released")
 	}
 }

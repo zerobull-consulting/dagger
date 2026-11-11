@@ -12,6 +12,10 @@
 //  2. the objects, PageSize per request, each listed under the prefix;
 //  3. the incomplete multipart uploads under the prefix;
 //
+// before each request of 2 and 3 it checks again that no ancestor prefix and
+// not the prefix itself has a marker: one that appeared is a writer's, and
+// stops the wipe with what it wrote left alone;
+//
 // then lists the prefix again, and exits 0 only if it is empty. It never
 // reads engine data, and deletes only keys a listing under the prefix
 // returned (or the marker's own key). It refuses a prefix inside another
@@ -44,8 +48,9 @@ const (
 	// ExitOK: a dry run reported, or a wipe left the prefix empty.
 	ExitOK = 0
 	// ExitError: a request or a key's delete failed, or the prefix is
-	// refused (inside another store's, or its marker unreadable); what was
-	// done so far is reported.
+	// refused (inside another store's, or its marker unreadable), or a
+	// marker appeared during the wipe (a writer claimed the prefix or an
+	// ancestor) or can't be read; what was done so far is reported.
 	ExitError = 1
 	// ExitUsage: bad flags, an empty prefix, or -confirm missing or wrong;
 	// nothing was read or deleted.
@@ -87,12 +92,13 @@ of any layout. By default a dry run: it reports the objects, their bytes, the
 incomplete multipart uploads and the ownership marker's layout, and deletes
 nothing. With -dry-run=false and -confirm repeating the bucket and the prefix,
 it deletes the marker, then the objects, then aborts the uploads, then lists
-the prefix again. Stop every writer on the prefix first. An empty prefix (the
-whole bucket) isn't supported, nor is a prefix inside another store's.
+the prefix again, and stops if a marker appears meanwhile. Stop every writer
+on the prefix first. An empty prefix (the whole bucket) isn't supported, nor
+is a prefix inside another store's.
 
-Exit codes: 0 ok (a wipe: the prefix is empty), 1 error or refusal, 2 usage
-or confirmation, 3 the prefix isn't empty after the wipe (a writer is
-running).
+Exit codes: 0 ok (a wipe: the prefix is empty), 1 error, refusal, or a marker
+that appeared during the wipe, 2 usage or confirmation, 3 the prefix isn't
+empty after the wipe (a writer is running).
 
 flags:
 `
@@ -266,11 +272,20 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		deleted, aborted int
 		bytes            int64
 		failures         failureLog
+		// countLow: a delete request failed, so deleted and bytes may be
+		// low (Store.Delete reports only failures).
+		countLow bool
 	)
 	// progress reports what was done, and the failures (up to MaxShown),
 	// on every way out after the marker.
 	progress := func() {
-		fmt.Fprintf(out, "deleted %d objects, %d bytes; aborted %d incomplete multipart uploads; %d failed\n", deleted, bytes, aborted, failures.n)
+		atLeast := ""
+		if countLow {
+			// A page's delete request failed: the keys it deleted one by
+			// one before that are not in the count.
+			atLeast = "at least "
+		}
+		fmt.Fprintf(out, "deleted %s%d objects, %s%d bytes; aborted %d incomplete multipart uploads; %d failed\n", atLeast, deleted, atLeast, bytes, aborted, failures.n)
 		for _, f := range failures.first {
 			fmt.Fprintf(out, "  FAILED %q: %s\n", f.Key, printable(f.Reason))
 		}
@@ -292,16 +307,29 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		if err != nil {
 			return fail(ExitError, "delete the ownership marker %s: %v; nothing else deleted", markerKey, err)
 		}
-		fmt.Fprintf(out, "deleted the ownership marker %s\n", markerKey)
+		fmt.Fprintf(out, "deleted the ownership marker %s\n", printable(markerKey))
 	}
 
 	// 2. The objects.
-	// recheck stops the wipe if an ancestor prefix was claimed since it
-	// started: that store's keys may be under this prefix (wiping <a>/ns
-	// under a new store at <a>). Before each destructive request.
+	// recheck stops the wipe if, since it started, an ancestor prefix was
+	// claimed (that store's keys may be under this prefix: wiping <a>/ns
+	// under a new store at <a>), or the prefix's own marker is back (a
+	// writer claimed the emptied prefix: its marker and first exports are
+	// not the old store's). Before each destructive request. It reads each
+	// ancestor's marker, then this prefix's: one GET more than the ancestor
+	// check alone, per page. A marker it can't read stops the wipe too: when
+	// it can't tell, it doesn't delete.
 	recheck := func() error {
 		if err := checkAncestors(ctx, st, o.Prefix); err != nil {
 			return fmt.Errorf("stopped before the next delete: %w", err)
+		}
+		switch m, err := readMarker(ctx, st, o.Prefix); {
+		case err != nil:
+			return fmt.Errorf("stopped before the next delete: can't read the ownership marker %s: %w", markerKey, err)
+		case m.present && marker.present:
+			return fmt.Errorf("stopped before the next delete: an ownership marker, %s, is back after the wipe deleted the old one: a writer claimed the prefix during the wipe; its marker and anything written after it were left alone", markerKey)
+		case m.present:
+			return fmt.Errorf("stopped before the next delete: an ownership marker, %s, appeared (the prefix had none): a writer claimed the prefix during the wipe; its marker and anything written after it were left alone", markerKey)
 		}
 		return nil
 	}
@@ -309,11 +337,13 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		if err := recheck(); err != nil {
 			return err
 		}
+		// The failures it collected count even when the request failed.
 		keyFailures, err := st.Delete(ctx, objKeys(objs))
+		failures.add(keyFailures...)
 		if err != nil {
+			countLow = true
 			return err
 		}
-		failures.add(keyFailures...)
 		bad := make(map[string]bool, len(keyFailures))
 		for _, f := range keyFailures {
 			bad[f.Key] = true
@@ -335,6 +365,11 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 		return stop("%v", err)
 	}
 	err = walkUploads(ctx, st, root, func(ups []Upload) error {
+		// Before each page of uploads: a writer's new ones are not the old
+		// store's.
+		if err := recheck(); err != nil {
+			return err
+		}
 		for _, u := range ups {
 			if err := st.Abort(ctx, u); err != nil {
 				if ctx.Err() != nil {

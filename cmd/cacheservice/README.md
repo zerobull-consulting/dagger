@@ -348,7 +348,9 @@ key the service writes is in [`layout`](layout/), and the ownership marker
 and its startup check in [`ownership`](ownership/). The one-shot
 `cacheservice lifecycle` subcommand, which sets the bucket's lifecycle rules,
 is [`lifecycle`](lifecycle/) (see
-[The lifecycle command](#the-lifecycle-command)).
+[The lifecycle command](#the-lifecycle-command)), and the one-shot
+`cacheservice gc` subcommand, which runs one garbage collection, is
+[`gccmd`](gccmd/) (see [The gc command](#the-gc-command)).
 
 ## Bucket ownership
 
@@ -521,6 +523,13 @@ wipe leaves new keys behind, and the wipe then exits 3. A writer that claims
 an ancestor prefix during the wipe stops it before its next delete, with
 exit 1, since that store's keys may be under the prefix
 (`TestAncestorClaimedDuringWipeStops`, `TestAncestorClaimedBeforeAbortsStops`).
+So does a writer that claims the prefix itself after the wipe deleted its
+marker: the new marker, and the keys written after it, are left alone, and it
+exits 1 (`TestMarkerReclaimedAfterStep1Stops`, `TestMarkerReclaimedBetweenPagesStops`,
+`TestMarkerReclaimedBeforeAbortsStops`, `TestMarkerReclaimedBetweenUploadPagesStops`).
+This only narrows what a mistake costs: the check is one request before each
+delete request, so a writer that claims the prefix in the moment between the
+two is not caught. Never run a writer on a prefix being wiped.
 
 `cacheservice wipe` empties the prefix, of any layout (layout 1 included,
 which has no marker). It reads the same `CACHESERVICE_S3_*` settings as the
@@ -555,6 +564,18 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   then the incomplete multipart uploads; then it lists the prefix again.
   If the marker can't be read (a dry run too) or deleted, nothing else is
   deleted, and it exits 1.
+- **Checked again before each delete request:** before each page of objects
+  and before each page of uploads to abort, the wipe reads the ancestors' markers
+  again, then the prefix's own. An ancestor's marker, or the prefix's own
+  marker back after the wipe deleted it, is a writer's: the wipe stops with
+  nothing more deleted, says a writer claimed the prefix during the wipe and
+  that its marker and what it wrote were left alone, and exits 1. A marker
+  it can't read stops it too: when it can't tell, it doesn't delete. This
+  costs one more GET per page of 1,000 keys or uploads, beside the ancestor
+  reads. When a delete request fails, the count in "deleted N objects" is
+  reported as "at least": the keys of that page deleted one by one before the
+  failure (those XML can't carry, below) aren't in it
+  (`TestBatchRequestFailureKeepsKeyFailures`).
 - **Not inside another store:** a prefix under one whose ancestor (the
   bucket's top included) holds an ownership marker is refused, by a dry run
   and a wipe, naming that marker: wiping it would delete part of that store.
@@ -566,8 +587,10 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   `<prefix>/` returned, so `cache2/` and the bucket's top are untouched when
   wiping `cache` (`TestWipeEmptiesPrefix`, `TestMinIOWipe`).
 - **Exit codes:** 0 a dry run reported, or the prefix is empty after the
-  wipe; 1 an error, a refusal, or a key or upload that failed (up to 20 are
-  listed); 2 usage or confirmation; 3 every request succeeded but the prefix isn't empty
+  wipe; 1 an error, a refusal, a wipe stopped because a writer claimed the
+  prefix or an ancestor during it, or a key or upload that failed (up to 20
+  are listed, also when a later request stopped the wipe); 2 usage or
+  confirmation; 3 every request succeeded but the prefix isn't empty
   after the wipe (a writer is running). `-timeout` (default 30m, room for
   about one to two million keys) bounds the run, and each request is bounded
   to 30s.
@@ -584,7 +607,8 @@ cacheservice wipe -dry-run=false -confirm=dagger-cache/cache   # wipe it
   (both seen on MinIO; `TestMinIOControlCharKeyDeleted`,
   `TestMinIODeleteObjectsKeepsControlCharKey`).
 - **What the store answers is printed escaped:** keys are quoted, and errors
-  and failure reasons have their control characters escaped
+  and failure reasons have their control characters escaped, the marker's
+  key too
   (`TestStoreStringsEscaped`).
 
 **Later: import from one prefix, export to another.** Images are pinned by
@@ -834,6 +858,14 @@ shell, in this order:
 
 Then start the service with its own key (the Read/Write/Delete one). A prefix
 a writer already started on needs no `claim`; running it anyway is harmless.
+
+**From Terraform,** `cacheservice provision claim|rules create|read|update|delete`
+does `claim` and `apply -allow-removals` as two declarative resources, for the
+shell provider's `shell_script` (package `provision`): the settings come from
+`CACHESERVICE_S3_*`, `CACHESERVICE_NAMESPACES` and `CACHESERVICE_ABORT_RULE`,
+the resource's state goes to stdout as JSON, and a read reports drift. It
+takes no `-confirm`: Terraform's plan is the confirmation.
+[`hack/remote-cache/spaces`](../../hack/remote-cache/spaces/README.md) uses it.
 
 **Run `apply` with the admin key, interactively.** Setting lifecycle rules
 takes the bucket's most powerful key (on DigitalOcean Spaces, a full-access
@@ -1886,13 +1918,18 @@ net/http holds with it, by trickling or stalling the body after a 401
     doesn't know, or that arrives with the wrong wire type for its number,
     at three times its wire size and at least 16 bytes, for the slice the
     decoder appends it to (`TestOTLPUnknownFieldsEstimateCoversDecodePeak`,
-    `TestOTLPWrongWireTypeChargedAsUnknown`). Two gaps: a singular string is
-    charged its length and 16 bytes, not its size class, so a 32,769-byte one
-    that takes 40,960 is charged 32,785
-    (`TestOTLPSingularStringSizeClassKnownGap`); and the fix for repeated
-    strings covers protobuf only, as a JSON body is charged 16 bytes for each
-    comma, so an empty element, `"",`, is charged 19 bytes, under what append
-    holds for it (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
+    `TestOTLPWrongWireTypeChargedAsUnknown`). A singular string or bytes field
+    (a trace or span ID is one) is charged its length and a quarter, for the
+    allocator's size classes, and 16 bytes, so a 32,769-byte one, whose copy
+    takes 40,960, is charged 40,977 (`TestOTLPSingularStringCoversSizeClass`,
+    [zerobull-consulting/dagger#232](https://github.com/zerobull-consulting/dagger/issues/232));
+    an empty one is charged the 16 bytes. That is the protobuf estimate. Two
+    gaps are left in the JSON one, which charges a string its bytes in the
+    body, not its size class, so a 32,769-byte `stringValue` is charged under
+    the 40,960 its copy takes (`TestOTLPJSONSingularStringSizeClassKnownGap`),
+    and charges 16 bytes for each comma, so an empty element of a repeated
+    string, `"",`, is charged 19 bytes, under what append holds for it
+    (`TestOTLPJSONEmptyRepeatedStringsKnownGap`). A body decodes to more than its
     size, and can decode to far more: one of empty entries, 2 bytes each on
     the wire, decodes to about 70 times its size. A body whose message could
     never fit in the budget is refused with **413** before it is decoded
@@ -2426,7 +2463,7 @@ signals describe one engine's cache, not the stored copy (see
 | `-gc-mode` | The service's schedule | `POST /debug/gc` | Meant for |
 |---|---|---|---|
 | `service` (default) | every `-gc-interval` (1h, jittered by ±25%, so replicas spread out) | runs | a service with no job beside it |
-| `batch` | none | runs, on demand | a bucket that a `cacheservice gc` job collects |
+| `batch` | none | runs, on demand | a bucket that a [`cacheservice gc`](#the-gc-command) job collects |
 | `off` | none | 409, `gc is off: -gc-mode=off, ...` | a bucket nothing collects: it grows without bound, so the startup log warns |
 
 A zero `-gc-interval` is refused at startup (it used to mean "only on `POST
@@ -2883,6 +2920,11 @@ first.
 | `-max-bytes` | 0 | Default max size of what a namespace keeps, such as `500GiB` (0: none) |
 | `-namespaces-file` | none | Per-namespace limits (see [The namespaces file](#the-namespaces-file)) |
 
+`cacheservice gc` takes `-max-age`, `-max-bytes`, `-namespaces-file`,
+`-gc-grace`, `-gc-staging-age` and `-gc-max-deletes` under the same names,
+defaults and rules, from the same code (`gc.RegisterFlags`); see
+[The gc command](#the-gc-command).
+
 The service's credentials also need `s3:ListBucket`,
 `s3:ListBucketMultipartUploads` (without it, GC does nothing:
 `uploads_unlisted`), `s3:DeleteObject` on every key under the prefix, and,
@@ -2917,6 +2959,72 @@ staged uploads itself" on each run, the fallback above, which is safe but
 costs requests; and `lifecycle check` needs the admin key there. A writer
 with such a key also claimed an empty prefix at startup, creating the marker
 with `If-None-Match: *`.
+
+### The gc command
+
+`cacheservice gc` runs one garbage collection over every namespace under the
+prefix, and exits: what collects a bucket whose writers run with
+`-gc-mode=batch`
+([zerobull-consulting/dagger#249](https://github.com/zerobull-consulting/dagger/issues/249)).
+It is a subcommand of the service's binary, so it ships in the image. It
+reads the same `CACHESERVICE_S3_*` settings as the service, with a key that
+can do what GC does (the Read/Write/Delete key, see [The keys](#the-keys)),
+and runs the same collector as `POST /debug/gc`, one pass, with the limits
+and settings its flags give. Scheduling it (a CronJob, a timer, a CI
+schedule) is up to the operator.
+
+```bash
+cacheservice gc                                              # dry run: report only
+cacheservice gc -max-age=720h -max-bytes=500GiB -confirm=dagger-cache/cache   # collect
+cacheservice gc -namespaces-file limits -confirm=dagger-cache/cache
+```
+
+- **A dry run is the default.** Without `-confirm`, it reports what a run
+  would expire and delete, and changes nothing: no object, no index, no
+  upload (`TestDryRunChangesNothing`). Without limits it still runs, and says
+  on stderr that no limits were given, so the report shows only what each
+  entry's own expiry and reachability decide.
+- **A confirmed run collects.** `-confirm=<bucket>/<prefix>` must repeat the
+  bucket and prefix of the settings (the prefix without surrounding slashes);
+  any other value exits 2 before anything is read, so a confirmation for one
+  prefix can't collect another (`TestConfirmMismatchExits2`). It does what
+  `POST /debug/gc` does on the same bucket (`TestConfirmedRunMatchesService`).
+- **A confirmed run needs explicit limits:** `-namespaces-file`, or both
+  `-max-age` and `-max-bytes`. `0` is a limit (none), so `-max-age=0
+  -max-bytes=0` collects with no age or size limit, on purpose. A confirmed
+  run without them exits 2 and names the flag it lacks
+  (`TestConfirmedRunNeedsExplicitLimits`): a job that deletes shouldn't do so
+  under limits nobody chose. `-namespaces-file` alone satisfies this, but a
+  file with no `*` line leaves every namespace it doesn't list with no limit
+  (`-max-age` and `-max-bytes` are 0 unless given), as in the service
+  (`TestNamespacesFileLimits`): put a `*` line in the file for defaults.
+- **An empty `-confirm=`** (say `-confirm="$VAR"` with `VAR` unset) exits 2:
+  it is not a dry run. Leave `-confirm` out for one.
+- **Flags:** `-confirm`, `-max-age`, `-max-bytes`, `-namespaces-file` (read
+  once; there is no SIGHUP), `-gc-grace`, `-gc-staging-age` and
+  `-gc-max-deletes`: the service's, with the same defaults. It has no
+  `-gc-mode` and no `-gc-interval`: `batch` is the service's setting, and a
+  job doesn't look at it. It has no `-gc-dry-run` either: no `-confirm` is its
+  dry run.
+- **Output:** the reports (`[]gc.Report`, the same fields as `POST /debug/gc`'s
+  `reports`) as a JSON array on stdout, and nothing else. Logs and errors go
+  to stderr. A run that did nothing prints `[]`, or the one report that says
+  why. No metrics are served.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | a clean run, or a dry run that ran cleanly |
+  | 1 | a namespace's report has errors, the run failed, the stores couldn't be opened, or a signal ended it; a dry run too |
+  | 2 | bad flags, or a `-confirm` that is wrong or without explicit limits; nothing was read or deleted |
+  | 3 | the run refused to do anything (`gc.ErrNotOwned`): no ownership marker, a marker of another layout, keys of no known shape at the root of the prefix, or the marker or the multipart uploads couldn't be read (so an unreachable store is 3 too). Nothing was changed |
+
+- **SIGTERM or an interrupt** ends the run's context. The collector still
+  finishes the claims it made, within a minute, so none is left in progress
+  for others to wait on until it goes stale
+  (`TestSigtermAfterClaimFinishesClaims`), then the process exits 1 with the
+  report so far. A second signal doesn't end the process or cut the finish
+  off; the process manager's kill is the last resort.
 
 ## Stopping and draining
 
@@ -3319,8 +3427,11 @@ for once the stop began answers 503 too
 (`TestStopCancelsAndWaitsForExplicitHooks`,
 `TestShutdownCancelsExplicitExport`,
 [#202](https://github.com/zerobull-consulting/dagger/issues/202)). An
-import sync still waits for the one under way of the same engine cache
-whatever its context says (`TestKnownGapImportSyncWaitsForSyncLockIgnoringCtx`). Pinned by
+import sync waits for the one under way of the same engine cache only as
+long as its context lives: one whose context is done, before it waits or
+while it does, returns the context's cause without waiting
+(`TestImportSyncCanceledDoesNotWaitForSyncLock`,
+[#240](https://github.com/zerobull-consulting/dagger/issues/240)). Pinned by
 `TestDrainWaitsForExplicitExport`, `TestDrainWaitsForExplicitImport`,
 `TestDrainRunsExplicitExportWaitingForSlot`, the
 `TestDrainEndsAtDeadlineWith…` tests and

@@ -61,7 +61,8 @@ type Store interface {
 	// the key may not read it.
 	Get(ctx context.Context, key string) ([]byte, error)
 	// Delete deletes up to PageSize keys, and returns those the store
-	// reported failing.
+	// reported failing. When a request fails, it returns the error and the
+	// failures it had collected before, which the caller still records.
 	Delete(ctx context.Context, keys []string) ([]Failure, error)
 	// Versioning is the bucket's versioning status: "" when it was never
 	// enabled, else Enabled or Suspended. metastore.ErrDenied when the key
@@ -198,7 +199,7 @@ func (s *S3Store) Delete(ctx context.Context, keys []string) ([]Failure, error) 
 		}
 		if err := s.deleteOne(ctx, k); err != nil {
 			if ctx.Err() != nil {
-				return nil, err
+				return failed, err
 			}
 			failed = append(failed, Failure{Key: k, Reason: err.Error()})
 		}
@@ -217,7 +218,7 @@ func (s *S3Store) Delete(ctx context.Context, keys []string) ([]Failure, error) 
 		Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("delete %d objects: %w", len(batch), err)
+		return failed, fmt.Errorf("delete %d objects: %w", len(batch), err)
 	}
 	for _, e := range out.Errors {
 		failed = append(failed, Failure{Key: aws.ToString(e.Key), Reason: aws.ToString(e.Code) + ": " + aws.ToString(e.Message)})
