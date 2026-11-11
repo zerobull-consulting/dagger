@@ -59,8 +59,9 @@
 #   release-check.sh [--dry-run] accept <version> <digest> <run URL> <sha> <PR>
 #       Step 4: pushes the accept line to the sync branch as the bot (only
 #       if its head is still <sha>, the commit the run verified), then
-#       marks the PR ready and says so on it and on the issue
-#       (GITHUB_TOKEN). If the bundle or protocol version changed since the
+#       says so on the PR and the issue and, last, marks the PR ready
+#       (GITHUB_TOKEN): a run that stops in between leaves a draft, which
+#       ready finishes. If the bundle or protocol version changed since the
 #       manifest's base, the accept list resets to this one version.
 #
 # plan prints action=, one of:
