@@ -708,7 +708,7 @@ cmd_plan() {
 pr_title() { echo "remote cache: sync upstream $1 (release check)"; }
 
 cmd_start() {
-	local v="$1" d="$2" ref merge old body pr run
+	local v="$1" d="$2" ref merge old body pr
 	need_tag "$v"
 	need_digest "$d"
 	ref="$(sync_branch "$v")"
@@ -762,8 +762,7 @@ cmd_start() {
 		say "merging $v conflicts: $ref waits for a human to merge it; nothing to verify yet"
 		return
 	fi
-	run="$(start_tests "$v" "$d")"
-	if [[ -n "$run" ]]; then out run "$run"; fi
+	cmd_verify "$v" "$d"
 }
 
 cmd_verify() {
@@ -835,12 +834,11 @@ cmd_report() {
 	# An issue filed by a run that stopped before linking it, or by the
 	# earlier flow, is linked now.
 	link_issue "$pr" "$issue"
-	# Once per run: the issue's body or a comment names it already.
-	seen="$( (
-		api "repos/$repo/issues/$issue" | jq -r '.body // ""'
-		api "repos/$repo/issues/$issue/comments?per_page=100" | jq -r '.[].body // ""'
-	))" ||
-		die "couldn't read #$issue and its comments"
+	# Once per run: the issue's body or a comment names it already. Both
+	# read, all pages, or nothing is decided.
+	seen="$(api "repos/$repo/issues/$issue" | jq -r '.body // ""')" || die "couldn't read #$issue"
+	seen+=$'\n'"$(api --paginate "repos/$repo/issues/$issue/comments?per_page=100" | jq -r '.[].body // ""')" ||
+		die "couldn't read #$issue's comments"
 	if grep -qF "$run" <<<"$seen"; then
 		say "#$issue names $run already"
 		return
@@ -924,7 +922,9 @@ cmd_accept() {
 		echo
 		echo "Ready to merge **with a merge commit** (\`gh pr merge --merge\`), never a squash, once its checks pass."
 	} >"$body"
-	mark_ready "$pr"
+	# The comments first, the PR marked ready last: a run that stops in
+	# between leaves a draft, which a later hour's ready marks and says so
+	# again, rather than a ready PR nobody was told about.
 	comment "$pr" "$body"
 	issue="$(open_issue "$v")"
 	if [[ -n "$issue" ]]; then
@@ -932,6 +932,7 @@ cmd_accept() {
 		echo "Green: $run. #$pr is ready to merge (with a merge commit), which closes this." >"$scratch/issue-green.md"
 		comment "$issue" "$scratch/issue-green.md"
 	fi
+	mark_ready "$pr"
 	out accepted "$v"
 }
 

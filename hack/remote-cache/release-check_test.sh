@@ -569,6 +569,7 @@ setup
 ARGS=(publish); rc env FAKE_PUBLISH_RUNS="push:completed:success workflow_dispatch:completed:failure workflow_dispatch:completed:failure"
 check "publish: a success outranks the bound" has "$tmp/out" "publish=none"
 
+check "early failure: the step names are the workflow's own" bash -c "test \"\$(grep -cxF '      - name: The engine pin, from the manifest' '$here/../../.github/workflows/remote-cache-tests.yml')\" = 2 && grep -qxF '      - name: Checkout' '$here/../../.github/workflows/remote-cache-tests.yml'"
 check "engine jobs: the names are the workflow's own" bash -c "grep -qxF '    name: real engines (e2e)' '$here/../../.github/workflows/remote-cache-tests.yml' && grep -qxF '    name: sidecar demo' '$here/../../.github/workflows/remote-cache-tests.yml'"
 
 echo "--- remote-cache-tests.yml's checkouts (zerobull-consulting/dagger#165, lead 2)"
