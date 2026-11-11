@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"slices"
 	"testing"
 	"time"
@@ -262,5 +263,53 @@ func testStoredBundlesHoldNoAddresses(t *testing.T, h *exportHarness) {
 		if o.Chain != nil && len(o.Chain.Addresses) != 0 {
 			t.Fatalf("output %d: stored chain has addresses", o.Ordinal)
 		}
+	}
+}
+
+// Since v1.0.0-beta.26 an engine sends the rows a merge of the service's
+// landed on as held rows, with no record (zerobull-consulting/dagger#227).
+// The service stores no such bundle, which no other engine could merge: it
+// releases it, which makes the engine forget the rows, and asks again, for
+// a bundle that carries them in full. A held row stands for its closure, so
+// the second bundle holds the row below the first's, and the third carries
+// everything. The imported entries still keep their stored entries'
+// numbers, so nothing is stored twice.
+func TestExportOverImportedEntriesAsksAgainForHeldRows(t *testing.T) {
+	h, _ := newMemExportHarness(t, nil)
+	layers := h.buildRecipes()
+	h.exportBuild()
+	b := fakeengine.New("cache-b", 1)
+	eng := h.connectEngine(b)
+	exec := waitLookup(t, b, "withExec(make)", hasOffer)
+	before := waitImports(t, h.meta, "cache-b", 2)
+
+	// B builds on the exec it imported, and exports that.
+	b.Add(fakeengine.Entry{Number: 50, Recipe: "withExec(test)", Deps: []uint64{exec.Number}, Layers: [][]byte{layers[0], layers[1], testLayer("test")}})
+	code, res := h.debugExportOf(eng, `{"roots":[50],"outputs":[{"number":50,"address":{"part":"fs"}}]}`)
+	if code != http.StatusOK || !slices.Equal(res.Stored, []uint64{50}) || len(res.Failed) != 0 || len(res.Bundles) != 1 {
+		t.Fatalf("export: %d %+v", code, res)
+	}
+	if b.HeldExports() != 2 || b.Exports() != 3 {
+		t.Fatalf("%d exports, %d of them with held rows; want 3 and 2: the first held the imported exec, the second its base, the third carried both in full", b.Exports(), b.HeldExports())
+	}
+	stored, err := h.meta.GetBundle(context.Background(), testScope, res.Bundles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Values) != 3 {
+		t.Fatalf("the stored bundle has %d values, want the root and both imported rows", len(stored.Values))
+	}
+	for _, v := range stored.Values {
+		if v.Held != "" || v.Record.Call == nil {
+			t.Fatalf("the stored bundle's value %d is a held row", v.Ordinal)
+		}
+	}
+	idx := waitMapped(t, h.meta, "cache-b", 50)
+	if len(idx.Entries) != len(before.Entries)+1 {
+		t.Fatalf("%d entries, want %d: the imported rows stored again", len(idx.Entries), len(before.Entries)+1)
+	}
+	root := idx.Entries[idx.Caches["cache-b"].Numbers[50].Number]
+	if want := idx.Caches[h.cache.ID].Numbers[11].Number; !slices.Equal(root.Deps, []uint64{want}) {
+		t.Fatalf("the root depends on %v, want A's stored exec [%d]", root.Deps, want)
 	}
 }

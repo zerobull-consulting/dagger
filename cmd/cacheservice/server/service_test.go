@@ -40,19 +40,39 @@ import (
 type logRecorder struct {
 	mu      sync.Mutex
 	records []slog.Record
+	attrs   []slog.Attr // from With, added to each record this handler keeps
+	root    *logRecorder
 }
 
 func (h *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *logRecorder) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.records = append(h.records, r.Clone())
+	// With attributes come before the record's own, as in a real handler.
+	withFirst := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	withFirst.AddAttrs(h.attrs...)
+	r.Attrs(func(a slog.Attr) bool {
+		withFirst.AddAttrs(a)
+		return true
+	})
+	r = withFirst
+	root := h
+	if h.root != nil {
+		root = h.root
+	}
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	root.records = append(root.records, r)
 	return nil
 }
 
-func (h *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *logRecorder) WithGroup(string) slog.Handler      { return h }
+func (h *logRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {
+	root := h
+	if h.root != nil {
+		root = h.root
+	}
+	return &logRecorder{root: root, attrs: append(append([]slog.Attr(nil), h.attrs...), attrs...)}
+}
+func (h *logRecorder) WithGroup(string) slog.Handler { return h }
 
 // find returns the attributes of every record with the message msg.
 func (h *logRecorder) find(msg string) []map[string]string {
@@ -768,9 +788,10 @@ func TestOTLPTraces(t *testing.T) {
 		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{kv(telemetryattrs.EngineCacheAttr, "cache-1")}},
 		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{
 			{Name: "plain"},
-			{Name: "cached", Attributes: []*commonpb.KeyValue{
+			{Name: "cached", EndTimeUnixNano: 1_700_000_000_123_456_789, Attributes: []*commonpb.KeyValue{
 				kv(telemetryattrs.CacheResultIDAttr, "42"),
 				kv(telemetryattrs.CacheOutcomeAttr, "hit"),
+				kv(telemetryattrs.CacheReplacementsAttr, "3"),
 				arrayKV(telemetryattrs.CacheDepsAttr, 2),
 				arrayKV(telemetryattrs.CachePartsAttr, 3),
 			}},
@@ -787,7 +808,7 @@ func TestOTLPTraces(t *testing.T) {
 	if len(spans) != 1 {
 		t.Fatalf("%d cache spans logged", len(spans))
 	}
-	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" {
+	if s := spans[0]; s["result"] != "42" || s["outcome"] != "hit" || s["cache"] != "cache-1" || s["deps"] != "2" || s["parts"] != "3" || s["replacements"] != "3" || s["endUnixNano"] != "1700000000123456789" {
 		t.Fatalf("unexpected cache span log: %v", s)
 	}
 }
@@ -806,6 +827,7 @@ func TestOTLPTraceLogsBounded(t *testing.T) {
 			kv(telemetryattrs.CacheOutcomeAttr, long),
 			kv(telemetryattrs.CacheTypeAttr, long),
 			kv(telemetryattrs.CacheRetainedAttr, long),
+			kv(telemetryattrs.CacheReplacementsAttr, long),
 		}}}}},
 	}}}
 	if code := otlpPost(t, srv.URL+"/v1/traces", req, &coltracepb.ExportTraceServiceResponse{}, false, false); code != http.StatusOK {
@@ -815,7 +837,7 @@ func TestOTLPTraceLogsBounded(t *testing.T) {
 	if len(spans) != 1 {
 		t.Fatalf("%d cache spans logged", len(spans))
 	}
-	for field, limit := range map[string]int{"result": 200, "outcome": 200, "type": 200, "retained": 200, "cache": 200, "session": 200, "name": 120} {
+	for field, limit := range map[string]int{"result": 200, "outcome": 200, "type": 200, "retained": 200, "replacements": 200, "cache": 200, "session": 200, "name": 120} {
 		got := spans[0][field]
 		if len(got) == 0 || len(got) > limit || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
 			t.Errorf("%s logged as %d bytes: %.40q", field, len(got), got)

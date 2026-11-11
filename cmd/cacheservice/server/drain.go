@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"slices"
@@ -36,8 +37,8 @@ type drainState struct {
 	started  time.Time
 	deadline time.Time
 	// stored are the roots stored by exports that ended while draining, by
-	// cache ID.
-	stored  map[string]int
+	// namespace and cache ID.
+	stored  map[drainCache]int
 	refused map[string]int
 	// engines is how many engine connections were welcomed when the drain
 	// started; it welcomes none after.
@@ -48,11 +49,16 @@ type drainState struct {
 	conns []lingerWait
 	// linger is the linger that followed the drain, once it started.
 	linger *LingerReport
-	// explicit is how many explicit exports and imports (Service.Export,
-	// Service.Import) were admitted and still run. They are admitted under
-	// mu, as the drain starts, so one is either counted here before the
-	// drain starts, and waited for, or refused (admitExplicit).
-	explicit int
+	// explicit counts the explicit exports and imports (Service.Export,
+	// Service.Import) admitted and still running; the drain and the stop's
+	// Wait wait for them (zerobull-consulting/dagger#72,
+	// zerobull-consulting/dagger#202). They are admitted under mu, as the
+	// drain starts, so one is either counted here before the drain starts,
+	// and waited for, or refused (admitExplicit). explicitClosed is set,
+	// under mu, once Wait began: none is admitted after it, so no Add races
+	// Wait.
+	explicit       workGroup
+	explicitClosed bool
 	// explicitEnded wakes a drain when an explicit request ends. New makes
 	// it.
 	explicitEnded chan struct{}
@@ -76,8 +82,9 @@ type DrainReport struct {
 	Outcome string        `json:"outcome,omitempty"`
 	Took    time.Duration `json:"took"`
 	// Stored are the roots stored by exports that ended while draining, by
-	// cache ID.
-	Stored map[string]int `json:"stored"`
+	// namespace and cache ID: one entry per engine cache that stored any,
+	// sorted as Left is.
+	Stored []DrainStored `json:"stored"`
 	// Left is what was left unexported, by cache.
 	Left []DrainLeft `json:"left"`
 	// Refused counts the new work refused: engine connections and spans.
@@ -88,19 +95,67 @@ type DrainReport struct {
 	Engines int `json:"engines"`
 	// Explicit is how many explicit exports and imports, admitted before
 	// the drain started, still ran when it ended: none, unless it ended at
-	// its deadline or was canceled. They run on until they end, or the stop
-	// that follows cuts them off (CloseEngines); what they store after the
-	// drain ended isn't in its report.
+	// its deadline or was canceled. They run on until they end, or the
+	// paths' context ends, which cancels them (in the binary, as the linger
+	// that follows the drain starts, or as the shutdown does); what they
+	// store after the drain ended isn't in its report.
 	Explicit int `json:"explicit,omitempty"`
 }
 
-// LeftRoots is how many roots were left unexported.
+// LeftRoots is how many roots were left unexported that the service could
+// still have exported: not those of a paused engine (PausedRoots).
 func (r DrainReport) LeftRoots() int {
 	n := 0
 	for _, l := range r.Left {
 		n += l.Roots()
 	}
 	return n
+}
+
+// PausedRoots is how many roots were left because their engine refuses
+// them: it has given up its remote-cache work until its next session, so
+// the drain neither waited for them nor tried them again
+// (exporter.DrainState.Paused).
+func (r DrainReport) PausedRoots() int {
+	n := 0
+	for _, l := range r.Left {
+		n += l.Paused
+	}
+	return n
+}
+
+// StoredRoots is how many roots the drain's exports stored, of every cache.
+func (r DrainReport) StoredRoots() int {
+	n := 0
+	for _, st := range r.Stored {
+		n += st.Roots
+	}
+	return n
+}
+
+// StoredOf is how many roots the drain's exports stored of one namespace's
+// engine cache.
+func (r DrainReport) StoredOf(namespace, cacheID string) int {
+	for _, st := range r.Stored {
+		if st.Namespace == namespace && st.CacheID == cacheID {
+			return st.Roots
+		}
+	}
+	return 0
+}
+
+// DrainStored is what a drain's exports stored of one engine cache. Two
+// namespaces' engines may say hello with the same cache ID: they are two
+// caches, each with its own count.
+type DrainStored struct {
+	Namespace string `json:"namespace"`
+	CacheID   string `json:"cacheID"`
+	Roots     int    `json:"roots"`
+}
+
+// drainCache names an engine cache in a drain's counts.
+type drainCache struct {
+	namespace, cacheID string
 }
 
 // Draining reports whether the service is draining (Drain was called).
@@ -142,7 +197,7 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 //     admitted before it started, up to its deadline, as for the exports it
 //     runs. It doesn't cancel them: one still running when it ends is
 //     counted in its report (DrainReport.Explicit), and runs on until it
-//     ends or the stop that follows cuts it off. Roots an explicit export
+//     ends or the paths' context ends, which cancels it. Roots an explicit export
 //     stores while draining are counted in DrainReport.Stored. From the
 //     drain's start, both hooks are refused (ErrDraining).
 //
@@ -152,7 +207,17 @@ func (s *Service) Draining() bool { return s.draining.Load() }
 // that follows (CloseEngines, the end of the export path's context and
 // Wait), and publishes nothing.
 //
-// Call it once, before CloseEngines and Wait; a second call returns at once.
+// A drain that begins once the export path's context ended (the stop
+// began) exports nothing. It logs that the service is stopping, and
+// reports what is left. It is complete when nothing is left that it could
+// have exported (an export in flight, or a root of a connected engine) and
+// no explicit request runs, and canceled, or deadline once ctx's deadline
+// passed, otherwise.
+//
+// Call it once, before CloseEngines and Wait. A second call returns a
+// canceled report at once, and doesn't end the first: only the first call's
+// ctx cancels a drain, which then reports canceled, or deadline once ctx's
+// deadline passed.
 // The goroutines it starts are exports, which Wait waits for.
 func (s *Service) Drain(ctx context.Context) DrainReport {
 	start := time.Now()
@@ -165,7 +230,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		return DrainReport{Outcome: metrics.DrainCanceled}
 	}
 	s.drain.started, s.drain.deadline = start, deadline
-	s.drain.stored = map[string]int{}
+	s.drain.stored = map[drainCache]int{}
 	explicitEnded := s.drain.explicitEnded
 	// A request that ended before the drain may have left a wake.
 	select {
@@ -197,7 +262,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 
 	p := s.export
-	if p == nil || p.ctx.Err() != nil {
+	if p == nil {
 		why := "the export path is off"
 		if s.readOnly {
 			why = "read-only: -export=false"
@@ -206,11 +271,28 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 		if n := s.explicitRunning(); n > 0 {
 			s.logger.Info("drain: waiting for explicit requests", "running", n, "deadline", deadline)
 		}
-		paths := context.Background()
-		if p != nil {
-			paths = p.ctx
+		return s.endDrain(start, s.waitExplicit(ctx, deadline, explicitEnded), nil)
+	}
+	if p.ctx.Err() != nil {
+		// The paths stopped before the drain began: the service is
+		// stopping, and nothing can be exported. The drain is complete when
+		// nothing is left that it could have exported (stoppedBusy) and no
+		// explicit request runs, whatever ctx says. Else it was cut short:
+		// deadline once ctx's deadline passed (on ctx's timer or the export
+		// path's clock), canceled otherwise. An explicit request still
+		// running isn't waited for: the paths' context ending canceled it,
+		// and the stop's Wait waits for it to end.
+		s.logger.Info("drain: nothing to export (the service is stopping)")
+		now := p.now()
+		left := s.drainLeft(now, deadline)
+		outcome := metrics.DrainComplete
+		if stoppedBusy(left) || s.explicitRunning() > 0 {
+			var ok bool
+			if outcome, ok = ctxEnded(ctx, now, deadline); !ok {
+				outcome = metrics.DrainCanceled
+			}
 		}
-		return s.endDrain(start, s.waitExplicit(ctx, paths, deadline, explicitEnded), nil)
+		return s.endDrain(start, outcome, left)
 	}
 	// Namespaces created from now on drain from their first span
 	// (trackSpans).
@@ -224,7 +306,7 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 	}
 	for _, l := range startLeft {
 		s.logger.Info("drain: started", "namespace", l.Namespace, "cacheID", l.CacheID, "connected", l.Connected,
-			"sessions", l.Sessions, "pending", l.Pending, "inFlight", l.InFlight, "retrying", l.Retrying+l.Later)
+			"sessions", l.Sessions, "pending", l.Pending, "inFlight", l.InFlight, "retrying", l.Retrying+l.Later, "paused", l.Paused)
 	}
 	if deadline.IsZero() {
 		s.logger.Info("drain: no deadline")
@@ -280,10 +362,10 @@ func (s *Service) Drain(ctx context.Context) DrainReport {
 }
 
 // waitExplicit waits for the explicit exports and imports admitted before
-// the drain, until ctx or paths (the export path's context) ends, or
-// deadline passes, and returns the drain's outcome. It is the drain's wait
-// when the export path is off, and so has nothing else to wait for.
-func (s *Service) waitExplicit(ctx, paths context.Context, deadline time.Time, ended <-chan struct{}) string {
+// the drain, until ctx ends or deadline passes, and returns the drain's
+// outcome. It is the drain's wait when the export path is off, and so has
+// nothing else to wait for.
+func (s *Service) waitExplicit(ctx context.Context, deadline time.Time, ended <-chan struct{}) string {
 	var timeout <-chan time.Time
 	if !deadline.IsZero() {
 		t := time.NewTimer(time.Until(deadline))
@@ -291,13 +373,12 @@ func (s *Service) waitExplicit(ctx, paths context.Context, deadline time.Time, e
 		timeout = t.C
 	}
 	for s.explicitRunning() > 0 {
-		if outcome, ok := drainEnded(ctx, paths, time.Now(), deadline); ok {
+		if outcome, ok := ctxEnded(ctx, time.Now(), deadline); ok {
 			return outcome
 		}
 		select {
 		case <-ended:
 		case <-ctx.Done():
-		case <-paths.Done():
 		case <-timeout:
 			timeout = nil
 		}
@@ -306,23 +387,34 @@ func (s *Service) waitExplicit(ctx, paths context.Context, deadline time.Time, e
 }
 
 // admitExplicit admits an explicit export or import (Service.Export,
-// Service.Import), unless the service drains: ErrDraining. A drain that
-// starts once it was admitted waits for it, until the drain's deadline. The
-// caller calls done when it ends.
-func (s *Service) admitExplicit() (done func(), err error) {
+// Service.Import), unless the service drains (ErrDraining) or its stop
+// began (ErrStopping): stop, the path's context, ended, or Wait began. A
+// drain that starts once it was admitted waits for it, until the drain's
+// deadline, and so does Wait. The caller runs it on run, which ends with
+// ctx or stop, and calls done when it ends.
+func (s *Service) admitExplicit(ctx, stop context.Context) (run context.Context, done func(), err error) {
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
 	// Under drain.mu, which Drain sets draining under.
 	if s.draining.Load() {
-		return nil, ErrDraining
+		return nil, nil, ErrDraining
 	}
-	s.drain.explicit++
+	if s.drain.explicitClosed || stop.Err() != nil {
+		return nil, nil, ErrStopping
+	}
+	s.drain.explicit.Add()
 	ended := s.drain.explicitEnded
+	// Canceled with ErrStopping as its cause, so a request the stop cut off
+	// answers 503, as one refused does (stoppedCause).
+	run, cancel := context.WithCancelCause(ctx)
+	stopCancel := context.AfterFunc(stop, func() { cancel(ErrStopping) })
 	var once sync.Once
-	return func() {
+	return run, func() {
 		once.Do(func() {
+			stopCancel()
+			cancel(nil)
 			s.drain.mu.Lock()
-			s.drain.explicit--
+			s.drain.explicit.Done()
 			s.drain.mu.Unlock()
 			select {
 			case ended <- struct{}{}:
@@ -332,26 +424,81 @@ func (s *Service) admitExplicit() (done func(), err error) {
 	}, nil
 }
 
+// waitExplicitHooks waits for the explicit exports and imports, after the
+// contexts that run them have ended, and admits none after.
+func (s *Service) waitExplicitHooks() {
+	s.drain.mu.Lock()
+	s.drain.explicitClosed = true
+	s.drain.mu.Unlock()
+	s.drain.explicit.Wait()
+}
+
+// stoppedCause is err, marked ErrStopping when the stop canceled run, the
+// context an explicit request ran on (admitExplicit), so its error answers
+// 503.
+func stoppedCause(run context.Context, err error) error {
+	if err == nil || errors.Is(err, ErrStopping) || !errors.Is(context.Cause(run), ErrStopping) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrStopping, err)
+}
+
 // explicitRunning is how many explicit exports and imports run.
 func (s *Service) explicitRunning() int {
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
-	return s.drain.explicit
+	return s.drain.explicit.Running()
 }
 
 // drainEnded reports whether a drain is over before its next pass, and its
 // outcome: canceled when ctx was canceled, or the export path stopped;
 // deadline when ctx's deadline passed, or now is past deadline.
 func drainEnded(ctx, paths context.Context, now, deadline time.Time) (string, bool) {
+	// Read once: a deadline that passes between two reads would be seen
+	// as no deadline by the first and as an end by the second, and taken
+	// for a cancellation.
+	err := ctx.Err()
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
 		return metrics.DrainDeadline, true
-	case ctx.Err() != nil, paths.Err() != nil:
+	case err != nil, paths.Err() != nil:
 		return metrics.DrainCanceled, true
 	case !deadline.IsZero() && !now.Before(deadline):
 		return metrics.DrainDeadline, true
 	}
 	return "", false
+}
+
+// ctxEnded reports whether ctx, a drain's own context, ended, and the
+// drain's outcome: deadline when ctx's deadline passed, canceled when it was
+// canceled, and deadline when now is past deadline. Unlike drainEnded, it
+// doesn't look at the export path.
+func ctxEnded(ctx context.Context, now, deadline time.Time) (string, bool) {
+	// Read once, as in drainEnded.
+	err := ctx.Err()
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return metrics.DrainDeadline, true
+	case err != nil:
+		return metrics.DrainCanceled, true
+	case !deadline.IsZero() && !now.Before(deadline):
+		return metrics.DrainDeadline, true
+	}
+	return "", false
+}
+
+// stoppedBusy reports whether a drain that began once the export path
+// stopped was cut short by it: an export in flight, or a root of a
+// connected engine left, whenever it is due. A session that hasn't ended,
+// with no root left, isn't: the flush stops tracking those at its first
+// pass (DrainDue).
+func stoppedBusy(left []DrainLeft) bool {
+	for _, l := range left {
+		if l.InFlight > 0 || (l.Connected && l.Roots() > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // drainBusy reports whether a drain has work left it can do: an export in
@@ -375,7 +522,7 @@ func (s *Service) drainLeft(now, deadline time.Time) []DrainLeft {
 		}
 	}
 	slices.SortFunc(out, func(a, b DrainLeft) int {
-		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.CacheID, b.CacheID))
+		return compareCaches(a.Namespace, a.CacheID, b.Namespace, b.CacheID)
 	})
 	return out
 }
@@ -387,20 +534,25 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 	rep := DrainReport{
 		Outcome:  outcome,
 		Took:     took,
-		Stored:   maps.Clone(s.drain.stored),
+		Stored:   drainStoredOf(s.drain.stored),
 		Left:     left,
 		Refused:  maps.Clone(s.drain.refused),
 		Engines:  s.drain.engines,
-		Explicit: s.drain.explicit,
+		Explicit: s.drain.explicit.Running(),
 	}
 	s.drain.ended = &rep
 	s.drain.mu.Unlock()
-	s.metrics.DrainEnded(outcome, took, rep.LeftRoots())
+	s.metrics.DrainEnded(outcome, took, rep.LeftRoots(), rep.PausedRoots())
 
-	for _, id := range slices.Sorted(maps.Keys(rep.Stored)) {
-		s.logger.Info("drain: stored", "cacheID", id, "roots", rep.Stored[id])
+	for _, st := range rep.Stored {
+		s.logger.Info("drain: stored", "namespace", st.Namespace, "cacheID", st.CacheID, "roots", st.Roots)
 	}
 	for _, l := range left {
+		if l.Paused > 0 {
+			// Not a failure of the drain: nothing it could do stores them.
+			s.logger.Info("drain: left for an engine that gave up its remote-cache work", "namespace", l.Namespace, "cacheID", l.CacheID,
+				"roots", l.Paused, "connected", l.Connected)
+		}
 		if l.Roots() == 0 {
 			continue
 		}
@@ -412,20 +564,40 @@ func (s *Service) endDrain(start time.Time, outcome string, left []DrainLeft) Dr
 		level = s.logger.Warn
 	}
 	level("drain: done", "outcome", outcome, "took", took.Round(time.Millisecond),
-		"storedRoots", sum(rep.Stored), "leftRoots", rep.LeftRoots(),
+		"storedRoots", rep.StoredRoots(), "leftRoots", rep.LeftRoots(), "pausedRoots", rep.PausedRoots(),
 		"refusedConnections", rep.Refused[metrics.DrainRefusedConnection], "refusedSpans", rep.Refused[metrics.DrainRefusedSpan],
 		"engines", rep.Engines, "explicitLeft", rep.Explicit)
 	return rep
 }
 
-// drainStored counts roots stored by an export that ended while draining.
-func (s *Service) drainStored(cacheID string, roots int) {
+// drainStored counts roots stored by an export of a namespace's cache that
+// ended while draining.
+func (s *Service) drainStored(ns *namespace, cacheID string, roots int) {
 	s.metrics.DrainStored(roots)
 	s.drain.mu.Lock()
 	defer s.drain.mu.Unlock()
 	if s.drain.stored != nil {
-		s.drain.stored[cacheID] += roots
+		s.drain.stored[drainCache{ns.name, cacheID}] += roots
 	}
+}
+
+// drainStoredOf is a drain's stored counts, sorted by namespace and cache
+// ID.
+func drainStoredOf(m map[drainCache]int) []DrainStored {
+	out := make([]DrainStored, 0, len(m))
+	for k, n := range m {
+		out = append(out, DrainStored{Namespace: k.namespace, CacheID: k.cacheID, Roots: n})
+	}
+	slices.SortFunc(out, func(a, b DrainStored) int {
+		return compareCaches(a.Namespace, a.CacheID, b.Namespace, b.CacheID)
+	})
+	return out
+}
+
+// compareCaches orders engine caches by namespace, then cache ID: the order
+// of a drain report's Stored and Left.
+func compareCaches(aNamespace, aCacheID, bNamespace, bCacheID string) int {
+	return cmp.Or(cmp.Compare(aNamespace, bNamespace), cmp.Compare(aCacheID, bCacheID))
 }
 
 // refusedSpan counts a span or session end dropped while draining.
@@ -476,7 +648,7 @@ func (s *Service) DrainStatus() DrainStatus {
 	}
 	s.drain.mu.Lock()
 	started, deadline, ended := s.drain.started, s.drain.deadline, s.drain.ended
-	explicit := s.drain.explicit
+	explicit := s.drain.explicit.Running()
 	if l := s.drain.linger; l != nil {
 		cp := *l
 		cp.Caches = slices.Clone(l.Caches)
@@ -502,12 +674,4 @@ func (s *Service) DrainStatus() DrainStatus {
 
 func (s *Service) serveDrain(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.DrainStatus())
-}
-
-func sum(m map[string]int) int {
-	n := 0
-	for _, v := range m {
-		n += v
-	}
-	return n
 }

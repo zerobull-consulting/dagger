@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/dagger/dagger/cmd/cacheservice/blobstore"
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
 	"github.com/dagger/dagger/cmd/cacheservice/layout"
 	"github.com/dagger/dagger/cmd/cacheservice/ownership"
 	"github.com/dagger/dagger/cmd/cacheservice/server"
@@ -322,8 +323,8 @@ func Run(ctx context.Context, o Options, st Store, out, errOut io.Writer) int {
 func runClaim(ctx context.Context, o Options, st Store, out io.Writer, fail func(int, string, ...any) int) int {
 	state, m, err := st.Claim(ctx, o.Prefix)
 	if err != nil {
-		if denied(err) {
-			err = fmt.Errorf("%w (the key isn't allowed to list the prefix and its multipart uploads and to write the marker there: a limited Read/Write/Delete key is, a Read key is not)", err)
+		if s3util.Denied(err) {
+			err = fmt.Errorf("%w (the key isn't allowed to list the prefix and its multipart uploads and to read and write the marker there: a limited Read/Write/Delete key is, a Read key is not)", err)
 		}
 		return fail(ExitError, "%v; nothing claimed", err)
 	}

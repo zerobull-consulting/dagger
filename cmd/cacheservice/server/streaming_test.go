@@ -139,7 +139,7 @@ func TestStreamDrainOneAtATime(t *testing.T) {
 	}
 	h.postSpans("session-1", spans...)
 	rep := drainFor(h.svc, 30*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != n || rep.LeftRoots() != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != n || rep.LeftRoots() != 0 {
 		t.Fatalf("report %+v", rep)
 	}
 	if exports, peak := h.cache.Exports(), h.cache.Peak(); exports != 2 || peak != 1 {

@@ -311,6 +311,8 @@ ones written here.**
   key, a file name.
 - Stage files explicitly. Never commit built binaries or `dagger.lock`
   changes by accident.
+- Never run an interactive command (`git checkout -p`, `git add -i`,
+  `git rebase -i`): it waits for input that never comes.
 - Full `owner/repo#N` references everywhere: a bare `#N` can link to the
   upstream repository.
 - **Never stop silently.** Stuck on a question or a blocker? Tell your lead
@@ -373,7 +375,7 @@ every issue, and merges; you write the code.
 
 *The draft: CI starts here*
 
-8. **Open the draft.** Push, and open the PR as a **draft** against
+8. **Open the draft,** only after block 1. Push, and open the PR as a **draft** against
    `feature/remote-cache`. Copilot doesn't review drafts, but every push
    runs CI, so push when you have something to show. Follow the
    repository's PR template, if it has one. The description says:
@@ -381,8 +383,8 @@ every issue, and merges; you write the code.
    - **the design choices you made:** what you weighed, what you picked and
      why, and where you'd want a reviewer to push back. Give this real
      thought: it's the part nobody can get from the diff;
-   - at the very end, the prompt, verbatim (not your standing
-     authorization):
+   - at the very end, the whole prompt, verbatim: section 12 included, not
+     shortened (and not your standing authorization):
 
    ```markdown
    ## Prompt
@@ -471,7 +473,8 @@ every issue, and merges; you write the code.
 
 *Wrap it up*
 
-22. **Hand off.** Check the prompt's "Done when" list. Then send your lead a
+22. **Hand off.** Check the prompt's "Done when" list. Update the PR
+    description if later commits changed what it says. Then send your lead a
     **"ready to merge" report**: the head SHA, Copilot reviews used, every
     finding with what your lead decided and what you did, anything on "Done
     when" that isn't met, and a squash title and message (the PR's title plus
@@ -487,6 +490,17 @@ every issue, and merges; you write the code.
 
 This section isn't copied into prompts. It's the history behind section 12,
 so changes to the steps can be weighed against what taught us each one.
+
+**The first Sonnet runs.** Three items ran on Sonnet
+(zerobull-consulting/dagger#207, zerobull-consulting/dagger#208,
+zerobull-consulting/dagger#210). Four slips led to four edits:
+- one opened its draft before block 1, so step 8 now says "only after
+  block 1";
+- one shortened section 12 in the PR description, so step 8 now says the
+  whole prompt;
+- one left a stale line in its PR description, so step 22 now says to
+  update it;
+- one hung on `git checkout -p`, so the rules now ban interactive commands.
 
 **The working agreement.** It was first posted on zerobull-consulting/dagger#1
 as [the agreement](https://github.com/zerobull-consulting/dagger/issues/1#issuecomment-6639444472)

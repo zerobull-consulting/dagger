@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -150,5 +152,66 @@ func TestInvalidScopeRefusedBeforeClaim(t *testing.T) {
 	}
 	if keys := stores.objs.Keys(); len(keys) != 0 {
 		t.Fatalf("keys %v", keys)
+	}
+}
+
+// failAncestor fails GETs of the bucket's top marker (an ancestor's, for
+// prefix cache/team) with err.
+type failAncestor struct {
+	*metastore.MemObjects
+	err error
+}
+
+func (f *failAncestor) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if key == "cacheservice.json" {
+		return nil, "", fmt.Errorf("get %s: %w", key, f.err)
+	}
+	return f.MemObjects.Get(ctx, key)
+}
+
+// Both kinds of instance on an empty prefix, cache/team, refuse to start
+// when an ancestor's marker can't be read for a 5xx or a timeout, naming
+// its key, and write nothing. A 403 there is skipped: a writer claims the
+// prefix, and a read-only instance starts on it.
+func TestStartupAncestorMarkerErrors(t *testing.T) {
+	start := func(t *testing.T, writer bool, cause error) (*metastore.MemObjects, error) {
+		t.Helper()
+		stores := emptyStores(t)
+		w := &failAncestor{MemObjects: stores.objs, err: cause}
+		meta, err := metastore.New(metastore.Config{Objects: w, Prefix: "cache/team"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		svc := New(slog.New(slog.DiscardHandler), "")
+		err = svc.enableStores(ctx, storeSet{Blobs: stores.blobs, Meta: meta}, S3Options{Scope: testScope, NoExport: !writer})
+		t.Cleanup(func() {
+			cancel()
+			svc.Wait()
+		})
+		return stores.objs, err
+	}
+	for name, cause := range map[string]error{
+		"5xx":     errors.New("InternalError: status 500"),
+		"timeout": context.DeadlineExceeded,
+	} {
+		for _, writer := range []bool{true, false} {
+			objs, err := start(t, writer, cause)
+			if err == nil || !strings.Contains(err.Error(), "ownership check") || !strings.Contains(err.Error(), "can't read cacheservice.json") || !errors.Is(err, cause) {
+				t.Fatalf("%s, writer %v: %v; want a refusal naming cacheservice.json", name, writer, err)
+			}
+			if keys := objs.Keys(); len(keys) > 0 {
+				t.Fatalf("%s, writer %v: keys %v", name, writer, keys)
+			}
+		}
+	}
+	for _, writer := range []bool{true, false} {
+		objs, err := start(t, writer, metastore.ErrDenied)
+		if err != nil {
+			t.Fatalf("403, writer %v: %v; want it skipped", writer, err)
+		}
+		if has := slices.Contains(objs.Keys(), "cache/team/cacheservice.json"); has != writer {
+			t.Fatalf("403, writer %v: keys %v", writer, objs.Keys())
+		}
 	}
 }

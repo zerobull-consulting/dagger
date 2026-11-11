@@ -54,6 +54,9 @@ disagree; `SERVICE_IMAGE` overrides the service (such as an image built
 from a checkout), and the start then fails, with the service's reason, if
 that service refuses the engine
 ([zerobull-consulting/dagger#146](https://github.com/zerobull-consulting/dagger/issues/146)).
+Until a service release logs `import sync: first done`, set `SERVICE_IMAGE`
+to a build of this checkout: the read-only check fails without that line
+([zerobull-consulting/dagger#103](https://github.com/zerobull-consulting/dagger/issues/103)).
 `ENGINE_IMAGE` is gone: `run.sh` refuses it. On a host behind a
 TLS-intercepting proxy, `CA_FILE=<bundle>` gives the engine its CA bundle.
 Each run uses a new prefix, `demo/<run>/`, and leaves its objects there;

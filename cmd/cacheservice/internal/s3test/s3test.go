@@ -379,7 +379,9 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 	}
 	under := strings.TrimSuffix(prefix, "/") + "/"
 	var errs []error
-	pages := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &under})
+	// URL-encoded keys: a key XML can't carry (U+0001, which MinIO stores)
+	// otherwise fails the listing's parse.
+	pages := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &under, EncodingType: types.EncodingTypeUrl})
 	for pages.HasMorePages() {
 		page, err := pages.NextPage(ctx)
 		if err != nil {
@@ -387,8 +389,12 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 			break
 		}
 		for _, o := range page.Contents {
-			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: o.Key}); err != nil {
-				errs = append(errs, fmt.Errorf("delete %s: %w", aws.ToString(o.Key), err))
+			key, err := decodeKey(o.Key)
+			if err == nil {
+				_, err = client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: key})
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("delete %q: %w", aws.ToString(o.Key), err))
 			}
 		}
 	}
@@ -407,7 +413,7 @@ func DeletePrefix(ctx context.Context, client *s3.Client, bucket, prefix string)
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	left, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &under, MaxKeys: aws.Int32(1)})
+	left, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &under, MaxKeys: aws.Int32(1), EncodingType: types.EncodingTypeUrl})
 	if err != nil {
 		return fmt.Errorf("list what is left: %w", err)
 	}
@@ -433,19 +439,27 @@ func uploadsUnder(ctx context.Context, client *s3.Client, bucket, under string) 
 	var out []types.MultipartUpload
 	var keyMarker, uploadMarker *string
 	for {
-		page, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &bucket, KeyMarker: keyMarker, UploadIdMarker: uploadMarker})
+		page, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &bucket, KeyMarker: keyMarker, UploadIdMarker: uploadMarker, EncodingType: types.EncodingTypeUrl})
 		if err != nil {
 			return out, fmt.Errorf("list uploads: %w", err)
 		}
 		for _, u := range page.Uploads {
-			if strings.HasPrefix(aws.ToString(u.Key), under) {
+			key, err := decodeKey(u.Key)
+			if err != nil {
+				return out, fmt.Errorf("list uploads: %w", err)
+			}
+			if strings.HasPrefix(aws.ToString(key), under) {
+				u.Key = key
 				out = append(out, u)
 			}
 		}
 		if !aws.ToBool(page.IsTruncated) {
 			return out, nil
 		}
-		keyMarker, uploadMarker = page.NextKeyMarker, page.NextUploadIdMarker
+		if keyMarker, err = decodeKey(page.NextKeyMarker); err != nil {
+			return out, fmt.Errorf("list uploads: %w", err)
+		}
+		uploadMarker = page.NextUploadIdMarker
 	}
 }
 
@@ -456,24 +470,48 @@ func deleteVersions(ctx context.Context, client *s3.Client, bucket, under string
 	var errs []error
 	del := func(key, version *string) {
 		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: key, VersionId: version}); err != nil {
-			errs = append(errs, fmt.Errorf("delete %s version %s: %w", aws.ToString(key), aws.ToString(version), err))
+			errs = append(errs, fmt.Errorf("delete %q version %s: %w", aws.ToString(key), aws.ToString(version), err))
 		}
 	}
 	var keyMarker, versionMarker *string
 	for {
-		out, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &under, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
+		out, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &under, KeyMarker: keyMarker, VersionIdMarker: versionMarker, EncodingType: types.EncodingTypeUrl})
 		if err != nil {
 			return errors.Join(append(errs, fmt.Errorf("list versions: %w", err))...)
 		}
 		for _, v := range out.Versions {
-			del(v.Key, v.VersionId)
+			key, err := decodeKey(v.Key)
+			if err != nil {
+				return errors.Join(append(errs, fmt.Errorf("list versions: %w", err))...)
+			}
+			del(key, v.VersionId)
 		}
 		for _, m := range out.DeleteMarkers {
-			del(m.Key, m.VersionId)
+			key, err := decodeKey(m.Key)
+			if err != nil {
+				return errors.Join(append(errs, fmt.Errorf("list versions: %w", err))...)
+			}
+			del(key, m.VersionId)
 		}
 		if !aws.ToBool(out.IsTruncated) {
 			return errors.Join(errs...)
 		}
-		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+		if keyMarker, err = decodeKey(out.NextKeyMarker); err != nil {
+			return errors.Join(append(errs, fmt.Errorf("list versions: %w", err))...)
+		}
+		versionMarker = out.NextVersionIdMarker
 	}
+}
+
+// decodeKey is a key of a listing asked for with EncodingType url (nil stays
+// nil).
+func decodeKey(k *string) (*string, error) {
+	if k == nil {
+		return nil, nil
+	}
+	d, err := url.QueryUnescape(*k)
+	if err != nil {
+		return nil, fmt.Errorf("the store listed a key it didn't URL-encode, %q: %w", *k, err)
+	}
+	return &d, nil
 }

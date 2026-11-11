@@ -143,13 +143,24 @@ type Collector struct {
 	listed map[string]bool
 }
 
+// ValidateSettings refuses the settings New refuses whatever the stores are:
+// a negative Grace, StagingAge, MaxDeletes or DeleteDeadline. It needs no
+// bucket, so a command can check its flags before it opens any store, and
+// can't disagree with New: New calls it.
+func (c Config) ValidateSettings() error {
+	if c.Grace < 0 || c.StagingAge < 0 || c.MaxDeletes < 0 || c.DeleteDeadline < 0 {
+		return errors.New("gc: negative setting")
+	}
+	return nil
+}
+
 // New returns a Collector for cfg.
 func New(cfg Config) (*Collector, error) {
 	if cfg.Bucket == nil || cfg.Meta == nil {
 		return nil, errors.New("gc: needs a bucket and a metadata store")
 	}
-	if cfg.Grace < 0 || cfg.StagingAge < 0 || cfg.MaxDeletes < 0 || cfg.DeleteDeadline < 0 {
-		return nil, errors.New("gc: negative setting")
+	if err := cfg.ValidateSettings(); err != nil {
+		return nil, err
 	}
 	if cfg.Grace == 0 {
 		cfg.Grace = DefaultGrace

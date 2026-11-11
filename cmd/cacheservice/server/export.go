@@ -202,11 +202,10 @@ func (s *Service) startBatches(ctx context.Context, ns *namespace, batches []exp
 // runBatch exports one batch of a namespace on the engine connected there
 // with its cache.
 func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch) {
-	p := s.export
 	eng := s.engineFor(ns, b.CacheID)
 	if eng == nil {
 		s.logger.Debug("export: engine not connected; waiting", "namespace", ns.name, "cacheID", b.CacheID, "roots", len(b.Request.Roots))
-		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+		s.requeueForEngine(ns, b)
 		return
 	}
 	if eng.Generation() < b.Generation() {
@@ -215,10 +214,45 @@ func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch)
 		// generation's hello rather than export from an older one.
 		s.logger.Debug("export: engine connected at an older generation; waiting", "namespace", ns.name, "cacheID", b.CacheID,
 			"generation", eng.Generation(), "batchGeneration", b.Generation(), "roots", len(b.Request.Roots))
-		ns.tracker.Requeue(b, p.now().Add(p.noEngineWait))
+		s.requeueForEngine(ns, b)
 		return
 	}
 	_, _ = s.exportBatch(ctx, eng, b)
+}
+
+// requeueForEngine puts a batch back to wait for its engine, up to
+// NoEngineWait, which the engine's hello cuts short (Tracker.Connected).
+func (s *Service) requeueForEngine(ns *namespace, b exporter.Batch) {
+	ns.tracker.Requeue(b, s.export.now().Add(s.export.noEngineWait))
+	s.wakeIfEngineConnected(ns, b)
+}
+
+// wakeIfEngineConnected wakes the roots of b, just put to wait for their
+// engine (Requeue, Interrupted), if one that can export them is connected. A
+// hello that registered after the connection was chosen, and ran Connected
+// before the wait was marked, woke nothing, so the connection is chosen again
+// once the wait is marked.
+func (s *Service) wakeIfEngineConnected(ns *namespace, b exporter.Batch) {
+	eng := s.engineFor(ns, b.CacheID)
+	if eng == nil || eng.Generation() < b.Generation() {
+		return
+	}
+	s.logger.Debug("export: engine connected while the batch was put to wait; due now", "namespace", ns.name, "cacheID", b.CacheID,
+		"generation", eng.Generation(), "roots", len(b.Request.Roots))
+	ns.tracker.WakeEngineWait(b.CacheID, eng.Generation(), s.export.now())
+}
+
+// exportStored counts the roots an export of a namespace's cache stored,
+// for the drain's report while draining and for each flush of the cache
+// under way. It is the one place exports report what they stored to both.
+func (s *Service) exportStored(ns *namespace, cacheID string, roots int) {
+	if roots == 0 {
+		return
+	}
+	if s.draining.Load() {
+		s.drainStored(ns, cacheID, roots)
+	}
+	s.flushStored(ns, cacheID, roots)
 }
 
 // exportBatch exports b on eng, records its result in the tracker, and
@@ -226,12 +260,9 @@ func (s *Service) runBatch(ctx context.Context, ns *namespace, b exporter.Batch)
 func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.Batch) (exporter.Result, error) {
 	start := time.Now()
 	res, err := eng.ns.exporter.Export(metrics.WithCaller(ctx, metrics.CallerExport), eng, b.Request)
-	// Counted before the tracker hears of it: once it does, the drain may
-	// see nothing in flight and end its report.
-	if len(res.Stored) > 0 && s.draining.Load() {
-		s.drainStored(eng.CacheID(), len(res.Stored))
-	}
-	s.flushStored(eng.ns, eng.CacheID(), len(res.Stored))
+	// Counted before the tracker hears of it: once it does, a drain or a
+	// flush may see nothing in flight and end its report.
+	s.exportStored(eng.ns, eng.CacheID(), len(res.Stored))
 	outcome := s.recordExport(ctx, eng, b, res, err)
 	if s.testHookExportRecorded != nil {
 		s.testHookExportRecorded()
@@ -246,6 +277,7 @@ func (s *Service) exportBatch(ctx context.Context, eng *engineConn, b exporter.B
 		Busy:     len(res.Busy),
 		Refused:  len(res.Refused),
 		Failed:   len(res.Failed),
+		Paused:   len(res.Paused),
 		Uploaded: len(res.Uploaded),
 		Present:  len(res.Present),
 		Rejected: len(res.Rejected),
@@ -264,6 +296,12 @@ func (s *Service) recordExport(ctx context.Context, eng *engineConn, b exporter.
 	if err != nil && (ctx.Err() != nil || !s.connected(eng)) {
 		eng.logger.Info("export interrupted", "roots", len(b.Request.Roots), "error", err)
 		tracker.Interrupted(b, res, p.now(), p.now().Add(p.noEngineWait))
+		if !s.connected(eng) {
+			// Its connection was lost: another may be there already. An
+			// export cut short with its engine still connected (its
+			// request ended) waits out its time as before.
+			s.wakeIfEngineConnected(eng.ns, b)
+		}
 		return metrics.ExportInterrupted
 	}
 	outcome := metrics.OutcomeOK
@@ -349,7 +387,7 @@ func (s *Service) trackSpans(ns *namespace, req *coltracepb.ExportTraceServiceRe
 			// Their IDs would key the tracker's state: none of these
 			// spans is taken.
 			if n := cacheSpanCount(rs); n > 0 {
-				s.refusedEngineIDs(metrics.EngineIDSourceSpan, n, len(cache), len(session))
+				s.refusedEngineIDs(s.logger, metrics.EngineIDSourceSpan, n, len(cache), len(session))
 			}
 			continue
 		}
@@ -432,7 +470,7 @@ func (s *Service) trackEvent(ns *namespace, key tokenKey, kind, cache, body stri
 		if wiped != "" && !validEngineID(wiped) {
 			// The start is taken; the wiped cache, which no cache can
 			// be named, isn't.
-			s.refusedEngineIDs(metrics.EngineIDSourceWipedCache, 1, len(wiped), 0)
+			s.refusedEngineIDs(s.logger, metrics.EngineIDSourceWipedCache, 1, len(wiped), 0)
 			wiped = ""
 		}
 		if wiped != "" && authenticated && !ns.ownerAccepts(wiped, key) {
@@ -521,14 +559,15 @@ func cacheSpanCount(rs *tracepb.ResourceSpans) int {
 // attribute isn't "<cacheID>/<generation>" with a valid engine ID, or their
 // cache ID or session isn't one (validEngineID), and logs it: at warning
 // level at most once a minute per source (rejectionLog), the rest at debug
-// level. The values themselves aren't logged, only their lengths.
-func (s *Service) refusedEngineIDs(source string, n, cacheLen, sessionLen int) {
+// level, through logger (the connection's, where there is one, so the record
+// names it). The values themselves aren't logged, only their lengths.
+func (s *Service) refusedEngineIDs(logger *slog.Logger, source string, n, cacheLen, sessionLen int) {
 	s.metrics.EngineIDsRefused(source, n)
 	level := slog.LevelDebug
 	if s.engineIDRefusals.allow(source, time.Now()) {
 		level = slog.LevelWarn
 	}
-	s.logger.Log(context.Background(), level, LogEngineIDsRefused, "source", source, "count", n,
+	logger.Log(context.Background(), level, LogEngineIDsRefused, "source", source, "count", n,
 		"cacheLength", cacheLen, "sessionLength", sessionLen, "maxLength", MaxEngineIDLen)
 }
 

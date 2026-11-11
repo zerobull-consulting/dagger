@@ -79,12 +79,17 @@ func TestMergeSizeBoundsBuildMerge(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			est := MergeSize(stored, len(storedData), addr, "team")
+			est, err := MergeSize(stored, addr, "team")
+			if err != nil {
+				t.Fatal(err)
+			}
 			if sent > est {
 				t.Fatalf("the merge is %d bytes as sent, over its estimate %d", sent, est)
 			}
-			// Within 5%, and the fixed overhead, of what was sent.
-			if est-sent > est/20+mergeOverheadBytes {
+			// Within 10%, and the fixed overhead, of what was sent: the
+			// growth counted per root and value is at its most, and a
+			// merge that lists its layers once is small beside it.
+			if est-sent > est/10+mergeOverheadBytes {
 				t.Fatalf("the merge is %d bytes as sent, its estimate %d: too far over", sent, est)
 			}
 			t.Logf("stored %d bytes; merge %d bytes as sent, estimated %d", len(storedData), sent, est)

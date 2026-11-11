@@ -748,8 +748,10 @@ func TestClaimRefuses(t *testing.T) {
 		if code != ExitError || st.claims != 0 || st.puts != 0 || !strings.Contains(out, "nothing claimed") {
 			t.Errorf("%s: %d, %d claims\n%s", name, code, st.claims, out)
 		}
-		if name == "denied" && !strings.Contains(out, "a Read key is not") {
-			t.Errorf("a 403 isn't explained:\n%s", out)
+		// The first request claim makes is the marker's GET, so the hint
+		// names reading it, not only writing it.
+		if name == "denied" && (!strings.Contains(out, "a Read key is not") || !strings.Contains(out, "to read and write the marker")) {
+			t.Errorf("a 403 isn't explained, or leaves out reading the marker:\n%s", out)
 		}
 	}
 }

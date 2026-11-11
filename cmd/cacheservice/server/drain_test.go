@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/dagger/dagger/cmd/cacheservice/internal/fakeengine"
 	"github.com/dagger/dagger/cmd/cacheservice/metastore"
 	"github.com/dagger/dagger/cmd/cacheservice/metrics"
+	"github.com/dagger/dagger/cmd/cacheservice/metrics/metricstest"
 	"github.com/dagger/dagger/engine/remotecache"
 	"github.com/dagger/dagger/engine/remotecache/protocol"
 )
@@ -115,7 +117,7 @@ func TestDrainExportsQuietSession(t *testing.T) {
 	if !indexHas(t, h, 10, 11) {
 		t.Fatal("the quiet session's entries weren't stored when Drain returned")
 	}
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.LeftRoots() != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.LeftRoots() != 0 {
 		t.Fatalf("report %+v", rep)
 	}
 	if took > testQuiet/4 {
@@ -125,7 +127,7 @@ func TestDrainExportsQuietSession(t *testing.T) {
 	if len(started) != 1 || started[0]["cacheID"] != h.cache.ID || started[0]["sessions"] != "1" || started[0]["pending"] != "2" {
 		t.Fatalf("drain start logged %v", started)
 	}
-	if stored := rec.find("drain: stored"); len(stored) != 1 || stored[0]["roots"] != "2" {
+	if stored := rec.find("drain: stored"); len(stored) != 1 || stored[0]["namespace"] != testScope || stored[0]["cacheID"] != h.cache.ID || stored[0]["roots"] != "2" {
 		t.Fatalf("drain stored logged %v", stored)
 	}
 	if done := rec.find("drain: done"); len(done) != 1 || done[0]["outcome"] != metrics.DrainComplete || done[0]["leftRoots"] != "0" {
@@ -159,7 +161,7 @@ func TestDrainTakesLateSpansOfEndedSession(t *testing.T) {
 	if !indexHas(t, h, 10, 11) {
 		t.Fatal("the span that arrived during the drain wasn't exported")
 	}
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.Refused[metrics.DrainRefusedSpan] != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.Refused[metrics.DrainRefusedSpan] != 0 {
 		t.Fatalf("report %+v", rep)
 	}
 	if took := time.Since(start); took > settle/2 {
@@ -203,7 +205,7 @@ func TestDrainWaitsForExportInFlight(t *testing.T) {
 			if !indexHas(t, h, 10, 11) {
 				t.Fatal("the export in flight wasn't stored when Drain returned")
 			}
-			if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 || rep.LeftRoots() != 0 {
+			if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.LeftRoots() != 0 {
 				t.Fatalf("report %+v", rep)
 			}
 		})
@@ -370,7 +372,7 @@ func TestDrainRetriesRootOnBackoff(t *testing.T) {
 			done := startDrain(t, h.svc, 20*time.Second)
 			waitUntil(t, 10*time.Second, "the export to fail during the drain", failed)
 			rep := waitDrain(t, done, 15*time.Second)
-			if !indexHas(t, h, 10, 11) || rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 {
+			if !indexHas(t, h, 10, 11) || rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 {
 				t.Fatalf("the root that failed during the drain wasn't retried and stored: %+v", rep)
 			}
 			if took := time.Since(start); took < tc.backoff {
@@ -380,11 +382,11 @@ func TestDrainRetriesRootOnBackoff(t *testing.T) {
 	}
 }
 
-// KNOWN GAP: an engine that goes away mid-drain can't reconnect to the
+// ACCEPTED: an engine that goes away mid-drain can't reconnect to the
 // draining service, which refuses every new connection: its export is
 // interrupted, as on any disconnect, and isn't tried again. The drain doesn't
-// wait for it: it logs the roots as left unexported, and returns. Tracked in
-// https://github.com/zerobull-consulting/dagger/issues/70.
+// wait for it: it logs the roots as left unexported, and returns. Accepted
+// for now, in https://github.com/zerobull-consulting/dagger/issues/70.
 func TestDrainEngineDisconnectDoesNotHang(t *testing.T) {
 	h, rec := newDrainHarness(t, nil)
 	h.build()
@@ -485,7 +487,7 @@ func TestDrainStopsImportsAndGC(t *testing.T) {
 	st := newGCStores(t, nil)
 	h := newExportHarness(t, st.blobs, st.meta, nil)
 	// Scheduled, though not within the test: the drain must end the loop.
-	if err := h.svc.EnableGC(h.ctx, GCConfig{Interval: time.Hour, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+	if err := h.svc.EnableGC(h.ctx, GCConfig{Mode: GCModeService, Interval: time.Hour, Collector: gc.Config{Bucket: st.bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
 		t.Fatal(err)
 	}
 	conn := h.engine
@@ -548,7 +550,7 @@ func TestDrainDebugStatus(t *testing.T) {
 	release()
 	waitDrain(t, done, 10*time.Second)
 	st = debugDrain(t, h)
-	if !st.Draining || st.Report == nil || st.Report.Outcome != metrics.DrainComplete || !slices.Equal(keysOf(st.Report.Stored), []string{h.cache.ID}) {
+	if !st.Draining || st.Report == nil || st.Report.Outcome != metrics.DrainComplete || !slices.Equal(st.Report.Stored, []DrainStored{{Namespace: testScope, CacheID: h.cache.ID, Roots: 2}}) {
 		t.Fatalf("after the drain: %+v", st)
 	}
 }
@@ -600,11 +602,42 @@ func TestDrainNewNamespaceTakesNoNewSession(t *testing.T) {
 	}
 	release()
 	rep := waitDrain(t, done, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[a.ID] != 2 || rep.Stored[b.ID] != 0 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf("team-a", a.ID) != 2 || len(rep.Stored) != 1 {
 		t.Fatalf("report %+v", rep)
 	}
 	if !h.svc.connected(conn) {
 		t.Fatal("the drain closed A's connection")
+	}
+}
+
+// Two namespaces whose engines both said hello with the same cache ID are
+// two caches: the drain's report counts what it stored of each on its own
+// (zerobull-consulting/dagger#160).
+func TestDrainStoredByNamespaceAndCacheID(t *testing.T) {
+	h := newAuthHarness(t)
+	a := fakeengine.New("cache-shared", 1)
+	authBuild(a, "a")
+	b := fakeengine.New("cache-shared", 1)
+	b.Add(fakeengine.Entry{Number: 20, Recipe: "from(alpine)", Layers: [][]byte{testLayer("base")}})
+	h.connect(a, "tok-a")
+	h.connect(b, "tok-b")
+	// Their sessions' ends never come, and Settle is a minute: the drain
+	// exports them.
+	h.postSpans("tok-a", a, "session-a", cacheSpan(10), cacheSpan(11, "10"))
+	h.postSpans("tok-b", b, "session-b", cacheSpan(20))
+	waitUntil(t, 5*time.Second, "both caches' roots to be tracked", func() bool {
+		return len(h.ns("team-a").tracker.Entries(a.ID)) == 2 && len(h.ns("team-b").tracker.Entries(b.ID)) == 1
+	})
+	rep := drainFor(h.svc, 10*time.Second)
+	want := []DrainStored{
+		{Namespace: "team-a", CacheID: "cache-shared", Roots: 2},
+		{Namespace: "team-b", CacheID: "cache-shared", Roots: 1},
+	}
+	if rep.Outcome != metrics.DrainComplete || !slices.Equal(rep.Stored, want) || rep.StoredRoots() != 3 {
+		t.Fatalf("report %+v, want stored %+v", rep, want)
+	}
+	if rep.StoredOf("team-a", "cache-shared") != 2 || rep.StoredOf("team-b", "cache-shared") != 1 || rep.StoredOf("team-c", "cache-shared") != 0 {
+		t.Fatalf("StoredOf: %+v", rep.Stored)
 	}
 }
 
@@ -654,7 +687,7 @@ func TestDrainCancelsGCRunAskedFor(t *testing.T) {
 	st := newGCStores(t, nil)
 	h := newExportHarness(t, st.blobs, st.meta, nil)
 	bucket := &blockingBucket{Bucket: st.bucket, blocked: make(chan struct{})}
-	if err := h.svc.EnableGC(h.ctx, GCConfig{Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
+	if err := h.svc.EnableGC(h.ctx, GCConfig{Mode: GCModeBatch, Collector: gc.Config{Bucket: bucket, Meta: st.meta, Now: st.clock.Now}}); err != nil {
 		t.Fatal(err)
 	}
 	ran := make(chan error, 1)
@@ -694,7 +727,7 @@ func TestDrainCountsStoredBeforeItEnds(t *testing.T) {
 	h.build()
 	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
 	rep := drainFor(h.svc, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Stored[h.cache.ID] != 2 {
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 {
 		t.Fatalf("the drain's report misses the roots its export stored: %+v", rep)
 	}
 }
@@ -760,7 +793,7 @@ func TestDrainWaitsForExplicitExport(t *testing.T) {
 		t.Fatalf("the explicit export: %v", err)
 	}
 	rep := waitDrain(t, drained, 10*time.Second)
-	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.Stored[h.cache.ID] != 1 {
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.StoredOf(testScope, h.cache.ID) != 1 {
 		t.Fatalf("drain report %+v", rep)
 	}
 }
@@ -811,7 +844,7 @@ func TestDrainRunsExplicitExportWaitingForSlot(t *testing.T) {
 	rep := waitDrain(t, drained, 10*time.Second)
 	// Roots 10 and 11, by the scheduler's export, and 99, by the explicit
 	// one.
-	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.Stored[h.cache.ID] != 3 {
+	if rep.Outcome != metrics.DrainComplete || rep.Explicit != 0 || rep.StoredOf(testScope, h.cache.ID) != 3 {
 		t.Fatalf("drain report %+v", rep)
 	}
 }
@@ -830,6 +863,165 @@ func TestDrainPathsStoppedDoesNotWaitForExplicit(t *testing.T) {
 	}
 	if rep.Outcome != metrics.DrainCanceled || rep.Explicit != 1 {
 		t.Fatalf("drain report %+v", rep)
+	}
+}
+
+// A drain that begins once the paths stopped has nothing to export, and
+// says the service is stopping. It reports what is left, and is complete
+// when nothing is left that it could have exported (an export in flight,
+// or a root of a connected engine), whatever its ctx says. A session that
+// hasn't ended, with no root left, doesn't count. With a root left, it was
+// cut short: deadline once its ctx expired, or the export path's clock
+// passed its deadline, canceled otherwise.
+// (zerobull-consulting/dagger#74, point 2.)
+func TestDrainPathsStoppedReportsFromContext(t *testing.T) {
+	live := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), time.Minute)
+	}
+	expired := func() (context.Context, context.CancelFunc) {
+		return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	}
+	canceled := func() (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx, cancel
+	}
+	// short ends before retryLater's retries are due (BusyBackoff).
+	short := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 10*time.Second)
+	}
+	// openRoots leaves the roots of a session that hasn't ended, waiting
+	// to settle.
+	openRoots := func(t *testing.T, h *exportHarness) {
+		h.build()
+		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"))
+		waitUntil(t, 5*time.Second, "the roots to be tracked", func() bool {
+			left := h.svc.drainLeft(time.Now(), time.Time{})
+			return len(left) == 1 && left[0].Roots() == 2
+		})
+	}
+	// openSession leaves a session that hasn't ended, with its roots
+	// already stored: no root left.
+	openSession := func(t *testing.T, h *exportHarness) {
+		h.build()
+		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+		waitUntil(t, 10*time.Second, "the export", func() bool {
+			return indexHas(t, h, 10, 11) && len(h.svc.drainLeft(time.Now(), time.Time{})) == 0
+		})
+		h.postSpans("session-2", cacheSpan(10))
+		waitUntil(t, 5*time.Second, "the open session to be tracked", func() bool {
+			left := h.svc.drainLeft(time.Now(), time.Time{})
+			return len(left) == 1 && left[0].Sessions == 1 && left[0].Roots() == 0
+		})
+	}
+	// retryLater leaves roots whose export failed, waiting on a retry due
+	// after the drain's deadline (DrainState.Later).
+	retryLater := func(t *testing.T, h *exportHarness) {
+		digests := h.build()
+		h.cache.CorruptUploads(digests[1], 3)
+		h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+		waitUntil(t, 10*time.Second, "the export to fail", func() bool {
+			left := h.svc.drainLeft(time.Now(), time.Now().Add(time.Second))
+			return len(left) == 1 && left[0].Later == 2
+		})
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *exportHarness)
+		ctx   func() (context.Context, context.CancelFunc)
+		// skew moves the export path's clock an hour on once the paths
+		// stopped: past the drain's deadline, before ctx's timer fires.
+		skew  bool
+		want  string
+		roots int
+		// later is how many of the roots left are due after the deadline.
+		later int
+	}{
+		{"nothing left, live", nil, live, false, metrics.DrainComplete, 0, 0},
+		{"nothing left, deadline passed", nil, expired, false, metrics.DrainComplete, 0, 0},
+		{"nothing left, canceled", nil, canceled, false, metrics.DrainComplete, 0, 0},
+		{"open session with no root left, canceled", openSession, canceled, false, metrics.DrainComplete, 0, 0},
+		{"roots left, live", openRoots, live, false, metrics.DrainCanceled, 2, 0},
+		{"roots left, deadline passed", openRoots, expired, false, metrics.DrainDeadline, 2, 0},
+		{"roots left, canceled", openRoots, canceled, false, metrics.DrainCanceled, 2, 0},
+		{"roots left, export clock past the deadline", openRoots, live, true, metrics.DrainDeadline, 2, 0},
+		{"retry due after the deadline, live", retryLater, short, false, metrics.DrainCanceled, 2, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var skewed atomic.Bool
+			h, rec := newDrainHarness(t, func(c *ExportConfig) {
+				c.Tracker.BusyBackoff = testQuiet
+				c.Now = func() time.Time {
+					if skewed.Load() {
+						return time.Now().Add(time.Hour)
+					}
+					return time.Now()
+				}
+			})
+			if tc.setup != nil {
+				tc.setup(t, h)
+			}
+			// The stop began: the paths end, the engine stays connected.
+			h.cancelPaths()
+			skewed.Store(tc.skew)
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			start := time.Now()
+			rep := h.svc.Drain(ctx)
+			if took := time.Since(start); took > time.Second {
+				t.Fatalf("the drain took %s", took)
+			}
+			if rep.Outcome != tc.want || rep.Explicit != 0 || rep.LeftRoots() != tc.roots {
+				t.Fatalf("report %+v, want outcome %q with %d roots left", rep, tc.want, tc.roots)
+			}
+			if tc.roots > 0 && (len(rep.Left) != 1 || rep.Left[0].CacheID != h.cache.ID || !rep.Left[0].Connected || rep.Left[0].Later != tc.later) {
+				t.Fatalf("report left %+v", rep.Left)
+			}
+			if len(rec.find("drain: nothing to export (the service is stopping)")) != 1 {
+				t.Fatal("the drain didn't log that the service is stopping")
+			}
+			if len(rec.find("drain: nothing to export (the export path is off)")) != 0 {
+				t.Fatal("the drain logged that the export path is off")
+			}
+			if n := len(rec.find("drain: left unexported")); (tc.roots > 0) != (n == 1) {
+				t.Fatalf("logged %d left unexported", n)
+			}
+		})
+	}
+}
+
+// A second Drain returns canceled at once, and doesn't end the first: only
+// the first call's ctx cancels a drain, and the first still ends with its
+// own outcome. (zerobull-consulting/dagger#74, point 3.)
+func TestDrainSecondCallDoesNotCancelFirst(t *testing.T) {
+	h, _ := newDrainHarness(t, nil)
+	h.build()
+	release := h.cache.Hold()
+	defer release()
+	h.postSpans("session-1", cacheSpan(10), cacheSpan(11, "10"), carrierSpan(2))
+	waitUntil(t, 5*time.Second, "the export to be held", func() bool { return h.cache.InFlight() == 1 })
+	done := startDrain(t, h.svc, time.Minute)
+
+	start := time.Now()
+	second := drainFor(h.svc, time.Minute)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the second Drain took %s", took)
+	}
+	if second.Outcome != metrics.DrainCanceled {
+		t.Fatalf("the second Drain's report %+v", second)
+	}
+	if st := h.svc.DrainStatus(); !st.Draining || st.Report != nil {
+		t.Fatalf("the second Drain ended the first: %+v", st)
+	}
+	drainRunning(t, done, "after a second Drain")
+
+	release()
+	rep := waitDrain(t, done, 10*time.Second)
+	if rep.Outcome != metrics.DrainComplete || rep.StoredOf(testScope, h.cache.ID) != 2 || rep.LeftRoots() != 0 {
+		t.Fatalf("the first Drain's report %+v", rep)
+	}
+	if st := h.svc.DrainStatus(); st.Report == nil || st.Report.Outcome != metrics.DrainComplete {
+		t.Fatalf("drain status after the first Drain %+v", st)
 	}
 }
 
@@ -936,5 +1128,95 @@ func TestDrainStartsNothingPastItsDeadline(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := h.cache.Exports(); n != 0 || h.cache.InFlight() != 0 {
 		t.Fatalf("%d exports reached the engine after a drain past its deadline", n)
+	}
+}
+
+// A drain asks a paused engine for what is dirty once, then is done: it
+// neither waits out the roots' wait nor asks again, and reports them left
+// for the engine, not as roots it failed to export.
+func TestDrainPausedEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// before has the engine refuse the root before the drain starts.
+		before bool
+	}{
+		{"paused before the drain", true},
+		{"found paused by the drain", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, rec := newDrainHarness(t, func(c *ExportConfig) { c.Tracker.PausedWait = 200 * time.Millisecond })
+			h.cache.Add(fakeengine.Entry{Number: 10, Layers: [][]byte{testLayer("base")}, Refused: exporter.EnginePausedMessage})
+			h.postSpans("session-1", cacheSpan(10))
+			if tc.before {
+				if code, _ := h.debugExport(""); code != http.StatusOK {
+					t.Fatalf("export: %d", code)
+				}
+			}
+			start := time.Now()
+			rep := drainFor(h.svc, time.Minute)
+			if took := time.Since(start); took > 10*time.Second {
+				t.Fatalf("the drain took %s: it waited for a paused engine", took)
+			}
+			if rep.Outcome != metrics.DrainComplete || rep.LeftRoots() != 0 || rep.PausedRoots() != 1 {
+				t.Fatalf("report %+v", rep)
+			}
+			if left := rec.find("drain: left for an engine that gave up its remote-cache work"); len(left) != 1 || left[0]["roots"] != "1" {
+				t.Fatalf("paused roots logged %v", left)
+			}
+			if warned := rec.find("drain: left unexported"); len(warned) != 0 {
+				t.Fatalf("paused roots logged as left unexported: %v", warned)
+			}
+			if tc.before {
+				if started := rec.find("drain: started"); len(started) != 1 || started[0]["paused"] != "1" || started[0]["pending"] != "0" {
+					t.Fatalf("drain start logged %v, want the paused root counted as such", started)
+				}
+			}
+			waitMetric(t, h.svc, "cacheservice_drain_paused_roots_total", nil, 1)
+			if left := metricstest.Read(t, h.svc.registry, "cacheservice_drain_unexported_roots_total", nil); left.Value != 0 {
+				t.Fatalf("%v roots counted left unexported, want the paused root counted apart", left.Value)
+			}
+			// Past the roots' own wait: nothing more is asked of the engine.
+			time.Sleep(600 * time.Millisecond)
+			if asked := metricstest.Read(t, h.svc.registry, "cacheservice_export_roots_total", map[string]string{"result": "paused"}); asked.Value != 1 {
+				t.Fatalf("the paused engine was asked for the root %v times, want once", asked.Value)
+			}
+		})
+	}
+}
+
+// expiringCtx is a context whose deadline passes between two reads of its
+// error: the first read finds none, every later one the deadline's.
+type expiringCtx struct {
+	context.Context
+	reads int
+}
+
+func (c *expiringCtx) Err() error {
+	c.reads++
+	if c.reads == 1 {
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+// A drain's deadline that passes while its end is being decided is still
+// its deadline, not a cancellation: the drain polls every 100ms, so with a
+// timeout of whole tenths of a second a pass begins as the deadline passes
+// (seen as outcome=canceled in TestMinIOBinaryLingerStoresNothing).
+func TestDrainEndReadsItsContextOnce(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background()}, context.Background(), now, later); ok {
+		t.Fatalf("drainEnded: %q for a context that hadn't ended when read", outcome)
+	}
+	if outcome, ok := ctxEnded(&expiringCtx{Context: context.Background()}, now, later); ok {
+		t.Fatalf("ctxEnded: %q for a context that hadn't ended when read", outcome)
+	}
+	// The next pass, or the drain's own clock, then says deadline.
+	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background(), reads: 1}, context.Background(), now, later); !ok || outcome != metrics.DrainDeadline {
+		t.Fatalf("drainEnded: %q, %v after the deadline; want deadline", outcome, ok)
+	}
+	if outcome, ok := drainEnded(&expiringCtx{Context: context.Background()}, context.Background(), later, later); !ok || outcome != metrics.DrainDeadline {
+		t.Fatalf("drainEnded: %q, %v at the deadline on the drain's clock; want deadline", outcome, ok)
 	}
 }

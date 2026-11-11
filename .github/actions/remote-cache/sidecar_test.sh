@@ -42,6 +42,47 @@ check "an image starting with '-' is refused" not valid_image "--privileged"
 check "a docker call in a wait is bounded by what is left of it" [ "$(step_bound $((SECONDS + 3)))" -le 3 ]
 check "... at most 10s" [ "$(step_bound $((SECONDS + 600)))" = 10 ]
 check "... and at least 1s, past its end" [ "$(step_bound $((SECONDS - 5)))" = 1 ]
+# zerobull-consulting/dagger#209: under start/run (SIDECAR_GROUP_KILLED=1), a
+# bounded docker call stays in the script's process group, which start/run
+# kills at its bound (GNU timeout alone moves to a group of its own). Run any
+# other way, timeout is GNU's own, which kills its command's children too.
+# The process group of a /proc/<pid>/stat line on stdin: the 3rd field after
+# the command's name, which is in parentheses.
+stat_pgid() {
+	local s
+	s="$(cat)"
+	s="${s##*) }"
+	read -r _ _ pgid _ <<<"$s"
+	echo "${pgid:-}"
+}
+timeout_keeps_group() {
+	local inner outer
+	inner="$(timeout 5 sh -c 'cat /proc/$$/stat' | stat_pgid)"
+	outer="$(stat_pgid </proc/$$/stat)"
+	[[ -n "$inner" && "$inner" == "$outer" ]]
+}
+# A fresh bash that sourced sidecar.sh with the settings given, running CMD.
+sourced() {
+	local cmd="$1"
+	shift
+	env "$@" bash -c "source '$here/sidecar.sh'; set +e; $(declare -f stat_pgid timeout_keeps_group); $cmd"
+}
+which_timeout='if declare -F timeout >/dev/null; then echo wrapped; else echo plain; fi'
+check "under start/run, a timeout call stays in the script's process group" \
+	sourced timeout_keeps_group SIDECAR_GROUP_KILLED=1
+check "... and run any other way, timeout is not wrapped" \
+	[ "$(sourced "$which_timeout" SIDECAR_GROUP_KILLED=)" = plain ]
+# A timeout with no --foreground (BusyBox's) is used as it is, not wrapped.
+mkdir -p "$tmp/bbtimeout"
+cat >"$tmp/bbtimeout/timeout" <<'FAKE'
+#!/bin/sh
+case "$1" in -*) echo "timeout: unrecognized option '$1'" >&2; exit 125 ;; esac
+shift
+exec "$@"
+FAKE
+chmod +x "$tmp/bbtimeout/timeout"
+check "... and under start/run, a timeout with no --foreground still runs the command" \
+	[ "$(sourced 'timeout 5 echo ran' SIDECAR_GROUP_KILLED=1 PATH="$tmp/bbtimeout:$PATH" 2>&1)" = ran ]
 check "10m is 600s" [ "$(duration_seconds 10m)" = 600 ]
 check "1h30m is 5400s" [ "$(duration_seconds 1h30m)" = 5400 ]
 check "1.5h is refused" not duration_seconds 1.5h
@@ -247,6 +288,15 @@ in_order() {
 	done
 }
 took_hello_at_most() { [[ "$(cat "$tmp/hello.took")" -le "$1" ]]; }
+took_hello_at_least() { [[ "$(cat "$tmp/hello.took")" -ge "$1" ]]; }
+# in_file_order <file> <first> <second>: the first line matching first
+# comes before the first matching second.
+in_file_order() {
+	local a b
+	a="$(grep -nF -m1 -- "$2" "$1" | cut -d: -f1)"
+	b="$(grep -nF -m1 -- "$3" "$1" | cut -d: -f1)"
+	[[ -n "$a" && -n "$b" && "$a" -lt "$b" ]]
+}
 cleaned_up() { called "rm -f t-engine" && called "volume rm -f t-engine-state" && called "network rm t-net" && [[ ! -e "$tmp/sc/t/state" ]]; }
 took_at_most() { [[ "$(cat "$tmp/stop.took")" -le "$1" ]]; }
 
@@ -473,10 +523,17 @@ check "a service that exits while the engine starts fails the start with both lo
 
 # --- start waits for the welcome, and fails on a refusal (#146) ---
 # A docker on which the start runs to the end. Once the engine has started,
-# the service's log says, per FAKE_HELLO: welcome, it welcomed the engine;
-# refused, it refused its version; silent, it connected and said no more;
-# none, nothing. Every docker run is recorded in $FAKE_DIR/runs, and docker
-# cp writes a fake CLI.
+# the service's log says, per FAKE_HELLO: welcome, it welcomed the engine
+# and its first import sync is done; refused, it refused its version;
+# silent, it connected and said no more; none, nothing. With welcome,
+# FAKE_SYNC says how the first sync shows (zerobull-consulting/dagger#103):
+# done (the default), at once; late, 3s after the engine started; failed,
+# done with an error; partial, done with a bundle that failed to merge and
+# no error; never, it isn't logged (an image from before the line). With
+# FAKE_ENGINE_DIES, the engine is running at its first inspect only; with
+# FAKE_INSPECT_FAILS, every inspect of it after the first fails. Every
+# docker run is recorded in $FAKE_DIR/runs, and docker cp
+# writes a fake CLI.
 mkdir -p "$tmp/okbin"
 cat >"$tmp/okbin/docker" <<'EOF2'
 #!/usr/bin/env bash
@@ -491,7 +548,16 @@ case "$1 $2" in
 	exit 0
 	;;
 "port "*) echo 10.9.0.1:30000 ;;
-"inspect -f") echo true ;;
+"inspect -f")
+	if [[ -n "${FAKE_ENGINE_DIES:-}" && "$4" == *-engine && -f "$FAKE_DIR/engine.inspected" ]]; then
+		echo false
+	elif [[ -n "${FAKE_INSPECT_FAILS:-}" && "$4" == *-engine && -f "$FAKE_DIR/engine.inspected" ]]; then
+		exit 1
+	else
+		[[ "$4" == *-engine && -f "$FAKE_DIR/engine.started" ]] && : >"$FAKE_DIR/engine.inspected"
+		echo true
+	fi
+	;;
 "logs --tail") echo "LOG OF $4" ;;
 "logs "*)
 	echo 'time=x level=INFO msg=listening addr=:8090'
@@ -500,6 +566,15 @@ case "$1 $2" in
 	welcome)
 		echo 'time=x level=INFO msg="engine connected" conn=1'
 		echo 'time=x level=INFO msg="engine welcomed" conn=1 engineVersion=v1.0.0-beta.25 versionAccepted=true'
+		case "${FAKE_SYNC:-done}" in
+		done) echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=2 failed=0' ;;
+		late)
+			(($(date +%s) - $(stat -c %Y "$FAKE_DIR/engine.started") >= 3)) &&
+				echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=0 failed=0'
+			;;
+		failed) echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=0 failed=0 error=true' ;;
+		partial) echo 'time=x level=INFO msg="import sync: first done" conn=1 namespace=default merged=1 failed=1' ;;
+		esac
 		;;
 	refused)
 		echo 'time=x level=INFO msg="engine connected" conn=1'
@@ -558,6 +633,47 @@ check "... with a warning that says why" grep -q "warning: the service (s) logge
 check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
 check "... but not before the grace: a refusal comes first" not hello_start refused SIDECAR_WELCOME_GRACE=0
 check "... and a grace longer than the start's timeout still fails at the timeout" not hello_start silent SIDECAR_WELCOME_GRACE=60
+
+# --- start waits for the first import sync (#103) ---
+check "a welcomed engine: the start waits for the first import sync" hello_start welcome
+check "... and says what it merged" grep -q "the first import sync is done: it merged 2 stored bundle(s)" "$tmp/hello.out"
+check "... before it is ready" in_file_order "$tmp/hello.out" "the first import sync is done" "remote-cache-sidecar: ready"
+check "... without a warning" not grep -q "warning:" "$tmp/hello.out"
+check "a first sync that comes late: the start waits for it" hello_start welcome FAKE_SYNC=late
+check "... and is ready only after it" took_hello_at_least 3
+check "... says so" grep -q "the first import sync is done: it merged 0 stored bundle(s)" "$tmp/hello.out"
+check "... without a warning" not grep -q "warning:" "$tmp/hello.out"
+check "a first sync never logged: the start goes on after its bound" hello_start welcome FAKE_SYNC=never SIDECAR_FIRST_SYNC_TIMEOUT=2
+check "... with a warning that says why" grep -q "warning: the service (s) logged no first import sync within 2s of the welcome" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "... after the bound, not at once" took_hello_at_least 2
+check "... and not much later: a timeout, not a retry" took_hello_at_most 6
+check "... telling a given image to use the version's" grep -q "never logs it: use the version input's service image" "$tmp/hello.out"
+check "the version's own service image is waited for the same" hello_start welcome FAKE_SYNC=never SIDECAR_FIRST_SYNC_TIMEOUT=2 SIDECAR_SERVICE_IMAGE=
+check "... with the warning" grep -q "logged no first import sync within 2s of the welcome" "$tmp/hello.out"
+check "... which doesn't tell it to use the image it runs" not grep -q "use the version input's service image" "$tmp/hello.out"
+check "... but says why it may be" grep -q "the version's service image is a release from before that line" "$tmp/hello.out"
+check "a first sync that failed: the start goes on, with a warning" hello_start welcome FAKE_SYNC=failed
+check "... that shows the line" grep -q 'warning: the service.s first import sync failed, .*msg="import sync: first done" conn=1 .*error=true' "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "a first sync with a bundle that failed to merge, and no error: a warning too" hello_start welcome FAKE_SYNC=partial
+check "... that shows the line" grep -q 'warning: the service.s first import sync failed, in whole or in part, .*merged=1 failed=1' "$tmp/hello.out"
+check "... not a plain success" not grep -q "the first import sync is done" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "an engine that exits after the welcome fails the start" not hello_start welcome FAKE_SYNC=never FAKE_ENGINE_DIES=1 SIDECAR_FIRST_SYNC_TIMEOUT=30
+check "... at once, not at the first sync's bound" took_hello_at_most 6
+check "... says so" grep -q "the engine exited before the service's first import sync" "$tmp/hello.out"
+check "... with the engine's log" grep -q "LOG OF remote-cache-engine" "$tmp/hello.out"
+check "... never ready" not grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+check "a docker inspect that fails during the first-sync wait isn't an exit (zerobull-consulting/dagger#125)" hello_start welcome FAKE_INSPECT_FAILS=1
+check "... the start waits for the sync" grep -q "the first import sync is done: it merged 2 stored bundle(s)" "$tmp/hello.out"
+check "... ready" grep -q "remote-cache-sidecar: ready" "$tmp/hello.out"
+# An image from before the welcome line predates the first sync's line.
+check "an image from before the welcome line: no first-sync wait" hello_start silent SIDECAR_WELCOME_GRACE=1 SIDECAR_FIRST_SYNC_TIMEOUT=30
+check "... nor its warning" not grep -q "first import sync" "$tmp/hello.out"
+check "... ready well before the sync's bound" took_hello_at_most 6
+check "a first-sync bound that isn't a number is refused" not hello_start welcome SIDECAR_FIRST_SYNC_TIMEOUT=30s
+check "... says so" grep -q "SIDECAR_FIRST_SYNC_TIMEOUT '30s' isn't a number of seconds" "$tmp/hello.out"
 check "an engine that never connects: the start fails" not hello_start none
 check "... says so" grep -q "the engine didn't connect to the service within 5s" "$tmp/hello.out"
 
@@ -625,6 +741,31 @@ check "... without copying the CLI out of the engine" [ ! -e "$tmp/okbin.fake/cp
 check "... and says which CLI it uses" grep -q "using the CLI $fake_cli ($first_version)" "$tmp/hello.out"
 sidecar_wrapper="$tmp/okbin.sc/remote-cache/bin/dagger"
 check "... the wrapper runs that CLI" grep -qF "$fake_cli" "$sidecar_wrapper"
+# zerobull-consulting/dagger#209: the start runs the wrapper under start/run,
+# where its timeout calls stay in the group too; the job's later steps run it
+# with GNU's own. A timeout that records how it was called tells them apart.
+mkdir -p "$tmp/rectimeout"
+cat >"$tmp/rectimeout/timeout" <<'FAKE'
+#!/bin/sh
+echo "$*" >>"$TIMEOUT_LOG"
+while [ "${1#-}" != "$1" ]; do shift; done
+shift
+exec "$@"
+FAKE
+chmod +x "$tmp/rectimeout/timeout"
+wrapper_timeout() {
+	rm -f "$tmp/timeout.log"
+	TIMEOUT_LOG="$tmp/timeout.log" PATH="$tmp/rectimeout:$tmp/okbin:$PATH" "$@" "$sidecar_wrapper" call >/dev/null 2>&1
+	if grep -q -- '^--foreground 30 docker inspect' "$tmp/timeout.log"; then
+		echo wrapped
+	elif grep -q -- '^30 docker inspect' "$tmp/timeout.log"; then
+		echo plain
+	fi
+}
+check "... and under start/run, its timeout calls keep to the caller's process group" \
+	[ "$(wrapper_timeout env SIDECAR_GROUP_KILLED=1)" = wrapped ]
+check "... but in the job's later steps, its timeout is GNU's own" \
+	[ "$(wrapper_timeout env SIDECAR_GROUP_KILLED=)" = plain ]
 # The guards survive: a job with a trace and settings of its own.
 wrapped() { TRACEPARENT=00-aa-bb-00 DAGGER_ENGINE=other OTEL_X=1 PATH="$tmp/okbin:$PATH" "$sidecar_wrapper" call; }
 check "... which drops an inherited TRACEPARENT, DAGGER_* and OTEL_*" grep -q "^TRACEPARENT=unset DAGGER_ENGINE=unset OTEL_X=unset" <<<"$(wrapped)"
@@ -712,6 +853,20 @@ check "debug-port: its file is readable by the service's UID" [ "$(stat -c %a "$
 check "debug-port: its directory only by this user" [ "$(stat -c %a "$dbg_dir")" = 700 ]
 check "debug-port: the service gets the file, read-only" grep -qxF -- "$dbg_dir/debug-token:/run/secrets/debug-token:ro" <<<"$dbg_args"
 check "debug-port: and -debug-token-file" grep -qxF -- "-debug-token-file" <<<"$dbg_args"
+# The args files are there (a flag that is absent proves nothing when no
+# service was started): each has the flags every start passes.
+check "writer: the service was started, with its -scope" grep -qxF -- "-scope" <<<"$dbg_args"
+check "writer: the service gets -gc-mode=batch" grep -qxF -- "-gc-mode=batch" <<<"$dbg_args"
+check "writer: and no -gc-interval" not grep -q -- "-gc-interval" <<<"$dbg_args"
+# Its own bin directory (a copy of the same fake docker), so it leaves the
+# debug-port start's state alone.
+mkdir -p "$tmp/robin"
+cp "$tmp/dbgbin/docker" "$tmp/robin/docker"
+fake_start robin SIDECAR_ROLE=read-only >/dev/null
+ro_args="$(cat "$tmp/robin.fake/service.args" 2>/dev/null)"
+check "read-only: the service was started, with its -scope" grep -qxF -- "-scope" <<<"$ro_args"
+check "read-only: the service gets -export=false" grep -qxF -- "-export=false" <<<"$ro_args"
+check "read-only: and neither -gc-mode nor -gc-interval" not grep -qE -- "^-gc-(mode|interval)" <<<"$ro_args"
 check "start passes the linger the stop's bounds assume" grep -qx -- "-drain-linger" <<<"$dbg_args"
 check "... 15s" bash -c 'grep -A1 -x -- "-drain-linger" <<<"$1" | tail -1 | grep -qx 15s' _ "$dbg_args"
 check "... and records it for the stop" grep -qx linger_seconds=15 "$tmp/dbgbin.sc/remote-cache/state"

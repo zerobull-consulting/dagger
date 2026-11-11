@@ -104,6 +104,17 @@ type Service struct {
 	registry *prometheus.Registry
 	metrics  *metrics.Metrics
 
+	// settleMarkerWait is DefaultSettleMarkerWait, in nanoseconds; tests
+	// change it.
+	settleMarkerWait atomic.Int64
+	// maxSettleWait is MaxSettleWait, in nanoseconds; tests change it.
+	maxSettleWait atomic.Int64
+	// settleRetryWait is DefaultSettleRetryWait, in nanoseconds; tests
+	// change it.
+	settleRetryWait atomic.Int64
+	// settleQuiet is DefaultSettleQuiet, in nanoseconds; tests change it.
+	settleQuiet atomic.Int64
+
 	// otlp bounds the OTLP bodies (otlplimit.go); otlpRefusals rate-limits
 	// the warnings of the requests it refuses, by route and reason.
 	otlp         otlpLimits
@@ -127,7 +138,7 @@ type Service struct {
 func New(logger *slog.Logger, dumpDir string) *Service {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	return &Service{
+	s := &Service{
 		logger:     logger,
 		dumpDir:    dumpDir,
 		conns:      map[uint64]*engineConn{},
@@ -139,6 +150,11 @@ func New(logger *slog.Logger, dumpDir string) *Service {
 		engines:    defaultEnginePolicy(),
 		drain:      drainState{explicitEnded: make(chan struct{}, 1)},
 	}
+	s.settleMarkerWait.Store(int64(DefaultSettleMarkerWait))
+	s.maxSettleWait.Store(int64(MaxSettleWait))
+	s.settleRetryWait.Store(int64(DefaultSettleRetryWait))
+	s.settleQuiet.Store(int64(DefaultSettleQuiet))
+	return s
 }
 
 // newMetrics are a new service's metrics: its export path is off until
@@ -210,6 +226,12 @@ type engineConn struct {
 	// versionAccepted is set when the hello's version is on an accept line;
 	// it is unset for an engine welcomed by -allow-engine-version-mismatch.
 	versionAccepted bool
+	// period is the engine's idle period: the hello's, then its opens'
+	// (settle.go).
+	period periodState
+	// firstSyncDone is set once the sync loop's first import sync ended
+	// (LogImportFirstSync).
+	firstSyncDone atomic.Bool
 
 	mu sync.Mutex
 	// stopImports ends the import sync loop; set once it starts.
@@ -312,7 +334,7 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// The cache ID keys the tracker's, the importer's and the namespace's
 	// state, as a span's does (parseEngineCache).
 	if !validEngineID(c.hello.CacheID) {
-		c.svc.refusedEngineIDs(metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
+		c.svc.refusedEngineIDs(c.logger.With("remote", c.remote), metrics.EngineIDSourceHello, 1, len(c.hello.CacheID), 0)
 		_ = c.replyError(ctx, env, "invalid cache ID")
 		return errors.New("hello: invalid cache ID")
 	}
@@ -350,10 +372,11 @@ func (c *engineConn) serve(ctx context.Context) error {
 	// upgrade, before the hello says whether the engine is accepted.
 	c.logger.Info(LogEngineWelcomed, "engineVersion", boundVersion(c.hello.EngineVersion),
 		"versionAccepted", c.versionAccepted)
+	c.period.open(c.hello.Period)
 	// The engine reports in at its generation: a newer one clears the
 	// cache's stale-generation refusals, to be exported from it (#129).
 	if c.ns.tracker != nil {
-		c.ns.tracker.Connected(c.hello.CacheID, c.hello.Generation)
+		c.ns.tracker.Connected(c.hello.CacheID, c.hello.Generation, c.svc.export.now())
 	}
 	// The import sync loop ends with the connection.
 	importCtx, stopImports := context.WithCancel(ctx)
@@ -421,6 +444,14 @@ func (c *engineConn) dispatch(ctx context.Context, env protocol.Envelope) {
 			}
 			_ = c.reply(ctx, env, protocol.TypeRenewed, c.svc.renew(ctx, c, req))
 		}()
+	case protocol.TypeOpen:
+		go c.serveOpen(ctx, env)
+	case protocol.TypeClaims:
+		go c.serveClaims(ctx, env)
+	case protocol.TypeSettle:
+		go c.serveSettle(ctx, env)
+	case protocol.TypeLookup:
+		go c.serveLookup(ctx, env)
 	default:
 		go func() { _ = c.replyError(ctx, env, fmt.Sprintf("unexpected request %q", env.Type)) }()
 	}
@@ -535,7 +566,28 @@ func summarize(env protocol.Envelope) []any {
 	case protocol.TypeHello:
 		var b protocol.Hello
 		if env.Decode(&b) == nil {
-			return []any{"cacheID", b.CacheID, "generation", b.Generation, "engineVersion", b.EngineVersion, "engineName", b.EngineName}
+			return []any{"cacheID", b.CacheID, "generation", b.Generation, "engineVersion", b.EngineVersion, "engineName", b.EngineName,
+				"period", b.Period, "settled", b.Settled}
+		}
+	case protocol.TypeOpen:
+		var b protocol.Open
+		if env.Decode(&b) == nil {
+			return []any{"period", b.Period}
+		}
+	case protocol.TypeSettle:
+		var b protocol.Settle
+		if env.Decode(&b) == nil {
+			return []any{"period", b.Period, "sessions", len(b.Sessions)}
+		}
+	case protocol.TypeClaims:
+		var b protocol.Claims
+		if env.Decode(&b) == nil {
+			return []any{"sessions", len(b.Sessions)}
+		}
+	case protocol.TypeLookup:
+		var b protocol.Lookup
+		if env.Decode(&b) == nil {
+			return []any{"misses", len(b.Misses)}
 		}
 	case protocol.TypeRenew:
 		var b protocol.Renew
@@ -560,7 +612,7 @@ func summarize(env protocol.Envelope) []any {
 	case protocol.TypeMerged:
 		var b protocol.Merged
 		if env.Decode(&b) == nil {
-			return []any{"generation", b.Generation, "values", len(b.Values), "retained", len(b.Retained), "skipped", len(b.Skipped)}
+			return []any{"generation", b.Generation, "values", len(b.Values), "retained", len(b.Retained), "skipped", len(b.Skipped), "stale", len(b.Stale)}
 		}
 	case protocol.TypeOffered:
 		var b protocol.Offered
@@ -742,6 +794,10 @@ type EngineInfo struct {
 	// welcomed by -allow-engine-version-mismatch.
 	VersionAccepted bool   `json:"versionAccepted"`
 	EngineName      string `json:"engineName"`
+	// FirstSyncDone is set once the connection's first import sync ended,
+	// even when it merged nothing (LogImportFirstSync); it stays unset
+	// with the import path off.
+	FirstSyncDone bool `json:"firstSyncDone"`
 }
 
 // serveIdentity answers with the service's identity: its base release (or

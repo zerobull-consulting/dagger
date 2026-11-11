@@ -48,6 +48,10 @@ type exportHarness struct {
 	// ends it.
 	ctx    context.Context
 	cancel context.CancelFunc
+	// cancelPaths ends the export and import paths alone (a child of ctx),
+	// the engines staying connected, as the stop does before CloseEngines.
+	// A GC path a test enables on ctx runs on.
+	cancelPaths context.CancelFunc
 }
 
 func newExportHarness(t *testing.T, blobs blobstore.Store, meta *metastore.Store, modify func(*ExportConfig)) *exportHarness {
@@ -67,6 +71,7 @@ func newExportHarnessWith(t *testing.T, blobs blobstore.Store, meta *metastore.S
 func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore.Store, logger *slog.Logger, modify func(*ExportConfig), modifyImport func(*ImportConfig)) *exportHarness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
+	paths, cancelPaths := context.WithCancel(ctx)
 	svc := New(logger, "")
 	cfg := ExportConfig{
 		Exporter: exporter.Config{Blobs: blobs, Meta: meta, Scope: testScope, RetryBackoff: time.Millisecond},
@@ -76,7 +81,7 @@ func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore
 	if modify != nil {
 		modify(&cfg)
 	}
-	err := svc.EnableExport(ctx, cfg)
+	err := svc.EnableExport(paths, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +90,7 @@ func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore
 	if modifyImport != nil {
 		modifyImport(&importCfg)
 	}
-	if err := svc.EnableImport(ctx, importCfg); err != nil {
+	if err := svc.EnableImport(paths, importCfg); err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(svc.Handler())
@@ -102,7 +107,7 @@ func newExportHarnessLogged(t *testing.T, blobs blobstore.Store, meta *metastore
 		srv.Close()
 		debug.Close()
 	})
-	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: scoped(t, blobs), meta: meta, ctx: ctx, cancel: cancel}
+	h := &exportHarness{t: t, svc: svc, srv: srv, debug: debug, cache: cache, blobs: scoped(t, blobs), meta: meta, ctx: ctx, cancel: cancel, cancelPaths: cancelPaths}
 	h.engine = waitEngines(t, svc, 1)[0]
 	return h
 }

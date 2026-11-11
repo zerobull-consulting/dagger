@@ -175,8 +175,13 @@ func New(cfg Config) (*Importer, error) {
 // cacheState is what the importer knows of one engine cache, at one
 // generation.
 type cacheState struct {
-	// sync serializes syncs of the cache, from any of its connections.
-	sync sync.Mutex
+	// sync serializes syncs that hold this state, from any of its
+	// connections: a one-slot semaphore, so a sync waits for it only as long
+	// as its context lives. Forget drops the state, so a sync after a Forget
+	// has a new one and doesn't wait for a sync still running on the old
+	// (TestKnownGapSyncAfterForgetOverlapsRunningSync). Made with the state
+	// (stateLocked, the only constructor): a nil channel would block forever.
+	sync chan struct{}
 
 	// The fields below are guarded by Importer.mu.
 	generation uint64
@@ -344,7 +349,7 @@ type FailedBundle struct {
 func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	st := im.caches[cacheID]
 	if st == nil {
-		st = &cacheState{}
+		st = &cacheState{sync: make(chan struct{}, 1)}
 		im.caches[cacheID] = st
 	}
 	if st.merged != nil && st.generation > generation {
@@ -363,6 +368,31 @@ func (im *Importer) stateLocked(cacheID string, generation uint64) *cacheState {
 	}
 	return st
 }
+
+// lockSync takes the cache's sync lock, waiting for the sync that holds it
+// only while ctx lives, and returns the context's cause when it ends. A ctx
+// already done when the call starts returns its cause without taking the
+// lock, even a free one. One that ends while the lock is taken may win the
+// select against a free slot, so ctx is checked again after, and the slot
+// given back.
+func (st *cacheState) lockSync(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	select {
+	case st.sync <- struct{}{}:
+		if ctx.Err() != nil {
+			<-st.sync
+			return context.Cause(ctx)
+		}
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+// unlockSync releases the sync lock lockSync took, once.
+func (st *cacheState) unlockSync() { <-st.sync }
 
 // Forget drops what the importer knows of an engine cache, as when its cache
 // was wiped.
@@ -420,8 +450,10 @@ func (im *Importer) Sync(ctx context.Context, eng Engine) (Result, error) {
 	if st == nil {
 		return res, errStateReset
 	}
-	st.sync.Lock()
-	defer st.sync.Unlock()
+	if err := st.lockSync(ctx); err != nil {
+		return res, err
+	}
+	defer st.unlockSync()
 	// The state may have moved on while this sync waited for the lock.
 	im.mu.Lock()
 	current := im.currentLocked(eng, st)
@@ -679,6 +711,12 @@ func (im *Importer) merge(ctx context.Context, eng Engine, st *cacheState, idx *
 	var reply protocol.Merged
 	if err := env.Decode(&reply); err != nil {
 		return MergedBundle{}, nil, err
+	}
+	if len(reply.Stale) > 0 {
+		// The engine committed nothing: it didn't hold a held row. A stored
+		// bundle has none (metastore.ValidateBundle), so this merge sent
+		// none.
+		return MergedBundle{}, nil, fmt.Errorf("merge: the engine refused %d held rows as stale, and the bundle has none", len(reply.Stale))
 	}
 	return im.applyMerged(ctx, eng, st, c, mb, reply)
 }
