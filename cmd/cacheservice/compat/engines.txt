@@ -24,6 +24,6 @@
 # Blank lines and lines starting with # are ignored. Anything else fails
 # the build's tests (and the service, at startup).
 
-base v1.0.0-beta.26
+base v1.0.0-beta.27
 
 accept v1.0.0-beta.26 sha256:53c0411ca73af93ceb88e97834a992754786d4919505394b699cc34fb76dd3e4 verified: https://github.com/zerobull-consulting/dagger/actions/runs/42882034834
