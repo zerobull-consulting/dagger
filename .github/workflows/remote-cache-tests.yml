@@ -209,44 +209,14 @@ jobs:
         uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Setup Go
-        id: setup-go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          # setup-go's own cache uses one key for every job, so only the first
-          # job to finish saves it; each job caches its own build below.
-          cache: false
-      # Module and build caches, per job (the unit job builds with -race, so
-      # its build cache differs). Every run restores the newest cache saved
-      # by a push to feature/remote-cache; only those pushes save one (see
-      # "Save Go cache"), so PRs don't fill the cache with their own copies.
-      - name: Restore Go cache
-        id: go-cache
-        uses: actions/cache/restore@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-minio-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: |
-            go-minio-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-            go-minio-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
-      # Starts MinIO from hack/remote-cache/compose.yaml and runs the tests
-      # in cmd/cacheservice that need a real S3-compatible store.
+      - name: Set up Dagger
+        uses: ./.github/actions/remote-cache/setup-dagger
+      # The tests in cmd/cacheservice that need a real S3-compatible store,
+      # against MinIO as a Dagger service: the cacheservice module's
+      # test-minio check (.dagger/modules/cacheservice).
       - name: MinIO tests
-        run: ./hack/remote-cache/dev.sh test
-      - name: Stop MinIO
-        if: always()
-        run: ./hack/remote-cache/dev.sh reset
-      - name: Save Go cache
-        if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+        run: dagger -m .dagger/modules/cacheservice check cacheservice:test-minio
+
   # The e2e on the stock engine (STOCK_ENGINE): its CLI is copied out of
   # the image, and only the service, in the test process, is built from this
   # checkout. E2E_BUILD_ENGINE=1 builds the engine too, for work on its
