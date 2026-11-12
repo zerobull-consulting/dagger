@@ -1,0 +1,148 @@
+package lifecycle
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"github.com/dagger/dagger/cmd/cacheservice/internal/s3util"
+	"github.com/dagger/dagger/cmd/cacheservice/metastore"
+	"github.com/dagger/dagger/cmd/cacheservice/ownership"
+)
+
+// CallTimeout bounds each request to the store.
+const CallTimeout = 30 * time.Second
+
+// Config is a bucket's lifecycle configuration.
+type Config struct {
+	Rules []types.LifecycleRule
+	// TransitionDefaultMinimumObjectSize is written back as it was read.
+	TransitionDefaultMinimumObjectSize types.TransitionDefaultMinimumObjectSize
+}
+
+// Store is what the command needs of the bucket.
+type Store interface {
+	// GetLifecycle reads the bucket's configuration: no rules when it has
+	// none.
+	GetLifecycle(ctx context.Context) (Config, error)
+	// PutLifecycle replaces it; with no rules, it deletes it.
+	PutLifecycle(ctx context.Context, cfg Config) error
+	// ReadMarker reads the prefix's ownership marker (ownership.ReadMarker).
+	ReadMarker(ctx context.Context, prefix string) (ownership.Marker, error)
+	// Claim creates the prefix's ownership marker when the prefix is empty,
+	// as a writer does at startup (ownership.Check with writer set). It
+	// writes nothing when the marker is already there.
+	Claim(ctx context.Context, prefix string) (ownership.State, ownership.Marker, error)
+}
+
+// S3Store is a Store in S3. Every request is bounded by CallTimeout.
+type S3Store struct {
+	Client *s3.Client
+	Bucket string
+	// FilterAllUploads is set for a custom endpoint (an S3-compatible store
+	// such as MinIO), which may list multipart uploads only by exact key:
+	// the ownership check then lists the bucket's and filters, as the
+	// service does (metastore.NewS3Objects).
+	FilterAllUploads bool
+}
+
+var _ Store = (*S3Store)(nil)
+
+func (s *S3Store) GetLifecycle(ctx context.Context) (Config, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	out, err := s.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: &s.Bucket})
+	if err != nil {
+		if s3util.ErrorCode(err) == "NoSuchLifecycleConfiguration" {
+			return Config{}, nil
+		}
+		return Config{}, err
+	}
+	return Config{Rules: out.Rules, TransitionDefaultMinimumObjectSize: out.TransitionDefaultMinimumObjectSize}, nil
+}
+
+func (s *S3Store) PutLifecycle(ctx context.Context, cfg Config) error {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	if len(cfg.Rules) == 0 {
+		_, err := s.Client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: &s.Bucket})
+		return err
+	}
+	_, err := s.Client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+		Bucket:                             &s.Bucket,
+		LifecycleConfiguration:             &types.BucketLifecycleConfiguration{Rules: cfg.Rules},
+		TransitionDefaultMinimumObjectSize: cfg.TransitionDefaultMinimumObjectSize,
+	})
+	return err
+}
+
+func (s *S3Store) ReadMarker(ctx context.Context, prefix string) (ownership.Marker, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return ownership.ReadMarker(ctx, &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket}, prefix)
+}
+
+// Claim is ownership.Check in writer mode, on the same object store the
+// service uses (FilterAllUploads included). Each of its requests is bounded
+// by CallTimeout, and the whole of it by ctx.
+func (s *S3Store) Claim(ctx context.Context, prefix string) (ownership.State, ownership.Marker, error) {
+	objs := &metastore.S3Objects{Client: s.Client, Bucket: s.Bucket, FilterAllUploads: s.FilterAllUploads}
+	return ownership.Check(ctx, timedObjects{objs}, prefix, true, time.Now())
+}
+
+// timedObjects bounds each request of an ownership.Store by CallTimeout.
+type timedObjects struct{ ownership.Store }
+
+func (t timedObjects) Get(ctx context.Context, key string) ([]byte, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.Get(ctx, key)
+}
+
+func (t timedObjects) Put(ctx context.Context, key string, body []byte, cond metastore.Condition) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.Put(ctx, key, body, cond)
+}
+
+func (t timedObjects) ListKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.ListKeys(ctx, prefix, max)
+}
+
+func (t timedObjects) ListUploadKeys(ctx context.Context, prefix string, max int) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
+	defer cancel()
+	return t.Store.ListUploadKeys(ctx, prefix, max)
+}
+
+// explainRead is an error reading the configuration, with what to do.
+func explainRead(err error) error {
+	if s3util.Denied(err) {
+		return fmt.Errorf("can't read the bucket's lifecycle configuration: the key isn't allowed to (%w). "+
+			"Use a key with s3:GetLifecycleConfiguration; apply needs the admin key, which also reads it", err)
+	}
+	return fmt.Errorf("can't read the bucket's lifecycle configuration: %w", err)
+}
+
+// explainWrite is an error writing the configuration, with what to do.
+func explainWrite(err error, abortRule bool) error {
+	switch {
+	case s3util.Denied(err):
+		return fmt.Errorf("the store refused to set the lifecycle configuration (%w). "+
+			"Setting it takes the admin key (on DigitalOcean Spaces, a full-access key): a Read or Read/Write/Delete key gets 403. "+
+			"Run apply with it, interactively; never put it in the service's or a job's secrets", err)
+	case abortRule && s3util.HTTPStatus(err) == http.StatusBadRequest:
+		// MinIO answers 400 InvalidArgument; other causes give 400 too,
+		// so the message names the likely one, not a certain one.
+		return fmt.Errorf("the store refused the configuration (%w). "+
+			"If this store refuses rules that abort incomplete multipart uploads (MinIO does, with InvalidArgument, and drops stale uploads itself after 24h), "+
+			"run again with -abort-rule=false; otherwise, see the store's error", err)
+	}
+	return fmt.Errorf("can't set the bucket's lifecycle configuration: %w", err)
+}

@@ -1,0 +1,24 @@
+# The build context of cmd/cacheservice/Dockerfile (BuildKit reads the ignore
+# file next to the Dockerfile, not the root's). The context is the repository
+# root; this keeps it to the packages cmd/cacheservice builds from:
+#
+#   go list -deps ./cmd/cacheservice | grep ^github.com/dagger/dagger/
+#
+# plus sdk/go, which go.mod replaces dagger.io/dagger with. If the service
+# starts importing a package outside these directories, add it here: the
+# image build then fails with "no required module provides package".
+*
+!go.mod
+!go.sum
+!cmd/cacheservice
+!dagql
+!engine
+!internal
+!sdk/go
+!util
+# Not needed to build the binary.
+**/*_test.go
+**/testdata
+cmd/cacheservice/e2e
+cmd/cacheservice/Dockerfile*
+**/*.md

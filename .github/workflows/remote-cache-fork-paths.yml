@@ -1,0 +1,122 @@
+name: Remote cache fork paths
+# Fails if the fork changes a path, relative to the upstream commit it last
+# merged, that hack/remote-cache/fork-paths.txt doesn't allow
+# (zerobull-consulting/dagger#117, D7). See hack/remote-cache/README.md,
+# "The fork's paths".
+"on":
+  pull_request:
+    branches:
+      - feature/remote-cache
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  push:
+    branches:
+      - feature/remote-cache
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  fork-paths:
+    name: fork paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      # Shallow: the check fetches upstream and deepens both histories, in
+      # bounded steps, until it finds the merge base.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 200
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      # On a pull request, the checker comes from the base branch, so a pull request can't weaken the check it's
+      # measured by. The allowlist comes from the pull request: an entry is
+      # meant to be added there, with its reason, and the job flags it for
+      # review. Until the base branch has a checker, the pull request's runs.
+      - name: Check the fork's paths
+        timeout-minutes: 10
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Empty unless set: only for a release tag merged from off upstream
+          # main, when the check can't pick one base (see the README).
+          FORK_BASE: ${{ vars.FORK_PATHS_BASE }}
+          # The branch to deepen when HEAD isn't fetchable by itself.
+          FORK_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          check=hack/remote-cache/check-fork-paths.sh
+          allow=hack/remote-cache/fork-paths.txt
+          if [ "$EVENT" = pull_request ]; then
+            # Fails closed: without the base commit, the pull request's own
+            # checker would run.
+            if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+              && ! timeout 120 git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"; then
+              echo "::error::Couldn't fetch the base commit $BASE_SHA, so the base branch's checker can't run."
+              exit 1
+            fi
+            if git cat-file -e "$BASE_SHA:$check" 2>/dev/null; then
+              git show "$BASE_SHA:$check" >"$RUNNER_TEMP/check-fork-paths.sh"
+              chmod +x "$RUNNER_TEMP/check-fork-paths.sh"
+              check=$RUNNER_TEMP/check-fork-paths.sh
+              echo "Running the base branch's checker ($(git rev-parse --short "$BASE_SHA"))."
+              git diff --quiet "$BASE_SHA" HEAD -- hack/remote-cache/check-fork-paths.sh \
+                || echo "::notice::This pull request changes the checker; its new version runs once merged."
+            else
+              echo "The base branch has no checker yet; running this pull request's."
+            fi
+            if ! git diff --quiet "$BASE_SHA" HEAD -- "$allow"; then
+              echo "::warning file=$allow::This pull request changes the fork's allowlist. Review each new entry and its reason."
+              git diff "$BASE_SHA" HEAD -- "$allow"
+            fi
+          fi
+          "$check"
+      # After the check, so the pull request's own scripts can't change the
+      # checkout before it's measured.
+      - name: Test the check
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: hack/remote-cache/check-fork-paths_test.sh
+      # The shim's pin (start/action.yml) must be a commit on
+      # feature/remote-cache, so it stays fetchable (zerobull-consulting/dagger#169).
+      # In this job, which is required. Like the fork-paths checker, the script
+      # comes from the base branch on a pull request, so the pull request can't
+      # weaken the check it's measured by (until the base has one, the pull
+      # request's runs). The pin is read from this checkout. The branch is
+      # fixed, not the event's: a manual run from another branch must still
+      # measure against feature/remote-cache. 6 attempts of 60s at most.
+      - name: Check the shim's pin
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FORK_BRANCH: feature/remote-cache
+          FETCH_TIMEOUT: "60"
+        run: |
+          pincheck=hack/remote-cache/check-shim-pin.sh
+          if [ "$EVENT" = pull_request ] && git cat-file -e "$BASE_SHA:$pincheck" 2>/dev/null; then
+            git show "$BASE_SHA:$pincheck" >"$RUNNER_TEMP/check-shim-pin.sh"
+            chmod +x "$RUNNER_TEMP/check-shim-pin.sh"
+            pincheck=$RUNNER_TEMP/check-shim-pin.sh
+            echo "Running the base branch's pin check ($(git rev-parse --short "$BASE_SHA"))."
+            git diff --quiet "$BASE_SHA" HEAD -- hack/remote-cache/check-shim-pin.sh \
+              || echo "::notice::This pull request changes the pin check; its new version runs once merged."
+          else
+            echo "Running this checkout's pin check."
+          fi
+          "$pincheck"
+      # The test of the pin check runs from the checkout, after it, like the
+      # fork-paths test.
+      - name: Test the pin check
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: hack/remote-cache/check-shim-pin_test.sh

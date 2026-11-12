@@ -1,0 +1,535 @@
+name: Remote cache tests
+"on":
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  # Only runs on the base branch save Go caches (see "Save Go cache"); every
+  # PR into it restores them.
+  push:
+    branches:
+      - feature/remote-cache
+  # By hand, optionally verifying an engine version not yet accepted: the
+  # e2e and the sidecar demo run it as the first accept line, verified by
+  # this run (hack/remote-cache/engines.sh candidate), so the run's service
+  # accepts it. A green run is what a commit of that accept line cites.
+  workflow_dispatch:
+    inputs:
+      candidate-version:
+        description: "Engine version to verify, such as v1.0.0-beta.24 (empty: the manifest's first accept line)"
+        required: false
+        default: ""
+      candidate-digest:
+        description: "Its registry.dagger.io/engine image index digest (sha256:...)"
+        required: false
+        default: ""
+  # The release matrix (cacheservice-publish.yml): its e2e and sidecar demo
+  # against one accept line of the manifest, the sidecar with the release
+  # image the caller built, not one built here. The unit and MinIO jobs
+  # don't depend on the engine, and don't run.
+  workflow_call:
+    inputs:
+      engine-version:
+        description: "The accept line to run, such as v1.0.0-beta.24"
+        type: string
+        required: true
+      service-image-artifact:
+        description: "The artifact of this run holding the service image to test (image.tar, the cacheservice module's image tarball)"
+        type: string
+        required: true
+permissions:
+  contents: read
+# A candidate's run is titled with what it verifies, because the runs API
+# doesn't return a dispatch's inputs: the release check
+# (hack/remote-cache/release-check.sh, verdict) reads this title to match a
+# sync branch's verifying runs to the release (zerobull-consulting/dagger#165).
+# Any other run keeps GitHub's default
+# title (an empty run-name falls back to it).
+run-name: "${{ inputs.candidate-version && format('Remote cache tests: candidate {0} {1}', inputs.candidate-version, inputs.candidate-digest) || '' }}"
+# The stock Dagger release the e2e and the sidecar demo run is not set here:
+# each job reads STOCK_ENGINE (the image, pinned by digest) and
+# STOCK_ENGINE_TAG (its version) from the service's engine manifest,
+# cmd/cacheservice/compat/engines.txt, its first accept line, with
+# hack/remote-cache/engines.sh pin. The e2e harness's default
+# (DefaultEngineImage) and demo/run.sh's default come from it too, and
+# TestPinsMatchManifest (unit tests) checks every pin the docs name against
+# it (zerobull-consulting/dagger#117, D1).
+# A candidate's run is a group of its own, so verifying a version neither
+# cancels nor is cancelled by the branch's other runs. So is each of the
+# release matrix's entries (workflow_call, where github.workflow is the
+# caller's): one per version and commit, so no entry cancels another, nor
+# one of another commit's matrix.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.candidate-version }}${{ inputs.engine-version && format('-matrix-{0}-{1}', inputs.engine-version, github.sha) || '' }}
+  cancel-in-progress: true
+jobs:
+  # Its first step, the service's, client's and protocol's tests, runs as a
+  # Dagger pipeline (hack/remote-cache/speedup/run.sh, unit) on an engine with
+  # a read-only remote cache sidecar (the pr-checks-readonly environment): it
+  # fetches the layers the update job (remote-cache-update.yml) stored for
+  # feature/remote-cache's newest commit (the modules and the -race build of
+  # every package the tests import) and runs only what changed. A layer that
+  # misses runs here, as it would without the cache; nothing is stored. The
+  # bucket is the PR checks' cache, not a test store: no test here reaches it
+  # (TestWorkflowOnlySpacesJobsAreExternal).
+  unit:
+    name: unit tests
+    # Not in the release matrix (workflow_call): it doesn't depend on the
+    # engine.
+    if: inputs.engine-version == ''
+    runs-on: ubuntu-24.04
+    environment: pr-checks-readonly
+    # The start (30m at worst: two image pulls of 15m, in parallel in
+    # practice), the Dagger tests (30m), the stop (12m) and the other steps.
+    timeout-minutes: 90
+    env:
+      # The update job's engine (remote-cache-update.yml, VERSION): the cache
+      # holds that engine's entries only, so the two, and the environments'
+      # CACHE_S3_PREFIX (cache-<version>), move together.
+      DAGGER_VERSION: v1.0.0-beta.26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Verify the sidecar is stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: unit
+      - name: Check the cache prefix is for the sidecar's engine
+        env:
+          PREFIX: ${{ vars.CACHE_S3_PREFIX }}
+        run: |
+          want="cache-${DAGGER_VERSION#*-}"
+          if [[ "$PREFIX" != "$want" ]]; then
+            echo "::error::CACHE_S3_PREFIX is '$PREFIX', but engine $DAGGER_VERSION reads under '$want': move the environments' prefix, DAGGER_VERSION and remote-cache-update.yml's VERSION together"
+            exit 1
+          fi
+      - name: Note the time
+        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
+      - name: Start the read-only sidecar
+        id: reader
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: read-only
+          name: unit
+          version: ${{ env.DAGGER_VERSION }}
+          verbose: "true"
+          s3-endpoint: ${{ vars.CACHE_S3_ENDPOINT }}
+          s3-region: ${{ vars.CACHE_S3_REGION }}
+          s3-bucket: ${{ vars.CACHE_S3_BUCKET }}
+          s3-prefix: ${{ vars.CACHE_S3_PREFIX }}
+          s3-access-key-id: ${{ secrets.CACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.CACHE_S3_SECRET_ACCESS_KEY }}
+      - name: Report the start's time
+        run: ./hack/remote-cache/ci/report-start-time.sh "read-only" "$T0"
+      # The remote cache service, the engine's client of it and their wire
+      # protocol: every test in these packages, in Dagger.
+      - name: Service, client and protocol
+        timeout-minutes: 30
+        env:
+          SERVICE: ${{ steps.reader.outputs.service-container }}
+          DAGGER: ${{ steps.reader.outputs.dagger }}
+        run: |
+          ./hack/remote-cache/speedup/run.sh unit unit "$RUNNER_TEMP/unit" "$SERVICE"
+          read -r hit executed <"$RUNNER_TEMP/unit/unit.spans"
+          echo "- service, client and protocol: **$hit** withExec step(s) from the remote cache, **$executed** run" >>"$GITHUB_STEP_SUMMARY"
+      - name: Stop the read-only sidecar
+        if: always()
+        timeout-minutes: 12
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: unit
+      - name: Setup Go
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # setup-go's own cache uses one key for every job, so only the first
+          # job to finish saves it; each job caches its own build below.
+          cache: false
+      # Module and build caches, per job (the unit job builds with -race, so
+      # its build cache differs). Every run restores the newest cache saved
+      # by a push to feature/remote-cache; only those pushes save one (see
+      # "Save Go cache"), so PRs don't fill the cache with their own copies.
+      - name: Restore Go cache
+        id: go-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-unit-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      # How the release workflow moves the image's engine-version tags
+      # (cacheservice-publish.yml), against a fake registry.
+      - name: Release tags
+        timeout-minutes: 5
+        run: ./hack/remote-cache/release-tags_test.sh
+      # The hourly release check (remote-cache-release-check.yml), against
+      # fake gh and registry, and scratch repositories.
+      - name: Release check
+        timeout-minutes: 5
+        run: |
+          ./hack/remote-cache/release-check_test.sh
+      # The engine's side of the remote cache: its adapter, configuration and
+      # fixtures, in packages shared with other engine code.
+      - name: Engine integration
+        run: |
+          go test -race -count=1 -run 'RemoteCache|SkippedMessage|ExportLogAttrs' \
+            ./engine/server/ ./cmd/engine/ ./core/schema/
+      - name: Upload the Dagger tests' logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: unit-dagger-logs
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/unit
+          if-no-files-found: ignore
+      - name: Save Go cache
+        if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+  minio:
+    name: S3 tests against MinIO
+    if: inputs.engine-version == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Set up Dagger
+        uses: ./.github/actions/remote-cache/setup-dagger
+      # The tests in cmd/cacheservice that need a real S3-compatible store,
+      # against MinIO as a Dagger service: the cacheservice module's
+      # test-minio check (.dagger/modules/cacheservice).
+      - name: MinIO tests
+        run: dagger -m .dagger/modules/cacheservice check cacheservice:test-minio
+
+  # The e2e on the stock engine (STOCK_ENGINE): its CLI is copied out of
+  # the image, and only the service, in the test process, is built from this
+  # checkout. E2E_BUILD_ENGINE=1 builds the engine too, for work on its
+  # client; CI doesn't.
+  e2e:
+    name: real engines (e2e)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # STOCK_ENGINE and STOCK_ENGINE_TAG, from the manifest's first accept
+      # line, a candidate's (workflow_dispatch), or the release matrix's
+      # entry (workflow_call), which must be an accept line. See the top of
+      # this file.
+      - name: The engine pin, from the manifest
+        # Explicit, for pipefail: the tee mustn't hide a refused version.
+        shell: bash
+        env:
+          CANDIDATE_VERSION: ${{ inputs.candidate-version }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate-digest }}
+          ENGINE_VERSION: ${{ inputs.engine-version }}
+        run: |
+          if [[ -n "$CANDIDATE_VERSION$CANDIDATE_DIGEST" ]]; then
+            ./hack/remote-cache/engines.sh candidate "$CANDIDATE_VERSION" "$CANDIDATE_DIGEST"
+          fi
+          ./hack/remote-cache/engines.sh pin ${ENGINE_VERSION:+"$ENGINE_VERSION"} | tee -a "$GITHUB_ENV"
+      # Warns when this branch's engine side of the remote cache differs from
+      # STOCK_ENGINE's (run `E2E_BUILD_ENGINE=1 dev.sh e2e` to test it);
+      # fails only on a pin that contradicts itself. See the script.
+      - name: Compare the engine's client with the stock engine's
+        timeout-minutes: 8
+        run: ./hack/remote-cache/compare-client.sh "the e2e"
+      - name: Setup Go
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # setup-go's own cache uses one key for every job, so only the first
+          # job to finish saves it; each job caches its own build below.
+          cache: false
+      # Module and build caches of the e2e package alone (go-e2e-test-: the
+      # engine isn't built, so the old go-e2e- cache was mostly unused).
+      # Measured in zerobull-consulting/dagger#120: ~495 MB restores in 10s
+      # and the test then builds in 20s; without it, it builds in ~95s.
+      # Every run restores the newest cache saved by a push to
+      # feature/remote-cache; only those pushes save one.
+      - name: Restore Go cache
+        id: go-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-e2e-test-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      # The test's own build, apart from the run so its time shows; the
+      # engine image is pulled meanwhile.
+      - name: Build the test, pull the engine
+        timeout-minutes: 15
+        run: |
+          docker pull -q "$STOCK_ENGINE" &
+          go test -count=1 -run '^$' ./cmd/cacheservice/e2e/
+          wait $!
+      # Starts MinIO, builds the run's engine image on STOCK_ENGINE (GC off,
+      # the mirror), and runs TestRealEngines in cmd/cacheservice/e2e: the
+      # service in-process, engines in Docker. See hack/remote-cache/README.md,
+      # "Real engines".
+      - name: Real engines
+        env:
+          E2E_DIR: ${{ runner.temp }}/e2e
+          E2E_ENGINE_IMAGE: ${{ env.STOCK_ENGINE }}
+        run: ./hack/remote-cache/dev.sh e2e
+      # Each run's service logs, CLI output, index and importer state, and
+      # the engines' logs when it failed.
+      - name: Upload the run's files
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: e2e-runs${{ inputs.engine-version && format('-{0}', inputs.engine-version) || '' }}
+          path: ${{ runner.temp }}/e2e/runs
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: ./hack/remote-cache/dev.sh reset
+      - name: Save Go cache
+        if: github.event_name == 'push' && inputs.engine-version == '' && !cancelled()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+  # The sidecar demo (hack/remote-cache/demo) through the composite action
+  # (.github/actions/remote-cache/start and stop), against MinIO: a writer
+  # phase (start, the demo, an explicit stop, which flushes), then a read-only
+  # phase on a fresh engine (-export=false and MinIO's read-only user) that is
+  # stopped by the start's own post step,
+  # after a step that failed. Each start's time is reported in the step
+  # summary. check.sh counts
+  # cache spans in the service's log: the cacheable step must be a hit with
+  # 0 executed, and the cache-volume step must rerun. The service's image is
+  # built from this checkout, so a pull request tests its own service; the
+  # engine is a stock Dagger release (STOCK_ENGINE), whose remote cache
+  # client is the one users run.
+  sidecar:
+    name: sidecar demo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # What some runners export: an unsampled trace. The CLI the start sets
+      # up must not continue it, or the service learns no entries and the
+      # demo's export is never stored.
+      TRACEPARENT: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # STOCK_ENGINE and STOCK_ENGINE_TAG, from the manifest's first accept
+      # line, a candidate's (workflow_dispatch), or the release matrix's
+      # entry (workflow_call), which must be an accept line. See the top of
+      # this file.
+      - name: The engine pin, from the manifest
+        # Explicit, for pipefail: the tee mustn't hide a refused version.
+        shell: bash
+        env:
+          CANDIDATE_VERSION: ${{ inputs.candidate-version }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate-digest }}
+          ENGINE_VERSION: ${{ inputs.engine-version }}
+        run: |
+          if [[ -n "$CANDIDATE_VERSION$CANDIDATE_DIGEST" ]]; then
+            ./hack/remote-cache/engines.sh candidate "$CANDIDATE_VERSION" "$CANDIDATE_DIGEST"
+          fi
+          ./hack/remote-cache/engines.sh pin ${ENGINE_VERSION:+"$ENGINE_VERSION"} | tee -a "$GITHUB_ENV"
+      # sidecar.sh's validation, start and stop, against a fake docker. Not
+      # in the release matrix: it doesn't depend on the engine.
+      - name: Test the action's script
+        if: inputs.engine-version == ''
+        run: ./.github/actions/remote-cache/sidecar_test.sh
+      # The JavaScript shim that runs the script, and stops it at the job's end.
+      - name: Test the action's shim
+        if: inputs.engine-version == ''
+        run: node --test .github/actions/remote-cache/start/run/index.test.js
+      # Warns when this branch's engine side of the remote cache differs from
+      # STOCK_ENGINE's; fails only on a pin that contradicts itself. See the
+      # script.
+      - name: Compare the engine's client with the stock engine's
+        timeout-minutes: 8
+        run: ./hack/remote-cache/compare-client.sh "the sidecar demo"
+      # The demo's default engine and the docs' examples are checked against
+      # the manifest by TestPinsMatchManifest, in unit tests.
+      # The service as cacheservice-image.yml builds it, or, in the release
+      # matrix, the release image its caller built and smoke-tested.
+      - name: Download the release image
+        if: inputs.service-image-artifact != ''
+        timeout-minutes: 10
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.service-image-artifact }}
+          path: ${{ runner.temp }}/release-image
+      # Not the engine's: the start pulls it, which is part of the time it
+      # reports.
+      - name: Build the service's image
+        env:
+          REVISION: ${{ github.sha }}
+          RELEASE_IMAGE: ${{ inputs.service-image-artifact && format('{0}/release-image/image.tar', runner.temp) || '' }}
+        run: |
+          if [[ -n "$RELEASE_IMAGE" ]]; then
+            ./hack/remote-cache/load-image.sh "$RELEASE_IMAGE" cacheservice:ci
+          else
+            docker build -f cmd/cacheservice/Dockerfile \
+              --build-arg REVISION="$REVISION" -t cacheservice:ci .
+          fi
+      # MinIO on the Docker bridge gateway, where the sidecar's containers
+      # reach it, with a read-only user for the demo's prefix (demo/). The
+      # credentials are MinIO's committed dev ones.
+      - name: Start MinIO
+        id: store
+        run: ./hack/remote-cache/dev.sh demo-store >>"$GITHUB_OUTPUT"
+      # Declared before the starts: its post step runs after theirs, and
+      # fails the job unless they stopped everything (the reader's, by the
+      # start's own post step).
+      - name: Verify the sidecars are stopped at the job's end
+        uses: ./hack/remote-cache/ci/verify-stopped
+        with:
+          names: demo-writer demo-reader
+      - name: "Writer: note the time"
+        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
+      - name: "Writer: start the sidecar"
+        id: writer
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: writer
+          name: demo-writer
+          version: ${{ env.STOCK_ENGINE_TAG }}
+          # The image this run built or loaded, not the published one.
+          service-image: cacheservice:ci
+          s3-endpoint: ${{ steps.store.outputs.endpoint }}
+          s3-region: ${{ steps.store.outputs.region }}
+          s3-bucket: ${{ steps.store.outputs.bucket }}
+          s3-prefix: demo/${{ github.run_id }}-${{ github.run_attempt }}
+          s3-access-key-id: ${{ steps.store.outputs.access-key-id }}
+          s3-secret-access-key: ${{ steps.store.outputs.secret-access-key }}
+          s3-path-style: "true"
+          verbose: "true"
+          debug-port: "8091"
+      # What a consumer waits for: the CLI's install, both images' pulls (here
+      # the engine's: the service's image was built above) and the wait for
+      # the welcome.
+      - name: "Writer: report the start's time"
+        run: ./hack/remote-cache/ci/report-start-time.sh "writer" "$T0"
+      # The debug API through debug-port: 401 without the generated token,
+      # and the connected engine with it.
+      - name: "Writer: check the debug API takes only its token"
+        env:
+          TOKEN_FILE: ${{ steps.writer.outputs.debug-token-file }}
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8091/debug/engines)"
+          [[ "$code" == 401 ]] || { echo "::error::without the token: $code, want 401"; exit 1; }
+          # The header from a file descriptor: the token on no command line.
+          curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")") http://127.0.0.1:8091/debug/engines | grep -q '"conn"' ||
+            { echo "::error::with the token: no engine listed"; exit 1; }
+      # The CLI the demo runs is the wrapper over the one the official action
+      # installed, with TRACEPARENT (job env above) set.
+      - name: "Writer: the installed CLI is the engine's version"
+        run: |
+          [[ "$(dagger version | sed -n 's/^version: *//p')" == "$STOCK_ENGINE_TAG" ]]
+          [[ "${{ steps.writer.outputs.dagger }}" == "$(command -v dagger)" ]]
+      - name: "Writer: run the demo"
+        timeout-minutes: 10
+        env:
+          SERVICE: ${{ steps.writer.outputs.service-container }}
+          DAGGER: ${{ steps.writer.outputs.dagger }}
+        run: ./hack/remote-cache/demo/check.sh writer "$SERVICE" "$RUNNER_TEMP/demo/writer"
+      # Explicit: the flush must be done before the export is checked, and
+      # before the next phase. The start's post step then finds nothing to
+      # stop.
+      - name: "Writer: stop the sidecar"
+        id: writer-stop
+        if: always()
+        # The settle timeout (10s) plus 3 minutes: the flush, the engine's
+        # stop (cut off at 90s), the service's, the cleanup.
+        timeout-minutes: 4
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: demo-writer
+      - name: "Writer: check the export was stored"
+        env:
+          LOGS: ${{ steps.writer-stop.outputs.logs }}
+        run: ./hack/remote-cache/demo/check.sh stored "$LOGS/service.log" "$RUNNER_TEMP/demo/writer"
+      # A new engine, with a new, empty state volume: the writer's was
+      # removed by its stop.
+      - name: "Read-only: note the time"
+        run: echo "T0=$(date +%s.%N)" >>"$GITHUB_ENV"
+      - name: "Read-only: start the sidecar"
+        id: reader
+        uses: ./.github/actions/remote-cache/start
+        with:
+          role: read-only
+          name: demo-reader
+          version: ${{ env.STOCK_ENGINE_TAG }}
+          # The image this run built or loaded, not the published one.
+          service-image: cacheservice:ci
+          s3-endpoint: ${{ steps.store.outputs.endpoint }}
+          s3-region: ${{ steps.store.outputs.region }}
+          s3-bucket: ${{ steps.store.outputs.bucket }}
+          s3-prefix: demo/${{ github.run_id }}-${{ github.run_attempt }}
+          s3-access-key-id: ${{ steps.store.outputs.readonly-access-key-id }}
+          s3-secret-access-key: ${{ steps.store.outputs.readonly-secret-access-key }}
+          s3-path-style: "true"
+          verbose: "true"
+      - name: "Read-only: report the start's time"
+        run: ./hack/remote-cache/ci/report-start-time.sh "read-only" "$T0"
+      - name: "Read-only: run the demo"
+        timeout-minutes: 10
+        env:
+          SERVICE: ${{ steps.reader.outputs.service-container }}
+          DAGGER: ${{ steps.reader.outputs.dagger }}
+        run: ./hack/remote-cache/demo/check.sh read-only "$SERVICE" "$RUNNER_TEMP/demo/read-only" "$RUNNER_TEMP/demo/writer"
+      # No stop step: the start's post step stops the reader at the job's end,
+      # whatever happens before, and the step above checks it did. A failing
+      # step, allowed to fail, is in the way.
+      - name: "Read-only: a step that fails before the job's end"
+        continue-on-error: true
+        run: exit 1
+      # The reader's logs are written by its stop, which the start's post
+      # step does only after every step here, this upload included: a job that
+      # failed would upload no reader logs (zerobull-consulting/dagger#174).
+      # So, on failure only (a passing job keeps the post step's stop, which
+      # the verify step at the top checks), stop it here. The post step then
+      # finds nothing to stop.
+      - name: "Read-only: stop the sidecar, to upload its logs"
+        if: failure()
+        timeout-minutes: 4
+        uses: ./.github/actions/remote-cache/stop
+        with:
+          name: demo-reader
+      # The service's and the engine's logs of both phases (presigned URLs'
+      # credentials redacted), and the demo's CLI output.
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: sidecar-demo${{ inputs.engine-version && format('-{0}', inputs.engine-version) || '' }}
+          path: |
+            ${{ runner.temp }}/remote-cache-sidecar/*/logs
+            ${{ runner.temp }}/demo
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: ./hack/remote-cache/dev.sh reset

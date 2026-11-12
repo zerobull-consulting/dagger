@@ -140,6 +140,9 @@ legacy-default-path = true
 source = ".dagger/modules/test-split"
 legacy-default-path = true
 
+[modules.cacheservice]
+source = ".dagger/modules/cacheservice"
+
 [modules.typescript-client]
 source = ".dagger/modules/typescript-client-dev"
 legacy-default-path = true
@@ -246,6 +249,9 @@ clients = ["./.dagger/modules/engine-dev"]
 [sdks.dang.scopes.".dagger/modules/security"]
 is-module = true
 clients = ["./.dagger/modules/engine-dev"]
+
+[sdks.dang.scopes.".dagger/modules/cacheservice"]
+is-module = true
 
 [sdks.dang.scopes.".dagger/modules/test-split"]
 is-module = true

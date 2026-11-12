@@ -1,0 +1,47 @@
+# The paths this fork may change relative to upstream dagger/dagger.
+#
+# hack/remote-cache/check-fork-paths.sh diffs the fork against the upstream
+# commit it last merged and fails on any changed path no entry here allows.
+# Keep this list small: a change outside it is a change to upstream's code,
+# which brings back merge conflicts and makes the service harder to extract
+# (zerobull-consulting/dagger#117, D7).
+#
+# One entry per line: <rule> <path> <reason>
+#
+#   <path> is a file, or a directory ending in "/" (everything under it).
+#   No globs.
+#
+#   any      the fork may add, change or delete the path.
+#   deleted  the fork deletes this upstream file, and does nothing else to it.
+#   go-mod   a go.mod in which the fork only adds requirements: every module
+#            upstream requires keeps its version, and every other directive
+#            (module, go, toolchain, godebug, replace, exclude, retract, tool,
+#            ignore) is unchanged. "// indirect" may change.
+#   add-lines  the fork only adds lines to this upstream file, and removes
+#            or changes none of upstream's.
+#
+# The reason is required. An entry that matches no changed path fails the
+# check too, so the list can't keep entries nothing needs.
+
+# The service and its tooling.
+any       cmd/cacheservice/                              the cache service, its tests and its docs
+any       hack/remote-cache/                             the service's dev scripts, demo, docs and this check
+any       .dagger/modules/cacheservice/                  the Dagger module that builds and publishes the service's image
+any       .github/actions/remote-cache/                  the remote-cache actions (start, stop, the script they share) that run the service next to an engine in CI
+
+# The fork's own workflows, by name. Upstream's workflows aren't the fork's.
+any       .github/workflows/cacheservice-image.yml       builds and smoke-tests the service image on pull requests
+any       .github/workflows/cacheservice-publish.yml     builds the service's release image on pushes to feature/remote-cache, verifies it against every accept line, then publishes it and moves its engine-version tags
+any       .github/workflows/remote-cache-tests.yml       the service's unit (the release check's script tests included), MinIO, e2e and sidecar jobs, and the release matrix's e2e and sidecar runs
+any       .github/workflows/remote-cache-spaces.yml      the service's DigitalOcean Spaces jobs
+any       .github/workflows/remote-cache-update.yml      fills the remote cache bucket PR checks read from: a writer sidecar runs the checks' Dagger pipelines on pushes to feature/remote-cache
+any       .github/workflows/remote-cache-fork-paths.yml  runs this check
+any       .github/workflows/remote-cache-release-check.yml  the hourly release check: syncs each new upstream release through one release-check/sync/<version> branch at a time (zerobull-consulting/dagger#117, D5)
+
+# Changes to upstream files the fork must make.
+deleted   .github/workflows/changelog.yml                gated on a needs/changelog label this repository doesn't have, so it only ever showed as a skipped check (zerobull-consulting/dagger#122)
+add-lines dagger.toml                                    registers the cacheservice module and its SDK scope
+go-mod    go.mod                                         the service's own dependencies (the S3 SDK, prometheus/client_model) share the root module; moves out with the service's own module (zerobull-consulting/dagger#117, D7 spike)
+add-lines dagger.lock                                    pins the cacheservice module's MinIO image by digest (the CLI records it)
+add-lines go.sum                                         the checksums of those dependencies
+add-lines .gitignore                                     ignores dotenvx's .env.keys, the private key for cmd/cacheservice/.env's encrypted values; a nested .gitignore wouldn't cover a key file written at the root

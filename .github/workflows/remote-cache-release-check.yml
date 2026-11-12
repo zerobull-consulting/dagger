@@ -1,0 +1,298 @@
+name: Remote cache release check
+# Brings each new upstream Dagger release into feature/remote-cache through
+# one sync branch at a time, release-check/sync/<version>
+# (zerobull-consulting/dagger#117, D5): a new release starts it (the tag
+# merged, a draft PR); each hour its head is verified; red files or updates
+# a compat-break issue, and fixes are squash-merged into the sync branch;
+# green gets the accept line and the PR marked ready, for a human to merge
+# with a merge commit. hack/remote-cache/release-check.sh does the work;
+# this file only decides when it runs and with which token. See
+# hack/remote-cache/README.md, "Release check".
+#
+# Tokens: the sync bot's token (CACHE_BOT_SYNC_TOKEN in the cache-bot-sync
+# environment) pushes the sync branch and opens its PR, so the PR's CI runs;
+# the merge may change workflows, which its token may. It is requested only
+# by this workflow's schedule and workflow_dispatch jobs on
+# feature/remote-cache, never from pull_request_target or workflow_run, and
+# read in one step ("The bot's token"), which a GitHub App token would
+# replace (zerobull-consulting/dagger#152). Everything else, dispatches,
+# issues, comments and marking the PR ready included, uses GITHUB_TOKEN.
+# Neither token merges anything.
+#
+# Upstream's code never runs in this workflow: it only merges, diffs and
+# pushes it. It runs in the verifying runs of remote-cache-tests.yml.
+"on":
+  schedule:
+    # Hourly, off the hour.
+    - cron: "17 * * * *"
+  # By hand: to read a fix sooner than the next hour, or a dry run. On any
+  # branch but feature/remote-cache it is always a dry run, since only that
+  # branch may deploy the bot's environment.
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Print what it would do, and push, open, file, comment, mark or dispatch nothing (always, off feature/remote-cache)"
+        type: boolean
+        default: true
+      version:
+        description: "In a dry run, the release to start a sync for, such as v1.0.0-beta.27, listed or not (empty: the plan as it is)"
+        type: string
+        default: ""
+permissions:
+  contents: read
+# One run at a time, across branches.
+concurrency:
+  group: remote-cache-release-check
+  cancel-in-progress: false
+# bash with pipefail: a "| tee" mustn't hide the script's failure.
+defaults:
+  run:
+    shell: bash
+jobs:
+  # Publish what nothing published, and read the state. No upstream code
+  # runs here.
+  check:
+    name: poll
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+      issues: read
+    outputs:
+      dry: ${{ steps.mode.outputs.dry }}
+      action: ${{ steps.plan.outputs.action }}
+      version: ${{ steps.plan.outputs.version }}
+      digest: ${{ steps.plan.outputs.digest }}
+      pr: ${{ steps.plan.outputs.pr }}
+      sha: ${{ steps.plan.outputs.sha }}
+      state: ${{ steps.plan.outputs.state }}
+      draft: ${{ steps.plan.outputs.draft }}
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      # Full history, without blobs: the plan fetches the sync branch and
+      # the tag, to see whether one contains the other.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Dry run or not
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_INPUT: ${{ inputs.dry-run }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          dry=false
+          if [[ "$GITHUB_REF" != refs/heads/feature/remote-cache || ( "$EVENT" == workflow_dispatch && "$DRY_INPUT" != false ) ]]; then
+            dry=true
+          fi
+          if [[ -n "$VERSION" && "$dry" != true ]]; then
+            echo "::error::version is for dry runs only"
+            exit 1
+          fi
+          echo "dry=$dry" >>"$GITHUB_OUTPUT"
+          echo "RELEASE_CHECK_DRY_RUN=$dry" >>"$GITHUB_ENV"
+          echo "dry run: $dry" | tee -a "$GITHUB_STEP_SUMMARY"
+      # A merge of a sync PR starts its push's publish run; this catches one
+      # that failed, or a head nothing published.
+      - name: Publish a head nothing published
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./hack/remote-cache/release-check.sh publish | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Poll upstream and the sync
+        id: plan
+        timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: ./hack/remote-cache/release-check.sh plan ${VERSION:+"$VERSION"} | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # A new release, and no sync open: the sync branch and its draft PR, as
+  # the sync bot, and its first verification (GITHUB_TOKEN).
+  start:
+    name: start the sync
+    needs: check
+    if: >-
+      needs.check.outputs.dry == 'false' && needs.check.outputs.action == 'start' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: cache-bot-sync
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      # The one step that gets the bot's token. A GitHub App
+      # (actions/create-github-app-token, zerobull-consulting/dagger#152)
+      # replaces this step and nothing else.
+      - name: The bot's token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CACHE_BOT_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::CACHE_BOT_SYNC_TOKEN is empty or unreadable in the cache-bot-sync environment: nothing was pushed. Renew it (hack/remote-cache/README.md, \"Automation tokens\"); GITHUB_TOKEN is no substitute, since its PR's CI would never run."
+            exit 1
+          fi
+          echo "token=$TOKEN" >>"$GITHUB_OUTPUT"
+      - name: Merge the tag, push the sync branch, open its PR
+        timeout-minutes: 25
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+        run: ./hack/remote-cache/release-check.sh start "$VERSION" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The open sync's head: verify it (a dispatch, not waited on: a later hour
+  # reads its verdict), report it red, or mark a sync PR with its accept
+  # line ready if accept stopped before it could. GITHUB_TOKEN only. In a
+  # dry run, printed.
+  follow:
+    name: verify or report the sync
+    needs: check
+    if: >-
+      needs.check.outputs.action == 'sync' &&
+      (needs.check.outputs.state == 'verify' || needs.check.outputs.state == 'red' ||
+       (needs.check.outputs.state == 'ready' && needs.check.outputs.draft == 'true'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Dispatch the verifying run
+        if: needs.check.outputs.state == 'verify'
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: ${{ needs.check.outputs.dry }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+        run: ./hack/remote-cache/release-check.sh verify "$VERSION" "$DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: File or update the compat-break issue
+        if: needs.check.outputs.state == 'red'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: ${{ needs.check.outputs.dry }}
+          VERSION: ${{ needs.check.outputs.version }}
+          RUN: ${{ needs.check.outputs.run }}
+          PR: ${{ needs.check.outputs.pr }}
+        run: ./hack/remote-cache/release-check.sh report "$VERSION" "$RUN" "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Mark the PR ready
+        if: needs.check.outputs.state == 'ready'
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: ${{ needs.check.outputs.dry }}
+          VERSION: ${{ needs.check.outputs.version }}
+          PR: ${{ needs.check.outputs.pr }}
+        run: ./hack/remote-cache/release-check.sh ready "$VERSION" "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The sync's head is green: its accept line, pushed as the sync bot; then
+  # the PR marked ready and the issue told (GITHUB_TOKEN). A human merges.
+  accept:
+    name: accept the green sync
+    needs: check
+    if: >-
+      needs.check.outputs.dry == 'false' &&
+      needs.check.outputs.action == 'sync' && needs.check.outputs.state == 'green' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/feature/remote-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: cache-bot-sync
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      # The one step that gets the bot's token (see start).
+      - name: The bot's token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CACHE_BOT_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::CACHE_BOT_SYNC_TOKEN is empty or unreadable in the cache-bot-sync environment: nothing was pushed. Renew it (hack/remote-cache/README.md, \"Automation tokens\"); GITHUB_TOKEN is no substitute, since its PR's CI would never run."
+            exit 1
+          fi
+          echo "token=$TOKEN" >>"$GITHUB_OUTPUT"
+      - name: Push the accept line, mark the PR ready
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+          RUN: ${{ needs.check.outputs.run }}
+          SHA: ${{ needs.check.outputs.sha }}
+          PR: ${{ needs.check.outputs.pr }}
+        run: ./hack/remote-cache/release-check.sh accept "$VERSION" "$DIGEST" "$RUN" "$SHA" "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # A dry run of start or accept: the merge is real and local; the pushes,
+  # the PR, the dispatch and the comments are printed. No token.
+  dry-run:
+    name: what it would do (dry run)
+    needs: check
+    if: >-
+      needs.check.outputs.dry == 'true' &&
+      (needs.check.outputs.action == 'start' || (needs.check.outputs.action == 'sync' && needs.check.outputs.state == 'green'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: What it would do
+        timeout-minutes: 25
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_DRY_RUN: "true"
+          ACTION: ${{ needs.check.outputs.action }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DIGEST: ${{ needs.check.outputs.digest }}
+          RUN: ${{ needs.check.outputs.run }}
+          SHA: ${{ needs.check.outputs.sha }}
+          PR: ${{ needs.check.outputs.pr }}
+        run: |
+          rc=./hack/remote-cache/release-check.sh
+          if [[ "$ACTION" == start ]]; then
+            "$rc" start "$VERSION" "$DIGEST"
+          else
+            "$rc" accept "$VERSION" "$DIGEST" "$RUN" "$SHA" "$PR"
+          fi
