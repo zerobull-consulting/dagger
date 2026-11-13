@@ -69,7 +69,7 @@ Each is a complete answer; a "no" to all of them is fine, and leaves the service
 
 The proposal is for A, with B open to discussion. C is not proposed.
 
-The service imports 49 packages from `internal/buildkit`, plus `engine/snapshots`, `internal/fsutil`, `internal/cloud` and others. Go does not allow another module to import `internal/`, so as an independent project it keeps a synced copy of what it needs. In the tree, those imports are ordinary.
+The service's production code imports only public packages of this repository: `engine/remotecache/protocol` (the wire types), `dagql` (the transfer types, such as `ValueBundle`), `engine/telemetryattrs` (attribute names), `engine/remotecache` and `engine/snapshots` (`ExportLayer`). It imports nothing from `internal/` directly, so it does not need to live in this tree: a separate module could require `github.com/dagger/dagger` at an engine release. The cost of that is a transitive dependency on the whole engine module, and restating the root `go.mod`'s `replace` directives. *[untested]*
 
 ## Layout, if any of it lands
 
