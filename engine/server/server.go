@@ -26,7 +26,6 @@ import (
 	ctdsnapshot "github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/pkg/sys"
-	localcontentstore "github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/containerd/v2/plugins/diff/walking"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/platforms"
@@ -36,6 +35,7 @@ import (
 	"github.com/dagger/dagger/engine/cachevolumedir"
 	"github.com/dagger/dagger/engine/config"
 	bkcache "github.com/dagger/dagger/engine/snapshots"
+	"github.com/dagger/dagger/engine/snapshots/blobstore"
 	containerdsnapshot "github.com/dagger/dagger/engine/snapshots/containerd"
 	controlapi "github.com/dagger/dagger/internal/buildkit/api/services/control"
 	apitypes "github.com/dagger/dagger/internal/buildkit/api/types"
@@ -594,10 +594,9 @@ func NewServer(ctx context.Context, opts *NewServerOpts) (*Server, error) {
 	}
 
 	// The image's entries join the cache before the server dispatches any
-	// request, so the first module build already finds them.
-	if err := srv.mergeImageEntries(ctx, distconsts.EngineContainerImageEntriesDir); err != nil {
-		return nil, err
-	}
+	// request, so the first module build already finds them. The start
+	// doesn't depend on them.
+	srv.mergeImageEntries(ctx, distconsts.EngineContainerImageEntriesDir)
 
 	// The integration attaches after local cache initialization and before
 	// the server dispatches any request.
@@ -783,7 +782,7 @@ func (srv *Server) initLocalCacheStateOnce(ctx context.Context, cfg config.Confi
 		}
 	}
 
-	srv.localContentStore, err = localcontentstore.NewStore(srv.contentStoreRootDir)
+	srv.localContentStore, err = blobstore.New(srv.contentStoreRootDir)
 	if err != nil {
 		return localCacheStateResetNone, fmt.Errorf("failed to create content store: %w", err)
 	}
